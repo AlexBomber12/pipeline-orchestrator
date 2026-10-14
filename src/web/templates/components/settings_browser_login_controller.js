@@ -17,6 +17,7 @@
         let session = null;
         let timer = null;
         let state = null;
+        let cleanupConfirmed = null;
         const requests = new Set();
         const submitted = new Set();
         const cancelled = new Set();
@@ -128,6 +129,7 @@
                 return;
             }
             state = login.state;
+            cleanupConfirmed = login.cleanup_confirmed;
             const view = {
                 kind: "snapshot",
                 sessionId: login.session_id,
@@ -175,7 +177,7 @@
 
         async function start(replaceExisting = false) {
             if (disposed || typeof replaceExisting !== "boolean" || state === "cleanup_failed" ||
-                (session && cancelled.has(session.id) && state !== "cancelled")) return false;
+                (session && cancelled.has(session.id) && cleanupConfirmed !== true)) return false;
             const version = supersede();
             const result = classify(await request(base, "POST", { replace_existing: replaceExisting }));
             show(result, version, true);
@@ -193,7 +195,10 @@
                 "POST", { reference: session.reference, authorization_code: authorizationCode }));
             if (!current(version)) return false;
             show(result, version, false);
-            if (result.kind === "unavailable") queuePoll(version);
+            if (result.kind === "unavailable" ||
+                (result.kind === "refusal" && result.reason === "daemon_unavailable")) {
+                queuePoll(version);
+            }
             return result.kind === "snapshot";
         }
 
@@ -204,7 +209,10 @@
             const result = classify(await request(sessionUrl(), "DELETE"));
             if (!current(version)) return false;
             show(result, version, false);
-            if (result.kind === "unavailable") queuePoll(version);
+            if (result.kind === "unavailable" ||
+                (result.kind === "refusal" && result.reason === "daemon_unavailable")) {
+                queuePoll(version);
+            }
             return result.kind === "snapshot";
         }
 

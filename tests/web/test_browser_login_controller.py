@@ -81,6 +81,7 @@ async function main() {
         await h.finish(1, { ok: false, reason: 'daemon_unavailable', detail: code });
         assert.equal(await first, false);
         assert.equal(h.views.at(-1).reason, 'daemon_unavailable');
+        assert.equal(h.timers.size, 1); // inspect the captured session after lost handoff
         assert.equal(JSON.stringify(h.views).includes(code), false);
         assert.equal(JSON.stringify(h.controller).includes(code), false);
         assert.equal(await h.controller.submit(code), false);
@@ -160,6 +161,25 @@ async function main() {
         assert.equal(h.calls[0].init.signal.aborted, true);
         assert.equal(h.views.at(-1).kind, 'unavailable');
         assert.equal(h.timers.size, 0);
+        h.controller.dispose();
+    }
+    {
+        const h = harness();
+        const start = h.controller.start(); await tick();
+        await h.finish(0, snapshot('waiting_for_code')); await start;
+        const cancel = h.controller.cancel(); await tick();
+        await h.finish(1, { ok: false, reason: 'daemon_unavailable', detail: 'unavailable' });
+        assert.equal(await cancel, false);
+        assert.equal(h.timers.size, 1);
+        await h.firePoll();
+        await h.finish(2, snapshot('succeeded', sid, { cleanup_confirmed: true,
+            auth_status: { status: 'ok', saved_credentials_present: true,
+                failure_reason: null } }));
+        assert.equal(h.successes.length, 1);
+        const restart = h.controller.start(); await tick();
+        assert.equal(h.calls[3].init.method, 'POST');
+        await h.finish(3, snapshot('waiting_for_code', sid2));
+        assert.equal(await restart, true);
         h.controller.dispose();
     }
     {
