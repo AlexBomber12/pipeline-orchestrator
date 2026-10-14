@@ -138,6 +138,7 @@
             }
             state = login.state;
             cleanupConfirmed = login.cleanup_confirmed;
+            if (session && login.state === "cleanup_failed") cancelled.delete(session.id);
             const view = {
                 kind: "snapshot",
                 sessionId: login.session_id,
@@ -211,7 +212,7 @@
         }
 
         async function cancel() {
-            if (disposed || !session || cancelled.has(session.id) || state === "cleanup_failed") return false;
+            if (disposed || !session || cancelled.has(session.id)) return false;
             cancelled.add(session.id);
             const version = supersede();
             const result = classify(await request(sessionUrl(), "DELETE"));

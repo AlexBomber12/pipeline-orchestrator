@@ -134,6 +134,15 @@ async function main() {
         assert.equal(h.timers.size, 0);
         assert.equal(await h.controller.start(), false);
         assert.equal(h.successes.length, 0);
+        const retry = h.controller.cancel(); await tick();
+        assert.equal(h.calls[3].init.method, 'DELETE');
+        assert.equal(await h.controller.cancel(), false);
+        await h.finish(3, snapshot('cancelled', sid, { cleanup_confirmed: true }));
+        assert.equal(await retry, true);
+        const restart = h.controller.start(); await tick();
+        await h.finish(4, snapshot('waiting_for_code', sid2));
+        assert.equal(await restart, true);
+        h.controller.dispose();
     }
     {
         const h = harness();
