@@ -15,6 +15,7 @@ from src import coder_auth as _coder_auth
 from src import coder_auth_worker as _auth_worker
 from src import config as src_config
 from src.coder_registry import (
+    CoderBrowserLoginFailure,
     CoderRegistry,
     ModelCatalog,
     ModelCatalogUnavailable,
@@ -3207,6 +3208,226 @@ def test_api_auth_status_returns_ok_for_both(
     assert payload["gh"]["status"] == "ok"
     assert "Logged in" in payload["gh"]["detail"]
     assert "octocat" in payload["gh"]["detail"]
+
+
+def _browser_login_payload(
+    *,
+    state: str = "waiting_for_code",
+    failure_reason: str | None = None,
+) -> dict[str, object]:
+    return {
+        "login_method": "browser_code",
+        "plugin": "claude",
+        "session_id": "s" * 32,
+        "state": state,
+        "detail": "Browser login status",
+        "failure_reason": failure_reason,
+        "authorization_url": "https://claude.com/cai/oauth/authorize?state=abc"
+        if state == "waiting_for_code"
+        else None,
+        "application_deadline": 1_800_000_000.0,
+        "cleanup_confirmed": False if state == "cleanup_failed" else True if state == "cancelled" else None,
+        "replacement_requested": False,
+        "reused_session": False,
+        "replacement_warning": "Existing credentials may be replaced",
+        "auth_status": None,
+        "observed_cli_version": "2.1.126",
+        "minimum_cli_version": "2.1.126",
+    }
+
+
+def test_browser_login_api_delegates_with_captured_reference(
+    empty_config: Path,
+) -> None:
+    calls: list[tuple[str, tuple[object, ...], dict[str, object]]] = []
+
+    class Bridge:
+        async def start_browser_login(self, *args: object, **kwargs: object):
+            calls.append(("start", args, kwargs))
+            return _browser_login_payload()
+
+        async def inspect_browser_login(self, *args: object, **kwargs: object):
+            calls.append(("inspect", args, kwargs))
+            return _browser_login_payload()
+
+        async def submit_browser_login(self, *args: object, **kwargs: object):
+            calls.append(("submit", args, kwargs))
+            return _browser_login_payload(state="cleanup_failed", failure_reason="cancellation_failed")
+
+        async def cancel_browser_login(self, *args: object, **kwargs: object):
+            calls.append(("cancel", args, kwargs))
+            return _browser_login_payload(state="cancelled")
+
+    reference = "src.coders.claude:ClaudePlugin"
+    session = "s" * 32
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        started = client.post("/api/coders/claude/browser-login", json={"replace_existing": True})
+        assert started.status_code == 202
+        assert started.json()["reference"] == reference
+        registry = client.app.state.coder_registry
+        registry._plugins.clear()
+        inspected = client.get(f"/api/coders/claude/browser-login/{session}", params={"reference": reference})
+        submitted = client.post(
+            f"/api/coders/claude/browser-login/{session}/code",
+            json={"reference": reference, "authorization_code": " exact-code#token "},
+        )
+        cancelled = client.delete(f"/api/coders/claude/browser-login/{session}", params={"reference": reference})
+    assert [started.status_code, inspected.status_code, submitted.status_code, cancelled.status_code] == [
+        202,
+        200,
+        200,
+        200,
+    ]
+    assert submitted.json()["login"]["state"] == "cleanup_failed"
+    assert submitted.json()["login"]["cleanup_confirmed"] is False
+    assert [item[0] for item in calls] == ["start", "inspect", "submit", "cancel"]
+    assert calls[0][1] == ("claude",)
+    assert calls[0][2] == {"expected_reference": reference, "replace_existing": True}
+    assert calls[1][1] == calls[2][1] == calls[3][1] == ("claude", session)
+    assert calls[2][2] == {"expected_reference": reference, "authorization_code": " exact-code#token "}
+    assert all(
+        response.headers["cache-control"] == "no-store" for response in (started, inspected, submitted, cancelled)
+    )
+
+
+def test_browser_login_api_rejects_private_invalid_input_before_bridge(
+    empty_config: Path,
+) -> None:
+    class Bridge:
+        async def submit_browser_login(self, *_args: object, **_kwargs: object):
+            raise AssertionError("invalid input reached bridge")
+
+        async def start_browser_login(self, *_args: object, **_kwargs: object):
+            raise AssertionError("invalid input reached bridge")
+
+    path = "/api/coders/claude/browser-login"
+    session_path = f"{path}/{'s' * 32}"
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        responses = [
+            client.post(
+                path,
+                content='{"replace_existing":false,"replace_existing":true}',
+                headers={"content-type": "application/json"},
+            ),
+            client.post(path, json={"replace_existing": "true"}),
+            client.post(path, json={"extra": "synthetic-secret"}),
+            client.post(path, content="not json", headers={"content-type": "application/json"}),
+            client.post(path, content="{}", headers={"content-type": "text/plain"}),
+            client.post(
+                path,
+                content=b" " * (32 * 1024 + 1),
+                headers={"content-type": "application/json", "content-length": "2"},
+            ),
+            client.post(path + "?authorization_code=synthetic-secret", json={}),
+            client.get(session_path, params={"reference": "x", "authorization_code": "synthetic-secret"}),
+            client.delete(session_path, params={"reference": ["x", "y"]}),
+            client.post(f"{path}/short/code", json={"reference": "x", "authorization_code": "code"}),
+            client.post(session_path + "/code", json={"reference": "x", "authorization_code": "bad\ncode"}),
+            client.post(session_path + "/code", json={"reference": "x", "authorization_code": "é" * 2049}),
+            client.post(
+                session_path + "/code", json={"reference": "x", "authorization_code": "synthetic-secret", "extra": 1}
+            ),
+            client.post(
+                session_path + "/code?authorization_code=synthetic-secret",
+                json={"reference": "x", "authorization_code": "ok"},
+            ),
+        ]
+    assert [response.status_code for response in responses] == [
+        400,
+        422,
+        422,
+        400,
+        415,
+        413,
+        422,
+        422,
+        422,
+        422,
+        422,
+        422,
+        422,
+        422,
+    ]
+    assert all(response.headers["cache-control"] == "no-store" for response in responses)
+    assert all("synthetic-secret" not in response.text for response in responses)
+
+
+@pytest.mark.parametrize(
+    ("reason", "status"),
+    [
+        ("session_not_found", 404),
+        ("session_plugin_mismatch", 409),
+        ("replacement_required", 409),
+        ("unsupported", 422),
+        ("unsupported_cli_version", 422),
+        ("startup_failed", 503),
+    ],
+)
+def test_browser_login_api_maps_sanitized_refusals(
+    empty_config: Path,
+    reason: str,
+    status: int,
+) -> None:
+    class Bridge:
+        async def start_browser_login(self, *_args: object, **_kwargs: object):
+            return CoderBrowserLoginFailure(reason, "synthetic-secret")
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        response = client.post("/api/coders/claude/browser-login", json={})
+    assert response.status_code == status
+    assert response.json()["ok"] is False
+    assert response.json()["reason"] == reason
+    assert "synthetic-secret" not in response.text
+
+
+def test_browser_login_api_unavailable_and_missing_plugin(empty_config: Path) -> None:
+    class Bridge:
+        async def start_browser_login(self, *_args: object, **_kwargs: object):
+            raise ModelCatalogUnavailable("synthetic-secret")
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        missing = client.post("/api/coders/missing/browser-login", json={})
+        unavailable = client.post("/api/coders/claude/browser-login", json={})
+    assert missing.status_code == 404
+    assert unavailable.status_code == 503
+    assert "synthetic-secret" not in unavailable.text
+
+
+def test_browser_login_api_preserves_context_conflicts_and_ambiguous_submission(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture,
+) -> None:
+    calls: list[str] = []
+
+    class Bridge:
+        async def inspect_browser_login(self, *_args: object, **_kwargs: object):
+            calls.append("inspect")
+            return CoderBrowserLoginFailure("session_plugin_mismatch", "synthetic-secret")
+
+        async def submit_browser_login(self, *_args: object, **_kwargs: object):
+            calls.append("submit")
+            raise ModelCatalogUnavailable("synthetic-secret")
+
+        async def cancel_browser_login(self, *_args: object, **_kwargs: object):
+            calls.append("cancel")
+            return CoderBrowserLoginFailure("session_not_found", "synthetic-secret")
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        monkeypatch.setattr(subprocess, "run", lambda *_a, **_kw: pytest.fail("web launched a subprocess"))
+        path = f"/api/coders/claude/browser-login/{'s' * 32}"
+        inspected = client.get(path, params={"reference": "captured:Plugin"})
+        submitted = client.post(
+            path + "/code", json={"reference": "captured:Plugin", "authorization_code": "synthetic-secret"},
+        )
+        cancelled = client.delete(path, params={"reference": "captured:Plugin"})
+    assert [inspected.status_code, submitted.status_code, cancelled.status_code] == [409, 503, 404]
+    assert calls == ["inspect", "submit", "cancel"]
+    assert all("synthetic-secret" not in response.text for response in (inspected, submitted, cancelled))
+    assert "synthetic-secret" not in caplog.text
 
 
 def _device_login_payload(

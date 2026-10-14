@@ -25,6 +25,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, StrictBool, ValidationError
 
 from src.audit.webhook_log import write_webhook_audit
+from src.coder_login import validate_browser_authorization_code
 from src.coder_registry import (
     CoderAuthCapabilities,
     CoderAuthStatus,
@@ -39,6 +40,7 @@ from src.config import (
     load_config,
 )
 from src.daemon.sandbox import is_bubblewrap_available
+from src.model_catalog_bridge import _browser_login_envelope
 from src.utils import repo_slug_from_url
 from src.web.services.auth_probe import (
     _collect_auth_status,
@@ -1269,6 +1271,195 @@ async def api_auth_status(request: Request) -> JSONResponse:
     return JSONResponse(
         await _collect_auth_status(request.app.state.coder_registry)
     )
+
+
+_BROWSER_BODY_LIMIT = 32 * 1024
+_BROWSER_SESSION_ID = re.compile(r"[A-Za-z0-9_-]{32,128}\Z")
+_BROWSER_REFUSAL_STATUSES = {
+    "session_not_found": 404,
+    "session_plugin_mismatch": 409,
+    "replacement_required": 409,
+    "credential_in_use": 409,
+    "session_capacity": 409,
+    "unsupported": 422,
+    "unsupported_cli_version": 422,
+    "cli_missing": 422,
+    "daemon_shutdown": 503,
+    "auth_status_unavailable": 503,
+    "startup_failed": 503,
+    "cancelled": 503,
+}
+
+
+def _browser_response(payload: dict[str, Any], status_code: int) -> JSONResponse:
+    return JSONResponse(payload, status_code=status_code, headers={"Cache-Control": "no-store"})
+
+
+def _browser_input_error(status_code: int, detail: str) -> JSONResponse:
+    return _browser_response({"ok": False, "detail": detail}, status_code)
+
+
+def _browser_unavailable() -> JSONResponse:
+    return _browser_response(
+        {"ok": False, "reason": "daemon_unavailable", "detail": "Browser login is unavailable"}, 503
+    )
+
+
+def _browser_object_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON field")
+        result[key] = value
+    return result
+
+
+async def _browser_json_body(request: Request) -> dict[str, Any] | JSONResponse:
+    media_type = request.headers.get("content-type", "").partition(";")[0].strip().lower()
+    if media_type != "application/json":
+        return _browser_input_error(415, "Content type must be application/json")
+    data = bytearray()
+    async for chunk in request.stream():
+        if len(data) + len(chunk) > _BROWSER_BODY_LIMIT:
+            return _browser_input_error(413, "Browser login request body is too large")
+        data.extend(chunk)
+    try:
+        raw = json.loads(data.decode("utf-8"), object_pairs_hook=_browser_object_pairs)
+    except (UnicodeDecodeError, ValueError):
+        return _browser_input_error(400, "Invalid JSON browser login request body")
+    if not isinstance(raw, dict):
+        return _browser_input_error(422, "Invalid browser login request body")
+    return raw
+
+
+def _browser_reference(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= 512
+        and not any(ord(char) < 32 or ord(char) == 127 for char in value)
+    )
+
+
+def _browser_session_context(request: Request, session_id: str) -> str | JSONResponse:
+    if _BROWSER_SESSION_ID.fullmatch(session_id) is None:
+        return _browser_input_error(422, "Invalid browser login session ID")
+    params = request.query_params
+    if set(params) != {"reference"} or len(params.getlist("reference")) != 1:
+        return _browser_input_error(422, "Invalid browser login reference")
+    reference = params["reference"]
+    if not _browser_reference(reference):
+        return _browser_input_error(422, "Invalid browser login reference")
+    return reference
+
+
+async def _browser_bridge_result(
+    request: Request,
+    coder_name: str,
+    reference: str,
+    operation: str,
+    *args: str,
+    **kwargs: Any,
+) -> JSONResponse:
+    bridge = getattr(request.app.state, "plugin_bridge", None)
+    if bridge is None:
+        return _browser_unavailable()
+    try:
+        result = await getattr(bridge, operation)(coder_name, *args, expected_reference=reference, **kwargs)
+        envelope = _browser_login_envelope(result, expected_plugin=coder_name)
+    except Exception:
+        # Bridge failures, including ambiguous code handoffs, have no safe retry.
+        return _browser_unavailable()
+    if not envelope["ok"]:
+        reason = envelope["reason"]
+        return _browser_response(envelope, _BROWSER_REFUSAL_STATUSES.get(reason, 422))
+    login = envelope["login"]
+    status = 200
+    if operation == "start_browser_login" and login["state"] in {
+        "starting",
+        "waiting_for_user",
+        "waiting_for_code",
+        "authorizing",
+    }:
+        status = 202
+    elif login["state"] == "not_found":
+        status = 404
+    elif login["failure_reason"] in {
+        "session_plugin_mismatch",
+        "replacement_required",
+        "credential_in_use",
+        "session_capacity",
+    }:
+        status = 409
+    elif login["state"] == "unsupported" or login["failure_reason"] in {"unsupported_cli_version", "cli_missing"}:
+        status = 422
+    elif login["failure_reason"] == "daemon_unavailable":
+        status = 503
+    return _browser_response({"ok": True, "reference": reference, "login": login}, status)
+
+
+@router.post("/api/coders/{coder_name}/browser-login")
+async def api_start_browser_login(request: Request, coder_name: str) -> JSONResponse:
+    if request.query_params:
+        return _browser_input_error(422, "Invalid browser login request body")
+    body = await _browser_json_body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    if set(body) - {"replace_existing"} or type(body.get("replace_existing", False)) is not bool:
+        return _browser_input_error(422, "Invalid browser login request body")
+    registry: CoderRegistry = request.app.state.coder_registry
+    if registry.get_optional(coder_name) is None:
+        return _browser_input_error(404, "Coder plugin was not found")
+    reference = registry.reference_for(coder_name)
+    if not _browser_reference(reference):
+        return _browser_unavailable()
+    return await _browser_bridge_result(
+        request,
+        coder_name,
+        reference,
+        "start_browser_login",
+        replace_existing=body.get("replace_existing", False),
+    )
+
+
+@router.get("/api/coders/{coder_name}/browser-login/{session_id}")
+async def api_inspect_browser_login(request: Request, coder_name: str, session_id: str) -> JSONResponse:
+    reference = _browser_session_context(request, session_id)
+    if isinstance(reference, JSONResponse):
+        return reference
+    return await _browser_bridge_result(request, coder_name, reference, "inspect_browser_login", session_id)
+
+
+@router.post("/api/coders/{coder_name}/browser-login/{session_id}/code")
+async def api_submit_browser_login(request: Request, coder_name: str, session_id: str) -> JSONResponse:
+    if _BROWSER_SESSION_ID.fullmatch(session_id) is None:
+        return _browser_input_error(422, "Invalid browser login session ID")
+    if request.query_params:
+        return _browser_input_error(422, "Invalid browser login request body")
+    body = await _browser_json_body(request)
+    if isinstance(body, JSONResponse):
+        return body
+    if set(body) != {"reference", "authorization_code"} or not _browser_reference(body["reference"]):
+        return _browser_input_error(422, "Invalid browser login request body")
+    try:
+        validate_browser_authorization_code(body["authorization_code"])
+    except (ValueError, UnicodeEncodeError):
+        return _browser_input_error(422, "Invalid browser authorization code")
+    return await _browser_bridge_result(
+        request,
+        coder_name,
+        body["reference"],
+        "submit_browser_login",
+        session_id,
+        authorization_code=body["authorization_code"],
+    )
+
+
+@router.delete("/api/coders/{coder_name}/browser-login/{session_id}")
+async def api_cancel_browser_login(request: Request, coder_name: str, session_id: str) -> JSONResponse:
+    reference = _browser_session_context(request, session_id)
+    if isinstance(reference, JSONResponse):
+        return reference
+    return await _browser_bridge_result(request, coder_name, reference, "cancel_browser_login", session_id)
 
 
 def _device_login_unavailable(
