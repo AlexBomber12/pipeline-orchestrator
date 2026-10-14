@@ -171,6 +171,25 @@ async function main() {
         const h = harness();
         const start = h.controller.start(); await tick();
         await h.finish(0, snapshot('waiting_for_code')); await start;
+        const reattach = h.controller.start(); await tick();
+        await h.finish(1, { ok: false, reason: 'daemon_unavailable', detail: 'unavailable' });
+        assert.equal(await reattach, false);
+        assert.equal(h.timers.size, 1);
+        const refused = h.controller.start(true); await tick();
+        await h.finish(2, { ok: false, reason: 'credential_in_use', detail: 'in use' });
+        assert.equal(await refused, false);
+        assert.equal(h.timers.size, 1);
+        await h.firePoll();
+        assert.equal(h.calls[3].init.method, 'GET');
+        await h.finish(3, snapshot('cancelled', sid, { cleanup_confirmed: true }));
+        assert.equal(h.views.at(-1).state, 'cancelled');
+        assert.equal(h.timers.size, 0);
+        h.controller.dispose();
+    }
+    {
+        const h = harness();
+        const start = h.controller.start(); await tick();
+        await h.finish(0, snapshot('waiting_for_code')); await start;
         const cancel = h.controller.cancel(); await tick();
         await h.finish(1, { ok: false, reason: 'daemon_unavailable', detail: 'unavailable' });
         assert.equal(await cancel, false);

@@ -113,6 +113,11 @@
             return { kind: "snapshot", reference: payload.reference, login };
         }
 
+        function retryable(result) {
+            return result.kind === "unavailable" ||
+                (result.kind === "refusal" && result.reason === "daemon_unavailable");
+        }
+
         function show(result, version, fromStart) {
             if (!current(version)) return;
             if (result.kind !== "snapshot") {
@@ -167,8 +172,7 @@
             if (!context || !current(version)) return;
             const result = classify(await request(sessionUrl(), "GET"));
             if (!current(version) || session !== context) return;
-            if (result.kind === "unavailable" ||
-                (result.kind === "refusal" && result.reason === "daemon_unavailable")) {
+            if (retryable(result)) {
                 emit(result, version);
                 queuePoll(version);
             } else {
@@ -182,7 +186,7 @@
             const version = supersede();
             const result = classify(await request(base, "POST", { replace_existing: replaceExisting }));
             show(result, version, true);
-            if (result.kind === "unavailable" && session && active.has(state)) queuePoll(version);
+            if (result.kind !== "snapshot" && session && active.has(state)) queuePoll(version);
             return current(version) && result.kind === "snapshot";
         }
 
@@ -196,8 +200,7 @@
                 "POST", { reference: session.reference, authorization_code: authorizationCode }));
             if (!current(version)) return false;
             show(result, version, false);
-            if (result.kind === "unavailable" ||
-                (result.kind === "refusal" && result.reason === "daemon_unavailable")) {
+            if (retryable(result)) {
                 queuePoll(version);
             }
             return result.kind === "snapshot";
@@ -210,8 +213,7 @@
             const result = classify(await request(sessionUrl(), "DELETE"));
             if (!current(version)) return false;
             show(result, version, false);
-            if (result.kind === "unavailable" ||
-                (result.kind === "refusal" && result.reason === "daemon_unavailable")) {
+            if (retryable(result)) {
                 queuePoll(version);
             }
             return result.kind === "snapshot";
