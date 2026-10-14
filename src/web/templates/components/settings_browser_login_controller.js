@@ -167,7 +167,8 @@
             if (!context || !current(version)) return;
             const result = classify(await request(sessionUrl(), "GET"));
             if (!current(version) || session !== context) return;
-            if (result.kind === "unavailable") {
+            if (result.kind === "unavailable" ||
+                (result.kind === "refusal" && result.reason === "daemon_unavailable")) {
                 emit(result, version);
                 queuePoll(version);
             } else {

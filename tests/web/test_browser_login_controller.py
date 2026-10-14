@@ -94,23 +94,27 @@ async function main() {
         assert.equal(h.calls[3].url,
             '/api/coders/claude/browser-login/' + sid + '?reference=ref%20%2F%3F%26');
         assert.equal([...h.timers.values()].length, 1); // fetch deadline only
-        await h.finish(3, snapshot('succeeded', sid, { cleanup_confirmed: true,
+        await h.finish(3, { ok: false, reason: 'daemon_unavailable', detail: 'unavailable' });
+        assert.equal(h.timers.size, 1);
+        await h.firePoll();
+        assert.equal(h.calls[4].init.method, 'GET');
+        await h.finish(4, snapshot('succeeded', sid, { cleanup_confirmed: true,
             auth_status: { status: 'ok', saved_credentials_present: true,
                 failure_reason: null } }));
         assert.equal(h.successes.length, 1);
         assert.equal(h.timers.size, 0);
         const again = h.controller.start(false);
-        await tick(); await h.finish(4, snapshot('succeeded', sid, { cleanup_confirmed: true,
+        await tick(); await h.finish(5, snapshot('succeeded', sid, { cleanup_confirmed: true,
             auth_status: { status: 'ok', saved_credentials_present: true,
                 failure_reason: null } }));
         await again;
         assert.equal(h.successes.length, 1);
         const different = h.controller.start(false);
-        await tick(); await h.finish(5, snapshot('waiting_for_code', sid2));
+        await tick(); await h.finish(6, snapshot('waiting_for_code', sid2));
         await different;
         const newSubmit = h.controller.submit('another');
-        await tick(); assert.equal(h.calls[6].init.method, 'POST');
-        await h.finish(6, snapshot('waiting_for_code', sid2));
+        await tick(); assert.equal(h.calls[7].init.method, 'POST');
+        await h.finish(7, snapshot('waiting_for_code', sid2));
         await newSubmit;
         h.controller.dispose();
     }
