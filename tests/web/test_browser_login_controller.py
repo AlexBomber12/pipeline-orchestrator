@@ -148,6 +148,22 @@ async function main() {
         const h = harness();
         const start = h.controller.start(); await tick();
         await h.finish(0, snapshot('waiting_for_code')); await start;
+        const cancel = h.controller.cancel(); await tick();
+        await h.finish(1, snapshot('cleanup_failed', sid, { cleanup_confirmed: false }));
+        await cancel;
+        assert.equal(await h.controller.start(), false);
+        const retry = h.controller.cancel(); await tick();
+        await h.finish(2, { ok: false, reason: 'session_not_found', detail: 'gone' });
+        assert.equal(await retry, false);
+        const restart = h.controller.start(); await tick();
+        await h.finish(3, snapshot('waiting_for_code', sid2));
+        assert.equal(await restart, true);
+        h.controller.dispose();
+    }
+    {
+        const h = harness();
+        const start = h.controller.start(); await tick();
+        await h.finish(0, snapshot('waiting_for_code')); await start;
         await h.firePoll();
         assert.equal(h.calls.length, 2);
         assert.equal(h.timers.size, 1); // only fetch deadline while the read is pending

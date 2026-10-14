@@ -185,7 +185,8 @@
         }
 
         async function start(replaceExisting = false) {
-            if (disposed || typeof replaceExisting !== "boolean" || state === "cleanup_failed" ||
+            if (disposed || typeof replaceExisting !== "boolean" ||
+                (state === "cleanup_failed" && (!session || !missing.has(session.id))) ||
                 (session && cancelled.has(session.id) && cleanupConfirmed !== true &&
                     !missing.has(session.id))) return false;
             const version = supersede();
