@@ -3430,6 +3430,61 @@ def test_browser_login_api_preserves_context_conflicts_and_ambiguous_submission(
     assert "synthetic-secret" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("state", "reason", "status"),
+    [("not_found", "session_not_found", 404),
+     ("failed", "session_plugin_mismatch", 409),
+     ("unsupported", "unsupported", 422),
+     ("failed", "daemon_unavailable", 503)],
+)
+def test_browser_login_api_maps_valid_snapshots(
+    empty_config: Path, state: str, reason: str, status: int,
+) -> None:
+    snapshot = _browser_login_payload(state=state, failure_reason=reason)
+    if reason != "session_plugin_mismatch":
+        snapshot["session_id"] = None
+        snapshot["application_deadline"] = None
+
+    class Bridge:
+        async def inspect_browser_login(self, *_args: object, **_kwargs: object):
+            return snapshot
+
+    with TestClient(app) as client:
+        client.app.state.plugin_bridge = Bridge()
+        response = client.get(
+            f"/api/coders/claude/browser-login/{'s' * 32}", params={"reference": "captured:Plugin"},
+        )
+    assert response.status_code == status
+    assert response.json()["login"]["failure_reason"] == reason
+
+
+def test_browser_login_api_rejects_missing_context_and_non_object_bodies(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        path = "/api/coders/claude/browser-login"
+        session_path = f"{path}/{'s' * 32}"
+        non_object = client.post(path, content="[]", headers={"content-type": "application/json"})
+        bad_id = client.get(path + "/short", params={"reference": "captured:Plugin"})
+        bad_reference = client.delete(session_path, params={"reference": "bad\x7freference"})
+        bad_submit_type = client.post(
+            session_path + "/code", content="[]", headers={"content-type": "application/json"},
+        )
+        bad_submit_media = client.post(session_path + "/code", content="code", headers={"content-type": "text/plain"})
+        del client.app.state.plugin_bridge
+        no_bridge = client.get(session_path, params={"reference": "captured:Plugin"})
+        client.app.state.coder_registry._references.pop("claude")
+        no_reference = client.post(path, json={})
+    assert [response.status_code for response in (
+        non_object, bad_id, bad_reference, bad_submit_type, bad_submit_media,
+        no_bridge, no_reference,
+    )] == [422, 422, 422, 422, 415, 503, 503]
+    assert all(response.headers["cache-control"] == "no-store" for response in (
+        non_object, bad_id, bad_reference, bad_submit_type, bad_submit_media,
+        no_bridge, no_reference,
+    ))
+
+
 def _device_login_payload(
     *,
     state: str = "waiting_for_user",
