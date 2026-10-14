@@ -171,6 +171,21 @@ async function main() {
         const h = harness();
         const start = h.controller.start(); await tick();
         await h.finish(0, snapshot('waiting_for_code')); await start;
+        const cancel = h.controller.cancel(); await tick();
+        assert.equal(await h.controller.submit('must-not-send'), false);
+        assert.equal(h.calls.length, 2);
+        await h.finish(1, { ok: false, reason: 'session_not_found', detail: 'gone' });
+        assert.equal(await cancel, false);
+        const restart = h.controller.start(); await tick();
+        assert.equal(h.calls[2].init.method, 'POST');
+        await h.finish(2, snapshot('waiting_for_code', sid2));
+        assert.equal(await restart, true);
+        h.controller.dispose();
+    }
+    {
+        const h = harness();
+        const start = h.controller.start(); await tick();
+        await h.finish(0, snapshot('waiting_for_code')); await start;
         const reattach = h.controller.start(); await tick();
         await h.finish(1, { ok: false, reason: 'daemon_unavailable', detail: 'unavailable' });
         assert.equal(await reattach, false);

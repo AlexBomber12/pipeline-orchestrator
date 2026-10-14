@@ -21,6 +21,7 @@
         const requests = new Set();
         const submitted = new Set();
         const cancelled = new Set();
+        const missing = new Set();
         const succeeded = new Set();
         const refusals = new Set(["unsupported", "cli_missing", "unsupported_cli_version",
             "replacement_required", "credential_in_use", "session_capacity",
@@ -121,6 +122,8 @@
         function show(result, version, fromStart) {
             if (!current(version)) return;
             if (result.kind !== "snapshot") {
+                if (!fromStart && session && result.kind === "refusal" &&
+                    result.reason === "session_not_found") missing.add(session.id);
                 emit(result.kind === "refusal" ? result : { kind: "unavailable" }, version);
                 return;
             }
@@ -182,7 +185,8 @@
 
         async function start(replaceExisting = false) {
             if (disposed || typeof replaceExisting !== "boolean" || state === "cleanup_failed" ||
-                (session && cancelled.has(session.id) && cleanupConfirmed !== true)) return false;
+                (session && cancelled.has(session.id) && cleanupConfirmed !== true &&
+                    !missing.has(session.id))) return false;
             const version = supersede();
             const result = classify(await request(base, "POST", { replace_existing: replaceExisting }));
             show(result, version, true);
@@ -191,7 +195,7 @@
         }
 
         async function submit(authorizationCode) {
-            if (disposed || !session || submitted.has(session.id) ||
+            if (disposed || !session || submitted.has(session.id) || cancelled.has(session.id) ||
                 state !== "waiting_for_code" || typeof authorizationCode !== "string") return false;
             // Claim synchronously; the code is used only to build this one request body.
             submitted.add(session.id);
