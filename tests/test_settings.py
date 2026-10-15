@@ -3835,7 +3835,7 @@ def test_settings_browser_login_requires_advertised_daemon_capability(
         assert 'autocomplete="off"' in response.text
         assert 'hx-preserve="true"' in response.text
         assert "If replacement fails or is cancelled, the prior login may become unavailable." in response.text
-    assert "controller.start(false)" in advertised.text
+    assert "begin(false)" in advertised.text
     assert 'id="coder-claude-browser-login"' not in unknown.text
     assert 'id="coder-codex-device-login"' in advertised.text
 
@@ -3851,7 +3851,8 @@ def test_settings_login_success_refresh_is_bounded_and_failure_is_separate(
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
 const listeners = {}, calls = [], ajax = [], timeouts = [];
-const status = { textContent: '', classList: { remove() {}, add() {} } };
+const status = { textContent: '', dataset: { loginRefreshToken: '1' },
+    classList: { remove() {}, add() {} } };
 const shell = { dataset: { modelCatalogRefreshable: 'true' },
     querySelector: selector => selector === '[data-browser-login-refresh-status]'
         ? status : null };
@@ -3875,7 +3876,7 @@ vm.createContext(context);
 vm.runInContext(process.argv[1], context);
 const tick = () => new Promise(resolve => setImmediate(resolve));
 const event = { detail: { plugin: 'claude', shellId: 'coder-claude-browser-login',
-    refreshSelector: '[data-browser-login-refresh-status]' } };
+    refreshSelector: '[data-browser-login-refresh-status]', refreshToken: '1' } };
 async function main() {
     listeners.deviceLoginSucceeded(event);
     listeners.deviceLoginSucceeded(event);
@@ -3886,9 +3887,18 @@ async function main() {
     assert.equal(ajax[0][1], '/partials/settings/coders/claude/models/refresh');
     assert.match(status.textContent, /refreshed/);
     failAjax = true;
+    event.detail.refreshToken = '2';
+    status.dataset.loginRefreshToken = '2';
     listeners.deviceLoginSucceeded(event);
     resolveFetch({ ok: true }); await tick(); await tick();
     assert.match(status.textContent, /Login succeeded, but Settings metadata/);
+    event.detail.refreshToken = '3';
+    status.dataset.loginRefreshToken = '3';
+    listeners.deviceLoginSucceeded(event);
+    status.dataset.loginRefreshToken = '4'; // a newer login started
+    status.textContent = 'New login in progress';
+    resolveFetch({ ok: true }); await tick(); await tick();
+    assert.equal(status.textContent, 'New login in progress');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
 """

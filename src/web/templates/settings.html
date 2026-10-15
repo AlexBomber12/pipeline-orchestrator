@@ -176,7 +176,8 @@
                 const status = refreshedShell
                     ? refreshedShell.querySelector(refreshSelector)
                     : null;
-                if (status) {
+                if (status && (!event.detail.refreshToken ||
+                    status.dataset.loginRefreshToken === event.detail.refreshToken)) {
                     status.textContent = 'Authentication status and model metadata refreshed.';
                     status.classList.remove('text-gray-500', 'text-warn');
                     status.classList.add('text-ok');
@@ -186,7 +187,8 @@
                 const status = shell
                     ? shell.querySelector(refreshSelector)
                     : null;
-                if (status) {
+                if (status && (!event.detail.refreshToken ||
+                    status.dataset.loginRefreshToken === event.detail.refreshToken)) {
                     status.textContent = 'Login succeeded, but Settings metadata could not be refreshed. Reload Settings to retry the read-only checks.';
                     status.classList.remove('text-gray-500');
                     status.classList.add('text-warn');

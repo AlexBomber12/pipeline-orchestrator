@@ -330,6 +330,7 @@
         const cancel = panel.querySelector('[data-browser-login-action="cancel"]');
         const refresh = panel.querySelector("[data-browser-login-refresh-status]");
         let alive = true;
+        let refreshGeneration = 0;
         const controller = root.createBrowserLoginController(plugin, {
             onView(view) {
                 if (!alive || !panel.isConnected) return;
@@ -376,17 +377,27 @@
             },
             onSuccess() {
                 if (!alive || !panel.isConnected) return;
+                refreshGeneration += 1;
+                refresh.dataset.loginRefreshToken = String(refreshGeneration);
                 refresh.textContent = "Refreshing authentication status and model metadata…";
                 setVisible(refresh, true);
                 document.body.dispatchEvent(new CustomEvent("deviceLoginSucceeded", {
                     detail: { plugin, shellId: panel.id,
-                        refreshSelector: "[data-browser-login-refresh-status]" },
+                        refreshSelector: "[data-browser-login-refresh-status]",
+                        refreshToken: refresh.dataset.loginRefreshToken },
                 }));
             },
         });
-        start.addEventListener("click", () => { void controller.start(false); });
+        function begin(replaceExisting) {
+            refreshGeneration += 1;
+            refresh.dataset.loginRefreshToken = String(refreshGeneration);
+            refresh.textContent = "";
+            setVisible(refresh, false);
+            void controller.start(replaceExisting);
+        }
+        start.addEventListener("click", () => { begin(false); });
         panel.querySelector('[data-browser-login-action="replace"]').addEventListener(
-            "click", () => { void controller.start(true); });
+            "click", () => { begin(true); });
         cancel.addEventListener("click", () => {
             input.value = "";
             void controller.cancel();

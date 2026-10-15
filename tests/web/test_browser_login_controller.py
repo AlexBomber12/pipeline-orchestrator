@@ -448,31 +448,39 @@ async function main() {
             failure_reason: null } }));
     assert.equal(events.length, 1);
     assert.equal(events[0].detail.shellId, panel.id);
+    const previousRefreshToken = events[0].detail.refreshToken;
     assert.equal(nodes.cancel.hidden.has('hidden'), true);
+    assert.equal(nodes.refresh.hidden.has('hidden'), false);
+    nodes.start.fire('click');
+    assert.equal(nodes.refresh.textContent, '');
+    assert.equal(nodes.refresh.hidden.has('hidden'), true);
+    assert.notEqual(nodes.refresh.dataset.loginRefreshToken, previousRefreshToken);
+    await tick();
+    await finish(8, snapshot('cancelled', { cleanup_confirmed: true }));
     context.reconcileBrowserLoginPanels();
-    assert.equal(calls.length, 8);
+    assert.equal(calls.length, 9);
     panel.isConnected = false;
     context.reconcileBrowserLoginPanels();
     assert.equal(nodes.code.value, '');
     panel.isConnected = true;
     context.reconcileBrowserLoginPanels();
     nodes.start.fire('click'); await tick();
-    await finish(8, snapshot('waiting_for_code'));
+    await finish(9, snapshot('waiting_for_code'));
     const pending = [...timers.entries()].at(-1);
     timers.delete(pending[0]); pending[1](); await tick();
     panel.isConnected = false;
     context.reconcileBrowserLoginPanels();
-    await finish(9, snapshot('succeeded', { cleanup_confirmed: true,
+    await finish(10, snapshot('succeeded', { cleanup_confirmed: true,
         auth_status: { status: 'ok', saved_credentials_present: true,
             failure_reason: null } }));
     assert.equal(events.length, 1); // disposed panel suppresses late success
     panel.isConnected = true;
     context.reconcileBrowserLoginPanels();
     nodes.start.fire('click'); await tick();
-    await finish(10, { ok: false, reason: 'unsupported_cli_version', detail: 'upgrade' });
+    await finish(11, { ok: false, reason: 'unsupported_cli_version', detail: 'upgrade' });
     assert.equal(nodes.start.hidden.has('hidden'), true);
     nodes.start.fire('click'); await tick();
-    assert.equal(calls.length, 11);
+    assert.equal(calls.length, 12);
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
 """
