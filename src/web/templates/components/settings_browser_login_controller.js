@@ -50,13 +50,14 @@
         function actions() {
             const id = session && session.id;
             return Object.freeze({
-                start: !disposed && !unsupported && !(id && active.has(state)) &&
+                start: !disposed && !unsupported &&
+                    !(id && active.has(state) && !missing.has(id)) &&
                     !(state === "cleanup_failed" &&
                     (!id || !missing.has(id))) && !(id && cancelled.has(id) &&
                     cleanupConfirmed !== true && !missing.has(id)),
                 submit: !disposed && Boolean(id) && state === "waiting_for_code" &&
                     !submitted.has(id) && !cancelled.has(id),
-                cancel: !disposed && Boolean(id) &&
+                cancel: !disposed && Boolean(id) && !missing.has(id) &&
                     (active.has(state) || state === "cleanup_failed") &&
                     !cancelInFlight.has(id) &&
                     (!cancelled.has(id) || cancelRetryReady.has(id)),
@@ -236,7 +237,8 @@
             const version = supersede();
             const result = classify(await request(base, "POST", { replace_existing: replaceExisting }));
             show(result, version, true);
-            if (result.kind !== "snapshot" && session && active.has(state)) queuePoll(version);
+            if (result.kind !== "snapshot" && session && active.has(state) &&
+                !missing.has(session.id)) queuePoll(version);
             return current(version) && result.kind === "snapshot";
         }
 
@@ -345,6 +347,8 @@
                                 : labels[view.state] :
                     view.kind === "refusal" && view.reason === "replacement_required"
                         ? "Existing credentials require your consent before replacement."
+                        : view.kind === "refusal" && view.reason === "session_not_found"
+                            ? "The previous session is gone. Start a new browser login."
                         : view.kind === "refusal" && ["unsupported", "cli_missing",
                             "unsupported_cli_version"].includes(view.reason)
                             ? "Browser login is unavailable. Reload Settings after updating the CLI to check capabilities again."

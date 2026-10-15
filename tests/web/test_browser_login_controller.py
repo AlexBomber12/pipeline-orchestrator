@@ -195,6 +195,20 @@ async function main() {
         const h = harness();
         const start = h.controller.start(); await tick();
         await h.finish(0, snapshot('waiting_for_code')); await start;
+        await h.firePoll();
+        await h.finish(1, { ok: false, reason: 'session_not_found', detail: 'gone' });
+        assert.equal(h.views.at(-1).actions.start, true);
+        assert.equal(h.views.at(-1).actions.cancel, false);
+        const restart = h.controller.start(); await tick();
+        await h.finish(2, { ok: false, reason: 'daemon_unavailable', detail: 'offline' });
+        assert.equal(await restart, false);
+        assert.equal(h.timers.size, 0); // no polling of the known-missing ID
+        h.controller.dispose();
+    }
+    {
+        const h = harness();
+        const start = h.controller.start(); await tick();
+        await h.finish(0, snapshot('waiting_for_code')); await start;
         const cancel = h.controller.cancel(); await tick();
         await h.finish(1, snapshot('cleanup_failed', sid, { cleanup_confirmed: false }));
         await cancel;
@@ -481,6 +495,22 @@ async function main() {
     assert.equal(nodes.start.hidden.has('hidden'), true);
     nodes.start.fire('click'); await tick();
     assert.equal(calls.length, 12);
+    panel.isConnected = false;
+    context.reconcileBrowserLoginPanels();
+    panel.isConnected = true;
+    context.reconcileBrowserLoginPanels();
+    nodes.start.fire('click'); await tick();
+    await finish(12, snapshot('waiting_for_code'));
+    const missingPoll = [...timers.entries()].at(-1);
+    timers.delete(missingPoll[0]); missingPoll[1](); await tick();
+    await finish(13, { ok: false, reason: 'session_not_found', detail: 'gone' });
+    assert.equal(nodes.start.hidden.has('hidden'), false);
+    assert.equal(nodes.cancel.hidden.has('hidden'), true);
+    assert.match(nodes.status.textContent, /previous session is gone/);
+    nodes.start.fire('click'); await tick();
+    assert.equal(calls[14].init.method, 'POST');
+    await finish(14, { ok: false, reason: 'daemon_unavailable', detail: 'offline' });
+    assert.equal(timers.size, 0);
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
 """
