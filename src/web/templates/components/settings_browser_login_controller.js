@@ -172,8 +172,10 @@
             }
             const login = result.login;
             if (fromStart && login.session_id) {
-                const id = login.session_id;
-                session = { id, reference: result.reference };
+                session = { id: login.session_id, reference: result.reference };
+            } else if (fromStart && (!session || !active.has(state) ||
+                missing.has(session.id))) {
+                session = null;
             } else if (session && (login.session_id !== session.id ||
                 result.reference !== session.reference)) {
                 emit({ kind: "unavailable" }, version);

@@ -357,6 +357,22 @@ async function main() {
         assert.equal(h.calls.length, 1);
         h.controller.dispose();
     }
+    {
+        const h = harness();
+        const start = h.controller.start(); await tick();
+        await h.finish(0, snapshot('succeeded', sid, { cleanup_confirmed: true,
+            auth_status: { status: 'ok', saved_credentials_present: true,
+                failure_reason: null } }));
+        await start;
+        const unsupported = h.controller.start(); await tick();
+        await h.finish(1, snapshot('unsupported', null));
+        assert.equal(await unsupported, true);
+        assert.equal(h.views.at(-1).state, 'unsupported');
+        assert.equal(h.views.at(-1).actions.start, false);
+        assert.equal(await h.controller.start(), false);
+        assert.equal(h.calls.length, 2);
+        h.controller.dispose();
+    }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
 """
@@ -483,7 +499,8 @@ async function main() {
     assert.equal(nodes.refresh.hidden.has('hidden'), true);
     assert.notEqual(nodes.refresh.dataset.loginRefreshToken, previousRefreshToken);
     await tick();
-    await finish(8, snapshot('cancelled', { cleanup_confirmed: true }));
+    await finish(8, snapshot('unsupported', null));
+    assert.equal(nodes.start.hidden.has('hidden'), true);
     context.reconcileBrowserLoginPanels();
     assert.equal(calls.length, 9);
     panel.isConnected = false;
