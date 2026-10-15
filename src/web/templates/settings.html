@@ -62,6 +62,8 @@
         let leavingSettings = false;
         const retryTimers = new Set();
         const metadataRefreshes = new Set();
+        const activeRefreshTokens = new Map();
+        const pendingMetadataRefreshes = new Map();
         window.reconcileBrowserLoginPanels();
         document.body.addEventListener('htmx:afterSwap', function () {
             window.setTimeout(window.reconcileBrowserLoginPanels, 0);
@@ -131,12 +133,19 @@
             const plugin = event.detail && event.detail.plugin;
             if (
                 typeof plugin !== 'string' ||
-                !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(plugin) ||
-                metadataRefreshes.has(plugin)
+                !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(plugin)
             ) {
                 return;
             }
+            const refreshToken = event.detail.refreshToken || null;
+            if (metadataRefreshes.has(plugin)) {
+                if (refreshToken && refreshToken !== activeRefreshTokens.get(plugin)) {
+                    pendingMetadataRefreshes.set(plugin, event.detail);
+                }
+                return;
+            }
             metadataRefreshes.add(plugin);
+            activeRefreshTokens.set(plugin, refreshToken);
             const shellId = event.detail && event.detail.shellId ||
                 'coder-' + plugin + '-device-login';
             const refreshSelector = event.detail && event.detail.refreshSelector ||
@@ -195,6 +204,19 @@
                 }
             } finally {
                 metadataRefreshes.delete(plugin);
+                activeRefreshTokens.delete(plugin);
+                const pending = pendingMetadataRefreshes.get(plugin);
+                pendingMetadataRefreshes.delete(plugin);
+                const pendingShell = pending && document.getElementById(pending.shellId);
+                const pendingStatus = pendingShell &&
+                    pendingShell.querySelector(pending.refreshSelector);
+                if (!leavingSettings && window.location.pathname === '/settings' &&
+                    pendingStatus &&
+                    pendingStatus.dataset.loginRefreshToken === pending.refreshToken) {
+                    document.body.dispatchEvent(new CustomEvent('deviceLoginSucceeded', {
+                        detail: pending,
+                    }));
+                }
             }
         });
 

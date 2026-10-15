@@ -3859,10 +3859,14 @@ const shell = { dataset: { modelCatalogRefreshable: 'true' },
 let resolveFetch;
 let failAjax = false;
 const document = {
-    body: { addEventListener: (name, fn) => { listeners[name] = fn; } },
+    body: { addEventListener: (name, fn) => { listeners[name] = fn; },
+        dispatchEvent: event => listeners[event.type](event) },
     getElementById: id => id === 'coder-claude-browser-login' ? shell : null,
 };
-const context = { document, AbortController, window: {
+const context = { document, AbortController,
+    CustomEvent: class { constructor(type, options) {
+        this.type = type; this.detail = options.detail;
+    } }, window: {
     location: { pathname: '/settings' },
     reconcileBrowserLoginPanels() {}, disposeBrowserLoginPanels() {},
     setTimeout: fn => { timeouts.push(fn); return timeouts.length; },
@@ -3875,27 +3879,37 @@ const context = { document, AbortController, window: {
 vm.createContext(context);
 vm.runInContext(process.argv[1], context);
 const tick = () => new Promise(resolve => setImmediate(resolve));
-const event = { detail: { plugin: 'claude', shellId: 'coder-claude-browser-login',
-    refreshSelector: '[data-browser-login-refresh-status]', refreshToken: '1' } };
+const eventFor = token => ({ detail: { plugin: 'claude',
+    shellId: 'coder-claude-browser-login',
+    refreshSelector: '[data-browser-login-refresh-status]', refreshToken: token } });
 async function main() {
-    listeners.deviceLoginSucceeded(event);
-    listeners.deviceLoginSucceeded(event);
+    listeners.deviceLoginSucceeded(eventFor('1'));
+    listeners.deviceLoginSucceeded(eventFor('1'));
     assert.equal(calls.length, 1);
+    status.dataset.loginRefreshToken = '2';
+    status.textContent = 'Refreshing newer login…';
+    listeners.deviceLoginSucceeded(eventFor('2'));
+    status.dataset.loginRefreshToken = '3';
+    status.textContent = 'Refreshing newest login…';
+    listeners.deviceLoginSucceeded(eventFor('3'));
+    assert.equal(calls.length, 1); // queued while first read is pending
     resolveFetch({ ok: true }); await tick(); await tick();
     assert.equal(ajax.length, 1);
     assert.equal(ajax[0][0], 'POST');
     assert.equal(ajax[0][1], '/partials/settings/coders/claude/models/refresh');
+    assert.equal(calls.length, 2); // latest login gets its own read
+    assert.equal(status.textContent, 'Refreshing newest login…');
+    resolveFetch({ ok: true }); await tick(); await tick();
+    assert.equal(ajax.length, 2);
     assert.match(status.textContent, /refreshed/);
     failAjax = true;
-    event.detail.refreshToken = '2';
-    status.dataset.loginRefreshToken = '2';
-    listeners.deviceLoginSucceeded(event);
+    status.dataset.loginRefreshToken = '4';
+    listeners.deviceLoginSucceeded(eventFor('4'));
     resolveFetch({ ok: true }); await tick(); await tick();
     assert.match(status.textContent, /Login succeeded, but Settings metadata/);
-    event.detail.refreshToken = '3';
-    status.dataset.loginRefreshToken = '3';
-    listeners.deviceLoginSucceeded(event);
-    status.dataset.loginRefreshToken = '4'; // a newer login started
+    status.dataset.loginRefreshToken = '5';
+    listeners.deviceLoginSucceeded(eventFor('5'));
+    status.dataset.loginRefreshToken = '6'; // a newer login started
     status.textContent = 'New login in progress';
     resolveFetch({ ok: true }); await tick(); await tick();
     assert.equal(status.textContent, 'New login in progress');
