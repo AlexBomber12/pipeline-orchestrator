@@ -21,6 +21,8 @@
         const requests = new Set();
         const submitted = new Set();
         const cancelled = new Set();
+        const cancelInFlight = new Set();
+        const cancelRetryReady = new Set();
         const missing = new Set();
         const succeeded = new Set();
         const refusals = new Set(["unsupported", "cli_missing", "unsupported_cli_version",
@@ -129,7 +131,10 @@
             if (!current(version)) return;
             if (result.kind !== "snapshot") {
                 if (!fromStart && session && result.kind === "refusal" &&
-                    result.reason === "session_not_found") missing.add(session.id);
+                    result.reason === "session_not_found") {
+                    missing.add(session.id);
+                    cancelRetryReady.delete(session.id);
+                }
                 emit(result.kind === "refusal" ? result : { kind: "unavailable" }, version);
                 return;
             }
@@ -144,6 +149,7 @@
             }
             state = login.state;
             cleanupConfirmed = login.cleanup_confirmed;
+            if (session && !active.has(login.state)) cancelRetryReady.delete(session.id);
             if (session && login.state === "cleanup_failed") cancelled.delete(session.id);
             const view = {
                 kind: "snapshot",
@@ -187,6 +193,10 @@
                 queuePoll(version);
             } else {
                 show(result, version, false);
+                if (current(version) && session === context && result.kind === "snapshot" &&
+                    result.login.session_id === context.id && result.reference === context.reference &&
+                    active.has(result.login.state) && cancelled.has(context.id) &&
+                    !cancelInFlight.has(context.id)) cancelRetryReady.add(context.id);
             }
         }
 
@@ -219,16 +229,24 @@
         }
 
         async function cancel() {
-            if (disposed || !session || cancelled.has(session.id)) return false;
-            cancelled.add(session.id);
+            if (disposed || !session || cancelInFlight.has(session.id) ||
+                (cancelled.has(session.id) && !cancelRetryReady.has(session.id))) return false;
+            const id = session.id;
+            cancelled.add(id);
+            cancelRetryReady.delete(id);
+            cancelInFlight.add(id);
             const version = supersede();
-            const result = classify(await request(sessionUrl(), "DELETE"));
-            if (!current(version)) return false;
-            show(result, version, false);
-            if (retryable(result)) {
-                queuePoll(version);
+            try {
+                const result = classify(await request(sessionUrl(), "DELETE"));
+                if (!current(version)) return false;
+                show(result, version, false);
+                if (retryable(result)) {
+                    queuePoll(version);
+                }
+                return result.kind === "snapshot";
+            } finally {
+                cancelInFlight.delete(id);
             }
-            return result.kind === "snapshot";
         }
 
         function dispose() {

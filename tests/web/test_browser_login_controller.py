@@ -35,7 +35,10 @@ const snapshot = (state, id = sid, more = {}) => ({
         application_deadline: 1800000000, replacement_requested: false,
         reused_session: false, auth_status: null, ...more },
 });
-const response = value => ({ status: value.ok === false ? 409 : 200, json: async () => value });
+const response = value => ({
+    status: value.reason === 'daemon_unavailable' ? 503 : value.ok === false ? 409 : 200,
+    json: async () => value,
+});
 function harness() {
     const calls = [], views = [], successes = [], timers = new Map();
     let nextTimer = 1;
@@ -147,6 +150,36 @@ async function main() {
         const restart = h.controller.start(); await tick();
         await h.finish(4, snapshot('waiting_for_code', sid2));
         assert.equal(await restart, true);
+        h.controller.dispose();
+    }
+    for (const outage of ['503', 'timeout']) {
+        const h = harness();
+        const start = h.controller.start(); await tick();
+        await h.finish(0, snapshot('waiting_for_code')); await start;
+        const cancel = h.controller.cancel(); await tick();
+        assert.equal(await h.controller.cancel(), false);
+        if (outage === '503') {
+            await h.finish(1, { ok: false, reason: 'daemon_unavailable', detail: 'unavailable' });
+        } else {
+            [...h.timers.values()][0]();
+        }
+        assert.equal(await cancel, false);
+        assert.equal(h.calls[1].init.method, 'DELETE');
+        if (outage === 'timeout') assert.equal(h.calls[1].init.signal.aborted, true);
+        assert.equal(await h.controller.cancel(), false);
+        await h.firePoll();
+        assert.equal(h.calls[2].init.method, 'GET');
+        await h.finish(2, snapshot('waiting_for_code'));
+        assert.equal(h.calls.length, 3); // polling never repeats a mutation
+        assert.equal(await h.controller.submit('must-not-send'), false);
+        const retry = h.controller.cancel(); await tick();
+        assert.equal(h.calls[3].init.method, 'DELETE');
+        assert.equal(h.calls[3].url, h.calls[1].url);
+        assert.equal(await h.controller.cancel(), false);
+        assert.equal(await h.controller.submit('must-not-send'), false);
+        assert.equal(h.calls.length, 4);
+        await h.finish(3, snapshot('cancelled', sid, { cleanup_confirmed: true }));
+        assert.equal(await retry, true);
         h.controller.dispose();
     }
     {
