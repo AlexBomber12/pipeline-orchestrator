@@ -50,7 +50,8 @@
         function actions() {
             const id = session && session.id;
             return Object.freeze({
-                start: !disposed && !unsupported && !(state === "cleanup_failed" &&
+                start: !disposed && !unsupported && !(id && active.has(state)) &&
+                    !(state === "cleanup_failed" &&
                     (!id || !missing.has(id))) && !(id && cancelled.has(id) &&
                     cleanupConfirmed !== true && !missing.has(id)),
                 submit: !disposed && Boolean(id) && state === "waiting_for_code" &&
@@ -368,7 +369,6 @@
                     active.has(view.state) ? "Expires " + deadline.toLocaleString() : "";
                 setVisible(expiry, Boolean(expiry.textContent));
                 setVisible(start, view.actions.start &&
-                    (!snapshot || !active.has(view.state)) &&
                     !(view.kind === "refusal" && view.reason === "replacement_required"));
                 setVisible(cancel, view.actions.cancel);
                 cancel.textContent = view.actions.cancelRetry ? "Retry cancellation" : "Cancel";

@@ -91,6 +91,7 @@ async function main() {
         await h.finish(1, { ok: false, reason: 'daemon_unavailable', detail: code });
         assert.equal(await first, false);
         assert.equal(h.views.at(-1).reason, 'daemon_unavailable');
+        assert.equal(h.views.at(-1).actions.start, false);
         assert.equal(h.timers.size, 1); // inspect the captured session after lost handoff
         assert.equal(JSON.stringify(h.views).includes(code), false);
         assert.equal(JSON.stringify(h.controller).includes(code), false);
@@ -419,6 +420,7 @@ async function main() {
     assert.equal(JSON.parse(calls[1].init.body).authorization_code, 'private-code');
     await finish(1, { ok: false, reason: 'daemon_unavailable', detail: 'private-code' });
     assert.equal(nodes.form.hidden.has('hidden'), true);
+    assert.equal(nodes.start.hidden.has('hidden'), true);
     const poll = [...timers.entries()].at(-1);
     timers.delete(poll[0]); poll[1](); await tick();
     await finish(2, snapshot('waiting_for_code'));
