@@ -3807,6 +3807,100 @@ def test_settings_device_login_controls_follow_plugin_capabilities(
     assert "Starts only when you press this button" in response.text
 
 
+def test_settings_browser_login_requires_advertised_daemon_capability(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.web.routes import settings as settings_routes
+
+    original = settings_routes._collect_auth_status
+    methods: list[str] | None = ["browser_code"]
+
+    async def auth_with_capability(registry: CoderRegistry) -> dict[str, dict[str, Any]]:
+        result = await original(registry)
+        result["claude"]["capabilities"] = {"interactive_login_methods": methods}
+        return result
+
+    monkeypatch.setattr(settings_routes, "_collect_auth_status", auth_with_capability)
+    with TestClient(app) as client:
+        advertised = client.get("/settings")
+        partial = client.get("/partials/settings/coders")
+        methods = None
+        unknown = client.get("/settings")
+
+    for response in (advertised, partial):
+        assert response.status_code == 200
+        assert 'data-browser-login-plugin="claude"' in response.text
+        assert 'data-browser-login-plugin="codex"' not in response.text
+        assert 'type="password"' in response.text
+        assert 'autocomplete="off"' in response.text
+        assert 'hx-preserve="true"' in response.text
+    assert "controller.start(false)" in advertised.text
+    assert 'id="coder-claude-browser-login"' not in unknown.text
+    assert 'id="coder-codex-device-login"' in advertised.text
+
+
+def test_settings_login_success_refresh_is_bounded_and_failure_is_separate(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        page = client.get("/settings").text
+    scripts = re.findall(r"<script>(.*?)</script>", page, re.S)
+    source = next(script for script in scripts if "metadataRefreshes" in script)
+    script = r"""
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const listeners = {}, calls = [], ajax = [], timeouts = [];
+const status = { textContent: '', classList: { remove() {}, add() {} } };
+const shell = { dataset: { modelCatalogRefreshable: 'true' },
+    querySelector: selector => selector === '[data-browser-login-refresh-status]'
+        ? status : null };
+let resolveFetch;
+let failAjax = false;
+const document = {
+    body: { addEventListener: (name, fn) => { listeners[name] = fn; } },
+    getElementById: id => id === 'coder-claude-browser-login' ? shell : null,
+};
+const context = { document, AbortController, window: {
+    location: { pathname: '/settings' },
+    reconcileBrowserLoginPanels() {}, disposeBrowserLoginPanels() {},
+    setTimeout: fn => { timeouts.push(fn); return timeouts.length; },
+    clearTimeout() {}, addEventListener() {},
+}, fetch: (url, options) => {
+    calls.push({ url, options });
+    return new Promise(resolve => { resolveFetch = resolve; });
+}, htmx: { ajax: async (...args) => { ajax.push(args); if (failAjax) throw Error('refresh'); } },
+};
+vm.createContext(context);
+vm.runInContext(process.argv[1], context);
+const tick = () => new Promise(resolve => setImmediate(resolve));
+const event = { detail: { plugin: 'claude', shellId: 'coder-claude-browser-login',
+    refreshSelector: '[data-browser-login-refresh-status]' } };
+async function main() {
+    listeners.deviceLoginSucceeded(event);
+    listeners.deviceLoginSucceeded(event);
+    assert.equal(calls.length, 1);
+    resolveFetch({ ok: true }); await tick(); await tick();
+    assert.equal(ajax.length, 1);
+    assert.equal(ajax[0][0], 'POST');
+    assert.equal(ajax[0][1], '/partials/settings/coders/claude/models/refresh');
+    assert.match(status.textContent, /refreshed/);
+    failAjax = true;
+    listeners.deviceLoginSucceeded(event);
+    resolveFetch({ ok: true }); await tick(); await tick();
+    assert.match(status.textContent, /Login succeeded, but Settings metadata/);
+}
+main().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    with subprocess.Popen(
+        ["node", "-e", script, source],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        _, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, stderr
+
+
 def test_device_login_waiting_partial_has_bounded_serial_poll_and_cancel(
     empty_config: Path,
 ) -> None:

@@ -56,11 +56,17 @@
     {% include "components/settings_sandbox_backup.html" %}
 </div>
 
+<script>{% include "components/settings_browser_login_controller.js" %}</script>
 <script>
     (function () {
         let leavingSettings = false;
         const retryTimers = new Set();
         const metadataRefreshes = new Set();
+        window.reconcileBrowserLoginPanels();
+        document.body.addEventListener('htmx:afterSwap', function () {
+            window.setTimeout(window.reconcileBrowserLoginPanels, 0);
+        });
+        window.addEventListener('popstate', window.reconcileBrowserLoginPanels);
 
         function loginRequestElement(event) {
             return event.detail && event.detail.elt instanceof Element
@@ -131,7 +137,10 @@
                 return;
             }
             metadataRefreshes.add(plugin);
-            const shellId = 'coder-' + plugin + '-device-login';
+            const shellId = event.detail && event.detail.shellId ||
+                'coder-' + plugin + '-device-login';
+            const refreshSelector = event.detail && event.detail.refreshSelector ||
+                '[data-device-login-refresh-status]';
             try {
                 const controller = new AbortController();
                 const timeout = window.setTimeout(function () {
@@ -165,7 +174,7 @@
 
                 const refreshedShell = document.getElementById(shellId);
                 const status = refreshedShell
-                    ? refreshedShell.querySelector('[data-device-login-refresh-status]')
+                    ? refreshedShell.querySelector(refreshSelector)
                     : null;
                 if (status) {
                     status.textContent = 'Authentication status and model metadata refreshed.';
@@ -175,7 +184,7 @@
             } catch (_error) {
                 const shell = document.getElementById(shellId);
                 const status = shell
-                    ? shell.querySelector('[data-device-login-refresh-status]')
+                    ? shell.querySelector(refreshSelector)
                     : null;
                 if (status) {
                     status.textContent = 'Login succeeded, but Settings metadata could not be refreshed. Reload Settings to retry the read-only checks.';
@@ -189,6 +198,7 @@
 
         window.addEventListener('beforeunload', function () {
             leavingSettings = true;
+            window.disposeBrowserLoginPanels();
             retryTimers.forEach(function (timer) {
                 window.clearTimeout(timer);
             });
