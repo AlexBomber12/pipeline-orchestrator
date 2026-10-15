@@ -56,11 +56,19 @@
     {% include "components/settings_sandbox_backup.html" %}
 </div>
 
+<script>{% include "components/settings_browser_login_controller.js" %}</script>
 <script>
     (function () {
         let leavingSettings = false;
         const retryTimers = new Set();
         const metadataRefreshes = new Set();
+        const activeRefreshTokens = new Map();
+        const pendingMetadataRefreshes = new Map();
+        window.reconcileBrowserLoginPanels();
+        document.body.addEventListener('htmx:afterSwap', function () {
+            window.setTimeout(window.reconcileBrowserLoginPanels, 0);
+        });
+        window.addEventListener('popstate', window.reconcileBrowserLoginPanels);
 
         function loginRequestElement(event) {
             return event.detail && event.detail.elt instanceof Element
@@ -125,13 +133,23 @@
             const plugin = event.detail && event.detail.plugin;
             if (
                 typeof plugin !== 'string' ||
-                !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(plugin) ||
-                metadataRefreshes.has(plugin)
+                !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(plugin)
             ) {
                 return;
             }
+            const refreshToken = event.detail.refreshToken || null;
+            if (metadataRefreshes.has(plugin)) {
+                if (refreshToken && refreshToken !== activeRefreshTokens.get(plugin)) {
+                    pendingMetadataRefreshes.set(plugin, event.detail);
+                }
+                return;
+            }
             metadataRefreshes.add(plugin);
-            const shellId = 'coder-' + plugin + '-device-login';
+            activeRefreshTokens.set(plugin, refreshToken);
+            const shellId = event.detail && event.detail.shellId ||
+                'coder-' + plugin + '-device-login';
+            const refreshSelector = event.detail && event.detail.refreshSelector ||
+                '[data-device-login-refresh-status]';
             try {
                 const controller = new AbortController();
                 const timeout = window.setTimeout(function () {
@@ -158,16 +176,26 @@
                 const path = refreshable
                     ? '/partials/settings/coders/' + plugin + '/models/refresh'
                     : '/partials/settings/coders';
-                await htmx.ajax(refreshable ? 'POST' : 'GET', path, {
-                    target: '#settings-coders',
-                    swap: 'outerHTML',
-                });
+                // HTMX reads hx-request from its source and applies timeout to its XHR.
+                const requestSource = document.createElement('span');
+                requestSource.setAttribute('hx-request', '{"timeout":10000}');
+                document.body.appendChild(requestSource);
+                try {
+                    await htmx.ajax(refreshable ? 'POST' : 'GET', path, {
+                        source: requestSource,
+                        target: '#settings-coders',
+                        swap: 'outerHTML',
+                    });
+                } finally {
+                    requestSource.remove();
+                }
 
                 const refreshedShell = document.getElementById(shellId);
                 const status = refreshedShell
-                    ? refreshedShell.querySelector('[data-device-login-refresh-status]')
+                    ? refreshedShell.querySelector(refreshSelector)
                     : null;
-                if (status) {
+                if (status && (!event.detail.refreshToken ||
+                    status.dataset.loginRefreshToken === event.detail.refreshToken)) {
                     status.textContent = 'Authentication status and model metadata refreshed.';
                     status.classList.remove('text-gray-500', 'text-warn');
                     status.classList.add('text-ok');
@@ -175,20 +203,35 @@
             } catch (_error) {
                 const shell = document.getElementById(shellId);
                 const status = shell
-                    ? shell.querySelector('[data-device-login-refresh-status]')
+                    ? shell.querySelector(refreshSelector)
                     : null;
-                if (status) {
+                if (status && (!event.detail.refreshToken ||
+                    status.dataset.loginRefreshToken === event.detail.refreshToken)) {
                     status.textContent = 'Login succeeded, but Settings metadata could not be refreshed. Reload Settings to retry the read-only checks.';
                     status.classList.remove('text-gray-500');
                     status.classList.add('text-warn');
                 }
             } finally {
                 metadataRefreshes.delete(plugin);
+                activeRefreshTokens.delete(plugin);
+                const pending = pendingMetadataRefreshes.get(plugin);
+                pendingMetadataRefreshes.delete(plugin);
+                const pendingShell = pending && document.getElementById(pending.shellId);
+                const pendingStatus = pendingShell &&
+                    pendingShell.querySelector(pending.refreshSelector);
+                if (!leavingSettings && window.location.pathname === '/settings' &&
+                    pendingStatus &&
+                    pendingStatus.dataset.loginRefreshToken === pending.refreshToken) {
+                    document.body.dispatchEvent(new CustomEvent('deviceLoginSucceeded', {
+                        detail: pending,
+                    }));
+                }
             }
         });
 
         window.addEventListener('beforeunload', function () {
             leavingSettings = true;
+            window.disposeBrowserLoginPanels();
             retryTimers.forEach(function (timer) {
                 window.clearTimeout(timer);
             });

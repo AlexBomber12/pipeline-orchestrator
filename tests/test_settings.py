@@ -3807,6 +3807,183 @@ def test_settings_device_login_controls_follow_plugin_capabilities(
     assert "Starts only when you press this button" in response.text
 
 
+def test_settings_browser_login_requires_advertised_daemon_capability(
+    empty_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from src.web.routes import settings as settings_routes
+
+    original = settings_routes._collect_auth_status
+    methods: list[str] | None = ["browser_code"]
+
+    async def auth_with_capability(registry: CoderRegistry) -> dict[str, dict[str, Any]]:
+        result = await original(registry)
+        result["claude"]["capabilities"] = {"interactive_login_methods": methods}
+        return result
+
+    monkeypatch.setattr(settings_routes, "_collect_auth_status", auth_with_capability)
+    with TestClient(app) as client:
+        advertised = client.get("/settings")
+        partial = client.get("/partials/settings/coders")
+        methods = None
+        unknown = client.get("/settings")
+
+    for response in (advertised, partial):
+        assert response.status_code == 200
+        assert 'data-browser-login-plugin="claude"' in response.text
+        assert 'data-browser-login-plugin="codex"' not in response.text
+        assert 'type="password"' in response.text
+        assert 'autocomplete="off"' in response.text
+        assert 'hx-preserve="true"' in response.text
+        assert "If replacement fails or is cancelled, the prior login may become unavailable." in response.text
+    assert "begin(false)" in advertised.text
+    assert 'id="coder-claude-browser-login"' not in unknown.text
+    assert 'id="coder-codex-device-login"' in advertised.text
+
+
+def test_settings_login_success_refresh_is_bounded_and_failure_is_separate(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        page = client.get("/settings").text
+    scripts = re.findall(r"<script>(.*?)</script>", page, re.S)
+    source = next(script for script in scripts if "metadataRefreshes" in script)
+    script = r"""
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+const listeners = {}, calls = [], ajax = [], timers = new Map();
+let timerId = 0;
+let ajaxMode = 'success';
+let lateResponse;
+let swaps = 0;
+let abortedRequest;
+const status = { textContent: '', dataset: { loginRefreshToken: '1' },
+    classList: { remove() {}, add() {} } };
+const shell = { dataset: { modelCatalogRefreshable: 'true' },
+    querySelector: selector => selector === '[data-browser-login-refresh-status]'
+        ? status : null };
+let resolveFetch;
+const document = {
+    body: { addEventListener: (name, fn) => { listeners[name] = fn; },
+        dispatchEvent: event => listeners[event.type](event),
+        appendChild: element => { element.isConnected = true; } },
+    createElement: () => ({ attributes: {}, isConnected: false,
+        setAttribute(name, value) { this.attributes[name] = value; },
+        getAttribute(name) { return this.attributes[name]; },
+        remove() { this.isConnected = false; } }),
+    getElementById: id => id === 'coder-claude-browser-login' ? shell : null,
+};
+const context = { document, AbortController,
+    CustomEvent: class { constructor(type, options) {
+        this.type = type; this.detail = options.detail;
+    } }, window: {
+    location: { pathname: '/settings' },
+    reconcileBrowserLoginPanels() {}, disposeBrowserLoginPanels() {},
+    setTimeout: (fn, ms) => { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
+    clearTimeout: id => timers.delete(id), addEventListener() {},
+}, fetch: (url, options) => {
+    calls.push({ url, options });
+    return new Promise(resolve => { resolveFetch = resolve; });
+}, htmx: { ajax: (...args) => {
+    ajax.push(args);
+    const source = args[2].source;
+    assert.equal(source.isConnected, true);
+    assert.equal(args[2].target, '#settings-coders');
+    assert.equal(args[2].swap, 'outerHTML');
+    const timeout = JSON.parse(source.getAttribute('hx-request')).timeout;
+    assert.equal(timeout, 10000); // HTMX applies this to the actual XHR
+    if (ajaxMode === 'fail') return Promise.reject(Error('refresh'));
+    if (ajaxMode === 'hang') {
+        return new Promise((resolve, reject) => {
+            const xhr = { timeout, aborted: false, abort() {
+                this.aborted = true;
+                reject(Error('XHR timeout'));
+            } };
+            abortedRequest = xhr;
+            lateResponse = () => { if (!xhr.aborted) swaps++; resolve(); };
+            context.window.setTimeout(() => xhr.abort(), xhr.timeout);
+        });
+    }
+    swaps++;
+    return Promise.resolve();
+} },
+};
+vm.createContext(context);
+vm.runInContext(process.argv[1], context);
+const tick = () => new Promise(resolve => setImmediate(resolve));
+const eventFor = token => ({ detail: { plugin: 'claude',
+    shellId: 'coder-claude-browser-login',
+    refreshSelector: '[data-browser-login-refresh-status]', refreshToken: token } });
+async function main() {
+    listeners.deviceLoginSucceeded(eventFor('1'));
+    listeners.deviceLoginSucceeded(eventFor('1'));
+    assert.equal(calls.length, 1);
+    status.dataset.loginRefreshToken = '2';
+    status.textContent = 'Refreshing newer login…';
+    listeners.deviceLoginSucceeded(eventFor('2'));
+    status.dataset.loginRefreshToken = '3';
+    status.textContent = 'Refreshing newest login…';
+    listeners.deviceLoginSucceeded(eventFor('3'));
+    assert.equal(calls.length, 1); // queued while first read is pending
+    resolveFetch({ ok: true }); await tick(); await tick();
+    assert.equal(ajax.length, 1);
+    assert.equal(ajax[0][0], 'POST');
+    assert.equal(ajax[0][1], '/partials/settings/coders/claude/models/refresh');
+    assert.equal(ajax[0][2].source.isConnected, false);
+    assert.equal(calls.length, 2); // latest login gets its own read
+    assert.equal(status.textContent, 'Refreshing newest login…');
+    resolveFetch({ ok: true }); await tick(); await tick();
+    assert.equal(ajax.length, 2);
+    assert.match(status.textContent, /refreshed/);
+    ajaxMode = 'fail';
+    status.dataset.loginRefreshToken = '4';
+    listeners.deviceLoginSucceeded(eventFor('4'));
+    resolveFetch({ ok: true }); await tick(); await tick();
+    assert.match(status.textContent, /Login succeeded, but Settings metadata/);
+    status.dataset.loginRefreshToken = '5';
+    listeners.deviceLoginSucceeded(eventFor('5'));
+    status.dataset.loginRefreshToken = '6'; // a newer login started
+    status.textContent = 'New login in progress';
+    resolveFetch({ ok: true }); await tick(); await tick();
+    assert.equal(status.textContent, 'New login in progress');
+    ajaxMode = 'hang';
+    status.dataset.loginRefreshToken = '7';
+    listeners.deviceLoginSucceeded(eventFor('7'));
+    resolveFetch({ ok: true }); await tick(); await tick();
+    assert.equal(ajax.length, 5);
+    assert.equal(abortedRequest.timeout, 10000);
+    status.dataset.loginRefreshToken = '8';
+    status.textContent = 'Refreshing latest login…';
+    listeners.deviceLoginSucceeded(eventFor('8'));
+    assert.equal(calls.length, 5); // queued behind the hanging partial
+    const partialTimeout = [...timers.values()].find(timer =>
+        timer.ms === 10000);
+    assert(partialTimeout);
+    partialTimeout.fn(); await tick(); await tick();
+    assert.equal(abortedRequest.aborted, true);
+    assert.equal(ajax[4][2].source.isConnected, false);
+    assert.equal(status.textContent, 'Refreshing latest login…');
+    assert.equal(calls.length, 6); // claim released; latest queued login starts
+    const swapsBeforeLateResponse = swaps;
+    lateResponse(); await tick();
+    assert.equal(swaps, swapsBeforeLateResponse); // aborted XHR cannot swap
+    ajaxMode = 'success';
+    resolveFetch({ ok: true }); await tick(); await tick();
+    assert.equal(ajax.length, 6);
+    assert.match(status.textContent, /refreshed/);
+    assert.equal(swaps, swapsBeforeLateResponse + 1);
+}
+main().catch(error => { console.error(error); process.exitCode = 1; });
+"""
+    with subprocess.Popen(
+        ["node", "-e", script, source],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        _, stderr = process.communicate(timeout=10)
+    assert process.returncode == 0, stderr
+
+
 def test_device_login_waiting_partial_has_bounded_serial_poll_and_cancel(
     empty_config: Path,
 ) -> None:

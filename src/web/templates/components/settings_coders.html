@@ -157,6 +157,34 @@
                             {% endwith %}
                         </div>
                         {% endif %}
+                        {% set login_methods = auth_entry.capabilities.interactive_login_methods if auth_entry.capabilities is mapping else none %}
+                        {% if login_methods is sequence and login_methods is not string and 'browser_code' in login_methods %}
+                        <div id="coder-{{ coder.name }}-browser-login"
+                             data-browser-login-panel
+                             data-browser-login-plugin="{{ coder.name }}"
+                             data-model-catalog-refreshable="{{ 'true' if coder.model_catalog.refreshable else 'false' }}"
+                             hx-preserve="true"
+                             class="mt-3 rounded border border-white/10 bg-surface-3 p-3 text-xs">
+                            <div class="font-medium text-gray-200">Browser login</div>
+                            <p data-browser-login-status role="status" aria-live="polite" class="mt-1 text-gray-400">Ready. Starts only when you press Start.</p>
+                            <p data-browser-login-expiry class="mt-1 text-gray-400 hidden"></p>
+                            <div data-browser-login-replace class="mt-2 hidden">
+                                <p class="text-warn">Existing credentials may be replaced. If replacement fails or is cancelled, the prior login may become unavailable.</p>
+                                <button type="button" data-browser-login-action="replace" class="secondary-interactive mt-1 rounded border border-white/10 px-2 py-1">I understand — replace credentials and start</button>
+                            </div>
+                            <a data-browser-login-link target="_blank" rel="noopener noreferrer" class="mt-2 hidden text-accent underline">Open authorization page</a>
+                            <form data-browser-login-form class="mt-2 hidden">
+                                <label class="block text-gray-300" for="coder-{{ coder.name }}-browser-code">Authorization code</label>
+                                <input id="coder-{{ coder.name }}-browser-code" data-browser-login-code type="password" autocomplete="off" spellcheck="false" class="mt-1 w-full rounded border border-white/10 bg-surface-2 px-2 py-1 text-gray-200">
+                                <button type="submit" data-browser-login-action="submit" class="secondary-interactive mt-1 rounded border border-white/10 px-2 py-1">Submit code</button>
+                            </form>
+                            <div class="mt-2 flex gap-2">
+                                <button type="button" data-browser-login-action="start" class="secondary-interactive rounded border border-white/10 px-2 py-1">Start browser login</button>
+                                <button type="button" data-browser-login-action="cancel" class="secondary-interactive hidden rounded border border-white/10 px-2 py-1">Cancel</button>
+                            </div>
+                            <p data-browser-login-refresh-status class="mt-2 hidden text-gray-400"></p>
+                        </div>
+                        {% endif %}
                     </td>
                     <td class="py-3 align-top">
                         {% if coder.runtime_selectable %}
