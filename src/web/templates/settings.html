@@ -176,10 +176,19 @@
                 const path = refreshable
                     ? '/partials/settings/coders/' + plugin + '/models/refresh'
                     : '/partials/settings/coders';
-                await htmx.ajax(refreshable ? 'POST' : 'GET', path, {
-                    target: '#settings-coders',
-                    swap: 'outerHTML',
-                });
+                // HTMX reads hx-request from its source and applies timeout to its XHR.
+                const requestSource = document.createElement('span');
+                requestSource.setAttribute('hx-request', '{"timeout":10000}');
+                document.body.appendChild(requestSource);
+                try {
+                    await htmx.ajax(refreshable ? 'POST' : 'GET', path, {
+                        source: requestSource,
+                        target: '#settings-coders',
+                        swap: 'outerHTML',
+                    });
+                } finally {
+                    requestSource.remove();
+                }
 
                 const refreshedShell = document.getElementById(shellId);
                 const status = refreshedShell

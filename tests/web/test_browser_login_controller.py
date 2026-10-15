@@ -202,11 +202,25 @@ async function main() {
         await h.firePoll();
         await h.finish(1, { ok: false, reason: 'session_not_found', detail: 'gone' });
         assert.equal(h.views.at(-1).actions.start, true);
+        assert.equal(h.views.at(-1).actions.submit, false);
         assert.equal(h.views.at(-1).actions.cancel, false);
+        assert.equal(await h.controller.submit('must-not-send'), false);
+        assert.equal(h.calls.length, 2);
         const restart = h.controller.start(); await tick();
         await h.finish(2, { ok: false, reason: 'daemon_unavailable', detail: 'offline' });
         assert.equal(await restart, false);
         assert.equal(h.timers.size, 0); // no polling of the known-missing ID
+        assert.equal(await h.controller.submit('still-missing'), false);
+        assert.equal(h.calls.length, 3);
+        const newStart = h.controller.start(); await tick();
+        await h.finish(3, snapshot('waiting_for_code', sid2));
+        assert.equal(await newStart, true);
+        assert.equal(h.controller.actions().submit, true);
+        const newSubmit = h.controller.submit('new-session-code'); await tick();
+        assert.equal(h.calls[4].url,
+            '/api/coders/claude/browser-login/' + sid2 + '/code');
+        await h.finish(4, snapshot('authorizing', sid2));
+        assert.equal(await newSubmit, true);
         h.controller.dispose();
     }
     {
@@ -533,14 +547,30 @@ async function main() {
     await finish(12, snapshot('waiting_for_code'));
     const missingPoll = [...timers.entries()].at(-1);
     timers.delete(missingPoll[0]); missingPoll[1](); await tick();
+    nodes.code.value = 'must-be-cleared';
     await finish(13, { ok: false, reason: 'session_not_found', detail: 'gone' });
     assert.equal(nodes.start.hidden.has('hidden'), false);
     assert.equal(nodes.cancel.hidden.has('hidden'), true);
+    assert.equal(nodes.form.hidden.has('hidden'), true);
+    assert.equal(nodes.code.value, '');
     assert.match(nodes.status.textContent, /previous session is gone/);
+    nodes.code.value = 'must-not-send';
+    nodes.form.fire('submit'); await tick();
+    assert.equal(calls.length, 14);
+    assert.equal(nodes.code.value, '');
     nodes.start.fire('click'); await tick();
     assert.equal(calls[14].init.method, 'POST');
     await finish(14, { ok: false, reason: 'daemon_unavailable', detail: 'offline' });
     assert.equal(timers.size, 0);
+    nodes.start.fire('click'); await tick();
+    await finish(15, snapshot('waiting_for_code', { session_id: 't'.repeat(32) }));
+    assert.equal(nodes.form.hidden.has('hidden'), false);
+    nodes.code.value = 'new-session-code';
+    nodes.form.fire('submit'); await tick();
+    assert.equal(calls[16].url,
+        '/api/coders/claude/browser-login/' + 't'.repeat(32) + '/code');
+    assert.equal(JSON.parse(calls[16].init.body).authorization_code, 'new-session-code');
+    await finish(16, snapshot('authorizing', { session_id: 't'.repeat(32) }));
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
 """

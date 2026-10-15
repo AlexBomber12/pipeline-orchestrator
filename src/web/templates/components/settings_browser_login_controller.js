@@ -48,6 +48,11 @@
         }
 
         function current(version) { return !disposed && version === generation; }
+        function canSubmit() {
+            const id = session && session.id;
+            return !disposed && Boolean(id) && state === "waiting_for_code" &&
+                !missing.has(id) && !submitted.has(id) && !cancelled.has(id);
+        }
         function actions() {
             const id = session && session.id;
             return Object.freeze({
@@ -56,8 +61,7 @@
                     !(state === "cleanup_failed" &&
                     (!id || !missing.has(id))) && !(id && cancelled.has(id) &&
                     cleanupConfirmed !== true && !missing.has(id)),
-                submit: !disposed && Boolean(id) && state === "waiting_for_code" &&
-                    !submitted.has(id) && !cancelled.has(id),
+                submit: canSubmit(),
                 cancel: !disposed && Boolean(id) && !missing.has(id) &&
                     (active.has(state) || state === "cleanup_failed") &&
                     !cancelInFlight.has(id) &&
@@ -253,8 +257,7 @@
         }
 
         async function submit(authorizationCode) {
-            if (disposed || !session || submitted.has(session.id) || cancelled.has(session.id) ||
-                state !== "waiting_for_code" || !validCode(authorizationCode)) return false;
+            if (!canSubmit() || !validCode(authorizationCode)) return false;
             // Claim synchronously; the code is used only to build this one request body.
             submitted.add(session.id);
             const version = supersede();

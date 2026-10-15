@@ -3850,17 +3850,26 @@ def test_settings_login_success_refresh_is_bounded_and_failure_is_separate(
     script = r"""
 const assert = require('node:assert/strict');
 const vm = require('node:vm');
-const listeners = {}, calls = [], ajax = [], timeouts = [];
+const listeners = {}, calls = [], ajax = [], timers = new Map();
+let timerId = 0;
+let ajaxMode = 'success';
+let lateResponse;
+let swaps = 0;
+let abortedRequest;
 const status = { textContent: '', dataset: { loginRefreshToken: '1' },
     classList: { remove() {}, add() {} } };
 const shell = { dataset: { modelCatalogRefreshable: 'true' },
     querySelector: selector => selector === '[data-browser-login-refresh-status]'
         ? status : null };
 let resolveFetch;
-let failAjax = false;
 const document = {
     body: { addEventListener: (name, fn) => { listeners[name] = fn; },
-        dispatchEvent: event => listeners[event.type](event) },
+        dispatchEvent: event => listeners[event.type](event),
+        appendChild: element => { element.isConnected = true; } },
+    createElement: () => ({ attributes: {}, isConnected: false,
+        setAttribute(name, value) { this.attributes[name] = value; },
+        getAttribute(name) { return this.attributes[name]; },
+        remove() { this.isConnected = false; } }),
     getElementById: id => id === 'coder-claude-browser-login' ? shell : null,
 };
 const context = { document, AbortController,
@@ -3869,12 +3878,34 @@ const context = { document, AbortController,
     } }, window: {
     location: { pathname: '/settings' },
     reconcileBrowserLoginPanels() {}, disposeBrowserLoginPanels() {},
-    setTimeout: fn => { timeouts.push(fn); return timeouts.length; },
-    clearTimeout() {}, addEventListener() {},
+    setTimeout: (fn, ms) => { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
+    clearTimeout: id => timers.delete(id), addEventListener() {},
 }, fetch: (url, options) => {
     calls.push({ url, options });
     return new Promise(resolve => { resolveFetch = resolve; });
-}, htmx: { ajax: async (...args) => { ajax.push(args); if (failAjax) throw Error('refresh'); } },
+}, htmx: { ajax: (...args) => {
+    ajax.push(args);
+    const source = args[2].source;
+    assert.equal(source.isConnected, true);
+    assert.equal(args[2].target, '#settings-coders');
+    assert.equal(args[2].swap, 'outerHTML');
+    const timeout = JSON.parse(source.getAttribute('hx-request')).timeout;
+    assert.equal(timeout, 10000); // HTMX applies this to the actual XHR
+    if (ajaxMode === 'fail') return Promise.reject(Error('refresh'));
+    if (ajaxMode === 'hang') {
+        return new Promise((resolve, reject) => {
+            const xhr = { timeout, aborted: false, abort() {
+                this.aborted = true;
+                reject(Error('XHR timeout'));
+            } };
+            abortedRequest = xhr;
+            lateResponse = () => { if (!xhr.aborted) swaps++; resolve(); };
+            context.window.setTimeout(() => xhr.abort(), xhr.timeout);
+        });
+    }
+    swaps++;
+    return Promise.resolve();
+} },
 };
 vm.createContext(context);
 vm.runInContext(process.argv[1], context);
@@ -3897,12 +3928,13 @@ async function main() {
     assert.equal(ajax.length, 1);
     assert.equal(ajax[0][0], 'POST');
     assert.equal(ajax[0][1], '/partials/settings/coders/claude/models/refresh');
+    assert.equal(ajax[0][2].source.isConnected, false);
     assert.equal(calls.length, 2); // latest login gets its own read
     assert.equal(status.textContent, 'Refreshing newest login…');
     resolveFetch({ ok: true }); await tick(); await tick();
     assert.equal(ajax.length, 2);
     assert.match(status.textContent, /refreshed/);
-    failAjax = true;
+    ajaxMode = 'fail';
     status.dataset.loginRefreshToken = '4';
     listeners.deviceLoginSucceeded(eventFor('4'));
     resolveFetch({ ok: true }); await tick(); await tick();
@@ -3913,6 +3945,32 @@ async function main() {
     status.textContent = 'New login in progress';
     resolveFetch({ ok: true }); await tick(); await tick();
     assert.equal(status.textContent, 'New login in progress');
+    ajaxMode = 'hang';
+    status.dataset.loginRefreshToken = '7';
+    listeners.deviceLoginSucceeded(eventFor('7'));
+    resolveFetch({ ok: true }); await tick(); await tick();
+    assert.equal(ajax.length, 5);
+    assert.equal(abortedRequest.timeout, 10000);
+    status.dataset.loginRefreshToken = '8';
+    status.textContent = 'Refreshing latest login…';
+    listeners.deviceLoginSucceeded(eventFor('8'));
+    assert.equal(calls.length, 5); // queued behind the hanging partial
+    const partialTimeout = [...timers.values()].find(timer =>
+        timer.ms === 10000);
+    assert(partialTimeout);
+    partialTimeout.fn(); await tick(); await tick();
+    assert.equal(abortedRequest.aborted, true);
+    assert.equal(ajax[4][2].source.isConnected, false);
+    assert.equal(status.textContent, 'Refreshing latest login…');
+    assert.equal(calls.length, 6); // claim released; latest queued login starts
+    const swapsBeforeLateResponse = swaps;
+    lateResponse(); await tick();
+    assert.equal(swaps, swapsBeforeLateResponse); // aborted XHR cannot swap
+    ajaxMode = 'success';
+    resolveFetch({ ok: true }); await tick(); await tick();
+    assert.equal(ajax.length, 6);
+    assert.match(status.textContent, /refreshed/);
+    assert.equal(swaps, swapsBeforeLateResponse + 1);
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
 """
