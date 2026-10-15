@@ -19,6 +19,7 @@
         let state = null;
         let cleanupConfirmed = null;
         let unsupported = false;
+        let startInFlight = false;
         const requests = new Set();
         const submitted = new Set();
         const cancelled = new Set();
@@ -50,7 +51,7 @@
         function actions() {
             const id = session && session.id;
             return Object.freeze({
-                start: !disposed && !unsupported &&
+                start: !disposed && !unsupported && !startInFlight &&
                     !(id && active.has(state) && !missing.has(id)) &&
                     !(state === "cleanup_failed" &&
                     (!id || !missing.has(id))) && !(id && cancelled.has(id) &&
@@ -230,12 +231,19 @@
         }
 
         async function start(replaceExisting = false) {
-            if (disposed || unsupported || typeof replaceExisting !== "boolean" ||
+            if (disposed || unsupported || startInFlight ||
+                typeof replaceExisting !== "boolean" ||
                 (state === "cleanup_failed" && (!session || !missing.has(session.id))) ||
                 (session && cancelled.has(session.id) && cleanupConfirmed !== true &&
                     !missing.has(session.id))) return false;
+            startInFlight = true;
             const version = supersede();
-            const result = classify(await request(base, "POST", { replace_existing: replaceExisting }));
+            let result;
+            try {
+                result = classify(await request(base, "POST", { replace_existing: replaceExisting }));
+            } finally {
+                startInFlight = false;
+            }
             show(result, version, true);
             if (result.kind !== "snapshot" && session && active.has(state) &&
                 !missing.has(session.id)) queuePoll(version);

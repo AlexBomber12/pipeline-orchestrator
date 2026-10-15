@@ -67,7 +67,11 @@ async function main() {
     {
         const h = harness();
         const started = h.controller.start(true);
+        const duplicateStart = h.controller.start(true);
+        assert.equal(await duplicateStart, false);
         await tick();
+        assert.equal(h.calls.length, 1);
+        assert.equal(h.controller.actions().start, false);
         assert.equal(h.calls[0].init.method, 'POST');
         assert.deepEqual(JSON.parse(h.calls[0].init.body), { replace_existing: true });
         await h.finish(0, snapshot('waiting_for_code'));
@@ -331,6 +335,13 @@ async function main() {
         assert.equal(await start, false);
         assert.equal(h.views.at(-1).reason, 'replacement_required');
         assert.equal(h.calls.length, 1);
+        const replace = h.controller.start(true);
+        assert.equal(await h.controller.start(true), false);
+        await tick();
+        assert.equal(h.calls.length, 2);
+        assert.deepEqual(JSON.parse(h.calls[1].init.body), { replace_existing: true });
+        await h.finish(1, snapshot('waiting_for_code'));
+        assert.equal(await replace, true);
         h.controller.dispose();
     }
     for (const result of [
@@ -424,7 +435,9 @@ async function main() {
     context.reconcileBrowserLoginPanels();
     context.reconcileBrowserLoginPanels();
     assert.equal(calls.length, 0); // rendering never starts a login
-    nodes.start.fire('click'); await tick();
+    nodes.start.fire('click');
+    nodes.start.fire('click');
+    await tick();
     assert.equal(calls.length, 1); // one panel has one controller/listener
     await finish(0, snapshot('waiting_for_code'));
     assert.equal(nodes.link.href, 'https://example.test/authorize');
