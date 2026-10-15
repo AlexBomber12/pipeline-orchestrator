@@ -56,7 +56,9 @@
                     cleanupConfirmed !== true && !missing.has(id)),
                 submit: !disposed && Boolean(id) && state === "waiting_for_code" &&
                     !submitted.has(id) && !cancelled.has(id),
-                cancel: !disposed && Boolean(id) && !cancelInFlight.has(id) &&
+                cancel: !disposed && Boolean(id) &&
+                    (active.has(state) || state === "cleanup_failed") &&
+                    !cancelInFlight.has(id) &&
                     (!cancelled.has(id) || cancelRetryReady.has(id)),
                 cancelRetry: Boolean(id) && (cancelRetryReady.has(id) ||
                     state === "cleanup_failed"),
@@ -255,8 +257,7 @@
         }
 
         async function cancel() {
-            if (disposed || !session || cancelInFlight.has(session.id) ||
-                (cancelled.has(session.id) && !cancelRetryReady.has(session.id))) return false;
+            if (!actions().cancel) return false;
             const id = session.id;
             cancelled.add(id);
             cancelRetryReady.delete(id);

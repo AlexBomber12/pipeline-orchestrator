@@ -113,6 +113,9 @@ async function main() {
             auth_status: { status: 'ok', saved_credentials_present: true,
                 failure_reason: null } }));
         assert.equal(h.successes.length, 1);
+        assert.equal(h.views.at(-1).actions.cancel, false);
+        assert.equal(await h.controller.cancel(), false);
+        assert.equal(h.calls.length, 5);
         assert.equal(h.timers.size, 0);
         const again = h.controller.start(false);
         await tick(); await h.finish(5, snapshot('succeeded', sid, { cleanup_confirmed: true,
@@ -150,6 +153,7 @@ async function main() {
         assert.equal(await h.controller.cancel(), false);
         await h.finish(3, snapshot('cancelled', sid, { cleanup_confirmed: true }));
         assert.equal(await retry, true);
+        assert.equal(h.controller.actions().cancel, false);
         const restart = h.controller.start(); await tick();
         await h.finish(4, snapshot('waiting_for_code', sid2));
         assert.equal(await restart, true);
@@ -444,6 +448,7 @@ async function main() {
             failure_reason: null } }));
     assert.equal(events.length, 1);
     assert.equal(events[0].detail.shellId, panel.id);
+    assert.equal(nodes.cancel.hidden.has('hidden'), true);
     context.reconcileBrowserLoginPanels();
     assert.equal(calls.length, 8);
     panel.isConnected = false;
