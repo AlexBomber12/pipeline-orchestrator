@@ -314,6 +314,19 @@ async function main() {
         assert.equal(h.calls.length, 1);
         h.controller.dispose();
     }
+    for (const result of [
+        { ok: false, reason: 'unsupported_cli_version', detail: 'upgrade required' },
+        { ok: false, reason: 'cli_missing', detail: 'CLI unavailable' },
+        snapshot('unsupported', null),
+    ]) {
+        const h = harness();
+        const start = h.controller.start(); await tick();
+        await h.finish(0, result); await start;
+        assert.equal(h.views.at(-1).actions.start, false);
+        assert.equal(await h.controller.start(), false);
+        assert.equal(h.calls.length, 1);
+        h.controller.dispose();
+    }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
 """
@@ -446,6 +459,13 @@ async function main() {
         auth_status: { status: 'ok', saved_credentials_present: true,
             failure_reason: null } }));
     assert.equal(events.length, 1); // disposed panel suppresses late success
+    panel.isConnected = true;
+    context.reconcileBrowserLoginPanels();
+    nodes.start.fire('click'); await tick();
+    await finish(10, { ok: false, reason: 'unsupported_cli_version', detail: 'upgrade' });
+    assert.equal(nodes.start.hidden.has('hidden'), true);
+    nodes.start.fire('click'); await tick();
+    assert.equal(calls.length, 11);
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });
 """

@@ -3834,6 +3834,7 @@ def test_settings_browser_login_requires_advertised_daemon_capability(
         assert 'type="password"' in response.text
         assert 'autocomplete="off"' in response.text
         assert 'hx-preserve="true"' in response.text
+        assert "If replacement fails or is cancelled, the prior login may become unavailable." in response.text
     assert "controller.start(false)" in advertised.text
     assert 'id="coder-claude-browser-login"' not in unknown.text
     assert 'id="coder-codex-device-login"' in advertised.text

@@ -18,6 +18,7 @@
         let timer = null;
         let state = null;
         let cleanupConfirmed = null;
+        let unsupported = false;
         const requests = new Set();
         const submitted = new Set();
         const cancelled = new Set();
@@ -49,7 +50,7 @@
         function actions() {
             const id = session && session.id;
             return Object.freeze({
-                start: !disposed && !(state === "cleanup_failed" &&
+                start: !disposed && !unsupported && !(state === "cleanup_failed" &&
                     (!id || !missing.has(id))) && !(id && cancelled.has(id) &&
                     cleanupConfirmed !== true && !missing.has(id)),
                 submit: !disposed && Boolean(id) && state === "waiting_for_code" &&
@@ -154,6 +155,8 @@
         function show(result, version, fromStart) {
             if (!current(version)) return;
             if (result.kind !== "snapshot") {
+                if (result.kind === "refusal" && ["unsupported", "cli_missing",
+                    "unsupported_cli_version"].includes(result.reason)) unsupported = true;
                 if (!fromStart && session && result.kind === "refusal" &&
                     result.reason === "session_not_found") {
                     missing.add(session.id);
@@ -172,6 +175,7 @@
                 return;
             }
             state = login.state;
+            if (login.state === "unsupported") unsupported = true;
             cleanupConfirmed = login.cleanup_confirmed;
             if (session && !active.has(login.state)) cancelRetryReady.delete(session.id);
             if (session && login.state === "cleanup_failed") cancelled.delete(session.id);
@@ -222,7 +226,7 @@
         }
 
         async function start(replaceExisting = false) {
-            if (disposed || typeof replaceExisting !== "boolean" ||
+            if (disposed || unsupported || typeof replaceExisting !== "boolean" ||
                 (state === "cleanup_failed" && (!session || !missing.has(session.id))) ||
                 (session && cancelled.has(session.id) && cleanupConfirmed !== true &&
                     !missing.has(session.id))) return false;
@@ -300,7 +304,7 @@
         expired: "Login expired. You can start another login.",
         timed_out: "Login timed out. Check cleanup before starting again.",
         not_found: "The session was not found. You can start another login.",
-        unsupported: "Browser login is unavailable for this plugin.",
+        unsupported: "Browser login is unavailable. Reload Settings after updating the CLI to check capabilities again.",
         cleanup_failed: "Cleanup is unconfirmed. Retry cancellation explicitly.",
     };
     const active = new Set(["starting", "waiting_for_user", "waiting_for_code",
@@ -338,6 +342,9 @@
                                 : labels[view.state] :
                     view.kind === "refusal" && view.reason === "replacement_required"
                         ? "Existing credentials require your consent before replacement."
+                        : view.kind === "refusal" && ["unsupported", "cli_missing",
+                            "unsupported_cli_version"].includes(view.reason)
+                            ? "Browser login is unavailable. Reload Settings after updating the CLI to check capabilities again."
                         : view.kind === "unavailable" || view.reason === "daemon_unavailable"
                             ? "Login status is unavailable. If a session exists, Settings will keep checking it."
                             : "Browser login request was refused (" + view.reason + ").";
