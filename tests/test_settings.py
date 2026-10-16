@@ -753,6 +753,40 @@ def test_partial_coders_returns_static_fragment(empty_config: Path) -> None:
     assert 'hx-get="/partials/settings/coders"' not in body
 
 
+def test_coder_cards_keep_controls_and_login_preservation(
+    empty_config: Path,
+) -> None:
+    with TestClient(app) as client:
+        response = client.get("/partials/settings/coders")
+
+    assert response.status_code == 200
+    body = response.text
+    assert '<table' not in body
+    assert 'class="grid gap-4 lg:grid-cols-2"' in body
+    assert "Repositories may override this preference." in body
+    for name in ("claude", "codex"):
+        card = re.search(
+            rf'<article\b[^>]*data-coder-card="{name}"[^>]*>(.*?)</article>',
+            body,
+            re.DOTALL,
+        )
+        assert card is not None
+        markup = card.group(1)
+        assert f'for="{name}-model"' in markup
+        assert f'id="{name}-model"' in markup
+        assert 'name="coder"' in markup
+        assert f'value="{name}"' in markup
+        assert "Preferred default" in markup
+        assert 'hx-put="/settings/daemon"' in markup
+        assert 'hx-target="#settings-daemon"' in markup
+        assert f'data-model-catalog-status="' in markup
+        assert 'class="primary-interactive block w-full min-w-0 max-w-full' in markup
+    assert 'id="coder-codex-device-login"' in body
+    assert 'data-device-login-shell' in body
+    assert 'hx-preserve="true"' in body
+    assert "GitHub CLI" in body
+
+
 def test_put_daemon_updates_numeric_fields(empty_config: Path) -> None:
     with TestClient(app) as client:
         response = client.put(
@@ -1063,6 +1097,8 @@ def test_arbitrary_plugin_model_round_trips_without_core_field(
     assert rendered.status_code == 200
     assert saved.status_code == 200
     assert "Configured Test Coder" in rendered.text
+    assert 'data-coder-card="third"' in rendered.text
+    assert 'for="third-model"' in rendered.text
     assert re.search(
         r'<input type="radio"[^>]*value="third"',
         rendered.text,
@@ -3869,6 +3905,9 @@ def test_settings_browser_login_requires_advertised_daemon_capability(
     for response in (advertised, partial):
         assert response.status_code == 200
         assert 'data-browser-login-plugin="claude"' in response.text
+        assert 'id="coder-claude-browser-login"' in response.text
+        assert 'data-browser-login-panel' in response.text
+        assert 'hx-preserve="true"' in response.text
         assert 'data-browser-login-plugin="codex"' not in response.text
         assert 'type="password"' in response.text
         assert 'autocomplete="off"' in response.text
