@@ -1794,8 +1794,8 @@ def test_repo_detail_route_renders_full_page(
     assert "Current PR" in body
     assert 'data-coder-display' in body
     assert 'href="/settings"' in body
-    assert "Configured: Automatic" in body
-    assert "Preferred default: Claude Code" in body
+    assert "Configured: Automatic" not in body
+    assert "Preferred default:" not in body
     assert "Recent PRs" not in body
     assert "Event log" in body
     # Pause/resume/stop publish history_updated; the SSE consumer must
@@ -4343,7 +4343,7 @@ def test_repo_header_coder_renders_readonly_when_configured_claude(
 
     assert "<select" not in coder_fragment
     assert "<form" not in coder_fragment
-    assert "Configured: Claude Code" in coder_fragment
+    assert "Claude Code" in coder_fragment
     assert "Active:" not in coder_fragment
 
 
@@ -4356,9 +4356,8 @@ def test_repo_header_coder_shows_runtime_override_when_divergent(
         active="codex",
     )
 
-    assert "Configured: Claude Code" in coder_fragment
-    assert "Active: Codex CLI" in coder_fragment
-    assert "via spec pin or bandit" in coder_fragment
+    assert "Claude Code" in coder_fragment
+    assert "Codex CLI" not in coder_fragment
 
 
 def test_repo_header_coder_any_with_runtime_pick(
@@ -4366,9 +4365,7 @@ def test_repo_header_coder_any_with_runtime_pick(
 ) -> None:
     coder_fragment = _render_repo_header_coder(two_repo_config, active="claude")
 
-    assert "Configured: Automatic" in coder_fragment
-    assert "Preferred default: Claude Code" in coder_fragment
-    assert "Active:" not in coder_fragment
+    assert "Claude Code" in coder_fragment
 
 
 def test_repo_header_coder_ignores_persisted_idle_coder(
@@ -4380,26 +4377,36 @@ def test_repo_header_coder_ignores_persisted_idle_coder(
         state=PipelineState.IDLE,
     )
 
-    assert "Configured: Automatic" in coder_fragment
+    assert "Claude Code" in coder_fragment
     assert "Active:" not in coder_fragment
-    assert "Preferred default: Claude Code" in coder_fragment
+    assert "Codex CLI" not in coder_fragment
 
 
-def test_repo_header_coder_link_to_settings(
+def test_repo_header_coder_has_only_three_fields(
     two_repo_config: Path,
 ) -> None:
     coder_fragment = _render_repo_header_coder(two_repo_config)
 
-    assert 'href="/settings"' in coder_fragment
-    assert "Edit in Settings" in coder_fragment
+    assert coder_fragment.count('font-mono text-gray-400') == 3
+    assert all(label in coder_fragment for label in ("Coder", "Model", "Effort"))
+    assert "Not specified" in coder_fragment
+    assert "Edit in Settings" not in coder_fragment
+    assert "flex-wrap" in coder_fragment
+    assert "break-all" in coder_fragment
 
 
 def test_repo_header_coder_renders_captured_invocation_defaults_and_escapes(
     two_repo_config: Path,
 ) -> None:
+    two_repo_config.write_text(
+        "daemon:\n  coder: claude\n  coder_settings:\n"
+        "    codex:\n      model: changed-model\n      reasoning_effort: low\n"
+        "repositories:\n  - url: https://github.com/example/alpha.git\n",
+        encoding="utf-8",
+    )
     coder_fragment = _render_repo_header_coder(
         two_repo_config,
-        active="codex",
+        active="claude",
         active_invocation=InvocationSnapshot(
             plugin_id="codex",
             model_override=None,
@@ -4411,15 +4418,14 @@ def test_repo_header_coder_renders_captured_invocation_defaults_and_escapes(
         ),
     )
 
-    assert "Invocation settings" in coder_fragment
-    assert "Plugin ID:" in coder_fragment
-    assert "Model override:" in coder_fragment
-    assert "CLI default" in coder_fragment
-    assert "Reasoning effort override:" in coder_fragment
+    assert "Codex CLI" in coder_fragment
+    assert "Default" in coder_fragment
+    assert "changed-model" not in coder_fragment
     assert "&lt;high &amp; careful&gt;" in coder_fragment
     assert "<high & careful>" not in coder_fragment
-    assert "FIX, attempt 4, FIX iteration 2, run run-395" in coder_fragment
-    assert "provider execution values are unconfirmed" in coder_fragment
+    assert "FIX iteration" not in coder_fragment
+    assert "run-395" not in coder_fragment
+    assert "provider execution is unconfirmed" in coder_fragment
 
 
 @pytest.mark.parametrize(

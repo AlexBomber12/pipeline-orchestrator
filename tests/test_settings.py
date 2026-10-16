@@ -1234,7 +1234,7 @@ def test_registered_plugin_round_trips_through_every_coder_mutation_endpoint(
         "Configured Test Coder"
         in inherited.text
     )
-    assert "Configured: Configured Test Coder" in detail_update.text
+    assert "Configured Test Coder" in detail_update.text
     assert "Switching to Configured Test Coder - applies after current PR" in (
         control_update.text
     )
@@ -1307,7 +1307,7 @@ def test_unavailable_configured_coders_remain_visible_and_preserved(
     assert "missing-repo (unavailable)" in initial.text
     assert "missing-default (unavailable)" in daemon_update.text
     assert "missing-repo (unavailable)" in repo_update.text
-    assert "Configured: missing-repo (unavailable)" in detail.text
+    assert "missing-repo (unavailable)" in detail.text
 
     cfg = load_config(str(cfg_path))
     assert cfg.daemon.coder == "missing-default"
@@ -5940,8 +5940,8 @@ def test_repo_detail_coder_display_renders_readonly(
     assert 'data-coder-display' in body
     assert '<select name="coder"' not in body
     assert 'hx-post="/repos/example__alpha/coder"' not in body
-    assert "Configured: Automatic" in body
-    assert "Preferred default: Claude Code" in body
+    assert "Configured: Automatic" not in body
+    assert "Preferred default:" not in body
     assert 'href="/settings"' in body
 
 
