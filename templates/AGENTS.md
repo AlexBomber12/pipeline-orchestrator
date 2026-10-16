@@ -297,6 +297,8 @@ Rules
 - Tests required for every PR: true  # set to false for prototypes
 - Minimum test coverage: none  # or specify percentage
 
+#### Observable test contract
+
 Choose the lowest test layer that proves the changed user-visible contract:
 deterministic unit/component tests for local logic and API behavior; isolated
 real Redis or temporary Git/process tests when their semantics matter; Chromium

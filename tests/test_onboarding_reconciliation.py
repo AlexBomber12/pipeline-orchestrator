@@ -75,6 +75,26 @@ def test_reconcile_agents_md_propagates_forbidden_actions_section(
     )
 
 
+def test_existing_repo_receives_observable_test_contract(tmp_path: Path) -> None:
+    target = tmp_path / "AGENTS.md"
+    target.write_text(
+        USER_INTRO
+        + "\n<!-- pipeline-orchestrator: managed BEGIN ci_gates -->\n"
+        "old CI guidance\n"
+        "<!-- pipeline-orchestrator: managed END ci_gates -->\n"
+    )
+
+    proposed, diff = reconcile_agents_md(target, dry_run=True)
+
+    ci_gates = proposed.split(
+        "<!-- pipeline-orchestrator: managed BEGIN ci_gates -->", 1
+    )[1].split("<!-- pipeline-orchestrator: managed END ci_gates -->", 1)[0]
+    assert "## Observable test contract" in ci_gates
+    assert "E2e completion must verify the intended external terminal outcome" in ci_gates
+    assert "old CI guidance" not in proposed
+    assert "+## Observable test contract" in diff
+
+
 def test_dry_run_on_existing_markers_updates_in_place(tmp_path: Path) -> None:
     target = tmp_path / "AGENTS.md"
     stale_body = (

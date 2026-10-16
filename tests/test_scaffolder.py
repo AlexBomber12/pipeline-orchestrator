@@ -1656,6 +1656,8 @@ def test_scaffolder_template_matches_daemon_managed_content(
     scaffolder.scaffold_repo(str(repo), "main")
 
     agents = (repo / "AGENTS.md").read_text()
+    assert "#### Observable test contract" in agents
+    assert "external terminal outcome, not merely IDLE" in agents
     work_modes_start = agents.index("### Work Modes")
     daemon_mode_start = agents.index("### Daemon Mode")
     template_work_modes = agents[work_modes_start:daemon_mode_start]
