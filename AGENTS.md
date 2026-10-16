@@ -107,6 +107,12 @@ Merge contract: a PR is merge-eligible when all three are true. (1) Unit job gre
 Failure handling: if the unit job fails, a later FIX FEEDBACK invocation fixes it the same as a `scripts/ci.sh` local failure, using the feedback supplied for that invocation. If the integration job fails, the failure is treated identically to a Codex review failure: a later FIX FEEDBACK invocation examines the supplied GHA failure context and `e2e-evidence`, fixes the issue, and publishes one changed HEAD. Daemon coders do not wait for the re-run; the daemon performs that waiting and dispatches another invocation if needed. Integration test failures must be fixed by code change, never by disabling or skipping the test. If a test is genuinely flaky and the failure is not reproducible, the human reviewer may rerun the failed job manually via the GHA UI.
 
 Setup prerequisite: `docs/ci-setup.md` describes the one-time setup of the GitHub App that powers integration tests. New deployments of pipeline-orchestrator must complete that setup before the integration job will function on their fork.
+
+## Observable test contract
+
+- Choose the lowest test layer that proves the changed user-visible contract: deterministic unit/component tests for local logic and API behavior, isolated real Redis or temporary Git/process tests when their semantics matter, Chromium for changed DOM/HTMX interactions, and the existing testbed e2e suite for cross-service lifecycle outcomes. A trivial change does not require a full e2e test.
+- Use existing fixtures and workflow. Assert bounded identity and state predicates, clean up fixture-owned state, and retain useful failure evidence. E2e completion must verify the intended external terminal outcome (for example the matching GitHub PR merged or the task marked ERROR), not merely a return to IDLE.
+- Record what remains unverified at provider, real-account, or deployment boundaries. A mock coder or transport shim does not prove real provider access. Checks requiring real credentials or deployment belong to operator-run upgrade/release verification; a source merge is not deployment. See `tests/e2e/README.md` for the current coverage map.
 <!-- pipeline-orchestrator: managed END ci_gates -->
 
 <!-- pipeline-orchestrator: managed BEGIN codex_review_gate -->

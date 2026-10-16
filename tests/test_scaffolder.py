@@ -1649,13 +1649,24 @@ def test_scaffolder_template_matches_daemon_managed_content(
     the four trigger phrases so a freshly scaffolded repo and a
     reconciled repo cannot disagree on which triggers exist."""
     from src.onboarding.agents_md_template import daemon_managed_content
+    from src.onboarding.reconciliation import reconcile_agents_md
 
     repo = _init_empty_repo(tmp_path)
     _patch_git(monkeypatch)
 
     scaffolder.scaffold_repo(str(repo), "main")
 
-    agents = (repo / "AGENTS.md").read_text()
+    agents_path = repo / "AGENTS.md"
+    agents = agents_path.read_text()
+    assert agents.count("## Observable test contract") == 1
+    assert "<!-- pipeline-orchestrator: managed BEGIN ci_gates -->" in agents
+    assert "must verify the intended external terminal outcome" in agents
+
+    reconciled, _ = reconcile_agents_md(agents_path, dry_run=True)
+    assert reconciled.count("## Observable test contract") == 1
+    assert reconciled.count("<!-- pipeline-orchestrator: managed BEGIN ci_gates -->") == 1
+    assert daemon_managed_content()["ci_gates"] in reconciled
+    assert "### Test requirements" in reconciled
     work_modes_start = agents.index("### Work Modes")
     daemon_mode_start = agents.index("### Daemon Mode")
     template_work_modes = agents[work_modes_start:daemon_mode_start]
