@@ -269,6 +269,22 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
 - Do not rewrite tasks retroactively during a PR.
 - If the user updates `tasks/` while you are working, stop and ask for explicit direction: continue as-is, incorporate changes, or revert.
 
+<!-- pipeline-orchestrator: managed BEGIN ci_gates -->
+## Observable test contract
+
+Choose the lowest test layer that proves the changed user-visible contract:
+deterministic unit/component tests for local logic and API behavior; isolated
+real Redis or temporary Git/process tests when their semantics matter; Chromium
+for changed DOM/HTMX interactions; and the existing testbed e2e suite for
+cross-service lifecycle outcomes. A trivial change does not require full e2e.
+Reuse existing fixtures and workflow, assert bounded identity/state predicates,
+clean up fixture-owned state, and retain useful failure evidence. E2e completion
+must verify the intended external terminal outcome, not merely IDLE. Record
+unverified provider, real-account, and deployment boundaries: test-only shims
+do not prove real service access. Checks requiring real credentials or deployment
+are operator-run upgrade/release verification; source merge is not deployment.
+<!-- pipeline-orchestrator: managed END ci_gates -->
+
 ## === PROJECT CONFIG (customize per repo) ===
 
 Fill in the placeholders below for this specific project. The orchestrator
@@ -296,20 +312,6 @@ Rules
 ### Test requirements
 - Tests required for every PR: true  # set to false for prototypes
 - Minimum test coverage: none  # or specify percentage
-
-#### Observable test contract
-
-Choose the lowest test layer that proves the changed user-visible contract:
-deterministic unit/component tests for local logic and API behavior; isolated
-real Redis or temporary Git/process tests when their semantics matter; Chromium
-for changed DOM/HTMX interactions; and the existing testbed e2e suite for
-cross-service lifecycle outcomes. A trivial change does not require full e2e.
-Reuse existing fixtures and workflow, assert bounded identity/state predicates,
-clean up fixture-owned state, and retain useful failure evidence. E2e completion
-must verify the intended external terminal outcome, not merely IDLE. Record
-unverified provider, real-account, and deployment boundaries: test-only shims
-do not prove real service access. Checks requiring real credentials or deployment
-are operator-run upgrade/release verification; source merge is not deployment.
 
 ### CI specifics
 - Run task-specific focused checks while implementing. After committing the final
