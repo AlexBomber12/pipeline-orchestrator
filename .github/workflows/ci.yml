@@ -90,6 +90,11 @@ jobs:
             --config config.test.yml \
             --github-output "$GITHUB_OUTPUT"
 
+      - name: Install shared integration config
+        run: |
+          python scripts/prepare_test_config.py config.test.yml tests/e2e/data/config.test.yml
+          sudo chown -R 1000:1000 tests/e2e/data
+
       - run: playwright install --with-deps chromium
 
       - name: Build test stack image

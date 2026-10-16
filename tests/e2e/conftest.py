@@ -1,4 +1,8 @@
+import hashlib
 import json
+import os
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -16,8 +20,83 @@ TESTBED_SLUG = "AlexBomber12__pipeline-orchestrator-testbed"
 REPO_DIR = Path(__file__).resolve().parents[2]
 TEST_DATA_DIR = REPO_DIR / "tests/e2e/data"
 EVIDENCE_DIR = REPO_DIR / "tests/e2e/evidence"
+SHARED_CONFIG_PATH = TEST_DATA_DIR / "config.test.yml"
 
 collect_ignore = ["data"]
+
+
+def _config_digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _daemon_reload_count() -> int:
+    result = subprocess.run(
+        ["docker", "compose", "-f", "docker-compose.test.yml", "logs", "--no-color", "daemon-test"],
+        cwd=REPO_DIR,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=15,
+    )
+    return result.stdout.count("Config change detected; reconciling runners")
+
+
+@pytest.fixture
+def shared_test_config(reset_testbed, get_state):
+    """Restore the shared file only if this test still owns its last write."""
+    baseline = SHARED_CONFIG_PATH.read_bytes()
+    expected_digest = _config_digest(SHARED_CONFIG_PATH)
+
+    def note_settings_write() -> None:
+        nonlocal expected_digest
+        observed = _config_digest(SHARED_CONFIG_PATH)
+        assert observed != expected_digest, "Settings did not replace the shared config"
+        expected_digest = observed
+
+    def wait_for_coder_dispatch(pr_id: str, plugin_id: str) -> dict:
+        deadline = time.monotonic() + 70
+        last_entry = None
+        while time.monotonic() < deadline:
+            last_entry = get_state()
+            task = (last_entry or {}).get("current_task") or {}
+            invocation = (last_entry or {}).get("active_invocation") or {}
+            if (
+                (last_entry or {}).get("state") == "CODING"
+                and task.get("pr_id") == pr_id
+                and invocation.get("plugin_id") == plugin_id
+            ):
+                return last_entry
+            time.sleep(0.5)
+        raise AssertionError(
+            f"daemon did not dispatch {pr_id} with {plugin_id}; last state={last_entry!r}"
+        )
+
+    try:
+        yield SHARED_CONFIG_PATH, note_settings_write, wait_for_coder_dispatch
+    finally:
+        observed = _config_digest(SHARED_CONFIG_PATH)
+        assert observed == expected_digest, (
+            "shared config changed outside this fixture; refusing to overwrite concurrent changes"
+        )
+        if baseline != SHARED_CONFIG_PATH.read_bytes():
+            reloads_before = _daemon_reload_count()
+            fd, temporary = tempfile.mkstemp(prefix="config.test.yml.", dir=TEST_DATA_DIR)
+            try:
+                with os.fdopen(fd, "wb") as output:
+                    output.write(baseline)
+                os.chmod(temporary, 0o644)
+                os.replace(temporary, SHARED_CONFIG_PATH)
+            finally:
+                if os.path.exists(temporary):
+                    os.unlink(temporary)
+            deadline = time.monotonic() + 30
+            while time.monotonic() < deadline:
+                if _daemon_reload_count() > reloads_before:
+                    break
+                time.sleep(0.5)
+            else:
+                raise AssertionError("daemon did not observe restored integration config")
+            assert SHARED_CONFIG_PATH.read_bytes() == baseline
 
 
 # 30 seconds proved insufficient on the shared testbed where dispatch was observed at ~39 seconds.

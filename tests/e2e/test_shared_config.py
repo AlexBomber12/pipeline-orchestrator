@@ -1,0 +1,48 @@
+"""Settings writes must steer a later dispatch by the real test daemon."""
+
+import time
+
+import requests
+import yaml
+
+from tests.e2e.lib.coder_shim import coder_shim
+
+
+def test_settings_repo_coder_changes_daemon_dispatch(
+    dashboard_url,
+    testbed_slug,
+    make_task_zip,
+    upload_zip,
+    wait_for_state,
+    shared_test_config,
+):
+    config_path, note_settings_write, wait_for_coder_dispatch = shared_test_config
+    wait_for_state(["IDLE"], timeout_sec=30)
+    original = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    repository = original["repositories"][0]
+    assert repository.get("coder") != "codex", "test requires a changed coder policy"
+    reviewer_identities = original["daemon"]["trusted_reviewer_identities"]
+
+    response = requests.put(
+        f"{dashboard_url}/settings/repos",
+        params={"url": repository["url"]},
+        data={"coder": "codex"},
+        timeout=15,
+    )
+    assert response.status_code == 200, response.text
+    note_settings_write()
+    updated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    assert updated["repositories"][0]["coder"] == "codex"
+    assert updated["daemon"]["trusted_reviewer_identities"] == reviewer_identities
+
+    pr_id = int(time.time())
+    try:
+        with coder_shim("hang"):
+            zip_path = make_task_zip(pr_id, "e2e-shared-config", coder="any")
+            assert upload_zip(zip_path) in (200, 201)
+            observed = wait_for_coder_dispatch(f"PR-{pr_id}", "codex")
+            assert observed["current_task"]["branch"] == f"pr-{pr_id}-e2e-shared-config"
+    finally:
+        stopped = requests.post(f"{dashboard_url}/repos/{testbed_slug}/stop", timeout=10)
+        assert stopped.status_code in (200, 204), stopped.text
+        wait_for_state(["PAUSED"], timeout_sec=30)
