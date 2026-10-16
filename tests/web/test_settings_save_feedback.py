@@ -149,6 +149,15 @@ for (const event of ['htmx:timeout', 'htmx:sendError']) {
     triggered.length = 0;
 }
 
+for (const field of [session, remaining.at(-1)]) {
+    edit(field, '');
+    const ignoredBlank = { status: 200 };
+    start(field, ignoredBlank);
+    done(field, ignoredBlank);
+    assert.equal(message(field), 'Not saved');
+    assert.equal(retry(field).classList.contains('hidden'), true);
+}
+
 edit(webhook, 'first');
 const old = { status: 200 };
 start(webhook, old);

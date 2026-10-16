@@ -92,6 +92,10 @@
         const status = event.detail.xhr && event.detail.xhr.status;
         if (transportFailure || !status) {
             display(state, 'Save not confirmed', 'text-warn', true);
+        } else if (status >= 200 && status < 300 &&
+            daemonFields.has(elt.name) && request.value === '') {
+            // The daemon endpoint accepts blank numbers but leaves them unchanged.
+            display(state, 'Not saved', 'text-fail', false);
         } else if (status >= 200 && status < 300) {
             display(state, 'Saved', 'text-ok', false);
         } else {
