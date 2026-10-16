@@ -208,6 +208,45 @@ def test_settings_page_returns_html(empty_config: Path) -> None:
     assert "Add Repository" in body
 
 
+def test_settings_navigation_resolves_unique_sections_in_order(empty_config: Path) -> None:
+    with TestClient(app) as client:
+        response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.text
+    navigation = body.split('<nav aria-label="Settings sections"', 1)[1].split(
+        "</nav>", 1
+    )[0]
+    targets = re.findall(r'<a href="#([^"]+)"', navigation)
+    assert targets == [
+        "settings-coders-section",
+        "settings-repositories",
+        "settings-automation",
+        "settings-usage",
+        "settings-notifications-section",
+        "settings-protection-backups",
+        "settings-appearance",
+    ]
+    positions = [body.index(f'id="{target}"') for target in targets]
+    assert positions == sorted(positions)
+    for target in targets:
+        assert len(re.findall(rf'<section id="{re.escape(target)}"', body)) == 1
+
+    # Navigation wrappers remain in place when these existing HTMX targets swap.
+    for target in (
+        "settings-coders",
+        "settings-repo-list",
+        "settings-daemon",
+        "settings-usage-limits",
+        "settings-notifications",
+        "settings-sandbox-backup",
+        "theme-toggle",
+    ):
+        assert len(re.findall(rf'\bid="{target}"', body)) == 1
+    assert 'hx-target="#settings-sandbox-backup"' in body
+    assert "Your selected theme is saved in this browser." in body
+
+
 def test_settings_add_repo_form_uses_global_spinner(empty_config: Path) -> None:
     """The Add Repository form relies on the base global spinner."""
     with TestClient(app) as client:
@@ -674,7 +713,7 @@ def test_settings_page_renders_daemon_section(empty_config: Path) -> None:
 
     assert response.status_code == 200
     body = response.text
-    assert "Daemon Settings" in body
+    assert ">Automation</h2>" in body
     assert 'id="settings-daemon"' in body
     assert 'name="poll_interval_sec"' in body
     assert 'name="review_timeout_min"' in body
@@ -5504,7 +5543,7 @@ def test_single_usage_limits_section(empty_config: Path) -> None:
 
     assert response.status_code == 200
     body = response.text
-    assert body.count(">Usage limits<") == 1
+    assert body.count(">Usage limits</h2>") == 1
     assert "Rate Limits" not in body
     assert "Spending controls" not in body
 

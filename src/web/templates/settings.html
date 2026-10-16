@@ -3,24 +3,26 @@
 {% block title %}Settings - Pipeline Orchestrator{% endblock %}
 
 {% block content %}
-<div class="space-y-10">
-    <section>
-        <h2 class="text-xl font-semibold tracking-tight mb-4">Appearance</h2>
-
-        <div class="rounded-lg border border-white/5 bg-surface-2 p-5">
-            <button
-                id="theme-toggle"
-                type="button"
-                class="secondary-interactive inline-flex h-10 w-10 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300"
-                aria-label="Switch to light theme"
-                title="Toggle theme">
-                <span id="theme-icon-dark" aria-hidden="true">☾</span>
-                <span id="theme-icon-light" class="hidden" aria-hidden="true">☀</span>
-            </button>
+<div class="grid min-w-0 gap-8 lg:grid-cols-[11rem_minmax(0,1fr)] lg:gap-10">
+    <nav aria-label="Settings sections"
+         class="min-w-0 overflow-x-auto rounded-lg border border-white/10 bg-surface-2 p-2 lg:sticky lg:top-6 lg:self-start lg:overflow-visible">
+        <div class="flex w-max gap-1 lg:w-auto lg:flex-col">
+            <a href="#settings-coders-section" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Coders</a>
+            <a href="#settings-repositories" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Repositories</a>
+            <a href="#settings-automation" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Automation</a>
+            <a href="#settings-usage" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Usage limits</a>
+            <a href="#settings-notifications-section" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Notifications</a>
+            <a href="#settings-protection-backups" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Protection &amp; backups</a>
+            <a href="#settings-appearance" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Appearance</a>
         </div>
+    </nav>
+
+    <div class="min-w-0 space-y-10">
+    <section id="settings-coders-section" class="scroll-mt-6">
+        {% include "components/settings_coders_wrapper.html" %}
     </section>
 
-    <section>
+    <section id="settings-repositories" class="scroll-mt-6">
         <div class="flex items-baseline justify-between mb-4">
             <h2 class="text-xl font-semibold tracking-tight">Repositories</h2>
             <span class="font-mono text-sm text-gray-500">{{ repos|length }} total</span>
@@ -34,8 +36,8 @@
         </div>
     </section>
 
-    <section>
-        <h2 class="text-xl font-semibold tracking-tight mb-4">Daemon Settings</h2>
+    <section id="settings-automation" class="scroll-mt-6">
+        <h2 class="text-xl font-semibold tracking-tight mb-4">Automation</h2>
 
         <div id="settings-daemon-error" class="mb-4"></div>
 
@@ -45,15 +47,38 @@
         </div>
     </section>
 
-    {% include "components/settings_spend_ceiling.html" %}
-
-    <section>
-        {% include "components/settings_coders_wrapper.html" %}
+    <section id="settings-usage" aria-label="Usage limits" class="scroll-mt-6">
+        {% include "components/settings_spend_ceiling.html" %}
     </section>
 
-    {% include "components/settings_notifications.html" %}
+    <section id="settings-notifications-section" aria-label="Notifications" class="scroll-mt-6">
+        {% include "components/settings_notifications.html" %}
+    </section>
 
-    {% include "components/settings_sandbox_backup.html" %}
+    <section id="settings-protection-backups" aria-label="Protection and backups" class="scroll-mt-6">
+        {% include "components/settings_sandbox_backup.html" %}
+    </section>
+
+    <section id="settings-appearance" class="scroll-mt-6">
+        <h2 class="text-xl font-semibold tracking-tight mb-4">Appearance</h2>
+
+        <div class="flex items-center justify-between gap-4 rounded-lg border border-white/5 bg-surface-2 p-5">
+            <div>
+                <h3 class="font-medium text-gray-200">Theme</h3>
+                <p class="mt-1 text-sm text-gray-400">Your selected theme is saved in this browser.</p>
+            </div>
+            <button
+                id="theme-toggle"
+                type="button"
+                class="secondary-interactive inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300"
+                aria-label="Switch to light theme"
+                title="Toggle theme">
+                <span id="theme-icon-dark" aria-hidden="true">☾</span>
+                <span id="theme-icon-light" class="hidden" aria-hidden="true">☀</span>
+            </button>
+        </div>
+    </section>
+    </div>
 </div>
 
 <script>{% include "components/settings_browser_login_controller.js" %}</script>
