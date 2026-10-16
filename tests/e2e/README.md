@@ -21,7 +21,7 @@ testbed repository. It runs after the unit job. Current paths include:
 | Area | Existing tests and observable contract |
 | --- | --- |
 | Stack/API and access | `test_smoke.py` checks `/api/states`; `test_shim.py` checks the installed coder shim; `test_ci_evidence_access.py` probes testbed GitHub App access to check runs and statuses in CI. |
-| Task lifecycle | `test_upload_and_merge.py` exercises upload through CODING/WATCH to IDLE with the success shim; `test_stop_and_resume.py` checks stop/resume and next-task selection; `test_watch_changes_requested.py`, `test_fix_coder_escalate.py`, and `test_fix_external_merge.py` exercise review, FIX, ERROR, and external-merge paths. |
+| Task lifecycle | `test_upload_and_merge.py` exercises upload through CODING/WATCH to IDLE with the success shim, but does not verify that the matching GitHub PR merged; `test_stop_and_resume.py` checks stop/resume and next-task selection; `test_watch_changes_requested.py`, `test_fix_coder_escalate.py`, and `test_fix_external_merge.py` exercise review, FIX, ERROR, and external-merge paths. |
 | Recovery and cancellation | `test_sigkill_recovery.py`, `test_sigkill_recovery_multitask.py`, `test_cancellation_cause_crash.py`, and `test_redis_down_and_recover.py` cover process/Redis failure and recovery signals. |
 | Chromium UI | `test_settings_navigation_ui.py` checks settings navigation, layout, and theme persistence; `test_settings_save_feedback_ui.py` checks real and mocked save responses, stale responses, retry behavior, and webhook feedback through browser interactions. |
 
@@ -29,6 +29,8 @@ These are the test paths currently present. Historical PR references in tests
 and task plans are context, not evidence that a proposed test exists. Any
 additional lifecycle, API, or browser case remains **planned** until its test
 is merged and collected by the existing workflow.
+Matching GitHub PR merge verification for the success-shim happy path is
+**planned**; its current IDLE assertion does not establish that outcome.
 An isolated real-Redis component test for Redis atomicity is likewise **planned**
 where that guarantee is needed; a fake Redis test does not prove it.
 
