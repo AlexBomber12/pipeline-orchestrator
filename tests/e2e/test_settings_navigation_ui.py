@@ -61,7 +61,7 @@ def _assert_responsive_layout(page, width, theme):
         "rgb(245, 247, 251)" if theme == "light" else "rgb(10, 10, 15)"
     ), layout
     assert layout["text"] == (
-        "rgb(31, 41, 55)" if theme == "light" else "rgb(209, 213, 219)"
+        "rgb(17, 24, 39)" if theme == "light" else "rgb(245, 247, 251)"
     ), layout
     if width >= 1024:
         assert layout["rootColumns"] == layout["cardColumns"] == 2, layout
