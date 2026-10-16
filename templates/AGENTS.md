@@ -297,6 +297,18 @@ Rules
 - Tests required for every PR: true  # set to false for prototypes
 - Minimum test coverage: none  # or specify percentage
 
+Choose the lowest test layer that proves the changed user-visible contract:
+deterministic unit/component tests for local logic and API behavior; isolated
+real Redis or temporary Git/process tests when their semantics matter; Chromium
+for changed DOM/HTMX interactions; and the existing testbed e2e suite for
+cross-service lifecycle outcomes. A trivial change does not require full e2e.
+Reuse existing fixtures and workflow, assert bounded identity/state predicates,
+clean up fixture-owned state, and retain useful failure evidence. E2e completion
+must verify the intended external terminal outcome, not merely IDLE. Record
+unverified provider, real-account, and deployment boundaries: test-only shims
+do not prove real service access. Checks requiring real credentials or deployment
+are operator-run upgrade/release verification; source merge is not deployment.
+
 ### CI specifics
 - Run task-specific focused checks while implementing. After committing the final
   change and before publication, attempt `scripts/make-review-artifacts.sh` as the

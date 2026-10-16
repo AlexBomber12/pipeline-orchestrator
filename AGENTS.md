@@ -236,6 +236,12 @@ If the script does not exist yet, manual fallback:
 
 Artifacts are generated for Codex review but excluded from commits by .gitignore. Do not use `git add -f` to override this. If code has not changed since a successful artifact-script run, do not repeat the full gate.
 
+## Observable test contract
+
+- Choose the lowest test layer that proves the changed user-visible contract: deterministic unit/component tests for local logic and API behavior, isolated real Redis or temporary Git/process tests when their semantics matter, Chromium for changed DOM/HTMX interactions, and the existing testbed e2e suite for cross-service lifecycle outcomes. A trivial change does not require a full e2e test.
+- Use existing fixtures and workflow. Assert bounded identity and state predicates, clean up fixture-owned state, and retain useful failure evidence. E2e completion must verify the intended external terminal outcome (for example the matching GitHub PR merged or the task marked ERROR), not merely a return to IDLE.
+- Record what remains unverified at provider, real-account, or deployment boundaries. A mock coder or transport shim does not prove real provider access. Checks requiring real credentials or deployment belong to operator-run upgrade/release verification; a source merge is not deployment. See `tests/e2e/README.md` for the current coverage map.
+
 <!-- pipeline-orchestrator: managed BEGIN branch_naming -->
 ## Branch naming
 - PLANNED: use `Branch:` from the active `tasks/PR-*.md` as the source of truth. Branch is required by the parser; tasks without Branch are rejected. There is no fallback.
