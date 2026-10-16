@@ -20,7 +20,7 @@ testbed repository. It runs after the unit job. Current paths include:
 
 | Area | Existing tests and observable contract |
 | --- | --- |
-| Stack/API and access | `test_smoke.py` checks dashboard and `/api/states`; `test_shim.py` checks the installed coder shim; `test_ci_evidence_access.py` probes testbed GitHub App access to check runs and statuses in CI. |
+| Stack/API and access | `test_smoke.py` checks `/api/states`; `test_shim.py` checks the installed coder shim; `test_ci_evidence_access.py` probes testbed GitHub App access to check runs and statuses in CI. |
 | Task lifecycle | `test_upload_and_merge.py` exercises upload through CODING/WATCH to IDLE with the success shim; `test_stop_and_resume.py` checks stop/resume and next-task selection; `test_watch_changes_requested.py`, `test_fix_coder_escalate.py`, and `test_fix_external_merge.py` exercise review, FIX, ERROR, and external-merge paths. |
 | Recovery and cancellation | `test_sigkill_recovery.py`, `test_sigkill_recovery_multitask.py`, `test_cancellation_cause_crash.py`, and `test_redis_down_and_recover.py` cover process/Redis failure and recovery signals. |
 | Chromium UI | `test_settings_navigation_ui.py` checks settings navigation, layout, and theme persistence; `test_settings_save_feedback_ui.py` checks real and mocked save responses, stale responses, retry behavior, and webhook feedback through browser interactions. |
