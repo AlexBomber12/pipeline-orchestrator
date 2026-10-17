@@ -6349,6 +6349,19 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
     assert comments.get_latest_codex_feedback("owner/name", 42) == "[P1] Fix the review complete callback"
+    issue_comments.append({
+        "id": 12, "user": receipt["user"], "body": "I found one issue.",
+        "created_at": "2026-10-17T21:12:00Z",
+    })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    assert comments.get_latest_codex_feedback("owner/name", 42) == "[P1] Fix the review complete callback"
+    anchor_reactions.append({
+        "content": "+1", "user": receipt["user"],
+        "created_at": "2026-10-17T21:13:00Z",
+    })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
 
 
 def test_review_feedback_classifies_nonfindings_and_unknown_provenance(

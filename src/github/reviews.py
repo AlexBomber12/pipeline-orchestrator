@@ -145,7 +145,7 @@ def feedback_from_comments(
     return ReviewFeedback(
         tuple(findings), tuple(ids),
         (
-            "trusted review text has no supported finding shape" if unknown
+            "trusted review text has no supported finding shape" if unknown and not findings
             else None
         ),
         tuple(sources),
