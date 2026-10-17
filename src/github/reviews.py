@@ -29,7 +29,9 @@ REVIEW_FEEDBACK_TRUNCATE_CHARS = 5000
 
 _FINDING = re.compile(r"\b(?:P[0-3]\b|please\b|consider\b|fix\b|missing\b|incorrect\b|bug\b|rename\b|change\b)", re.I)
 _RECEIPT = re.compile(
-    r"codex-review-receipt|didn't find any major issues|no (?:major )?(?:issues|findings)|"
+    r"^<!-- codex-review-receipt:v1 -->|"
+    r"^(?:codex review:\s*)?(?:didn't find any major issues(?:\. delightful!)?|"
+    r"no (?:major )?(?:issues|findings))[.!\s]*$|"
     r"^(?:lgtm|looks good overall)[.!\s]*$", re.I,
 )
 _PROGRESS = re.compile(
@@ -48,8 +50,8 @@ class ReviewFeedback:
     source_ids: tuple[int, ...]
     unknown_reason: str | None = None
     sources: tuple[tuple[str, int, int], ...] = ()
-    latest_finding_at: datetime | None = None
-    undated_finding: bool = False
+    latest_blocking_at: datetime | None = None
+    undated_blocking: bool = False
 
 
 def format_review_feedback(findings: tuple[str, ...]) -> str | None:
@@ -109,8 +111,8 @@ def feedback_from_comments(
     sources: list[tuple[str, int, int]] = []
     unknown = False
     receipt = False
-    latest_finding_at: datetime | None = None
-    undated_finding = False
+    latest_blocking_at: datetime | None = None
+    undated_blocking = False
     for inline, comments in ((False, issue_comments), (True, review_comments)):
         for comment in comments:
             if not _reactions._is_codex_user(comment.get("user"), policy=policy):
@@ -123,12 +125,13 @@ def feedback_from_comments(
             ):
                 continue
             kind = classify_review_comment(comment, inline=inline)
+            if kind in ("finding", "unknown", "provider_error"):
+                if created is None:
+                    undated_blocking = True
+                elif latest_blocking_at is None or created > latest_blocking_at:
+                    latest_blocking_at = created
             if kind == "finding":
                 findings.append((comment.get("body") or "").strip())
-                if created is None:
-                    undated_finding = True
-                elif latest_finding_at is None or created > latest_finding_at:
-                    latest_finding_at = created
                 comment_id = comment.get("id") or 0
                 ids.append(comment_id)
                 sources.append((
@@ -147,8 +150,8 @@ def feedback_from_comments(
             else None
         ),
         tuple(sources),
-        latest_finding_at,
-        undated_finding,
+        latest_blocking_at,
+        undated_blocking,
     )
 
 
@@ -394,7 +397,11 @@ def _compute_review_status(
     feedback = feedback_from_comments(
         issue_comments, review_comments, pr_author, reviewer_policy
     )
-    if feedback.unknown_reason and feedback.unknown_reason != "receipt conflicts with current findings":
+    approved_at = max(
+        (t for t in (body_approval_at, anchor_approval_at) if t is not None),
+        default=None,
+    )
+    if feedback.unknown_reason and approved_at is None:
         logger.info("PR #%s review pending: %s", pr_number, feedback.unknown_reason)
         return ReviewStatus.PENDING
     if body_eyes or anchor_eyes:
@@ -402,21 +409,14 @@ def _compute_review_status(
             logger.info("PR #%s review pending: conflicting +1 and eyes evidence", pr_number)
             return ReviewStatus.PENDING
         return ReviewStatus.EYES
-    approved_at = max(
-        (t for t in (body_approval_at, anchor_approval_at) if t is not None),
-        default=None,
-    )
-    if approved_at and feedback.findings:
+    if approved_at and (feedback.findings or feedback.unknown_reason):
         if (
-            feedback.latest_finding_at is not None
-            and not feedback.undated_finding
-            and approved_at > feedback.latest_finding_at
+            feedback.latest_blocking_at is not None
+            and not feedback.undated_blocking
+            and approved_at > feedback.latest_blocking_at
         ):
             return ReviewStatus.APPROVED
-        logger.info("PR #%s review pending: +1 does not supersede current findings", pr_number)
-        return ReviewStatus.PENDING
-    if feedback.unknown_reason:
-        logger.info("PR #%s review pending: %s", pr_number, feedback.unknown_reason)
+        logger.info("PR #%s review pending: +1 does not supersede current review text", pr_number)
         return ReviewStatus.PENDING
     if body_approved:
         return ReviewStatus.APPROVED

@@ -6341,6 +6341,11 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     })
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    anchor_reactions.clear()
+    issue_comments[-1]["body"] = "[P1] Fix the no findings empty state"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    assert comments.get_latest_codex_feedback("owner/name", 42) == "[P1] Fix the no findings empty state"
 
 
 def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
@@ -6356,6 +6361,7 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
         "Summary: review started": "summary",
         "A general update": "unknown",
         "P2: fix the null check": "finding",
+        "[P1] Fix the no findings empty state": "finding",
     }
     for body, expected in samples.items():
         assert reviews.classify_review_comment({"body": body}) == expected
@@ -6372,25 +6378,46 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
     assert evidence.findings == ("P1: fix the bug",)
     assert evidence.source_ids == (2,)
     assert evidence.sources == (("issue", 2, actor["id"]),)
-    assert evidence.latest_finding_at == datetime(2026, 1, 1, 0, 1, tzinfo=_tz.utc)
-    assert not evidence.undated_finding
+    assert evidence.latest_blocking_at == datetime(2026, 1, 1, 0, 1, tzinfo=_tz.utc)
+    assert not evidence.undated_blocking
     later = {**finding, "id": 4, "created_at": "2026-01-01T00:03:00Z"}
     undated = {**finding, "id": 5, "created_at": None}
     evidence = reviews.feedback_from_comments([finding, later], [undated], "author", policy)
-    assert evidence.latest_finding_at == datetime(2026, 1, 1, 0, 3, tzinfo=_tz.utc)
-    assert evidence.undated_finding
+    assert evidence.latest_blocking_at == datetime(2026, 1, 1, 0, 3, tzinfo=_tz.utc)
+    assert evidence.undated_blocking
     unsupported = {"id": 3, "user": actor, "body": "A general update",
                    "created_at": "2026-01-01T00:02:00Z"}
     assert reviews.feedback_from_comments(
         [anchor, unsupported], [], "author", policy
     ).unknown_reason is not None
 
+    body_reactions: list[dict] = []
+
     def unknown_transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/reactions"):
+            return body_reactions
         if path.endswith("/issues/42/comments"):
             return [anchor, unsupported]
         return []
 
     monkeypatch.setattr(cache, "_gh_api_paginated", unknown_transport)
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status(
+        "owner/name", 42, "author", "head", policy=policy
+    ) == ReviewStatus.PENDING
+    monkeypatch.setattr(
+        reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 1, 1, tzinfo=_tz.utc),
+    )
+    body_reactions.append({
+        "content": "+1", "user": actor,
+        "created_at": "2026-01-01T00:03:00Z",
+    })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status(
+        "owner/name", 42, "author", "head", policy=policy
+    ) == ReviewStatus.APPROVED
+    body_reactions[0]["created_at"] = "2026-01-01T00:01:00Z"
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status(
         "owner/name", 42, "author", "head", policy=policy
