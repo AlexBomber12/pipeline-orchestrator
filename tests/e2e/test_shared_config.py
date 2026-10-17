@@ -19,7 +19,7 @@ def test_settings_repo_coder_changes_daemon_dispatch(
     wait_for_state(["IDLE"], timeout_sec=30)
     original = yaml.safe_load(read_config().decode("utf-8"))
     repository = original["repositories"][0]
-    assert repository.get("coder") != "codex", "test requires a changed coder policy"
+    assert repository["coder"] == "claude", "test requires a Claude coder baseline"
     reviewer_identities = original["daemon"]["trusted_reviewer_identities"]
 
     response = requests.put(
