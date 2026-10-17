@@ -332,8 +332,6 @@ class FixMixin(BreachMixin):
             return
         prior = self.state.active_invocation
         if prior is not None and prior.phase == "fix" and prior.run_id is not None:
-            if self._current_run_record is None:
-                await self._restore_current_run_record()
             record = self._current_run_record
             if (
                 record is None or record.run_id != prior.run_id

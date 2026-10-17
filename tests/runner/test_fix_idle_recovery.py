@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -204,6 +205,30 @@ async def test_published_coding_defers_fix_if_new_record_cannot_persist(
     assert runner.state.state == PipelineState.WATCH
     assert runner._current_run_record.run_id == coding_record.run_id
     assert coding_record.ended_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record_problem", ["completed", "unrelated"])
+async def test_published_coding_rejects_ineligible_historical_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, record_problem: str,
+) -> None:
+    runner, _task, pr, _path = await _published_coding_runner(tmp_path, monkeypatch)
+    record = runner._current_run_record
+    if record_problem == "completed":
+        record.exit_reason = "success_merged"
+    else:
+        record.task_id = "PR-999"
+    calls: list[int] = []
+
+    async def fix(*_args, **_kwargs):
+        calls.append(pr.number)
+        return 0, "", ""
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fix)
+    await _watch_requires_fix(runner, pr, monkeypatch)
+    assert calls == []
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == record.run_id
 
 
 async def _timeout_runner(
@@ -736,6 +761,27 @@ async def test_watch_fix_dispatch_requires_persisted_remaining_budget(
         assert any(message in e["event"] for e in runner.state.history)
     else:
         assert seen == [458]
+
+
+@pytest.mark.asyncio
+async def test_watch_fix_defers_on_mismatched_active_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _task, _pr, _path = await _timeout_runner(tmp_path, monkeypatch)
+    runner.state.state = PipelineState.WATCH
+    runner.state.active_invocation = replace(
+        runner.state.active_invocation, run_id="unrelated-run"
+    )
+
+    async def allowed(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", h._async_cli_result(None))
+    monkeypatch.setattr(runner, "_get_coder", lambda **_kwargs: ("codex", object()))
+    monkeypatch.setattr(runner, "usage_gate", allowed)
+    await runner.handle_fix()
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.fix_iterations == 1
 
 
 @pytest.mark.asyncio
