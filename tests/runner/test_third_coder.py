@@ -29,6 +29,7 @@ from src.coder_registry import (
     ModelSetting,
 )
 from src.coders import build_coder_registry
+from src.coders import codex as codex_module
 from src.config import AppConfig, DaemonConfig, load_config
 from src.daemon import main as main_module
 from src.daemon import runner as runner_module
@@ -907,6 +908,93 @@ def test_get_coder_uses_cached_auth_statuses(
     assert getattr(seen[0], "auth_statuses") == runner._auth_status_cache
 
 
+@pytest.mark.parametrize(
+    ("auth_output", "selected", "expected_reason"),
+    [
+        ("Logged in using ChatGPT", "codex", None),
+        ("Logged in with token=secret-value", "claude", "auth response not recognized"),
+        ("Not logged in", "claude", "credentials missing"),
+    ],
+)
+def test_codex_auth_reason_follows_dispatch_decision(
+    monkeypatch: pytest.MonkeyPatch,
+    auth_output: str,
+    selected: str,
+    expected_reason: str | None,
+) -> None:
+    runner = h._make_runner(coder="codex")
+    runner._auth_status_cache = {}
+    calls: list[list[str]] = []
+
+    def cli(cmd: list[str], *, env: dict[str, str] | None = None) -> tuple[int, str, str]:
+        calls.append(cmd)
+        if cmd == ["codex", "--version"]:
+            return 0, "codex 0.160.0", ""
+        return (1 if auth_output == "Not logged in" else 0), auth_output, ""
+
+    monkeypatch.setattr(codex_module, "_run_auth_command", cli)
+    monkeypatch.setattr(
+        runner._registry.get("claude"),
+        "check_auth",
+        lambda: {"status": "ok", "detail": "ready"},
+    )
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = QueueTask(
+        pr_id="PR-395", title="Explain selection", status=TaskStatus.TODO
+    )
+    asyncio.run(runner._refresh_auth_status_cache())
+    initial_calls = list(calls)
+
+    assert runner._get_coder()[0] == selected
+    assert calls == initial_calls
+    events = [entry["event"] for entry in runner.state.history]
+    if expected_reason is None:
+        assert not any("automatic fallback" in event for event in events)
+    else:
+        assert len(events) == 1
+        assert "CODING: Task PR-395:" in events[0]
+        assert f"Configured Codex CLI unavailable: {expected_reason}" in events[0]
+        assert "selected Claude Code because automatic fallback is enabled" in events[0]
+        assert "secret-value" not in str(events)
+
+
+def test_selection_failure_and_third_party_fallback_use_safe_reasons(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner(coder="codex", disabled_coders=["claude"])
+    runner._auth_status_cache = {
+        "codex": {"status": "error", "failure_reason": "unrecognized_output"},
+        "claude": {"status": "ok"},
+    }
+    with pytest.raises(CoderSelectionUnavailable, match="auth response not recognized; no fallback is eligible"):
+        runner._get_coder()
+
+    fake = FakeCoderPlugin()
+    runner._registry.register(fake)
+    runner._auth_status_cache["fake"] = {"status": "ok"}
+    assert runner._get_coder()[0] == "fake"
+    assert "selected Fake Coder" in runner.state.history[-1]["event"]
+
+    runner.app_config.daemon.auto_fallback = False
+    with pytest.raises(CoderSelectionUnavailable, match="automatic fallback is disabled"):
+        runner._get_coder()
+
+    monkeypatch.setattr(runner, "_active_task_coder_pin", lambda: "codex")
+    runner.app_config.daemon.auto_fallback = True
+    with pytest.raises(CoderSelectionUnavailable, match="Task pinned to Codex CLI.*auth response not recognized"):
+        runner._get_coder()
+
+    monkeypatch.setattr(runner, "_active_task_coder_pin", lambda: "")
+    runner.repo_config.disabled_coders = ["claude", "codex"]
+    assert runner._get_coder()[0] == "fake"
+    assert "disabled for this repository" in runner.state.history[-1]["event"]
+
+    runner.repo_config.disabled_coders = ["claude"]
+    runner.state.rate_limited_coders.add("codex")
+    assert runner._get_coder()[0] == "fake"
+    assert "rate limited" in runner.state.history[-1]["event"]
+
+
 def test_select_auxiliary_coder_returns_none_when_resolver_has_no_plugin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -931,7 +1019,7 @@ def test_get_coder_does_not_bypass_selector_when_no_coder_is_eligible(
         lambda ctx, *, purpose: None,
     )
 
-    with pytest.raises(CoderSelectionUnavailable, match="claude is unavailable"):
+    with pytest.raises(CoderSelectionUnavailable, match="Claude Code is unavailable"):
         runner._get_coder()
 
 
@@ -947,7 +1035,7 @@ def test_get_coder_does_not_use_stale_reactive_coder_as_fallback(
         lambda ctx, *, purpose: None,
     )
 
-    with pytest.raises(CoderSelectionUnavailable, match="claude is unavailable"):
+    with pytest.raises(CoderSelectionUnavailable, match="Claude Code is unavailable"):
         runner._get_coder()
 
 
@@ -989,7 +1077,7 @@ def test_get_coder_hard_pin_never_falls_back_when_selector_returns_none(
         lambda ctx, *, purpose: None,
     )
 
-    with pytest.raises(CoderSelectionUnavailable, match="pinned to codex"):
+    with pytest.raises(CoderSelectionUnavailable, match="pinned to Codex CLI"):
         runner._get_coder()
 
 

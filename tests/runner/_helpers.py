@@ -443,7 +443,9 @@ def _make_runner(**repo_overrides: Any) -> PipelineRunner:
 
 
 def _allow_all_coder_auth(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(selector_module, "_auth_failed", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        selector_module, "_auth_failure_reason", lambda *args, **kwargs: None
+    )
 
 
 def _patch_subprocess(
