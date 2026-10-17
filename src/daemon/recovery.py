@@ -555,7 +555,7 @@ class RecoveryMixin:
                     self.state.error_message = (
                         "FIX idle timeout: recovered confirmed timeout"
                         if confirmed_timeout else saved.error_message
-                        or "Status write failed; operator Retry required"
+                        or "status:ERROR write failed; operator Retry required"
                     )
                 else:
                     self.state.error_message = saved.error_message

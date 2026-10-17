@@ -378,8 +378,9 @@ async def test_restart_with_unavailable_timeout_cause_does_not_admit(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cause_available", [True, False])
 async def test_restart_preserves_error_when_timeout_status_write_failed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cause_available: bool,
 ) -> None:
     runner, task, pr, task_path = await _timeout_runner(tmp_path, monkeypatch)
     write_frontmatter_status(task_path, "TODO")
@@ -394,10 +395,20 @@ async def test_restart_preserves_error_when_timeout_status_write_failed(
     restarted.repo_path = runner.repo_path
     await restarted._hydrate_current_task_from_persisted_state()
     await restarted._hydrate_status_write_failed_task_pr_ids()
+
+    async def unavailable(*_args, **_kwargs):
+        raise RuntimeError("cause read unavailable")
+
+    if not cause_available:
+        monkeypatch.setattr("src.daemon.recovery.get_cancellation_cause", unavailable)
     await restarted._apply_recovery_decisions(
         [task.model_copy(update={"status": TaskStatus.DOING})], [pr]
     )
     assert restarted.state.state == PipelineState.ERROR
+    if cause_available:
+        assert restarted.state.error_message.startswith("FIX idle timeout")
+    else:
+        assert restarted.state.error_message == "status:ERROR write failed; operator Retry required"
     assert restarted.state.current_pr.number == pr.number
     assert task.pr_id in restarted._status_write_failed_task_pr_ids
     assert "status: TODO" in task_path.read_text()
@@ -441,6 +452,36 @@ async def test_restart_does_not_relabel_review_status_failure_as_fix_timeout(
     assert reasons == [SuppressionReason.REVIEW_TIMEOUT]
     assert "blocked_reason: review_timeout" in task_path.read_text()
     assert restarted.state.state == PipelineState.ERROR
+
+
+@pytest.mark.asyncio
+async def test_unknown_status_write_failure_parks_until_write_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, task, _pr, task_path = await _timeout_runner(tmp_path, monkeypatch)
+    runner.state.error_message = "status:ERROR write failed; operator Retry required"
+    runner._status_write_failed_task_pr_ids.add(task.pr_id)
+    writes: list[SuppressionReason] = []
+
+    async def failing(_task, _status, _context, *, blocked_reason):
+        writes.append(blocked_reason)
+        return False
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", failing)
+    await runner.handle_error()
+    assert runner.state.state == PipelineState.ERROR
+    assert task.pr_id in runner._status_write_failed_task_pr_ids
+    assert writes == [SuppressionReason.CRASH]
+
+    async def repaired(_task, status, _context, *, blocked_reason):
+        write_frontmatter_status(task_path, status, blocked_reason)
+        return True
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", repaired)
+    await runner.handle_error()
+    assert runner.state.state == PipelineState.ERROR
+    assert task.pr_id not in runner._status_write_failed_task_pr_ids
+    assert "blocked_reason: crash" in task_path.read_text()
 
 
 @pytest.mark.asyncio
