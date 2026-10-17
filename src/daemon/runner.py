@@ -1055,7 +1055,7 @@ class PipelineRunner(
                 task = self.state.current_task
                 context = f"Task {task.pr_id}: " if task is not None else ""
                 self.log_event(
-                    f"[CODER] {self.state.state.value}: {context}"
+                    f"[INFRA] {self.state.state.value}: {context}"
                     f"Configured {preferred_label} unavailable: "
                     f"{explanation}; selected {resolution.plugin.display_name} "
                     "because automatic fallback is enabled."

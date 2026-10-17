@@ -1123,6 +1123,17 @@ def test_get_coder_exploration_occasionally_picks_non_greedy(
     assert 15 <= non_greedy <= 45
 
 
+def test_selection_can_disable_exploration_without_changing_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._allow_all_coder_auth(monkeypatch)
+    runner = h._make_runner()
+    runner.app_config.daemon.exploration_epsilon = 1.0
+
+    assert runner._select_coder(allow_exploration=False)[0] == "claude"
+    assert runner.app_config.daemon.exploration_epsilon == 1.0
+
+
 def test_event_log_includes_coder_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
