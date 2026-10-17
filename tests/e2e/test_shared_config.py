@@ -10,7 +10,6 @@ from tests.e2e.lib.coder_shim import coder_shim
 
 def test_settings_repo_coder_changes_daemon_dispatch(
     dashboard_url,
-    testbed_slug,
     make_task_zip,
     upload_zip,
     wait_for_state,
@@ -36,13 +35,8 @@ def test_settings_repo_coder_changes_daemon_dispatch(
     assert updated["daemon"]["trusted_reviewer_identities"] == reviewer_identities
 
     pr_id = int(time.time())
-    try:
-        with coder_shim("hang"):
-            zip_path = make_task_zip(pr_id, "e2e-shared-config", coder="any")
-            assert upload_zip(zip_path) in (200, 201)
-            observed = wait_for_coder_dispatch(f"PR-{pr_id}", "codex")
-            assert observed["current_task"]["branch"] == f"pr-{pr_id}-e2e-shared-config"
-    finally:
-        stopped = requests.post(f"{dashboard_url}/repos/{testbed_slug}/stop", timeout=10)
-        assert stopped.status_code in (200, 204), stopped.text
-        wait_for_state(["PAUSED"], timeout_sec=30)
+    with coder_shim("hang"):
+        zip_path = make_task_zip(pr_id, "e2e-shared-config", coder="any")
+        assert upload_zip(zip_path) in (200, 201)
+        observed = wait_for_coder_dispatch(f"PR-{pr_id}", "codex")
+        assert observed["current_task"]["branch"] == f"pr-{pr_id}-e2e-shared-config"

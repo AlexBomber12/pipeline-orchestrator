@@ -89,29 +89,35 @@ def shared_test_config(reset_testbed, get_state):
     try:
         yield _shared_config_bytes, note_settings_write, wait_for_coder_dispatch
     finally:
-        observed = _config_digest()
-        assert observed == expected_digest, (
-            "shared config changed outside this fixture; refusing to overwrite concurrent changes"
-        )
-        if baseline != _shared_config_bytes():
-            reloads_before = _daemon_reload_count()
-            fd, temporary = tempfile.mkstemp(prefix="config.test.yml.", dir=TEST_DATA_DIR)
-            try:
-                with os.fdopen(fd, "wb") as output:
-                    output.write(baseline)
-                os.chmod(temporary, 0o644)
-                os.replace(temporary, SHARED_CONFIG_PATH)
-            finally:
-                if os.path.exists(temporary):
-                    os.unlink(temporary)
-            deadline = time.monotonic() + 30
-            while time.monotonic() < deadline:
-                if _daemon_reload_count() > reloads_before:
-                    break
-                time.sleep(0.5)
-            else:
-                raise AssertionError("daemon did not observe restored integration config")
-            assert _shared_config_bytes() == baseline
+        try:
+            _stop_daemon_and_wait_paused(TESTBED_SLUG)
+            reset_testbed_full(TESTBED_SLUG)
+            clear_testbed_redis_state(TESTBED_SLUG)
+            observed = _config_digest()
+            assert observed == expected_digest, (
+                "shared config changed outside this fixture; refusing to overwrite concurrent changes"
+            )
+            if baseline != _shared_config_bytes():
+                reloads_before = _daemon_reload_count()
+                fd, temporary = tempfile.mkstemp(prefix="config.test.yml.", dir=TEST_DATA_DIR)
+                try:
+                    with os.fdopen(fd, "wb") as output:
+                        output.write(baseline)
+                    os.chmod(temporary, 0o644)
+                    os.replace(temporary, SHARED_CONFIG_PATH)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    if _daemon_reload_count() > reloads_before:
+                        break
+                    time.sleep(0.5)
+                else:
+                    raise AssertionError("daemon did not observe restored integration config")
+                assert _shared_config_bytes() == baseline
+        finally:
+            _resume_daemon(TESTBED_SLUG)
 
 
 # 30 seconds proved insufficient on the shared testbed where dispatch was observed at ~39 seconds.
