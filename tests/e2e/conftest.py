@@ -25,8 +25,23 @@ SHARED_CONFIG_PATH = TEST_DATA_DIR / "config.test.yml"
 collect_ignore = ["data"]
 
 
-def _config_digest(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+def _shared_config_bytes() -> bytes:
+    """Read through the container that owns Settings' mode-0600 replacements."""
+    result = subprocess.run(
+        [
+            "docker", "compose", "-f", "docker-compose.test.yml", "exec", "-T",
+            "web-test", "cat", "/data/config.test.yml",
+        ],
+        cwd=REPO_DIR,
+        capture_output=True,
+        check=True,
+        timeout=15,
+    )
+    return result.stdout
+
+
+def _config_digest() -> str:
+    return hashlib.sha256(_shared_config_bytes()).hexdigest()
 
 
 def _daemon_reload_count() -> int:
@@ -44,12 +59,12 @@ def _daemon_reload_count() -> int:
 @pytest.fixture
 def shared_test_config(reset_testbed, get_state):
     """Restore the shared file only if this test still owns its last write."""
-    baseline = SHARED_CONFIG_PATH.read_bytes()
-    expected_digest = _config_digest(SHARED_CONFIG_PATH)
+    baseline = _shared_config_bytes()
+    expected_digest = hashlib.sha256(baseline).hexdigest()
 
     def note_settings_write() -> None:
         nonlocal expected_digest
-        observed = _config_digest(SHARED_CONFIG_PATH)
+        observed = _config_digest()
         assert observed != expected_digest, "Settings did not replace the shared config"
         expected_digest = observed
 
@@ -72,13 +87,13 @@ def shared_test_config(reset_testbed, get_state):
         )
 
     try:
-        yield SHARED_CONFIG_PATH, note_settings_write, wait_for_coder_dispatch
+        yield _shared_config_bytes, note_settings_write, wait_for_coder_dispatch
     finally:
-        observed = _config_digest(SHARED_CONFIG_PATH)
+        observed = _config_digest()
         assert observed == expected_digest, (
             "shared config changed outside this fixture; refusing to overwrite concurrent changes"
         )
-        if baseline != SHARED_CONFIG_PATH.read_bytes():
+        if baseline != _shared_config_bytes():
             reloads_before = _daemon_reload_count()
             fd, temporary = tempfile.mkstemp(prefix="config.test.yml.", dir=TEST_DATA_DIR)
             try:
@@ -96,7 +111,7 @@ def shared_test_config(reset_testbed, get_state):
                 time.sleep(0.5)
             else:
                 raise AssertionError("daemon did not observe restored integration config")
-            assert SHARED_CONFIG_PATH.read_bytes() == baseline
+            assert _shared_config_bytes() == baseline
 
 
 # 30 seconds proved insufficient on the shared testbed where dispatch was observed at ~39 seconds.

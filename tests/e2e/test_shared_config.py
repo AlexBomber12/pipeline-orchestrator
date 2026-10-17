@@ -16,9 +16,9 @@ def test_settings_repo_coder_changes_daemon_dispatch(
     wait_for_state,
     shared_test_config,
 ):
-    config_path, note_settings_write, wait_for_coder_dispatch = shared_test_config
+    read_config, note_settings_write, wait_for_coder_dispatch = shared_test_config
     wait_for_state(["IDLE"], timeout_sec=30)
-    original = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    original = yaml.safe_load(read_config().decode("utf-8"))
     repository = original["repositories"][0]
     assert repository.get("coder") != "codex", "test requires a changed coder policy"
     reviewer_identities = original["daemon"]["trusted_reviewer_identities"]
@@ -31,7 +31,7 @@ def test_settings_repo_coder_changes_daemon_dispatch(
     )
     assert response.status_code == 200, response.text
     note_settings_write()
-    updated = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+    updated = yaml.safe_load(read_config().decode("utf-8"))
     assert updated["repositories"][0]["coder"] == "codex"
     assert updated["daemon"]["trusted_reviewer_identities"] == reviewer_identities
 
