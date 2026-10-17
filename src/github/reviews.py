@@ -48,6 +48,8 @@ class ReviewFeedback:
     source_ids: tuple[int, ...]
     unknown_reason: str | None = None
     sources: tuple[tuple[str, int, int], ...] = ()
+    latest_finding_at: datetime | None = None
+    undated_finding: bool = False
 
 
 def format_review_feedback(findings: tuple[str, ...]) -> str | None:
@@ -107,6 +109,8 @@ def feedback_from_comments(
     sources: list[tuple[str, int, int]] = []
     unknown = False
     receipt = False
+    latest_finding_at: datetime | None = None
+    undated_finding = False
     for inline, comments in ((False, issue_comments), (True, review_comments)):
         for comment in comments:
             if not _reactions._is_codex_user(comment.get("user"), policy=policy):
@@ -121,6 +125,10 @@ def feedback_from_comments(
             kind = classify_review_comment(comment, inline=inline)
             if kind == "finding":
                 findings.append((comment.get("body") or "").strip())
+                if created is None:
+                    undated_finding = True
+                elif latest_finding_at is None or created > latest_finding_at:
+                    latest_finding_at = created
                 comment_id = comment.get("id") or 0
                 ids.append(comment_id)
                 sources.append((
@@ -139,6 +147,8 @@ def feedback_from_comments(
             else None
         ),
         tuple(sources),
+        latest_finding_at,
+        undated_finding,
     )
 
 
@@ -247,6 +257,7 @@ def _compute_review_status(
     """Core review status logic, separated for caching."""
     body_eyes = False
     body_approved = False
+    body_approval_at: datetime | None = None
     saw_plus_one = False
     last_push_time: datetime | None = None
     last_push_time_loaded = False
@@ -295,6 +306,7 @@ def _compute_review_status(
                             and reaction_time >= threshold
                         ):
                             body_approved = True
+                            body_approval_at = reaction_time
             if not body_approved and any(
                 _reactions._is_reaction_content(
                     reaction, "eyes", policy=reviewer_policy
@@ -329,6 +341,7 @@ def _compute_review_status(
             break
 
     anchor_approved = False
+    anchor_approval_at: datetime | None = None
     anchor_eyes = False
     if anchor is not None:
         cid = anchor.get("id")
@@ -356,6 +369,8 @@ def _compute_review_status(
                                 and last_push_time
                                 and reaction_time >= last_push_time
                             )
+                            if anchor_approved:
+                                anchor_approval_at = reaction_time
                     if not anchor_approved and any(
                         _reactions._is_reaction_content(
                             reaction, "eyes", policy=reviewer_policy
@@ -379,17 +394,30 @@ def _compute_review_status(
     feedback = feedback_from_comments(
         issue_comments, review_comments, pr_author, reviewer_policy
     )
-    if feedback.unknown_reason:
+    if feedback.unknown_reason and feedback.unknown_reason != "receipt conflicts with current findings":
         logger.info("PR #%s review pending: %s", pr_number, feedback.unknown_reason)
-        return ReviewStatus.PENDING
-    if (body_approved or anchor_approved) and feedback.findings:
-        logger.info("PR #%s review pending: +1 conflicts with current findings", pr_number)
         return ReviewStatus.PENDING
     if body_eyes or anchor_eyes:
         if saw_plus_one:
             logger.info("PR #%s review pending: conflicting +1 and eyes evidence", pr_number)
             return ReviewStatus.PENDING
         return ReviewStatus.EYES
+    approved_at = max(
+        (t for t in (body_approval_at, anchor_approval_at) if t is not None),
+        default=None,
+    )
+    if approved_at and feedback.findings:
+        if (
+            feedback.latest_finding_at is not None
+            and not feedback.undated_finding
+            and approved_at > feedback.latest_finding_at
+        ):
+            return ReviewStatus.APPROVED
+        logger.info("PR #%s review pending: +1 does not supersede current findings", pr_number)
+        return ReviewStatus.PENDING
+    if feedback.unknown_reason:
+        logger.info("PR #%s review pending: %s", pr_number, feedback.unknown_reason)
+        return ReviewStatus.PENDING
     if body_approved:
         return ReviewStatus.APPROVED
     if anchor_approved:

@@ -24,6 +24,7 @@ from src.github import cache as gh_cache
 from src.github import reviews as gh_reviews
 from src.models import (
     CIStatus,
+    FeedbackCheckResult,
     PipelineState,
     PRInfo,
     QueueTask,
@@ -42,6 +43,7 @@ claude_cli = claude_plugin_module.claude_cli
         (False, CIStatus.PENDING, []),
         (True, CIStatus.PENDING, ["P1: fix the null check"]),
         (False, CIStatus.FAILURE, [None]),
+        (True, CIStatus.FAILURE, ["P1: fix the null check"]),
     ],
 )
 def test_watch_620_evidence_drives_fix_without_rereading(
@@ -106,8 +108,10 @@ def test_watch_620_evidence_drives_fix_without_rereading(
     assert runner.state.state == PipelineState.WATCH
 
 
+@pytest.mark.parametrize("ci_status", [CIStatus.PENDING, CIStatus.FAILURE])
 def test_watch_supplies_only_admitted_findings_to_fix_prompt(
     monkeypatch: pytest.MonkeyPatch,
+    ci_status: CIStatus,
 ) -> None:
     h._patch_subprocess(monkeypatch)
     captured = h._capture_fix_kwargs(monkeypatch)
@@ -130,7 +134,7 @@ def test_watch_supplies_only_admitted_findings_to_fix_prompt(
 
     def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
         return [PRInfo(
-            number=42, branch="pr-459", head_sha=head, ci_status=CIStatus.PENDING,
+            number=42, branch="pr-459", head_sha=head, ci_status=ci_status,
             review_status=gh_reviews.get_pr_review_status(
                 repo, 42, "author", head, policy=kwargs["reviewer_policy"]
             ),
@@ -139,6 +143,7 @@ def test_watch_supplies_only_admitted_findings_to_fix_prompt(
     monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
     monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
     monkeypatch.setattr(watch_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": head})
+    monkeypatch.setattr("src.daemon.handlers.fix._fetch_failed_ci_logs", lambda *_: "ci-boom")
     gh_reviews.clear_review_status_cache()
     runner = h._make_runner(review_timeout_min=120)
     runner.state.current_pr = PRInfo(number=42, branch="pr-459", head_sha=head)
@@ -154,6 +159,8 @@ def test_watch_supplies_only_admitted_findings_to_fix_prompt(
     context = captured["kwargs"]["extra_context"]
     assert "Latest review feedback:\nP1: fix the null check" in context
     assert "unrelated advice" not in context
+    if ci_status == CIStatus.FAILURE:
+        assert "ci-boom" in context
 
 
 def _ci_retrieval(
@@ -3367,13 +3374,16 @@ def test_first_infra_failure_retries_workflow(
     assert "infra retry: re-ran failed jobs" in history
 
 
+@pytest.mark.parametrize("review_status", [ReviewStatus.PENDING, ReviewStatus.CHANGES_REQUESTED])
 def test_second_infra_failure_routes_to_fix(
     monkeypatch: pytest.MonkeyPatch,
+    review_status: ReviewStatus,
 ) -> None:
     """PR-251: a second INFRA_FAILURE classification on the same head_sha
     (the prior retry didn't help) routes WATCH straight through
     ``handle_fix`` without issuing another ``gh run rerun``."""
     pr = _patch_infra_failure_pr(monkeypatch, pr_number=78, head_sha="d00df00d")
+    pr.review_status = review_status
 
     gh_calls: list[list[str]] = []
 
@@ -3391,6 +3401,13 @@ def test_second_infra_failure_routes_to_fix(
     monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
 
     runner = h._make_runner()
+    feedback_policies: list[object] = []
+
+    def feedback_check(policy: object) -> FeedbackCheckResult:
+        feedback_policies.append(policy)
+        return FeedbackCheckResult.NEW
+
+    monkeypatch.setattr(runner, "_has_new_codex_feedback_since_last_push", feedback_check)
     # Pre-seed the marker with a wall-clock timestamp older than the
     # grace window so the next cycle treats the retry as "elapsed
     # enough to escalate." A legacy "1" marker would also work (it's
@@ -3409,6 +3426,9 @@ def test_second_infra_failure_routes_to_fix(
     asyncio.run(runner.handle_watch())
 
     assert fix_calls == [None]
+    assert len(feedback_policies) == (1 if review_status == ReviewStatus.CHANGES_REQUESTED else 0)
+    if feedback_policies:
+        assert runner._fix_feedback_reviewer_policy is feedback_policies[0]
     # No workflow rerun calls were made — straight to FIX.
     assert all(args[:2] != ["run", "rerun"] for args in gh_calls)
     history = " ".join(entry.get("event", "") for entry in runner.state.history)

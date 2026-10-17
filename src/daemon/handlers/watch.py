@@ -314,6 +314,9 @@ class WatchMixin:
                     f"waiting for review timeout."
                 )
         elif ci == CIStatus.FAILURE:
+            if review == ReviewStatus.CHANGES_REQUESTED:
+                if self._has_new_codex_feedback_since_last_push(reviewer_policy) == FeedbackCheckResult.NEW:
+                    self._fix_feedback_reviewer_policy = reviewer_policy
             await self.handle_fix()
             return
         elif ci == CIStatus.INFRA_FAILURE:
@@ -344,6 +347,9 @@ class WatchMixin:
                 # INFRA_FAILURE would drop the very logs the coder
                 # needs for the effective-failure handoff.
                 found.ci_status = CIStatus.FAILURE
+                if review == ReviewStatus.CHANGES_REQUESTED:
+                    if self._has_new_codex_feedback_since_last_push(reviewer_policy) == FeedbackCheckResult.NEW:
+                        self._fix_feedback_reviewer_policy = reviewer_policy
                 await self.handle_fix()
                 return
             if marker_exists:

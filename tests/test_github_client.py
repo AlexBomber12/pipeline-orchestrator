@@ -6260,6 +6260,7 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
         "created_at": "2026-10-17T21:07:00Z",
     }
     body_reactions: list[dict] = []
+    anchor_reactions: list[dict] = []
     issue_comments = [anchor, receipt]
 
     def transport(path: str) -> list[dict]:
@@ -6270,7 +6271,7 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
         if path.endswith("/pulls/42/comments") or path.endswith("/pulls/42/reviews"):
             return []
         if path.endswith("/issues/comments/10/reactions"):
-            return []
+            return anchor_reactions
         raise AssertionError(path)
 
     monkeypatch.setattr(cache, "_gh_api_paginated", transport)
@@ -6315,6 +6316,17 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
     assert comments.get_latest_codex_feedback("owner/name", 42) is None
 
+    body_reactions[0]["created_at"] = "2026-10-17T21:11:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    body_reactions[0]["created_at"] = "2026-10-17T21:09:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    body_reactions[0]["created_at"] = "2026-10-17T21:06:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    body_reactions[0]["created_at"] = "2026-10-17T21:09:00Z"
+
     issue_comments.remove(receipt)
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
@@ -6322,6 +6334,13 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
     assert comments.get_latest_codex_feedback("owner/name", 42) == "P1: fix the null check"
+
+    anchor_reactions.append({
+        "content": "+1", "user": receipt["user"],
+        "created_at": "2026-10-17T21:11:00Z",
+    })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
 
 
 def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
@@ -6353,6 +6372,13 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
     assert evidence.findings == ("P1: fix the bug",)
     assert evidence.source_ids == (2,)
     assert evidence.sources == (("issue", 2, actor["id"]),)
+    assert evidence.latest_finding_at == datetime(2026, 1, 1, 0, 1, tzinfo=_tz.utc)
+    assert not evidence.undated_finding
+    later = {**finding, "id": 4, "created_at": "2026-01-01T00:03:00Z"}
+    undated = {**finding, "id": 5, "created_at": None}
+    evidence = reviews.feedback_from_comments([finding, later], [undated], "author", policy)
+    assert evidence.latest_finding_at == datetime(2026, 1, 1, 0, 3, tzinfo=_tz.utc)
+    assert evidence.undated_finding
     unsupported = {"id": 3, "user": actor, "body": "A general update",
                    "created_at": "2026-01-01T00:02:00Z"}
     assert reviews.feedback_from_comments(
