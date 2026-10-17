@@ -23,6 +23,7 @@ from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
+from src.github import reviews as gh_reviews
 from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
@@ -875,39 +876,28 @@ class WatchMixin:
             return FeedbackCheckResult.NONE
         last_activity = self._last_push_at
         if last_activity is None:
-            return FeedbackCheckResult.NEW
+            self.log_event("[WATCH] Review feedback pending: push provenance unavailable.")
+            return FeedbackCheckResult.UNKNOWN
         if last_activity.tzinfo is None:
             last_activity = last_activity.replace(tzinfo=timezone.utc)
-        try:
-            comments = gh_cache._gh_api_paginated(
-                f"repos/{self.owner_repo}/issues/"
-                f"{self.state.current_pr.number}/comments"
-            ) or []
-            review_comments = gh_cache._gh_api_paginated(
-                f"repos/{self.owner_repo}/pulls/"
-                f"{self.state.current_pr.number}/comments"
-            ) or []
-        except Exception:
-            logger.warning(
-                "GitHub API error checking Codex feedback for PR #%s; "
-                "returning UNKNOWN",
-                self.state.current_pr.number,
-                exc_info=True,
-            )
-            return FeedbackCheckResult.UNKNOWN
         reviewer_policy = reviewer_policy or reviewer_policy_from_config(
             self.app_config
         )
-        for c in reversed(comments + review_comments):
-            if not reviewer_policy.is_trusted_user(c.get("user")):
-                continue
-            created = gh_runner._parse_iso(c.get("created_at"))
-            if created is None:
-                continue
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-            if created > last_activity:
-                return FeedbackCheckResult.NEW
+        evidence = gh_reviews.read_review_feedback(
+            self.owner_repo, self.state.current_pr.number,
+            gh_reviews.cached_review_author(
+                self.owner_repo, self.state.current_pr.number,
+                self.state.current_pr.head_sha, reviewer_policy,
+            ),
+            reviewer_policy, last_activity,
+        )
+        if evidence.unknown_reason:
+            self.log_event(f"[WATCH] Review feedback pending: {evidence.unknown_reason}.")
+            return FeedbackCheckResult.UNKNOWN
+        if evidence.findings:
+            self._fix_review_feedback = gh_reviews.format_review_feedback(evidence.findings)
+            self._fix_review_head = self.state.current_pr.head_sha
+            return FeedbackCheckResult.NEW
         return FeedbackCheckResult.NONE
 
     async def _maybe_retrigger_stale_review(self, pr_number: int) -> bool:

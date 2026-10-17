@@ -7,9 +7,11 @@ tests/test_runner.py and are referenced via the ``h`` alias.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import types
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -18,6 +20,8 @@ from src.config import AppConfig, DaemonConfig, RepoConfig, TrustedReviewerIdent
 from src.daemon import runner as runner_module
 from src.daemon.handlers import watch as watch_module
 from src.daemon.runner import PipelineRunner
+from src.github import cache as gh_cache
+from src.github import reviews as gh_reviews
 from src.models import (
     CIStatus,
     PipelineState,
@@ -30,6 +34,126 @@ from src.models import (
 from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
+
+
+@pytest.mark.parametrize(
+    ("finding", "ci_status", "expected_feedback"),
+    [
+        (False, CIStatus.PENDING, []),
+        (True, CIStatus.PENDING, ["P1: fix the null check"]),
+        (False, CIStatus.FAILURE, [None]),
+    ],
+)
+def test_watch_620_evidence_drives_fix_without_rereading(
+    monkeypatch: pytest.MonkeyPatch,
+    finding: bool,
+    ci_status: CIStatus,
+    expected_feedback: list[str | None],
+) -> None:
+    receipt = json.loads(
+        (Path(__file__).parents[1] / "fixtures/review_receipt_620.json").read_text()
+    )
+    push_time = datetime.now(timezone.utc) - timedelta(minutes=2)
+    receipt["created_at"] = (push_time + timedelta(minutes=1)).isoformat()
+    issue_comments = [
+        {"id": 10, "user": {"login": "author"}, "body": "@codex review",
+         "created_at": (push_time + timedelta(seconds=10)).isoformat()},
+        receipt,
+    ]
+    if finding:
+        issue_comments.remove(receipt)
+        issue_comments.append({
+            "id": 11, "user": receipt["user"], "body": "P1: fix the null check",
+            "created_at": (push_time + timedelta(minutes=1, seconds=10)).isoformat(),
+        })
+
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return issue_comments
+        return []
+
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", transport)
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        return [PRInfo(
+            number=42, branch="pr-459", head_sha=head, ci_status=ci_status,
+            review_status=gh_reviews.get_pr_review_status(
+                repo, 42, "author", head, policy=kwargs["reviewer_policy"]
+            ),
+        )]
+
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    gh_reviews.clear_review_status_cache()
+    runner = h._make_runner(review_timeout_min=120)
+    runner.state.current_pr = PRInfo(number=42, branch="pr-459", head_sha=head)
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = push_time
+    runner._last_push_at_pr_number = 42
+    calls: list[str | None] = []
+
+    async def fake_fix() -> None:
+        calls.append(getattr(runner, "_fix_review_feedback", None))
+
+    async def no_scan() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_fix", fake_fix)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_scan)
+    asyncio.run(runner.handle_watch())
+    assert calls == expected_feedback
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_watch_supplies_only_admitted_findings_to_fix_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    captured = h._capture_fix_kwargs(monkeypatch)
+    push_time = datetime.now(timezone.utc) - timedelta(minutes=2)
+    actor = {"id": 199175422, "login": "chatgpt-codex-connector[bot]"}
+    issue_comments = [
+        {"id": 10, "user": {"login": "author"}, "body": "@codex review",
+         "created_at": (push_time + timedelta(seconds=10)).isoformat()},
+        {"id": 11, "user": actor, "body": "P1: fix the null check",
+         "created_at": (push_time + timedelta(minutes=1)).isoformat()},
+        {"id": 12, "user": {"id": 999, "login": "other"},
+         "body": "P1: unrelated advice",
+         "created_at": (push_time + timedelta(minutes=1, seconds=10)).isoformat()},
+    ]
+    monkeypatch.setattr(
+        gh_cache, "_gh_api_paginated",
+        lambda path: issue_comments if path.endswith("/issues/42/comments") else [],
+    )
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        return [PRInfo(
+            number=42, branch="pr-459", head_sha=head, ci_status=CIStatus.PENDING,
+            review_status=gh_reviews.get_pr_review_status(
+                repo, 42, "author", head, policy=kwargs["reviewer_policy"]
+            ),
+        )]
+
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": head})
+    gh_reviews.clear_review_status_cache()
+    runner = h._make_runner(review_timeout_min=120)
+    runner.state.current_pr = PRInfo(number=42, branch="pr-459", head_sha=head)
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = push_time
+    runner._last_push_at_pr_number = 42
+
+    async def no_scan() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_scan)
+    asyncio.run(runner.handle_watch())
+    context = captured["kwargs"]["extra_context"]
+    assert "Latest review feedback:\nP1: fix the null check" in context
+    assert "unrelated advice" not in context
 
 
 def _ci_retrieval(
@@ -120,6 +244,7 @@ def test_handle_watch_reuses_poll_reviewer_policy_for_feedback(
             return [
                 {
                     "user": {"id": fresh_reviewer_id, "login": "fresh-codex[bot]"},
+                    "body": "P1: fix the missing guard",
                     "created_at": "2026-01-01T00:00:02Z",
                 }
             ]
@@ -410,8 +535,8 @@ def test_handle_watch_changes_requested_triggers_fix(
 
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
-    assert runner.state.current_pr.push_count == 1
-    assert any("Fix pushed" in e["event"] for e in runner.state.history)
+    assert runner.state.current_pr.push_count == 0
+    assert any("push provenance unavailable" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_preserves_fix_iteration_count_for_same_pr(
@@ -626,8 +751,8 @@ def test_handle_watch_fix_when_ci_success_and_changes_requested(
 
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
-    assert runner.state.current_pr.push_count == 1
-    assert any("Fix pushed" in e["event"] for e in runner.state.history)
+    assert runner.state.current_pr.push_count == 0
+    assert any("push provenance unavailable" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_ci_failure_triggers_fix(

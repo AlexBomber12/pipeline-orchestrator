@@ -368,6 +368,21 @@ def test_handle_fix_injects_ci_logs_when_ci_failed(
     assert "Latest review feedback:" not in extra_context
 
 
+def test_handle_fix_keeps_ci_diagnostic_when_logs_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda *_: None)
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", ci_status=CIStatus.FAILURE,
+        review_status=ReviewStatus.PENDING,
+    )
+    asyncio.run(runner.handle_fix())
+    assert "CI failed for PR #77 on pr-019" in captured["kwargs"]["extra_context"]
+
+
 def test_handle_fix_injects_review_feedback_when_changes_requested(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -378,10 +393,7 @@ def test_handle_fix_injects_review_feedback_when_changes_requested(
         "_fetch_failed_ci_logs",
         lambda repo, branch: None,
     )
-    monkeypatch.setattr(
-        "src.github.comments.get_latest_codex_feedback",
-        lambda repo, pr_number, policy=None: "P1: please rename foo to bar",
-    )
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *args: {"head_sha": "head"})
     captured = h._capture_fix_kwargs(monkeypatch)
 
     runner = h._make_runner()
@@ -389,14 +401,39 @@ def test_handle_fix_injects_review_feedback_when_changes_requested(
     runner.state.current_pr = PRInfo(
         number=77,
         branch="pr-019",
+        head_sha="head",
         review_status=ReviewStatus.CHANGES_REQUESTED,
     )
+    runner._fix_review_feedback = "P1: please rename foo to bar"
+    runner._fix_review_head = "head"
     asyncio.run(runner.handle_fix())
 
     extra_context = captured["kwargs"]["extra_context"]
     assert "Latest review feedback:" in extra_context
     assert "P1: please rename foo to bar" in extra_context
     assert "CI failure logs" not in extra_context
+
+
+def test_handle_fix_defers_review_when_head_changes_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The admitted finding cannot start a coder for a later PR head."""
+    h._patch_subprocess(monkeypatch)
+    captured = h._capture_fix_kwargs(monkeypatch)
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *args: {"head_sha": "new-head"})
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", head_sha="old-head",
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    runner._fix_review_feedback = "P1: fix the null check"
+    runner._fix_review_head = "old-head"
+    asyncio.run(runner.handle_fix())
+
+    assert "kwargs" not in captured
+    assert runner.state.state == PipelineState.WATCH
+    assert any("HEAD changed before review dispatch" in e["event"] for e in runner.state.history)
 
 
 def test_handle_fix_uses_watch_reviewer_policy_for_feedback(
@@ -415,10 +452,7 @@ def test_handle_fix_uses_watch_reviewer_policy_for_feedback(
         return None
 
     monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda repo, branch: None)
-    monkeypatch.setattr(
-        "src.github.comments.get_latest_codex_feedback",
-        fake_feedback,
-    )
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *args: {"head_sha": "head"})
     captured = h._capture_fix_kwargs(monkeypatch)
 
     runner = h._make_runner()
@@ -426,8 +460,13 @@ def test_handle_fix_uses_watch_reviewer_policy_for_feedback(
     runner.state.current_pr = PRInfo(
         number=77,
         branch="pr-019",
+        head_sha="head",
         review_status=ReviewStatus.CHANGES_REQUESTED,
     )
+    runner._fix_review_feedback = fake_feedback("octo/demo", 77, fix_module.ReviewerPolicy(
+        [TrustedReviewerIdentity(user_id=trusted_id, login="trusted-reviewer")]
+    ))
+    runner._fix_review_head = "head"
     runner._fix_feedback_reviewer_policy = fix_module.ReviewerPolicy(
         [TrustedReviewerIdentity(user_id=trusted_id, login="trusted-reviewer")]
     )
@@ -451,10 +490,6 @@ def test_handle_fix_injects_both_ci_logs_and_review_feedback(
         "_fetch_failed_ci_logs",
         lambda repo, branch: "ci-boom",
     )
-    monkeypatch.setattr(
-        "src.github.comments.get_latest_codex_feedback",
-        lambda repo, pr_number, policy=None: "review-feedback-text",
-    )
     captured = h._capture_fix_kwargs(monkeypatch)
 
     runner = h._make_runner()
@@ -462,9 +497,12 @@ def test_handle_fix_injects_both_ci_logs_and_review_feedback(
     runner.state.current_pr = PRInfo(
         number=77,
         branch="pr-019",
+        head_sha="head",
         ci_status=CIStatus.FAILURE,
         review_status=ReviewStatus.CHANGES_REQUESTED,
     )
+    runner._fix_review_feedback = "review-feedback-text"
+    runner._fix_review_head = "head"
     asyncio.run(runner.handle_fix())
 
     extra_context = captured["kwargs"]["extra_context"]
@@ -472,6 +510,27 @@ def test_handle_fix_injects_both_ci_logs_and_review_feedback(
     assert "ci-boom" in extra_context
     assert "Latest review feedback:" in extra_context
     assert "review-feedback-text" in extra_context
+
+
+def test_ci_fix_drops_stale_review_findings_but_keeps_ci_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda *_: "ci-boom")
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": "new-head"})
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", head_sha="old-head",
+        ci_status=CIStatus.FAILURE,
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    runner._fix_review_feedback = "P1: stale finding"
+    runner._fix_review_head = "old-head"
+    asyncio.run(runner.handle_fix())
+    context = captured["kwargs"]["extra_context"]
+    assert "ci-boom" in context
+    assert "stale finding" not in context
 
 
 def test_handle_fix_omits_extra_context_when_no_signals(
@@ -2986,8 +3045,8 @@ def test_handle_fix_uses_codex_cli_when_coder_is_codex(
         number=42,
         url="https://github.com/octo/demo/pull/42",
         branch="fix-branch",
-        ci_status=CIStatus.PENDING,
-        review_status=ReviewStatus.CHANGES_REQUESTED,
+        ci_status=CIStatus.FAILURE,
+        review_status=ReviewStatus.PENDING,
     )
     asyncio.run(runner.handle_fix())
 
@@ -5010,11 +5069,11 @@ def test_has_new_feedback_returns_none_without_current_pr() -> None:
     assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NONE
 
 
-def test_has_new_feedback_returns_true_without_last_push_timestamp() -> None:
+def test_has_new_feedback_is_unknown_without_last_push_timestamp() -> None:
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
 
-    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.NEW
+    assert runner._has_new_codex_feedback_since_last_push() == FeedbackCheckResult.UNKNOWN
 
 
 def test_has_new_feedback_returns_true_for_trusted_comment_after_push(
@@ -5073,6 +5132,7 @@ def test_has_new_feedback_normalizes_naive_timestamps(
         lambda path: [
             {
                 "user": {"id": 199175422, "login": "chatgpt-codex-bot"},
+                "body": "P1: fix this regression",
                 "created_at": "2026-01-01T00:05:00",
             },
         ],

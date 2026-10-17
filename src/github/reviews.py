@@ -9,7 +9,10 @@ gate (``ReviewStatus.APPROVED`` / ``EYES`` / ``CHANGES_REQUESTED`` /
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import re
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from src.config import load_config
 from src.github import cache
@@ -22,8 +25,141 @@ from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_conf
 from src.models import ReviewStatus
 
 logger = logging.getLogger(__name__)
+REVIEW_FEEDBACK_TRUNCATE_CHARS = 5000
+
+_FINDING = re.compile(r"\b(?:P[0-3]\b|please\b|consider\b|fix\b|missing\b|incorrect\b|bug\b|rename\b|change\b)", re.I)
+_RECEIPT = re.compile(
+    r"codex-review-receipt|didn't find any major issues|no (?:major )?(?:issues|findings)|"
+    r"^(?:lgtm|looks good overall)[.!\s]*$", re.I,
+)
+_PROGRESS = re.compile(
+    r"review (?:is )?(?:in progress|started|complete)|reviewing (?:this|your|the) pr|"
+    r"^reviewing now[.!\s]*$", re.I,
+)
+_PROVIDER_ERROR = re.compile(r"unable to (?:review|complete)|encountered an error", re.I)
+_SUMMARY = re.compile(r"^(?:\*\*)?(?:review )?(?:summary|status update)(?:\*\*)?:", re.I)
+
+
+@dataclass(frozen=True)
+class ReviewFeedback:
+    """Actionable text and source identity from one reviewer-policy snapshot."""
+
+    findings: tuple[str, ...]
+    source_ids: tuple[int, ...]
+    unknown_reason: str | None = None
+    sources: tuple[tuple[str, int, int], ...] = ()
+
+
+def format_review_feedback(findings: tuple[str, ...]) -> str | None:
+    """Bound the exact admitted findings for a coder CLI argument."""
+    if not findings:
+        return None
+    joined = "\n\n".join(findings)
+    if len(joined) > REVIEW_FEEDBACK_TRUNCATE_CHARS:
+        return "[truncated]\n" + joined[-REVIEW_FEEDBACK_TRUNCATE_CHARS:]
+    return joined
+
+
+def classify_review_comment(comment: dict, *, inline: bool = False) -> str:
+    """Classify trusted reviewer text without treating receipts as findings."""
+    body = (comment.get("body") or "").strip()
+    if not body:
+        return "unknown"
+    if _RECEIPT.search(body):
+        return "receipt"
+    if _reactions._is_codex_onboarding_comment(comment):
+        return "onboarding"
+    if _PROVIDER_ERROR.search(body):
+        return "provider_error"
+    if _SUMMARY.search(body):
+        return "summary"
+    if _PROGRESS.search(body):
+        return "progress"
+    if inline or _FINDING.search(body):
+        return "finding"
+    return "unknown"
+
+
+def feedback_from_comments(
+    issue_comments: list[dict],
+    review_comments: list[dict],
+    pr_author: str,
+    policy: ReviewerPolicy,
+    after: datetime | None = None,
+) -> ReviewFeedback:
+    """Use the latest author anchor and optional push floor for both verdict and FIX."""
+    anchor = next(
+        (
+            c
+            for c in reversed(issue_comments)
+            if (not pr_author or (c.get("user") or {}).get("login") == pr_author)
+            and "@codex review" in (c.get("body") or "").lower()
+        ),
+        None,
+    )
+    anchor_time = _parse_iso(anchor.get("created_at")) if anchor else None
+    if anchor_time is not None and anchor_time.tzinfo is None:
+        anchor_time = anchor_time.replace(tzinfo=timezone.utc)
+    if after is not None and after.tzinfo is None:
+        after = after.replace(tzinfo=timezone.utc)
+    findings: list[str] = []
+    ids: list[int] = []
+    sources: list[tuple[str, int, int]] = []
+    unknown = False
+    receipt = False
+    for inline, comments in ((False, issue_comments), (True, review_comments)):
+        for comment in comments:
+            if not _reactions._is_codex_user(comment.get("user"), policy=policy):
+                continue
+            created = _parse_iso(comment.get("created_at"))
+            if created is not None and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if (anchor_time and (created is None or created <= anchor_time)) or (
+                after and (created is None or created <= after)
+            ):
+                continue
+            kind = classify_review_comment(comment, inline=inline)
+            if kind == "finding":
+                findings.append((comment.get("body") or "").strip())
+                comment_id = comment.get("id") or 0
+                ids.append(comment_id)
+                sources.append((
+                    "review" if inline else "issue", comment_id,
+                    (comment.get("user") or {}).get("id") or 0,
+                ))
+            elif kind in ("unknown", "provider_error"):
+                unknown = True
+            elif kind == "receipt":
+                receipt = True
+    return ReviewFeedback(
+        tuple(findings), tuple(ids),
+        (
+            "receipt conflicts with current findings" if receipt and findings
+            else "trusted review text has no supported finding shape" if unknown
+            else None
+        ),
+        tuple(sources),
+    )
+
+
+def read_review_feedback(
+    repo: str,
+    pr_number: int,
+    pr_author: str,
+    policy: ReviewerPolicy,
+    after: datetime | None = None,
+) -> ReviewFeedback:
+    """Read current actionable evidence; transport failures remain pending."""
+    try:
+        issues = cache._gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
+        inline = cache._gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+        return ReviewFeedback((), (), f"review feedback unavailable: {exc}")
+    return feedback_from_comments(issues, inline, pr_author, policy, after)
+
 
 _review_status_cache: dict[str, "ReviewStatus"] = {}
+_review_author_cache: dict[str, str] = {}
 _review_status_cache_cycle: int | None = None
 
 
@@ -37,6 +173,7 @@ def clear_review_status_cache() -> None:
     """Clear the review status cache (used in tests)."""
     global _review_status_cache_cycle
     _review_status_cache.clear()
+    _review_author_cache.clear()
     _review_status_cache_cycle = None
 
 
@@ -44,6 +181,7 @@ def _begin_review_cache_cycle() -> None:
     """Start a new cache cycle, invalidating all previous entries."""
     global _review_status_cache_cycle
     _review_status_cache.clear()
+    _review_author_cache.clear()
     if _review_status_cache_cycle is None:
         _review_status_cache_cycle = 0
     _review_status_cache_cycle += 1
@@ -78,6 +216,7 @@ def get_pr_review_status(
 
     if head_sha:
         ck = _cache_key(repo, pr_number, head_sha, reviewer_policy)
+        _review_author_cache[ck] = pr_author
         cached = _review_status_cache.get(ck)
         if cached is not None:
             return cached
@@ -91,6 +230,13 @@ def get_pr_review_status(
     return result
 
 
+def cached_review_author(
+    repo: str, pr_number: int, head_sha: str, policy: ReviewerPolicy
+) -> str:
+    """Use the author and policy snapshot from the PR status poll."""
+    return _review_author_cache.get(_cache_key(repo, pr_number, head_sha, policy), "")
+
+
 def _compute_review_status(
     repo: str,
     pr_number: int,
@@ -101,6 +247,7 @@ def _compute_review_status(
     """Core review status logic, separated for caching."""
     body_eyes = False
     body_approved = False
+    saw_plus_one = False
     last_push_time: datetime | None = None
     last_push_time_loaded = False
     reviewer_policy = (
@@ -116,6 +263,7 @@ def _compute_review_status(
                 codex_reactions, policy=reviewer_policy
             )
             if plus_one is not None:
+                saw_plus_one = True
                 if head_sha:
                     try:
                         review_info = _get_codex_review_signals(
@@ -154,7 +302,6 @@ def _compute_review_status(
                 for reaction in codex_reactions
             ):
                 body_eyes = True
-                return ReviewStatus.EYES
     except RuntimeError as exc:
         if not _is_http_404_error(exc):
             raise
@@ -196,6 +343,7 @@ def _compute_review_status(
                         policy=reviewer_policy,
                     )
                     if anchor_plus_one is not None:
+                        saw_plus_one = True
                         if head_sha:
                             if not last_push_time_loaded:
                                 last_push_time = _get_pr_push_time(repo, pr_number)
@@ -228,24 +376,32 @@ def _compute_review_status(
                 else:
                     raise
 
+    feedback = feedback_from_comments(
+        issue_comments, review_comments, pr_author, reviewer_policy
+    )
+    if feedback.unknown_reason:
+        logger.info("PR #%s review pending: %s", pr_number, feedback.unknown_reason)
+        return ReviewStatus.PENDING
+    if (body_approved or anchor_approved) and feedback.findings:
+        logger.info("PR #%s review pending: +1 conflicts with current findings", pr_number)
+        return ReviewStatus.PENDING
     if body_eyes or anchor_eyes:
+        if saw_plus_one:
+            logger.info("PR #%s review pending: conflicting +1 and eyes evidence", pr_number)
+            return ReviewStatus.PENDING
         return ReviewStatus.EYES
     if body_approved:
         return ReviewStatus.APPROVED
     if anchor_approved:
         return ReviewStatus.APPROVED
 
-    anchor_ts = (anchor.get("created_at") or "") if anchor else ""
-    for comment in issue_comments + review_comments:
-        if not _reactions._is_codex_user(
-            comment.get("user"), policy=reviewer_policy
-        ):
-            continue
-        if _reactions._is_codex_onboarding_comment(comment):
-            continue
-        if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
-            continue
+    if feedback.findings:
         return ReviewStatus.CHANGES_REQUESTED
+    if saw_plus_one:
+        logger.info(
+            "PR #%s approval pending: current HEAD push or reaction provenance unavailable or stale",
+            pr_number,
+        )
 
     return ReviewStatus.PENDING
 

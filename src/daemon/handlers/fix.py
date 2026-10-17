@@ -24,8 +24,8 @@ from src.daemon.handlers.breach import BreachMixin
 from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.daemon.selector import CoderSelectionUnavailable
-from src.github import comments as gh_comments
 from src.github import gh_runner
+from src.github import prs as gh_prs
 from src.github.reviewer_policy import ReviewerPolicy
 from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
 from src.retry import retry_transient
@@ -193,6 +193,7 @@ class FixMixin(BreachMixin):
         self,
         current_pr: PRInfo,
         reviewer_policy: ReviewerPolicy | None = None,
+        review_feedback: str | None = None,
     ) -> str | None:
         """Compose CI failure logs + latest review feedback for the FIX prompt.
 
@@ -210,14 +211,14 @@ class FixMixin(BreachMixin):
                 sections.append(
                     "CI failure logs (last 5000 chars):\n" + ci_logs
                 )
+            else:
+                sections.append(
+                    f"CI failed for PR #{current_pr.number} on {current_pr.branch}; "
+                    "failed-run logs unavailable."
+                )
         if current_pr.review_status == ReviewStatus.CHANGES_REQUESTED:
-            feedback = await asyncio.to_thread(
-                gh_comments.get_latest_codex_feedback,
-                self.owner_repo, current_pr.number,
-                reviewer_policy,
-            )
-            if feedback:
-                sections.append("Latest review feedback:\n" + feedback)
+            if review_feedback:
+                sections.append("Latest review feedback:\n" + review_feedback)
         if not sections:
             return None
         return "\n\n".join(sections)
@@ -227,6 +228,10 @@ class FixMixin(BreachMixin):
         self._stop_requested = False
         fix_feedback_reviewer_policy = self._fix_feedback_reviewer_policy
         self._fix_feedback_reviewer_policy = None
+        review_feedback = getattr(self, "_fix_review_feedback", None)
+        review_head = getattr(self, "_fix_review_head", None)
+        self._fix_review_feedback = None
+        self._fix_review_head = None
         # PR-358: a FIX entry begins a new review iteration; clear the
         # single-shot review_timeout repost flag so the next WATCH
         # iteration after this FIX can post one repost again if Codex
@@ -266,6 +271,15 @@ class FixMixin(BreachMixin):
 
         self.state.state = PipelineState.FIX
         current_pr = self.state.current_pr
+        if (
+            current_pr is not None
+            and current_pr.ci_status != CIStatus.FAILURE
+            and current_pr.review_status == ReviewStatus.CHANGES_REQUESTED
+            and (not review_feedback or not review_head or review_head != current_pr.head_sha)
+        ):
+            self.log_event("[FIX] Current actionable review findings unavailable; returning to WATCH.")
+            self.state.state = PipelineState.WATCH
+            return
         fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
         task = self.state.current_task
         if task is not None and current_pr is not None:
@@ -447,12 +461,34 @@ class FixMixin(BreachMixin):
             fix_kwargs["pr_id"] = self.state.current_task.pr_id
             fix_kwargs["task_file"] = self.state.current_task.task_file
         if self.state.current_pr is not None:
+            admitted_feedback = (
+                review_feedback if review_head and review_head == self.state.current_pr.head_sha else None
+            )
+            if admitted_feedback and self.state.current_pr.ci_status == CIStatus.FAILURE:
+                metadata = await asyncio.to_thread(
+                    gh_prs.get_pr_metadata, self.owner_repo, self.state.current_pr.number
+                )
+                if metadata.get("head_sha") != review_head:
+                    admitted_feedback = None
             extra_context = await self._build_fix_feedback_context(
                 self.state.current_pr,
                 reviewer_policy=fix_feedback_reviewer_policy,
+                review_feedback=admitted_feedback,
             )
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context
+            if review_feedback and self.state.current_pr.ci_status != CIStatus.FAILURE:
+                metadata = await asyncio.to_thread(
+                    gh_prs.get_pr_metadata, self.owner_repo, self.state.current_pr.number
+                )
+                if (
+                    metadata.get("head_sha") != review_head
+                    or self.state.current_pr is not current_pr
+                    or self.state.current_pr.head_sha != review_head
+                ):
+                    self.log_event("[FIX] PR HEAD changed before review dispatch; returning to WATCH.")
+                    self.state.state = PipelineState.WATCH
+                    return
         if not self._reserve_coder_credentials(
             coder_name,
             invocation_kwargs=fix_kwargs,

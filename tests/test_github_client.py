@@ -7,6 +7,7 @@ import logging
 import subprocess
 from datetime import datetime, timedelta
 from datetime import timezone as _tz
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -1414,7 +1415,7 @@ def test_review_status_eyes_wins_over_codex_comment(
 def test_body_eyes_wins_over_anchor_plus_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A PR-body eyes signal should beat an anchor +1 while review is in progress."""
+    """Conflicting PR-body eyes and anchor +1 remain pending."""
     import json as _json
 
     clear_review_status_cache()
@@ -1444,13 +1445,13 @@ def test_body_eyes_wins_over_anchor_plus_one(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
 
 
 def test_anchor_eyes_wins_over_body_plus_one(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An anchor eyes signal should beat a PR-body +1 while review is in progress."""
+    """Conflicting anchor eyes and PR-body +1 remain pending."""
     import json as _json
 
     clear_review_status_cache()
@@ -1480,7 +1481,7 @@ def test_anchor_eyes_wins_over_body_plus_one(
 
     monkeypatch.setattr(subprocess, "run", fake_run)
 
-    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
+    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
 
 
 def test_review_api_with_body_eyes_stays_eyes(
@@ -1914,10 +1915,10 @@ def test_no_plus_one_does_not_fetch_latest_push_time(
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="deadbeef") == ReviewStatus.PENDING
 
 
-def test_body_eyes_returns_before_comment_fetches(
+def test_body_eyes_without_conflicting_comments_stays_eyes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A body-level eyes signal should not depend on later comment API calls."""
+    """A body-level eyes signal remains in progress with no other evidence."""
     import json as _json
 
     clear_review_status_cache()
@@ -1926,10 +1927,8 @@ def test_body_eyes_returns_before_comment_fetches(
         path = _find_api_path(cmd)
         if path.endswith("/pulls/42/reviews"):
             raise AssertionError("review lookup should not run for body eyes only")
-        if "issues" in path and path.endswith("/comments"):
-            raise AssertionError("issue comments should not be fetched after body eyes")
-        if "pulls" in path and path.endswith("/comments"):
-            raise AssertionError("review comments should not be fetched after body eyes")
+        if path.endswith("/comments"):
+            return _FakeCompletedProcess(stdout=_json.dumps([]))
         if path.endswith("/reactions"):
             data = [[{"content": "eyes", "user": _codex_user("chatgpt-codex-bot")}]]
         else:
@@ -6249,6 +6248,137 @@ def test_get_latest_codex_feedback_collects_post_anchor_codex_comments(
     assert out == "P1: rename foo\n\nP2: extract helper"
 
 
+def test_recorded_620_receipt_requires_current_plus_one_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production readers agree on the sanitized receipt and body reaction."""
+    receipt = json.loads(
+        (Path(__file__).parent / "fixtures/review_receipt_620.json").read_text()
+    )
+    anchor = {
+        "id": 10, "user": {"login": "author"}, "body": "@codex review",
+        "created_at": "2026-10-17T21:07:00Z",
+    }
+    body_reactions: list[dict] = []
+    issue_comments = [anchor, receipt]
+
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/reactions"):
+            return body_reactions
+        if path.endswith("/issues/42/comments"):
+            return issue_comments
+        if path.endswith("/pulls/42/comments") or path.endswith("/pulls/42/reviews"):
+            return []
+        if path.endswith("/issues/comments/10/reactions"):
+            return []
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cache, "_gh_api_paginated", transport)
+    monkeypatch.setattr(prs, "get_pr_author", lambda *_: "author")
+    monkeypatch.setattr(
+        reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 10, 17, 21, 7, tzinfo=_tz.utc),
+    )
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    assert comments.get_latest_codex_feedback("owner/name", 42) is None
+
+    body_reactions.append({
+        "content": "+1", "user": receipt["user"],
+        "created_at": "2026-10-17T21:09:00Z",
+    })
+    monkeypatch.setattr(reviews, "_get_pr_push_time", lambda *_: None)
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    monkeypatch.setattr(
+        reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 10, 17, 21, 7, tzinfo=_tz.utc),
+    )
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+
+    body_reactions[0]["created_at"] = "2026-10-17T21:06:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    body_reactions[0]["user"] = {"id": 987654, "login": "other-bot"}
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+
+    body_reactions[0]["user"] = receipt["user"]
+    body_reactions[0]["created_at"] = "2026-10-17T21:09:00Z"
+    issue_comments.append({
+        "id": 11, "user": receipt["user"], "body": "P1: fix the null check",
+        "created_at": "2026-10-17T21:10:00Z",
+    })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    assert comments.get_latest_codex_feedback("owner/name", 42) is None
+
+    issue_comments.remove(receipt)
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    body_reactions.clear()
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    assert comments.get_latest_codex_feedback("owner/name", 42) == "P1: fix the null check"
+
+
+def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = _codex_user("chatgpt-codex-bot")
+    policy = reviews.reviewer_policy_from_config(reviews.load_config())
+    samples = {
+        "<!-- codex-review-receipt:v1 --> no findings": "receipt",
+        "create a Codex account and connect to github": "onboarding",
+        "Unable to review this PR": "provider_error",
+        "Review is in progress": "progress",
+        "Summary: review started": "summary",
+        "A general update": "unknown",
+        "P2: fix the null check": "finding",
+    }
+    for body, expected in samples.items():
+        assert reviews.classify_review_comment({"body": body}) == expected
+    assert reviews.classify_review_comment({"body": "rename this"}, inline=True) == "finding"
+
+    anchor = {"id": 1, "user": {"login": "author"}, "body": "@codex review",
+              "created_at": "2026-01-01T00:00:00"}
+    finding = {"id": 2, "user": actor, "body": "P1: fix the bug",
+               "created_at": "2026-01-01T00:01:00"}
+    evidence = reviews.feedback_from_comments(
+        [anchor, finding], [], "author", policy,
+        datetime(2026, 1, 1, 0, 0),
+    )
+    assert evidence.findings == ("P1: fix the bug",)
+    assert evidence.source_ids == (2,)
+    assert evidence.sources == (("issue", 2, actor["id"]),)
+    unsupported = {"id": 3, "user": actor, "body": "A general update",
+                   "created_at": "2026-01-01T00:02:00Z"}
+    assert reviews.feedback_from_comments(
+        [anchor, unsupported], [], "author", policy
+    ).unknown_reason is not None
+
+    def unknown_transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return [anchor, unsupported]
+        return []
+
+    monkeypatch.setattr(cache, "_gh_api_paginated", unknown_transport)
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status(
+        "owner/name", 42, "author", "head", policy=policy
+    ) == ReviewStatus.PENDING
+
+    def unavailable(path: str) -> list[dict]:
+        raise RuntimeError("transport unavailable")
+
+    monkeypatch.setattr(cache, "_gh_api_paginated", unavailable)
+    assert "transport unavailable" in (
+        reviews.read_review_feedback("owner/name", 42, "author", policy).unknown_reason or ""
+    )
+
+
 def test_get_latest_codex_feedback_returns_none_when_no_codex_comments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6315,7 +6445,7 @@ def test_get_latest_codex_feedback_returns_all_codex_comments_when_no_anchor(
                 {
                     "id": 1,
                     "user": _codex_user("codex-bot"),
-                    "body": "feedback before any anchor",
+                    "body": "P1: feedback before any anchor",
                     "created_at": "2026-04-27T01:00:00Z",
                 }
             ]
@@ -6326,7 +6456,7 @@ def test_get_latest_codex_feedback_returns_all_codex_comments_when_no_anchor(
     monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     out = comments.get_latest_codex_feedback("owner/name", 42)
-    assert out == "feedback before any anchor"
+    assert out == "P1: feedback before any anchor"
 
 
 def test_get_latest_codex_feedback_skips_non_author_anchor(
@@ -6409,7 +6539,7 @@ def test_get_latest_codex_feedback_truncates_oversized_output(
     """
     monkeypatch.setattr("src.github.prs.get_pr_author", lambda repo, n: "author")
 
-    big_body = "x" * 6000
+    big_body = "P1: " + "x" * 6000
 
     def fake_paginated(path: str) -> list[dict]:
         if path.endswith("/issues/42/comments"):

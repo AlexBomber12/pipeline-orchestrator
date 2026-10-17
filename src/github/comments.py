@@ -12,11 +12,10 @@ import subprocess
 from datetime import datetime, timezone
 
 from src.config import load_config
-from src.github import cache, gh_runner, reactions
+from src.github import cache, gh_runner, reviews
 from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 
-_REVIEW_FEEDBACK_TRUNCATE_CHARS = 5000
-
+_REVIEW_FEEDBACK_TRUNCATE_CHARS = reviews.REVIEW_FEEDBACK_TRUNCATE_CHARS
 
 def post_comment(repo: str, pr_number: int, body: str) -> None:
     """Post a comment on a PR via ``gh pr comment``."""
@@ -51,35 +50,10 @@ def get_latest_codex_feedback(
     except (RuntimeError, subprocess.TimeoutExpired, OSError):
         review_comments = []
 
-    anchor_ts = ""
-    for c in reversed(issue_comments):
-        author = (c.get("user") or {}).get("login", "")
-        if pr_author and author != pr_author:
-            continue
-        if "@codex review" in (c.get("body") or "").lower():
-            anchor_ts = c.get("created_at") or ""
-            break
-
-    sections: list[str] = []
-    for comment in issue_comments + review_comments:
-        if not reactions._is_codex_user(
-            comment.get("user"), policy=reviewer_policy
-        ):
-            continue
-        if reactions._is_codex_onboarding_comment(comment):
-            continue
-        if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
-            continue
-        body = (comment.get("body") or "").strip()
-        if body:
-            sections.append(body)
-
-    if not sections:
-        return None
-    joined = "\n\n".join(sections)
-    if len(joined) > _REVIEW_FEEDBACK_TRUNCATE_CHARS:
-        return f"[truncated]\n{joined[-_REVIEW_FEEDBACK_TRUNCATE_CHARS:]}"
-    return joined
+    evidence = reviews.feedback_from_comments(
+        issue_comments, review_comments, pr_author, reviewer_policy
+    )
+    return None if evidence.unknown_reason else reviews.format_review_feedback(evidence.findings)
 
 
 def has_recent_codex_review_request(
