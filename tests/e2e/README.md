@@ -42,7 +42,17 @@ unrelated task: e2e success must inspect the matching external PR, task status,
 or other outcome the scenario promises. Use deterministic fault injection and
 fixture-owned cleanup (`tests/e2e/conftest.py` and `tests/e2e/lib/testbed_reset.py`).
 Retain failure evidence; the integration workflow uploads `e2e-evidence` with
-screenshots and stack logs. For changed DOM/HTMX behavior, exercise Chromium;
+bounded failure records, screenshots for tests that requested a Playwright page,
+and the last 200 test-stack log lines when available. Each failure record names
+the test, pytest phase, tested checkout SHA, current testbed state and the last
+20 history entries (state metadata only). Browser records count page errors and
+console errors without saving messages; screenshots mask editable controls and
+skip authentication pages. Setup failures still produce a record, and the
+workflow writes a checkout marker before test setup so an earlier setup failure
+has an artifact. Collection errors are recorded when possible and never change
+the test result. These artifacts use synthetic testbed data; do not add raw
+configurations, headers, authorization codes, provider transcripts or browser
+traces. For changed DOM/HTMX behavior, exercise Chromium;
 HTML-string or fake-DOM assertions alone do not establish browser behavior.
 
 The daemon coder container has no host Docker socket. GitHub Actions owns the

@@ -41,6 +41,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Record tested checkout for setup failures
+        run: |
+          mkdir -p tests/e2e/evidence
+          printf '{"tested_sha":"%s","status":"setup may not have reached pytest"}\n' "$(git rev-parse HEAD)" > tests/e2e/evidence/run.json
+
       - id: testbed-token
         uses: actions/create-github-app-token@v1
         with:
@@ -172,8 +177,7 @@ jobs:
       - name: Capture stack logs on failure
         if: failure()
         run: |
-          docker compose -f docker-compose.test.yml logs > stack-logs.txt 2>&1 || true
-          cat stack-logs.txt || true
+          docker compose -f docker-compose.test.yml logs --no-color --tail 200 > stack-logs.txt 2>&1 || true
 
       - name: Upload evidence artifact
         if: always()
