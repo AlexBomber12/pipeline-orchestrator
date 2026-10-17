@@ -502,18 +502,21 @@ class RecoveryMixin:
             bound, saved_task = saved.current_pr, saved.current_task
             queued = next((task for task in tasks if task.pr_id == saved_task.pr_id), None)
             recovered_state = saved.state
-            if queued is not None and queued.status == TaskStatus.ERROR and saved.state != PipelineState.ERROR:
-                try:
-                    header = parse_task_header(Path(self.repo_path) / queued.task_file)
-                except (OSError, QueueValidationError):
-                    header = None
-                if (
-                    header is not None
-                    and header.pr_id == queued.pr_id
-                    and header.branch == queued.branch
-                    and header.blocked_reason == SuppressionReason.FIX_IDLE_TIMEOUT.value
-                ):
+            if queued is not None and saved.state != PipelineState.ERROR:
+                if queued.pr_id in self._status_write_failed_task_pr_ids:
                     recovered_state = PipelineState.ERROR
+                elif queued.status == TaskStatus.ERROR:
+                    try:
+                        header = parse_task_header(Path(self.repo_path) / queued.task_file)
+                    except (OSError, QueueValidationError):
+                        header = None
+                    if (
+                        header is not None
+                        and header.pr_id == queued.pr_id
+                        and header.branch == queued.branch
+                        and header.blocked_reason == SuppressionReason.FIX_IDLE_TIMEOUT.value
+                    ):
+                        recovered_state = PipelineState.ERROR
             if (
                 queued is not None and queued.branch == saved_task.branch
                 and bound.branch == queued.branch

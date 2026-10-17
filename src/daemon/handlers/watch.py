@@ -29,6 +29,7 @@ from src.keyspace import ci_infra_retried
 from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
 from src.queue_parser import parse_existing_task_header as parse_task_header
 from src.subsource_registry import SuppressionReason
+from src.task_status import find_matching_open_pr
 
 logger = logging.getLogger(__name__)
 _STALE_RETRIGGER_DEBOUNCE = timedelta(hours=1)
@@ -179,8 +180,12 @@ class WatchMixin:
                 await self._handle_external_pr_resolution(current_pr, "CLOSED")
                 return
             if (
-                self.state.active_invocation is not None
-                and self.state.active_invocation.phase == "fix"
+                self.state.current_task is not None
+                and find_matching_open_pr(
+                    self.state.current_task.pr_id,
+                    self.state.current_task.branch,
+                    [current_pr],
+                ) is current_pr
             ):
                 self.log_event(
                     f"[WATCH] PR #{current_number} no longer open (state "

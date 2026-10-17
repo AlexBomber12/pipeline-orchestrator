@@ -757,7 +757,14 @@ class RetryCommandMixin:
         pr, reset_counters = self._reset_retry_local_counters(pr)
         if self._current_run_record is not None and self._current_run_record.task_id != task.pr_id:
             self._current_run_record = None
-        self.state.active_invocation = None
+        self.state.active_invocation = (
+            self._current_run_record.invocations[-1]
+            if continuation_name == "watch" and self._current_run_record is not None
+            and self._current_run_record.task_id == task.pr_id
+            and self._current_run_record.invocations
+            and self._current_run_record.invocations[-1].phase == "fix"
+            else None
+        )
         self._set_retry_task_snapshot(task)
         self.state.error_message = None
         if continuation_name == "watch":
@@ -799,7 +806,9 @@ class RetryCommandMixin:
             pr, _reset = self._reset_retry_local_counters(pr)
             if self._current_run_record is not None and self._current_run_record.task_id != task.pr_id:
                 self._current_run_record = None
-            self.state.active_invocation = None
+            if self._current_run_record is not None and self._current_run_record.task_id == task.pr_id:
+                if self._current_run_record.invocations and self._current_run_record.invocations[-1].phase == "fix":
+                    self.state.active_invocation = self._current_run_record.invocations[-1]
             self._set_retry_task_snapshot(task)
             self.state.current_pr = pr
             self.state.state = PipelineState.WATCH

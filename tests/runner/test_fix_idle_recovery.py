@@ -378,6 +378,33 @@ async def test_restart_with_unavailable_timeout_cause_does_not_admit(
 
 
 @pytest.mark.asyncio
+async def test_restart_preserves_error_when_timeout_status_write_failed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, task, pr, task_path = await _timeout_runner(tmp_path, monkeypatch)
+    write_frontmatter_status(task_path, "TODO")
+    runner.state.state = PipelineState.FIX
+    runner.state.error_message = None
+    runner._status_write_failed_task_pr_ids.add(task.pr_id)
+    await runner._persist_status_write_failed_task_pr_ids()
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    restarted._metrics_store = runner._metrics_store
+    restarted.repo_path = runner.repo_path
+    await restarted._hydrate_current_task_from_persisted_state()
+    await restarted._hydrate_status_write_failed_task_pr_ids()
+    await restarted._apply_recovery_decisions(
+        [task.model_copy(update={"status": TaskStatus.DOING})], [pr]
+    )
+    assert restarted.state.state == PipelineState.ERROR
+    assert restarted.state.current_pr.number == pr.number
+    assert task.pr_id in restarted._status_write_failed_task_pr_ids
+    assert "status: TODO" in task_path.read_text()
+    assert await restarted.redis.get(cause_key(runner.name, task.pr_id))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("header", ["guardrail", "missing"])
 async def test_restart_does_not_relabel_other_or_unreadable_error_as_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, header: str,

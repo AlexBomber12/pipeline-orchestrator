@@ -19,7 +19,7 @@ from src.cancellation import (
 from src.daemon import retry_commands as retry_module
 from src.daemon.retry_commands import RetryDispatch
 from src.inhibitor import InhibitorType, WorkInhibitor
-from src.keyspace import retry_command, retry_command_pending
+from src.keyspace import pipeline_state, retry_command, retry_command_pending
 from src.models import (
     CIStatus,
     PipelineState,
@@ -869,6 +869,50 @@ async def test_retry_replaces_unrelated_cached_run_record(
         runner._current_run_record = unrelated
         assert await runner._reconcile_applied_retry(command) == RetryDispatch.WATCH
         assert runner._current_run_record is None
+
+
+@pytest.mark.asyncio
+async def test_watch_retry_keeps_fix_binding_when_pr_observation_is_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, command, task, _repo = await _prepared_runner(tmp_path)
+    pr = PRInfo(number=42, branch=task.branch, pr_id=task.pr_id)
+    runner._start_current_run_record("codex", "")
+    runner._current_run_record.fix_iterations = 1
+    runner._capture_invocation_snapshot("codex", {}, phase="fix", fix_iteration=1)
+    await runner._checkpoint_current_run_record()
+    monkeypatch.setattr(runner, "_validate_retry_command", _async_value((object(), task)))
+    monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
+    monkeypatch.setattr(runner, "_select_retry_continuation", _async_value(("watch", pr)))
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
+    monkeypatch.setattr(runner, "_clear_retry_failure_evidence", _async_value(None))
+    assert await runner._apply_retry_command(command) == RetryDispatch.WATCH
+    assert runner.state.active_invocation.phase == "fix"
+    runner.state.active_invocation = None
+    assert await runner._reconcile_applied_retry(command) == RetryDispatch.WATCH
+    assert runner.state.active_invocation.phase == "fix"
+    runner.state.active_invocation = None
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *_a, **_k: [])
+    monkeypatch.setattr(retry_module.gh_prs, "get_pr_state", lambda *_a: None)
+    monkeypatch.setattr(retry_module.gh_prs, "is_pr_merged", lambda *_a: None)
+    await runner.handle_watch()
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task.pr_id == task.pr_id
+    assert runner.state.current_pr.number == pr.number
+    runner.state.active_invocation = runner._current_run_record.invocations[-1]
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    restarted._metrics_store = runner._metrics_store
+    restarted.repo_path = runner.repo_path
+    await restarted._hydrate_current_task_from_persisted_state()
+    await restarted._apply_recovery_decisions(
+        [task.model_copy(update={"status": TaskStatus.TODO})], []
+    )
+    assert restarted.state.state == PipelineState.WATCH
+    await restarted.handle_watch()
+    assert restarted.state.state == PipelineState.WATCH
+    assert restarted.state.current_pr.number == pr.number
 
 
 @pytest.mark.asyncio
