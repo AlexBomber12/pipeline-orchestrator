@@ -93,7 +93,7 @@ class FixMixin(BreachMixin):
         pr_number: int,
         idle_limit: int,
         target: asyncio.Task,  # type: ignore[type-arg]
-        idle_flag: dict[str, bool],
+        idle_flag: dict[str, bool | float],
     ) -> None:
         """Thin wrapper — see ``fix_supervision.monitor_fix_idle``."""
         await fix_supervision.monitor_fix_idle(
@@ -348,7 +348,7 @@ class FixMixin(BreachMixin):
 
         breach_dir, breach_run_id = self._breach_env()
         breach_flag: dict[str, bool] = {"breached": False}
-        idle_flag: dict[str, bool] = {"timed_out": False}
+        idle_flag: dict[str, bool | float] = {"timed_out": False}
         external_state_flag: dict[str, str | None] = {"state": None}
 
         plugin_run_kwargs = plugin.build_run_kwargs(
@@ -421,6 +421,7 @@ class FixMixin(BreachMixin):
                     )
                 )
             )
+            idle_flag["started_at"] = fix_supervision.time.monotonic()
         except BaseException:
             if captured_snapshot is not None:
                 self.state.active_invocation = previous_active_invocation
@@ -673,7 +674,7 @@ class FixMixin(BreachMixin):
             if self.state.current_pr is not None:
                 no_push_policy.reset(self.state.current_pr)
             await self._transition_to_error(
-                f"FIX idle timeout: no push for {idle_limit}s",
+                f"FIX idle timeout: no new push for {idle_limit}s of active FIX time",
                 save_run_record_as=None,
                 publish=False,
                 log_prefix="[FIX]",

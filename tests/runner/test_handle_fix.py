@@ -4398,13 +4398,15 @@ def test_monitor_fix_idle_times_out_without_push_history(
     idle_flag, target = asyncio.run(run_monitor())
     assert idle_flag["timed_out"] is True
     assert target.cancelled() is True
-    assert events == ["[FIX] idle timeout (5s since last push), killing."]
+    assert events == [
+        "[FIX] idle timeout (5s since invocation start or last observed push), killing."
+    ]
 
 
-def test_monitor_fix_idle_backdates_elapsed_time_from_head_age(
+def test_monitor_fix_idle_ignores_head_age(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Head age should backdate the idle deadline before the first poll."""
+    """Head age must not shorten the deadline before the first poll."""
     runner = h._make_runner()
 
     async def fake_to_thread(func: Any, *args: object, **kwargs: object) -> Any:
@@ -4583,7 +4585,9 @@ def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
         events[0],
     )
     assert "simulated transient API error" in events[0]
-    assert events[1] == "[FIX] idle timeout (30s since last push), killing."
+    assert events[1] == (
+        "[FIX] idle timeout (30s since invocation start or last observed push), killing."
+    )
 
 
 def test_run_coder_with_polling_returns_none_when_pr_number_is_zero() -> None:
