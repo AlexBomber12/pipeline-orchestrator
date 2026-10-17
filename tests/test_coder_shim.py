@@ -55,6 +55,24 @@ def test_claude_auth_status_reports_sanitized_authenticated_fixture(
     assert result.stderr == ""
 
 
+def test_codex_auth_status_is_accepted_by_daemon_probe(tmp_path: Path) -> None:
+    from src.coders.codex import _authentication_mode
+
+    codex = tmp_path / "codex"
+    codex.symlink_to(SHIM)
+
+    result = subprocess.run(
+        [str(codex), "login", "status"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stderr == ""
+    assert _authentication_mode(result.stdout.strip()) == "chatgpt"
+
+
 def test_shim_reads_active_pr_from_runtime_file(tmp_path: Path) -> None:
     _write_task(tmp_path, "PR-004", branch="pr-004", status="TODO")
     _write_task(tmp_path, "PR-005", branch="pr-005", status=None)
