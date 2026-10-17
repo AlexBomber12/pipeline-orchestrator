@@ -617,8 +617,7 @@ class IdleMixin:
 
         Returns the ``QueueTask`` to dispatch into CODING, or ``None``
         when the handler must return without dispatching — either
-        nothing is actionable (logging "No tasks available", optionally
-        attaching ``current_pr`` to a manual-work open PR) or an
+        nothing is actionable (logging "No tasks available") or an
         existing open PR matched the chosen task and the runner has
         already transitioned to WATCH.
         """
@@ -674,22 +673,13 @@ class IdleMixin:
 
         if task is None:
             self.log_event("[INFRA] No tasks available.")
+            self.state.current_task = None
+            self._reset_runner_local_task_counters()
             if prs:
-                done_branches = {
-                    t.branch for t in dag_tasks
-                    if t.status == TaskStatus.DONE and t.branch
-                }
-                match = next(
-                    (pr for pr in prs if pr.branch in done_branches), None
-                )
-                selected = match or prs[0]
-                self.state.current_pr = self._preserve_fix_iteration_count(selected)
                 self.log_event(
                     f"[INFRA] IDLE: {len(prs)} open PR(s) detected "
                     f"(manual work)."
                 )
-            else:
-                self.state.current_pr = None
             return None
 
         self.state.current_task = task
@@ -712,6 +702,7 @@ class IdleMixin:
                 await self.publish_state()
                 return None
 
+        self.state.current_pr = None
         return task
 
     async def handle_idle(self) -> None:

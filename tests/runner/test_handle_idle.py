@@ -1146,9 +1146,10 @@ def test_handle_idle_preserves_fix_iteration_count_when_reattaching_same_pr(
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.CHANGES_REQUESTED,
     )
+    unrelated_pr = PRInfo(number=615, branch="manual-independent", title="Manual change")
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
-        lambda repo, **kw: [reattached_pr],
+        lambda repo, **kw: [unrelated_pr, reattached_pr],
     )
     monkeypatch.setattr(
         "src.github.prs.get_merged_prs",
@@ -1177,33 +1178,48 @@ def test_handle_idle_preserves_fix_iteration_count_when_reattaching_same_pr(
     assert runner.state.current_pr.no_push_fix_count == 2
 
 
-def test_handle_idle_no_tasks_but_open_pr_sets_current_pr(
+def test_handle_idle_error_task_with_open_prs_clears_stale_identity(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     h._patch_subprocess(monkeypatch)
-    done_task = QueueTask(
-        pr_id="PR-001",
-        title="Done",
-        status=TaskStatus.DONE,
-        branch="pr-001-done",
+    task_dir = tmp_path / "tasks"
+    task_dir.mkdir()
+    (task_dir / "PR-458.md").write_text(
+        "---\nstatus: ERROR\n---\n\n# PR-458: Shared config\n"
+        "Branch: pr-458-shared-integration-config\n"
+        "- Type: feature\n- Complexity: low\n- Depends on: none\n",
+        encoding="utf-8",
     )
-
-    open_pr = PRInfo(
-        number=42,
-        branch="pr-001-done",
-        ci_status=CIStatus.SUCCESS,
-        review_status=ReviewStatus.PENDING,
+    monkeypatch.setattr(
+        idle_module.IdleMixin, "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
     )
-    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [open_pr])
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *a, **kw: _merged_state())
+    manual = PRInfo(number=615, branch="micro-20261017-repo-header-coder")
+    owned = PRInfo(number=614, branch="pr-458-shared-integration-config")
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [manual, owned])
     monkeypatch.setattr("src.github.prs.get_merged_prs", lambda repo, branch, refresh=False: [])
 
     runner = h._make_runner()
-    asyncio.run(runner.handle_idle())
+    runner.repo_path = str(tmp_path)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-458", title="Shared config", status=TaskStatus.ERROR,
+        branch=owned.branch,
+    )
+    runner.state.current_pr = owned
+    runner.log_event("PR-458 failed: review timeout")
+    runner.redis.store["suppression:PR-458"] = "review timeout"
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_pr is not None
-    assert runner.state.current_pr.number == 42
-    assert any("open PR(s) detected" in e["event"] for e in runner.state.history)
+    for _ in range(2):
+        asyncio.run(runner.handle_idle())
+        assert runner.state.state == PipelineState.IDLE
+        assert runner.state.current_task is None
+        assert runner.state.current_pr is None
+        assert runner.state.current_queue
+        assert runner.state.current_queue[0].status == TaskStatus.ERROR
+    assert runner.redis.store["suppression:PR-458"] == "review timeout"
+    assert any("PR-458 failed: review timeout" in e["event"] for e in runner.state.history)
 
 
 def test_handle_idle_no_tasks_no_open_prs_clears_current_pr(
@@ -1222,13 +1238,18 @@ def test_handle_idle_no_tasks_no_open_prs_clears_current_pr(
     assert runner.state.current_pr is None
 
 
-def test_handle_idle_new_open_pr_resets_fix_iteration_count(
+def test_handle_idle_unrelated_open_pr_does_not_block_eligible_task(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
+    task = QueueTask(
+        pr_id="PR-459", title="Independent task", status=TaskStatus.TODO,
+        branch="pr-459-independent",
+    )
+    h._stub_dag_select(monkeypatch, task=task)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
-        lambda repo, **kw: [PRInfo(number=42, branch="fresh-branch")],
+        lambda repo, **kw: [PRInfo(number=615, branch="manual-independent")],
     )
     monkeypatch.setattr(
         "src.github.prs.get_merged_prs",
@@ -1236,17 +1257,19 @@ def test_handle_idle_new_open_pr_resets_fix_iteration_count(
     )
 
     runner = h._make_runner()
-    runner.state.current_pr = PRInfo(
-        number=99,
-        branch="old-branch",
-        fix_iteration_count=7,
-    )
+    runner.state.current_pr = PRInfo(number=615, branch="manual-independent")
+    coding_calls = []
+
+    async def spy_coding() -> None:
+        coding_calls.append(runner.state.current_task.pr_id)
+
+    runner.handle_coding = spy_coding  # type: ignore[method-assign]
 
     asyncio.run(runner.handle_idle())
 
-    assert runner.state.current_pr is not None
-    assert runner.state.current_pr.number == 42
-    assert runner.state.current_pr.fix_iteration_count == 0
+    assert coding_calls == ["PR-459"]
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.current_pr is None
 
 
 def test_handle_idle_no_tasks_does_not_change_state_from_idle(
@@ -1317,7 +1340,7 @@ def test_handle_idle_falls_back_when_merged_pr_check_fails(
     assert runner.state.state == PipelineState.CODING
     assert runner.state.current_task is not None
     assert runner.state.current_task.pr_id == task.pr_id
-    assert runner.state.current_pr.number == 5
+    assert runner.state.current_pr is None
     assert coding_called["v"] is True
     assert any("merged PR check failed" in e["event"] for e in runner.state.history)
 
