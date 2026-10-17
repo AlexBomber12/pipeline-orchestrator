@@ -64,6 +64,19 @@ def _runner_apply_count() -> int:
     return _daemon_log_count(f"[{TESTBED_SLUG}] [INFRA] Applied staged repo config.")
 
 
+def _runner_reload_count() -> int:
+    return _daemon_log_count(f"[{TESTBED_SLUG}] [INFRA] Reloaded repo config from config.yml.")
+
+
+def _wait_for_runner_config_ack(applies_before: int, reloads_before: int) -> None:
+    deadline = time.monotonic() + 70
+    while time.monotonic() < deadline:
+        if _runner_apply_count() > applies_before or _runner_reload_count() > reloads_before:
+            return
+        time.sleep(0.5)
+    raise AssertionError("runner did not apply updated integration config")
+
+
 def _wait_for_daemon_reload(reloads_before: int) -> None:
     deadline = time.monotonic() + 30
     while time.monotonic() < deadline:

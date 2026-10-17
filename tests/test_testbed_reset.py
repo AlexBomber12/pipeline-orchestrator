@@ -679,6 +679,26 @@ def test_wait_for_runner_apply_requires_new_acknowledgment() -> None:
         sys.modules.pop(module_name, None)
 
 
+@pytest.mark.parametrize("acknowledgment", ["apply", "reload"])
+def test_wait_for_runner_config_ack_requires_new_runner_event(acknowledgment: str) -> None:
+    module_name = "tests.e2e.conftest"
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+        apply_counts = [7, 8] if acknowledgment == "apply" else [7, 7]
+        reload_counts = [3, 4] if acknowledgment == "reload" else [3, 3]
+        with (
+            patch.object(e2e_conftest, "_runner_apply_count", side_effect=apply_counts),
+            patch.object(e2e_conftest, "_runner_reload_count", side_effect=reload_counts),
+            patch.object(e2e_conftest.time, "sleep") as sleep,
+        ):
+            e2e_conftest._wait_for_runner_config_ack(7, 3)
+        sleep.assert_called_once_with(0.5)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_stop_daemon_waits_for_runner_pause_ack() -> None:
     module_name = "tests.e2e.conftest"
     posts: list[tuple[str, int]] = []

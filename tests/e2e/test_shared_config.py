@@ -5,7 +5,14 @@ import time
 import requests
 import yaml
 
-from tests.e2e.conftest import _daemon_reload_count, _wait_for_daemon_reload
+from tests.e2e.conftest import (
+    TESTBED_SLUG,
+    _resume_daemon,
+    _runner_apply_count,
+    _runner_reload_count,
+    _stop_daemon_and_wait_paused,
+    _wait_for_runner_config_ack,
+)
 from tests.e2e.lib.coder_shim import coder_shim
 
 
@@ -23,7 +30,8 @@ def test_settings_repo_coder_changes_daemon_dispatch(
     assert repository["coder"] == "claude", "test requires a Claude coder baseline"
     reviewer_identities = original["daemon"]["trusted_reviewer_identities"]
 
-    reloads_before = _daemon_reload_count()
+    applies_before = _runner_apply_count()
+    reloads_before = _runner_reload_count()
     response = requests.put(
         f"{dashboard_url}/settings/repos",
         params={"url": repository["url"]},
@@ -35,7 +43,10 @@ def test_settings_repo_coder_changes_daemon_dispatch(
     updated = yaml.safe_load(read_config().decode("utf-8"))
     assert updated["repositories"][0]["coder"] == "codex"
     assert updated["daemon"]["trusted_reviewer_identities"] == reviewer_identities
-    _wait_for_daemon_reload(reloads_before)
+    # End any in-flight IDLE cycle, then require a runner-level config acknowledgment.
+    _stop_daemon_and_wait_paused(TESTBED_SLUG)
+    _resume_daemon(TESTBED_SLUG)
+    _wait_for_runner_config_ack(applies_before, reloads_before)
 
     pr_id = int(time.time())
     with coder_shim("hang"):
