@@ -11,6 +11,8 @@ from pathlib import Path
 
 import pytest
 import requests
+import yaml
+from src.config import AppConfig, RepoConfig, normalize_repo_url
 
 from tests.e2e.lib.review_api import ReviewApi
 from tests.e2e.lib.testbed_reset import clear_testbed_redis_state, reset_testbed_full
@@ -90,12 +92,29 @@ def _wait_for_daemon_reload(reloads_before: int) -> None:
 def shared_test_config(reset_testbed, get_state):
     """Restore the shared file only if this test still owns its last write."""
     baseline = _shared_config_bytes()
-    expected_digest = hashlib.sha256(baseline).hexdigest()
+    baseline_digest = hashlib.sha256(baseline).hexdigest()
+    expected_digest = baseline_digest
+    pending_digest = None
+
+    def expect_settings_coder_write(url: str, coder: str) -> None:
+        nonlocal pending_digest
+        config = AppConfig.model_validate(yaml.safe_load(baseline))
+        matches = [
+            index for index, repo in enumerate(config.repositories)
+            if normalize_repo_url(repo.url) == normalize_repo_url(url)
+        ]
+        assert len(matches) == 1, "expected exactly one repository for the Settings write"
+        index = matches[0]
+        existing = config.repositories[index]
+        config.repositories[index] = RepoConfig.model_validate({**existing.model_dump(), "coder": coder})
+        payload = config.model_dump(mode="json", exclude_none=True)
+        intended = yaml.dump(payload, default_flow_style=False, sort_keys=False).encode("utf-8")
+        pending_digest = hashlib.sha256(intended).hexdigest()
 
     def note_settings_write() -> None:
         nonlocal expected_digest
         observed = _config_digest()
-        assert observed != expected_digest, "Settings did not replace the shared config"
+        assert observed == pending_digest, "Settings did not write the intended shared config"
         expected_digest = observed
 
     def wait_for_coder_dispatch(pr_id: str, plugin_id: str) -> dict:
@@ -117,7 +136,7 @@ def shared_test_config(reset_testbed, get_state):
         )
 
     try:
-        yield _shared_config_bytes, note_settings_write, wait_for_coder_dispatch
+        yield _shared_config_bytes, expect_settings_coder_write, note_settings_write, wait_for_coder_dispatch
     finally:
         restored = False
         applies_before = 0
@@ -126,7 +145,7 @@ def shared_test_config(reset_testbed, get_state):
             reset_testbed_full(TESTBED_SLUG)
             clear_testbed_redis_state(TESTBED_SLUG)
             observed = _config_digest()
-            assert observed == expected_digest, (
+            assert observed == expected_digest or (expected_digest == baseline_digest and observed == pending_digest), (
                 "shared config changed outside this fixture; refusing to overwrite concurrent changes"
             )
             if baseline != _shared_config_bytes():

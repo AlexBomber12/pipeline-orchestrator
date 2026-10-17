@@ -23,7 +23,7 @@ def test_settings_repo_coder_changes_daemon_dispatch(
     wait_for_state,
     shared_test_config,
 ):
-    read_config, note_settings_write, wait_for_coder_dispatch = shared_test_config
+    read_config, expect_settings_coder_write, note_settings_write, wait_for_coder_dispatch = shared_test_config
     wait_for_state(["IDLE"], timeout_sec=30)
     original = yaml.safe_load(read_config().decode("utf-8"))
     repository = original["repositories"][0]
@@ -32,6 +32,7 @@ def test_settings_repo_coder_changes_daemon_dispatch(
 
     applies_before = _runner_apply_count()
     reloads_before = _runner_reload_count()
+    expect_settings_coder_write(repository["url"], "codex")
     response = requests.put(
         f"{dashboard_url}/settings/repos",
         params={"url": repository["url"]},

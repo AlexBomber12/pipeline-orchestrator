@@ -625,7 +625,8 @@ def test_shared_config_fixture_waits_for_runner_to_apply_restored_config(tmp_pat
     module_name = "tests.e2e.conftest"
     calls: list[str] = []
     config_path = tmp_path / "config.test.yml"
-    config_path.write_bytes(b"baseline")
+    baseline = Path("config.test.yml").read_bytes()
+    config_path.write_bytes(baseline)
 
     sys.modules.pop(module_name, None)
     try:
@@ -650,16 +651,60 @@ def test_shared_config_fixture_waits_for_runner_to_apply_restored_config(tmp_pat
             ),
         ):
             fixture = e2e_conftest.shared_test_config.__wrapped__(None, lambda: None)
-            _, note_settings_write, _ = next(fixture)
-            config_path.write_bytes(b"codex")
+            _, expect_settings_coder_write, note_settings_write, _ = next(fixture)
+            from src.config import update_repository
+
+            repo_url = "https://github.com/AlexBomber12/pipeline-orchestrator-testbed.git"
+            expect_settings_coder_write(repo_url, "codex")
+            update_repository(repo_url, path=str(config_path), coder="codex")
             note_settings_write()
             with pytest.raises(StopIteration):
                 next(fixture)
     finally:
         sys.modules.pop(module_name, None)
 
-    assert config_path.read_bytes() == b"baseline"
+    assert config_path.read_bytes() == baseline
     assert calls == ["stop", "reset", "clear", "reconciled", "resume", "applied-after:7"]
+
+
+@pytest.mark.parametrize("write_completed", [False, True])
+def test_shared_config_fixture_restores_after_settings_request_failure(tmp_path, write_completed: bool) -> None:
+    module_name = "tests.e2e.conftest"
+    config_path = tmp_path / "config.test.yml"
+    baseline = Path("config.test.yml").read_bytes()
+    config_path.write_bytes(baseline)
+    repo_url = "https://github.com/AlexBomber12/pipeline-orchestrator-testbed.git"
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+        with (
+            patch.object(e2e_conftest, "TEST_DATA_DIR", tmp_path),
+            patch.object(e2e_conftest, "SHARED_CONFIG_PATH", config_path),
+            patch.object(e2e_conftest, "_shared_config_bytes", side_effect=config_path.read_bytes),
+            patch.object(e2e_conftest, "_stop_daemon_and_wait_paused"),
+            patch.object(e2e_conftest, "reset_testbed_full"),
+            patch.object(e2e_conftest, "clear_testbed_redis_state"),
+            patch.object(e2e_conftest, "_runner_apply_count", return_value=7),
+            patch.object(e2e_conftest, "_daemon_reload_count", return_value=3),
+            patch.object(e2e_conftest, "_wait_for_daemon_reload"),
+            patch.object(e2e_conftest, "_resume_daemon"),
+            patch.object(e2e_conftest, "_wait_for_runner_apply") as wait_for_apply,
+        ):
+            fixture = e2e_conftest.shared_test_config.__wrapped__(None, lambda: None)
+            _, expect_settings_coder_write, _, _ = next(fixture)
+            expect_settings_coder_write(repo_url, "codex")
+            if write_completed:
+                from src.config import update_repository
+
+                update_repository(repo_url, path=str(config_path), coder="codex")
+            with pytest.raises(StopIteration):
+                next(fixture)
+            assert config_path.read_bytes() == baseline
+            assert wait_for_apply.called == write_completed
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 def test_wait_for_runner_apply_requires_new_acknowledgment() -> None:
