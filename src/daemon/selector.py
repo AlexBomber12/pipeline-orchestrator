@@ -63,6 +63,9 @@ def eligible_coders(ctx: SelectionContext) -> list[str]:
     if not ctx.app_config.daemon.auto_fallback:
         return [preferred] if _coder_runtime_ok(preferred, ctx) else []
 
+    if ctx.registry.get_optional(preferred) is None:
+        ctx.exclusion_reasons[preferred] = "plugin_unavailable"
+
     result = [
         name
         for name in ctx.registry.coder_names()

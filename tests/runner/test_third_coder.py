@@ -995,6 +995,21 @@ def test_selection_failure_and_third_party_fallback_use_safe_reasons(
     assert "rate limited" in runner.state.history[-1]["event"]
 
 
+def test_missing_configured_plugin_explains_registered_fallback() -> None:
+    runner = h._make_runner(coder="missing-plugin")
+    runner._auth_status_cache = {
+        "claude": {"status": "ok"},
+        "codex": {"status": "ok"},
+    }
+
+    assert runner._get_coder()[0] == "codex"
+    assert (
+        "Configured missing-plugin unavailable: plugin unavailable; "
+        "selected Codex CLI because automatic fallback is enabled"
+        in runner.state.history[-1]["event"]
+    )
+
+
 def test_select_auxiliary_coder_returns_none_when_resolver_has_no_plugin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
