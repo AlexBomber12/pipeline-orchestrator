@@ -148,6 +148,10 @@ class ErrorMixin:
         retry_task = self.state.current_task
         retry_task_id = retry_task.pr_id if retry_task is not None else None
 
+        if context.startswith("FIX idle timeout"):
+            await self._admit_fix_idle_timeout()
+            return
+
         if (
             retry_task is not None
             and retry_task_id in self._status_write_failed_task_pr_ids

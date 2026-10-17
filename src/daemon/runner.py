@@ -3552,7 +3552,9 @@ class PipelineRunner(
         elif current == PipelineState.PAUSED:
             await self.handle_paused()
         elif current == PipelineState.ERROR:
-            if self.repo_config.feature_flags.use_single_error_exit:
+            if (self.state.error_message or "").startswith("FIX idle timeout"):
+                await self._admit_fix_idle_timeout()
+            elif self.repo_config.feature_flags.use_single_error_exit:
                 await self._handle_single_error_exit()
             elif self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED

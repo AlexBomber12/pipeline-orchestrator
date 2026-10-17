@@ -750,6 +750,10 @@ async def test_watch_retry_preserves_pr_and_resets_pr_local_counters(
         text=text,
         command=_command(text, bound_pr=pr),
     )
+    runner._start_current_run_record("codex", "")
+    assert runner._current_run_record is not None
+    runner._current_run_record.fix_iterations = 4
+    await runner._checkpoint_current_run_record()
     _allow_validation(monkeypatch, runner, text)
     monkeypatch.setattr(runner, "_suppression_record_for_task", _none_record)
     monkeypatch.setattr(retry_module, "derive_active_inhibitors", _async_value([]))
@@ -766,10 +770,69 @@ async def test_watch_retry_preserves_pr_and_resets_pr_local_counters(
     assert runner.state.current_pr.fix_iteration_count == 0
     assert runner.state.current_pr.no_push_fix_count == 0
     assert runner.state.current_pr.watch_retrigger_count == 0
+    assert runner._current_run_record.fix_iterations == 4
+    assert runner._current_run_record.fix_recovery_baseline == 4
+    restored = await runner._metrics_store.get(runner._current_run_record.run_id)
+    assert restored is not None and restored.fix_recovery_baseline == 4
     stored = await load_retry_command(runner.redis, runner.name, command.command_id)
     assert stored is not None
     assert stored.selected_continuation == "watch"
     assert "fix_iteration_count" in stored.reset_counters
+
+
+@pytest.mark.asyncio
+async def test_watch_retry_budget_checkpoint_failure_keeps_command_pending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = _task_text()
+    pr = PRInfo(number=42, branch="fix/pr-42", pr_id="PR-42", head_sha="abc123")
+    runner, command, _task, _repo = await _prepared_runner(
+        tmp_path, text=text, command=_command(text, bound_pr=pr)
+    )
+    runner._start_current_run_record("codex", "")
+    record = runner._current_run_record
+    assert record is not None
+    record.fix_iterations = 3
+    _allow_validation(monkeypatch, runner, text)
+    monkeypatch.setattr(runner, "_suppression_record_for_task", _none_record)
+    monkeypatch.setattr(retry_module, "derive_active_inhibitors", _async_value([]))
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *args: [pr])
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
+
+    async def checkpoint_failed():
+        raise RuntimeError("metrics down")
+
+    monkeypatch.setattr(runner, "_checkpoint_current_run_record", checkpoint_failed)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored is not None and stored.status == RetryCommandStatus.DEFERRED
+    assert stored.effect_stage == RetryEffectStage.STATUS_COMMITTED
+    assert record.fix_recovery_baseline == 0
+    assert runner.state.state == PipelineState.ERROR
+
+
+@pytest.mark.asyncio
+async def test_retry_replaces_unrelated_cached_run_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, command, task, _repo = await _prepared_runner(tmp_path)
+    runner._start_current_run_record("codex", "")
+    unrelated = runner._current_run_record
+    assert unrelated is not None
+    unrelated.task_id = "PR-999"
+    pr = PRInfo(number=42, branch=task.branch, pr_id=task.pr_id)
+    monkeypatch.setattr(runner, "_validate_retry_command", _async_value((object(), task)))
+    monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
+    monkeypatch.setattr(runner, "_select_retry_continuation", _async_value(("watch", pr)))
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
+    monkeypatch.setattr(runner, "_clear_retry_failure_evidence", _async_value(None))
+    assert await runner._apply_retry_command(command) == RetryDispatch.WATCH
+    assert runner._current_run_record is None
+    assert runner.state.active_invocation is None
+
+    runner._current_run_record = unrelated
+    assert await runner._reconcile_applied_retry(command) == RetryDispatch.WATCH
+    assert runner._current_run_record is None
 
 
 @pytest.mark.asyncio

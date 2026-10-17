@@ -267,6 +267,28 @@ class FixMixin(BreachMixin):
         self.state.state = PipelineState.FIX
         current_pr = self.state.current_pr
         fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
+        prior = self.state.active_invocation
+        if prior is not None and prior.phase == "fix" and prior.run_id is not None:
+            if self._current_run_record is None:
+                await self._restore_current_run_record()
+            record = self._current_run_record
+            if (
+                record is None or record.run_id != prior.run_id
+                or record.task_id != getattr(self.state.current_task, "pr_id", None)
+                or record.ended_at is not None
+            ):
+                self.log_event(
+                    "[FIX] Persisted FIX invocation count unavailable; "
+                    "deferring dispatch for operator recovery."
+                )
+                self.state.state = PipelineState.WATCH
+                return
+            if (
+                record.fix_iterations - record.fix_recovery_baseline >= fix_iteration_cap
+                and current_pr is not None
+            ):
+                await self._escalate_fix_iteration_cap(current_pr)
+                return
         if current_pr is not None and current_pr.is_escalated:
             await self._clear_error_message_on_recovery(
                 log_prefix="[FIX]",
@@ -685,6 +707,9 @@ class FixMixin(BreachMixin):
                         "limit_type": "fix_idle",
                         "duration_elapsed_sec": idle_limit,
                         "active_phase": PipelineState.FIX.value,
+                        "pr_number": pr_number,
+                        "branch": self.state.current_pr.branch if self.state.current_pr else "",
+                        "run_id": run_record.run_id if run_record else None,
                     },
                 ),
                 commit_task_status=True,

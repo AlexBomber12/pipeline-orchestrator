@@ -296,7 +296,11 @@ async def escalate_fix_iteration_cap(
     success path's ``_escalate_and_skip`` → IDLE with a terminal ERROR
     park so the picker stops re-selecting the same task.
     """
-    count = current_pr.fix_iteration_count
+    record = runner._current_run_record
+    count = max(
+        current_pr.fix_iteration_count,
+        record.fix_iterations - record.fix_recovery_baseline if record is not None else 0,
+    )
     fix_iteration_cap = runner.app_config.daemon.fix_iteration_cap
     pr_number = current_pr.number
     comment = (

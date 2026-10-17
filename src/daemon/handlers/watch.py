@@ -178,6 +178,15 @@ class WatchMixin:
             if merged is False:
                 await self._handle_external_pr_resolution(current_pr, "CLOSED")
                 return
+            if (
+                self.state.active_invocation is not None
+                and self.state.active_invocation.phase == "fix"
+            ):
+                self.log_event(
+                    f"[WATCH] PR #{current_number} no longer open (state "
+                    "unknown); retaining bound FIX PR in WATCH."
+                )
+                return
             self.log_event(
                 f"[WATCH] PR #{current_number} no longer open (state "
                 f"unknown) -> IDLE."
