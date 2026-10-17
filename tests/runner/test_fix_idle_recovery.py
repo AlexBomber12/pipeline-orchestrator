@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from src.cancellation import (
     cause_key,
     record_cancellation_cause,
 )
+from src.coders.claude import claude_cli
 from src.daemon import retry_commands as retry_module
 from src.daemon.retry_commands import RetryDispatch
 from src.github import prs as gh_prs
@@ -20,6 +22,188 @@ from src.queue_parser import write_frontmatter_status
 from src.subsource_registry import SuppressionReason
 
 from tests.runner import _helpers as h
+
+
+async def _published_coding_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.app_config.daemon.fix_iteration_cap = 3
+    task_path = tmp_path / "tasks" / "PR-458.md"
+    task_path.parent.mkdir(parents=True)
+    task_path.write_text(
+        "---\nstatus: DOING\n---\n\n# PR-458: Recover FIX\n\n"
+        "Branch: fix/pr-458\n- Type: bugfix\n- Complexity: low\n"
+        "- Depends on: none\n- Priority: 1\n- Coder: claude\n",
+        encoding="utf-8",
+    )
+    task = QueueTask(
+        pr_id="PR-458", title="Recover FIX", status=TaskStatus.DOING,
+        task_file="tasks/PR-458.md", branch="fix/pr-458", priority=1,
+    )
+    pr = PRInfo(number=458, branch=task.branch, pr_id=task.pr_id, head_sha="a" * 40)
+    runner.state.current_task = task
+    runner.state.current_queue = [task]
+    runner.state.state = PipelineState.CODING
+    runner._start_current_run_record("claude", "opus")
+    runner._capture_invocation_snapshot("claude", {}, phase="coding")
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda _pr: None)
+    monkeypatch.setattr(runner, "_post_codex_review", lambda _number: None)
+    await runner._handoff_coding_pr_to_watch(pr, "Published PR -> WATCH")
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.ended_at is not None
+    return runner, task, pr, task_path
+
+
+async def _watch_requires_fix(runner, pr, monkeypatch: pytest.MonkeyPatch) -> None:
+    pr.ci_status = CIStatus.FAILURE
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_a, **_k: [pr])
+    monkeypatch.setattr(gh_prs, "get_pr_state", lambda *_a: "OPEN")
+    monkeypatch.setattr(runner, "_approval_filtered_pr", lambda found: found)
+    monkeypatch.setattr(runner, "_rehydrate_quarantine_from_pr_labels", h._async_cli_result(None))
+    monkeypatch.setattr(runner, "_detect_external_quarantine_release", h._async_cli_result(None))
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", h._async_cli_result(None))
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", h._async_cli_result(None))
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda _pr: None)
+    await runner.handle_watch()
+
+
+@pytest.mark.asyncio
+async def test_published_coding_record_allows_two_real_fix_dispatches(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, task, pr, _path = await _published_coding_runner(tmp_path, monkeypatch)
+    coding_record = runner._current_run_record
+    coding_record.tokens_in = 120
+    coding_record.diff_lines_added = 8
+    await runner._checkpoint_current_run_record()
+    calls: list[int] = []
+
+    async def fix(*_args, **_kwargs):
+        calls.append(pr.number)
+        return 0, "", ""
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fix)
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *_a, **_k: None)
+    await _watch_requires_fix(runner, pr, monkeypatch)
+    assert runner.state.state == PipelineState.WATCH
+    assert calls == [pr.number]
+    fix_record = runner._current_run_record
+    assert fix_record.run_id != coding_record.run_id
+    assert fix_record.tokens_in == 0 and fix_record.diff_lines_added == 0
+    await runner.publish_state()
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    restarted._metrics_store = runner._metrics_store
+    restarted.repo_path = runner.repo_path
+    await restarted._hydrate_current_task_from_persisted_state()
+    await restarted._apply_recovery_decisions([task], [pr])
+    assert restarted.state.state == PipelineState.WATCH
+    await _watch_requires_fix(restarted, pr, monkeypatch)
+    assert calls == [pr.number, pr.number]
+    assert restarted._current_run_record.fix_iterations == 2
+    historical = await runner._metrics_store.get(coding_record.run_id)
+    assert historical.ended_at is not None
+    assert historical.exit_reason == "coding_complete"
+    assert historical.fix_iterations == 0
+    assert historical.tokens_in == 120 and historical.diff_lines_added == 8
+
+
+@pytest.mark.asyncio
+async def test_published_coding_timeout_recovers_then_dispatches_fix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, task, pr, task_path = await _published_coding_runner(tmp_path, monkeypatch)
+
+    async def hangs(*_args, **_kwargs):
+        await asyncio.Future()
+        return 0, "", ""
+
+    async def timeout(_number, _limit, target, idle_flag):
+        await asyncio.sleep(0)
+        idle_flag["timed_out"] = True
+        target.cancel()
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", hangs)
+    monkeypatch.setattr(runner, "_monitor_fix_idle", timeout)
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *_a, **_k: None)
+    await _watch_requires_fix(runner, pr, monkeypatch)
+    assert runner.state.state == PipelineState.ERROR
+    assert "blocked_reason: fix_idle_timeout" in task_path.read_text()
+    await runner.publish_state()
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    restarted._metrics_store = runner._metrics_store
+    restarted.repo_path = runner.repo_path
+    await restarted._hydrate_current_task_from_persisted_state()
+    await restarted._apply_recovery_decisions(
+        [task.model_copy(update={"status": TaskStatus.ERROR})], [pr]
+    )
+    monkeypatch.setattr(restarted, "_retry_worktree_dirty", lambda: (False, ""))
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_a, **_k: [pr])
+    await restarted.handle_error()
+    assert restarted.state.state == PipelineState.WATCH
+    assert "status: TODO" in task_path.read_text()
+    assert restarted._current_run_record.ended_at is None
+    assert restarted._current_run_record.fix_iterations == 1
+    calls: list[int] = []
+
+    async def fix(*_args, **_kwargs):
+        calls.append(pr.number)
+        return 0, "", ""
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fix)
+    await _watch_requires_fix(restarted, pr, monkeypatch)
+    assert calls == [pr.number]
+    assert restarted._current_run_record.fix_iterations == 2
+
+
+@pytest.mark.asyncio
+async def test_published_coding_cannot_replenish_exhausted_fix_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _task, pr, task_path = await _published_coding_runner(tmp_path, monkeypatch)
+    runner._current_run_record.fix_iterations = runner.app_config.daemon.fix_iteration_cap
+    await runner._checkpoint_current_run_record()
+    calls: list[int] = []
+
+    async def fix(*_args, **_kwargs):
+        calls.append(pr.number)
+        return 0, "", ""
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fix)
+    await _watch_requires_fix(runner, pr, monkeypatch)
+    assert calls == []
+    assert runner._current_run_record.fix_iterations == 3
+    assert runner._current_run_record.ended_at is not None
+    assert runner.state.state == PipelineState.ERROR
+    assert "status: ERROR" in task_path.read_text()
+
+
+@pytest.mark.asyncio
+async def test_published_coding_defers_fix_if_new_record_cannot_persist(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _task, pr, _path = await _published_coding_runner(tmp_path, monkeypatch)
+    coding_record = runner._current_run_record
+    calls: list[int] = []
+
+    async def fix(*_args, **_kwargs):
+        calls.append(pr.number)
+        return 0, "", ""
+
+    async def unavailable():
+        raise RuntimeError("metrics unavailable")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", fix)
+    monkeypatch.setattr(runner, "_checkpoint_current_run_record", unavailable)
+    await _watch_requires_fix(runner, pr, monkeypatch)
+    assert calls == []
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == coding_record.run_id
+    assert coding_record.ended_at is not None
 
 
 async def _timeout_runner(
@@ -508,11 +692,11 @@ async def test_restart_does_not_relabel_other_or_unreadable_error_as_timeout(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("accounting", ["unavailable", "exhausted"])
+@pytest.mark.parametrize("accounting", ["unavailable", "missing", "exhausted"])
 async def test_watch_fix_dispatch_requires_persisted_remaining_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, accounting: str,
 ) -> None:
-    count = 1 if accounting == "unavailable" else 3
+    count = 3 if accounting == "exhausted" else 1
     runner, _task, _pr, _path = await _timeout_runner(
         tmp_path, monkeypatch, count=count
     )
@@ -529,7 +713,15 @@ async def test_watch_fix_dispatch_requires_persisted_remaining_budget(
     monkeypatch.setattr(runner, "usage_gate", allowed)
     runner._current_run_record = None
     if accounting == "unavailable":
-        monkeypatch.setattr(runner, "_restore_current_run_record", no_op)
+        async def unavailable(**_kwargs):
+            raise RuntimeError("metrics unavailable")
+
+        monkeypatch.setattr(runner._metrics_store, "recent", unavailable)
+    elif accounting == "missing":
+        async def missing(**_kwargs):
+            return []
+
+        monkeypatch.setattr(runner._metrics_store, "recent", missing)
     else:
         seen: list[int] = []
 
@@ -538,9 +730,10 @@ async def test_watch_fix_dispatch_requires_persisted_remaining_budget(
 
         monkeypatch.setattr(runner, "_escalate_fix_iteration_cap", escalated)
     await runner.handle_fix()
-    if accounting == "unavailable":
+    if accounting in {"unavailable", "missing"}:
         assert runner.state.state == PipelineState.WATCH
-        assert any("count unavailable" in e["event"] for e in runner.state.history)
+        message = "accounting unavailable" if accounting == "unavailable" else "accounting missing"
+        assert any(message in e["event"] for e in runner.state.history)
     else:
         assert seen == [458]
 

@@ -267,6 +267,69 @@ class FixMixin(BreachMixin):
         self.state.state = PipelineState.FIX
         current_pr = self.state.current_pr
         fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
+        task = self.state.current_task
+        if task is not None and current_pr is not None:
+            if (
+                (task.branch and current_pr.branch != task.branch)
+                or current_pr.pr_id not in (None, task.pr_id)
+                or (not task.branch and current_pr.pr_id != task.pr_id)
+            ):
+                self.log_event("[FIX] Task/PR binding unavailable; deferring dispatch.")
+                self.state.state = PipelineState.WATCH
+                return
+            if self._current_run_record is None:
+                try:
+                    recent = await self._metrics_store.recent(
+                        task_id=task.pr_id, limit=20, repo_name=self.name
+                    )
+                except Exception as exc:
+                    self.log_event(f"[FIX] Run accounting unavailable: {exc}; deferring dispatch.")
+                    self.state.state = PipelineState.WATCH
+                    return
+                self._current_run_record = next(
+                    (item for item in recent if item.task_id == task.pr_id), None
+                )
+            record = self._current_run_record
+            if record is None:
+                if (
+                    self.state.active_invocation is not None
+                    and self.state.active_invocation.phase == "fix"
+                ):
+                    self.log_event("[FIX] Prior FIX accounting missing; deferring dispatch.")
+                    self.state.state = PipelineState.WATCH
+                    return
+                self._start_current_run_record(coder_name, "")
+                record = self._current_run_record
+                assert record is not None
+                record.run_phase = "fix"
+            elif record.task_id != task.pr_id or (
+                record.ended_at is not None and record.exit_reason != "coding_complete"
+            ):
+                self.log_event("[FIX] Completed or unrelated run record; deferring dispatch.")
+                self.state.state = PipelineState.WATCH
+                return
+            elif record.ended_at is not None:
+                if record.fix_iterations - record.fix_recovery_baseline >= fix_iteration_cap:
+                    await self._escalate_fix_iteration_cap(current_pr)
+                    return
+                previous_snapshot = self.state.active_invocation
+                self._current_run_record = self._new_fix_run_record(record)
+                try:
+                    await self._checkpoint_current_run_record()
+                except Exception as exc:
+                    self._current_run_record = record
+                    self.state.active_invocation = previous_snapshot
+                    self.log_event(f"[FIX] Could not persist active FIX run: {exc}.")
+                    self.state.state = PipelineState.WATCH
+                    return
+                self.state.active_invocation = None
+        record = self._current_run_record
+        if (
+            record is not None and current_pr is not None
+            and record.fix_iterations - record.fix_recovery_baseline >= fix_iteration_cap
+        ):
+            await self._escalate_fix_iteration_cap(current_pr)
+            return
         prior = self.state.active_invocation
         if prior is not None and prior.phase == "fix" and prior.run_id is not None:
             if self._current_run_record is None:
@@ -282,12 +345,6 @@ class FixMixin(BreachMixin):
                     "deferring dispatch for operator recovery."
                 )
                 self.state.state = PipelineState.WATCH
-                return
-            if (
-                record.fix_iterations - record.fix_recovery_baseline >= fix_iteration_cap
-                and current_pr is not None
-            ):
-                await self._escalate_fix_iteration_cap(current_pr)
                 return
         if current_pr is not None and current_pr.is_escalated:
             await self._clear_error_message_on_recovery(

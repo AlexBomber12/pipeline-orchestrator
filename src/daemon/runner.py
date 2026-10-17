@@ -1229,6 +1229,41 @@ class PipelineRunner(
             stage="coder",
         )
 
+    def _new_fix_run_record(
+        self,
+        previous: RunRecord,
+        *,
+        operator_retry: bool = False,
+        task_spec_hash: str | None = None,
+    ) -> RunRecord:
+        """Start fresh FIX telemetry while preserving dispatched-attempt accounting."""
+        return RunRecord(
+            run_id=str(uuid.uuid4()),
+            task_id=previous.task_id,
+            profile_id=previous.profile_id,
+            task_type=previous.task_type,
+            complexity=previous.complexity,
+            started_at=datetime.now(timezone.utc).isoformat(),
+            ended_at=None,
+            duration_ms=None,
+            fix_iterations=previous.fix_iterations,
+            fix_recovery_baseline=(
+                previous.fix_iterations if operator_retry
+                else previous.fix_recovery_baseline
+            ),
+            tokens_in=0,
+            tokens_out=0,
+            exit_reason="",
+            operator_intervention=operator_retry,
+            outcome="failed",
+            cause="CRASH",
+            run_phase="fix",
+            attempt_index=previous.attempt_index + 1,
+            coder_session_id=str(uuid.uuid4()),
+            task_spec_hash=task_spec_hash or previous.task_spec_hash,
+            repo_name=self.name,
+        )
+
     @staticmethod
     def _invocation_override(value: object) -> str | None:
         """Return one allowlisted override without retaining plugin kwargs."""
