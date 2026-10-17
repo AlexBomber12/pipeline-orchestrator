@@ -56,6 +56,15 @@ def _daemon_reload_count() -> int:
     return result.stdout.count("Config change detected; reconciling runners")
 
 
+def _wait_for_daemon_reload(reloads_before: int) -> None:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if _daemon_reload_count() > reloads_before:
+            return
+        time.sleep(0.5)
+    raise AssertionError("daemon did not observe updated integration config")
+
+
 @pytest.fixture
 def shared_test_config(reset_testbed, get_state):
     """Restore the shared file only if this test still owns its last write."""
@@ -108,13 +117,7 @@ def shared_test_config(reset_testbed, get_state):
                 finally:
                     if os.path.exists(temporary):
                         os.unlink(temporary)
-                deadline = time.monotonic() + 30
-                while time.monotonic() < deadline:
-                    if _daemon_reload_count() > reloads_before:
-                        break
-                    time.sleep(0.5)
-                else:
-                    raise AssertionError("daemon did not observe restored integration config")
+                _wait_for_daemon_reload(reloads_before)
                 assert _shared_config_bytes() == baseline
         finally:
             _resume_daemon(TESTBED_SLUG)

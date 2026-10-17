@@ -5,6 +5,7 @@ import time
 import requests
 import yaml
 
+from tests.e2e.conftest import _daemon_reload_count, _wait_for_daemon_reload
 from tests.e2e.lib.coder_shim import coder_shim
 
 
@@ -22,6 +23,7 @@ def test_settings_repo_coder_changes_daemon_dispatch(
     assert repository["coder"] == "claude", "test requires a Claude coder baseline"
     reviewer_identities = original["daemon"]["trusted_reviewer_identities"]
 
+    reloads_before = _daemon_reload_count()
     response = requests.put(
         f"{dashboard_url}/settings/repos",
         params={"url": repository["url"]},
@@ -33,6 +35,7 @@ def test_settings_repo_coder_changes_daemon_dispatch(
     updated = yaml.safe_load(read_config().decode("utf-8"))
     assert updated["repositories"][0]["coder"] == "codex"
     assert updated["daemon"]["trusted_reviewer_identities"] == reviewer_identities
+    _wait_for_daemon_reload(reloads_before)
 
     pr_id = int(time.time())
     with coder_shim("hang"):
