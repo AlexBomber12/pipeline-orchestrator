@@ -490,6 +490,7 @@ def test_handle_fix_injects_both_ci_logs_and_review_feedback(
         "_fetch_failed_ci_logs",
         lambda repo, branch: "ci-boom",
     )
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": "head"})
     captured = h._capture_fix_kwargs(monkeypatch)
 
     runner = h._make_runner()
@@ -510,6 +511,22 @@ def test_handle_fix_injects_both_ci_logs_and_review_feedback(
     assert "ci-boom" in extra_context
     assert "Latest review feedback:" in extra_context
     assert "review-feedback-text" in extra_context
+
+
+def test_handle_fix_defers_review_without_admitted_findings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", head_sha="head",
+        review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    asyncio.run(runner.handle_fix())
+    assert "kwargs" not in captured
+    assert runner.state.state == PipelineState.WATCH
+    assert any("actionable review findings unavailable" in e["event"] for e in runner.state.history)
 
 
 def test_ci_fix_drops_stale_review_findings_but_keeps_ci_logs(
