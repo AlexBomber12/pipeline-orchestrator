@@ -263,7 +263,7 @@ main() {
         exit 0
     fi
     if [[ "${invoked}" == "codex" && "${1:-}" == "login" ]]; then
-        printf 'Logged in (shim)\n'
+        printf 'Logged in using ChatGPT\n'
         exit 0
     fi
 

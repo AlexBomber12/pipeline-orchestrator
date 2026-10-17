@@ -1,4 +1,8 @@
+import hashlib
 import json
+import os
+import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -7,6 +11,8 @@ from pathlib import Path
 
 import pytest
 import requests
+import yaml
+from src.config import AppConfig, RepoConfig, normalize_repo_url
 
 from tests.e2e.lib.review_api import ReviewApi
 from tests.e2e.lib.testbed_reset import clear_testbed_redis_state, reset_testbed_full
@@ -16,8 +22,160 @@ TESTBED_SLUG = "AlexBomber12__pipeline-orchestrator-testbed"
 REPO_DIR = Path(__file__).resolve().parents[2]
 TEST_DATA_DIR = REPO_DIR / "tests/e2e/data"
 EVIDENCE_DIR = REPO_DIR / "tests/e2e/evidence"
+SHARED_CONFIG_PATH = TEST_DATA_DIR / "config.test.yml"
 
 collect_ignore = ["data"]
+
+
+def _shared_config_bytes() -> bytes:
+    """Read through the container that owns Settings' mode-0600 replacements."""
+    result = subprocess.run(
+        [
+            "docker", "compose", "-f", "docker-compose.test.yml", "exec", "-T",
+            "web-test", "cat", "/data/config.test.yml",
+        ],
+        cwd=REPO_DIR,
+        capture_output=True,
+        check=True,
+        timeout=15,
+    )
+    return result.stdout
+
+
+def _config_digest() -> str:
+    return hashlib.sha256(_shared_config_bytes()).hexdigest()
+
+
+def _daemon_log_count(message: str) -> int:
+    result = subprocess.run(
+        ["docker", "compose", "-f", "docker-compose.test.yml", "logs", "--no-color", "daemon-test"],
+        cwd=REPO_DIR,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=15,
+    )
+    return result.stdout.count(message)
+
+
+def _daemon_reload_count() -> int:
+    return _daemon_log_count("Config change detected; reconciling runners")
+
+
+def _runner_apply_count() -> int:
+    return _daemon_log_count(f"[{TESTBED_SLUG}] [INFRA] Applied staged repo config.")
+
+
+def _runner_reload_count() -> int:
+    return _daemon_log_count(f"[{TESTBED_SLUG}] [INFRA] Reloaded repo config from config.yml.")
+
+
+def _wait_for_runner_config_ack(applies_before: int, reloads_before: int) -> None:
+    deadline = time.monotonic() + 70
+    while time.monotonic() < deadline:
+        if _runner_apply_count() > applies_before or _runner_reload_count() > reloads_before:
+            return
+        time.sleep(0.5)
+    raise AssertionError("runner did not apply updated integration config")
+
+
+def _wait_for_daemon_reload(reloads_before: int) -> None:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
+        if _daemon_reload_count() > reloads_before:
+            return
+        time.sleep(0.5)
+    raise AssertionError("daemon did not observe updated integration config")
+
+
+@pytest.fixture
+def shared_test_config(reset_testbed, get_state):
+    """Restore the shared file only if this test still owns its last write."""
+    baseline = _shared_config_bytes()
+    baseline_digest = hashlib.sha256(baseline).hexdigest()
+    expected_digest = baseline_digest
+    pending_digest = None
+
+    def expect_settings_coder_write(url: str, coder: str) -> None:
+        nonlocal pending_digest
+        config = AppConfig.model_validate(yaml.safe_load(baseline))
+        matches = [
+            index for index, repo in enumerate(config.repositories)
+            if normalize_repo_url(repo.url) == normalize_repo_url(url)
+        ]
+        assert len(matches) == 1, "expected exactly one repository for the Settings write"
+        index = matches[0]
+        existing = config.repositories[index]
+        config.repositories[index] = RepoConfig.model_validate({**existing.model_dump(), "coder": coder})
+        payload = config.model_dump(mode="json", exclude_none=True)
+        intended = yaml.dump(payload, default_flow_style=False, sort_keys=False).encode("utf-8")
+        pending_digest = hashlib.sha256(intended).hexdigest()
+
+    def note_settings_write() -> None:
+        nonlocal expected_digest
+        observed = _config_digest()
+        assert observed == pending_digest, "Settings did not write the intended shared config"
+        expected_digest = observed
+
+    def wait_for_coder_dispatch(pr_id: str, plugin_id: str) -> dict:
+        deadline = time.monotonic() + 70
+        last_entry = None
+        while time.monotonic() < deadline:
+            last_entry = get_state()
+            task = (last_entry or {}).get("current_task") or {}
+            invocation = (last_entry or {}).get("active_invocation") or {}
+            if (
+                (last_entry or {}).get("state") == "CODING"
+                and task.get("pr_id") == pr_id
+                and invocation.get("plugin_id") == plugin_id
+            ):
+                return last_entry
+            time.sleep(0.5)
+        raise AssertionError(
+            f"daemon did not dispatch {pr_id} with {plugin_id}; last state={last_entry!r}"
+        )
+
+    try:
+        yield _shared_config_bytes, expect_settings_coder_write, note_settings_write, wait_for_coder_dispatch
+    finally:
+        restored = False
+        applies_before = 0
+        try:
+            _stop_daemon_and_wait_paused(TESTBED_SLUG)
+            reset_testbed_full(TESTBED_SLUG)
+            clear_testbed_redis_state(TESTBED_SLUG)
+            observed = _config_digest()
+            assert observed == expected_digest or (expected_digest == baseline_digest and observed == pending_digest), (
+                "shared config changed outside this fixture; refusing to overwrite concurrent changes"
+            )
+            if baseline != _shared_config_bytes():
+                applies_before = _runner_apply_count()
+                reloads_before = _daemon_reload_count()
+                fd, temporary = tempfile.mkstemp(prefix="config.test.yml.", dir=TEST_DATA_DIR)
+                try:
+                    with os.fdopen(fd, "wb") as output:
+                        output.write(baseline)
+                    os.chmod(temporary, 0o644)
+                    os.replace(temporary, SHARED_CONFIG_PATH)
+                finally:
+                    if os.path.exists(temporary):
+                        os.unlink(temporary)
+                _wait_for_daemon_reload(reloads_before)
+                assert _shared_config_bytes() == baseline
+                restored = True
+        finally:
+            _resume_daemon(TESTBED_SLUG)
+        if restored:
+            _wait_for_runner_apply(applies_before)
+
+
+def _wait_for_runner_apply(applies_before: int) -> None:
+    deadline = time.monotonic() + 70
+    while time.monotonic() < deadline:
+        if _runner_apply_count() > applies_before:
+            return
+        time.sleep(0.5)
+    raise AssertionError("runner did not apply restored integration config after resume")
 
 
 # 30 seconds proved insufficient on the shared testbed where dispatch was observed at ~39 seconds.

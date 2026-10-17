@@ -578,6 +578,172 @@ def test_reset_testbed_fixture_resumes_when_stop_wait_fails() -> None:
     assert excinfo.value.__notes__ == ["resume failed after reset setup error: resume failed"]
 
 
+def test_shared_config_fixture_resets_testbed_after_dispatch() -> None:
+    module_name = "tests.e2e.conftest"
+    calls: list[str] = []
+    baseline = b"original config"
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+
+        with (
+            patch.object(e2e_conftest, "_shared_config_bytes", return_value=baseline),
+            patch.object(
+                e2e_conftest,
+                "_config_digest",
+                return_value=e2e_conftest.hashlib.sha256(baseline).hexdigest(),
+            ),
+            patch.object(
+                e2e_conftest,
+                "_stop_daemon_and_wait_paused",
+                side_effect=lambda slug: calls.append(f"stop:{slug}"),
+            ),
+            patch.object(e2e_conftest, "reset_testbed_full", side_effect=lambda slug: calls.append(f"reset:{slug}")),
+            patch.object(
+                e2e_conftest,
+                "clear_testbed_redis_state",
+                side_effect=lambda slug: calls.append(f"clear:{slug}"),
+            ),
+            patch.object(e2e_conftest, "_resume_daemon", side_effect=lambda slug: calls.append(f"resume:{slug}")),
+        ):
+            fixture = e2e_conftest.shared_test_config.__wrapped__(None, lambda: None)
+            next(fixture)
+            with pytest.raises(StopIteration):
+                next(fixture)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    assert calls == [
+        f"{action}:{e2e_conftest.TESTBED_SLUG}"
+        for action in ("stop", "reset", "clear", "resume")
+    ]
+
+
+def test_shared_config_fixture_waits_for_runner_to_apply_restored_config(tmp_path) -> None:
+    module_name = "tests.e2e.conftest"
+    calls: list[str] = []
+    config_path = tmp_path / "config.test.yml"
+    baseline = Path("config.test.yml").read_bytes()
+    config_path.write_bytes(baseline)
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+
+        with (
+            patch.object(e2e_conftest, "TEST_DATA_DIR", tmp_path),
+            patch.object(e2e_conftest, "SHARED_CONFIG_PATH", config_path),
+            patch.object(e2e_conftest, "_shared_config_bytes", side_effect=config_path.read_bytes),
+            patch.object(e2e_conftest, "_stop_daemon_and_wait_paused", side_effect=lambda _: calls.append("stop")),
+            patch.object(e2e_conftest, "reset_testbed_full", side_effect=lambda _: calls.append("reset")),
+            patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=lambda _: calls.append("clear")),
+            patch.object(e2e_conftest, "_runner_apply_count", side_effect=lambda: 7),
+            patch.object(e2e_conftest, "_daemon_reload_count", return_value=3),
+            patch.object(e2e_conftest, "_wait_for_daemon_reload", side_effect=lambda _: calls.append("reconciled")),
+            patch.object(e2e_conftest, "_resume_daemon", side_effect=lambda _: calls.append("resume")),
+            patch.object(
+                e2e_conftest,
+                "_wait_for_runner_apply",
+                side_effect=lambda count: calls.append(f"applied-after:{count}"),
+            ),
+        ):
+            fixture = e2e_conftest.shared_test_config.__wrapped__(None, lambda: None)
+            _, expect_settings_coder_write, note_settings_write, _ = next(fixture)
+            from src.config import update_repository
+
+            repo_url = "https://github.com/AlexBomber12/pipeline-orchestrator-testbed.git"
+            expect_settings_coder_write(repo_url, "codex")
+            update_repository(repo_url, path=str(config_path), coder="codex")
+            note_settings_write()
+            with pytest.raises(StopIteration):
+                next(fixture)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    assert config_path.read_bytes() == baseline
+    assert calls == ["stop", "reset", "clear", "reconciled", "resume", "applied-after:7"]
+
+
+@pytest.mark.parametrize("write_completed", [False, True])
+def test_shared_config_fixture_restores_after_settings_request_failure(tmp_path, write_completed: bool) -> None:
+    module_name = "tests.e2e.conftest"
+    config_path = tmp_path / "config.test.yml"
+    baseline = Path("config.test.yml").read_bytes()
+    config_path.write_bytes(baseline)
+    repo_url = "https://github.com/AlexBomber12/pipeline-orchestrator-testbed.git"
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+        with (
+            patch.object(e2e_conftest, "TEST_DATA_DIR", tmp_path),
+            patch.object(e2e_conftest, "SHARED_CONFIG_PATH", config_path),
+            patch.object(e2e_conftest, "_shared_config_bytes", side_effect=config_path.read_bytes),
+            patch.object(e2e_conftest, "_stop_daemon_and_wait_paused"),
+            patch.object(e2e_conftest, "reset_testbed_full"),
+            patch.object(e2e_conftest, "clear_testbed_redis_state"),
+            patch.object(e2e_conftest, "_runner_apply_count", return_value=7),
+            patch.object(e2e_conftest, "_daemon_reload_count", return_value=3),
+            patch.object(e2e_conftest, "_wait_for_daemon_reload"),
+            patch.object(e2e_conftest, "_resume_daemon"),
+            patch.object(e2e_conftest, "_wait_for_runner_apply") as wait_for_apply,
+        ):
+            fixture = e2e_conftest.shared_test_config.__wrapped__(None, lambda: None)
+            _, expect_settings_coder_write, _, _ = next(fixture)
+            expect_settings_coder_write(repo_url, "codex")
+            if write_completed:
+                from src.config import update_repository
+
+                update_repository(repo_url, path=str(config_path), coder="codex")
+            with pytest.raises(StopIteration):
+                next(fixture)
+            assert config_path.read_bytes() == baseline
+            assert wait_for_apply.called == write_completed
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_wait_for_runner_apply_requires_new_acknowledgment() -> None:
+    module_name = "tests.e2e.conftest"
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+        with (
+            patch.object(e2e_conftest, "_runner_apply_count", side_effect=[7, 7, 8]) as counts,
+            patch.object(e2e_conftest.time, "sleep") as sleep,
+        ):
+            e2e_conftest._wait_for_runner_apply(7)
+        assert counts.call_count == 3
+        assert sleep.call_count == 2
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+@pytest.mark.parametrize("acknowledgment", ["apply", "reload"])
+def test_wait_for_runner_config_ack_requires_new_runner_event(acknowledgment: str) -> None:
+    module_name = "tests.e2e.conftest"
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+        apply_counts = [7, 8] if acknowledgment == "apply" else [7, 7]
+        reload_counts = [3, 4] if acknowledgment == "reload" else [3, 3]
+        with (
+            patch.object(e2e_conftest, "_runner_apply_count", side_effect=apply_counts),
+            patch.object(e2e_conftest, "_runner_reload_count", side_effect=reload_counts),
+            patch.object(e2e_conftest.time, "sleep") as sleep,
+        ):
+            e2e_conftest._wait_for_runner_config_ack(7, 3)
+        sleep.assert_called_once_with(0.5)
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_stop_daemon_waits_for_runner_pause_ack() -> None:
     module_name = "tests.e2e.conftest"
     posts: list[tuple[str, int]] = []

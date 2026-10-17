@@ -901,6 +901,7 @@ class PipelineRunner(
                 usage_providers=self._pending_usage_provider_map,
             )
         self.clear_staged_config_reload()
+        self.log_event("[INFRA] Applied staged repo config.")
 
     def clear_staged_config_reload(self) -> None:
         """Drop any queued config swap once a newer config is in effect."""
