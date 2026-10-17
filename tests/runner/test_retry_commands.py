@@ -916,6 +916,67 @@ async def test_watch_retry_keeps_fix_binding_when_pr_observation_is_unknown(
 
 
 @pytest.mark.asyncio
+async def test_watch_retry_starts_active_record_after_completed_fix_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, command, task, _repo = await _prepared_runner(tmp_path)
+    pr = PRInfo(number=42, branch=task.branch, pr_id=task.pr_id)
+    runner._start_current_run_record("codex", "")
+    completed = runner._current_run_record
+    completed.fix_iterations = 3
+    runner._capture_invocation_snapshot("codex", {}, phase="fix", fix_iteration=3)
+    completed.ended_at = NOW.isoformat()
+    await runner._checkpoint_current_run_record()
+    monkeypatch.setattr(runner, "_validate_retry_command", _async_value((object(), task)))
+    monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
+    monkeypatch.setattr(runner, "_select_retry_continuation", _async_value(("watch", pr)))
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
+    monkeypatch.setattr(runner, "_clear_retry_failure_evidence", _async_value(None))
+    assert await runner._apply_retry_command(command) == RetryDispatch.WATCH
+    current = runner._current_run_record
+    assert current.run_id != completed.run_id
+    assert current.ended_at is None
+    assert current.fix_iterations == current.fix_recovery_baseline == 3
+    assert current.invocations == []
+    assert runner.state.active_invocation is None
+    assert (await runner._metrics_store.get(completed.run_id)).ended_at == NOW.isoformat()
+    runner._current_run_record = current
+    assert await runner._reconcile_applied_retry(command) == RetryDispatch.WATCH
+    assert runner.state.active_invocation is None
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    restarted._metrics_store = runner._metrics_store
+    restarted.repo_path = runner.repo_path
+    await restarted._hydrate_current_task_from_persisted_state()
+    await restarted._apply_recovery_decisions(
+        [task.model_copy(update={"status": TaskStatus.TODO})], []
+    )
+    assert restarted.state.state == PipelineState.WATCH
+    assert restarted._current_run_record.fix_recovery_baseline == 3
+
+
+@pytest.mark.asyncio
+async def test_applied_watch_retry_defers_when_accounting_restore_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, command, task, _repo = await _prepared_runner(tmp_path)
+    pr = PRInfo(number=42, branch=task.branch, pr_id=task.pr_id)
+    monkeypatch.setattr(runner, "_validate_retry_command", _async_value((object(), task)))
+    monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
+    monkeypatch.setattr(runner, "_select_retry_continuation", _async_value(("watch", pr)))
+
+    async def unavailable(**_kwargs):
+        raise RuntimeError("metrics down")
+
+    monkeypatch.setattr(runner._metrics_store, "recent", unavailable)
+    assert await runner._reconcile_applied_retry(command) == RetryDispatch.HANDLED
+    assert runner.state.state == PipelineState.ERROR
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored is not None and stored.status == RetryCommandStatus.DEFERRED
+
+
+@pytest.mark.asyncio
 async def test_apply_defers_each_durable_side_effect_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

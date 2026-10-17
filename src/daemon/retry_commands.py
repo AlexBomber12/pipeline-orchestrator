@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import uuid
+from dataclasses import replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -736,12 +738,27 @@ class RetryCommandMixin:
                 )
             record = self._current_run_record
             if record is not None and record.task_id == task.pr_id:
+                old_record = record
                 old_baseline = record.fix_recovery_baseline
+                if record.ended_at is not None:
+                    record = replace(
+                        record,
+                        run_id=str(uuid.uuid4()),
+                        started_at=datetime.now(timezone.utc).isoformat(),
+                        ended_at=None,
+                        duration_ms=None,
+                        invocations=[],
+                        attempt_index=record.attempt_index + 1,
+                        operator_intervention=True,
+                        run_phase="fix",
+                    )
+                    self._current_run_record = record
                 record.fix_recovery_baseline = record.fix_iterations
                 try:
                     await self._checkpoint_current_run_record()
                 except Exception as exc:
-                    record.fix_recovery_baseline = old_baseline
+                    self._current_run_record = old_record
+                    old_record.fix_recovery_baseline = old_baseline
                     return await self._defer_retry_command(
                         command, f"Could not persist FIX Retry budget baseline: {exc}."
                     )
@@ -761,6 +778,7 @@ class RetryCommandMixin:
             self._current_run_record.invocations[-1]
             if continuation_name == "watch" and self._current_run_record is not None
             and self._current_run_record.task_id == task.pr_id
+            and self._current_run_record.ended_at is None
             and self._current_run_record.invocations
             and self._current_run_record.invocations[-1].phase == "fix"
             else None
@@ -806,9 +824,25 @@ class RetryCommandMixin:
             pr, _reset = self._reset_retry_local_counters(pr)
             if self._current_run_record is not None and self._current_run_record.task_id != task.pr_id:
                 self._current_run_record = None
-            if self._current_run_record is not None and self._current_run_record.task_id == task.pr_id:
-                if self._current_run_record.invocations and self._current_run_record.invocations[-1].phase == "fix":
-                    self.state.active_invocation = self._current_run_record.invocations[-1]
+            if self._current_run_record is None:
+                try:
+                    recent = await self._metrics_store.recent(
+                        task_id=task.pr_id, limit=20, repo_name=self.name
+                    )
+                except Exception as exc:
+                    return await self._defer_retry_command(
+                        command, f"Could not restore applied Retry accounting: {exc}."
+                    )
+                self._current_run_record = next(
+                    (item for item in recent if item.task_id == task.pr_id), None
+                )
+            record = self._current_run_record
+            self.state.active_invocation = (
+                record.invocations[-1]
+                if record is not None and record.ended_at is None
+                and record.invocations and record.invocations[-1].phase == "fix"
+                else None
+            )
             self._set_retry_task_snapshot(task)
             self.state.current_pr = pr
             self.state.state = PipelineState.WATCH

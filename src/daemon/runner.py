@@ -2410,6 +2410,10 @@ class PipelineRunner(
         if not pr_id:
             return
         self._status_write_failed_task_pr_ids.add(pr_id)
+        if blocked_reason is not None and not self.state.error_message:
+            self.state.error_message = (
+                f"{blocked_reason.value}: status:ERROR write failed; operator Retry required"
+            )
         if ensure_suppression and await self._suppression_record_for_task(pr_id) is None:
             await self._suppress_task(
                 pr_id,

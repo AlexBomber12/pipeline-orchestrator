@@ -405,6 +405,45 @@ async def test_restart_preserves_error_when_timeout_status_write_failed(
 
 
 @pytest.mark.asyncio
+async def test_restart_does_not_relabel_review_status_failure_as_fix_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, task, pr, task_path = await _timeout_runner(tmp_path, monkeypatch)
+    write_frontmatter_status(task_path, "TODO")
+    await runner.redis.delete(cause_key(runner.name, task.pr_id))
+    runner.state.state = PipelineState.WATCH
+    runner.state.error_message = None
+    await runner._mark_status_write_failed_task(
+        task, blocked_reason=SuppressionReason.REVIEW_TIMEOUT,
+        ensure_suppression=False,
+    )
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    restarted._metrics_store = runner._metrics_store
+    restarted.repo_path = runner.repo_path
+    await restarted._hydrate_current_task_from_persisted_state()
+    await restarted._hydrate_status_write_failed_task_pr_ids()
+    await restarted._apply_recovery_decisions(
+        [task.model_copy(update={"status": TaskStatus.DOING})], [pr]
+    )
+    assert restarted.state.state == PipelineState.ERROR
+    assert restarted.state.error_message.startswith("review_timeout:")
+    assert task.pr_id in restarted._status_write_failed_task_pr_ids
+    reasons: list[SuppressionReason] = []
+
+    async def commit(_task, status, _reason, *, blocked_reason):
+        reasons.append(blocked_reason)
+        write_frontmatter_status(task_path, status, blocked_reason)
+        return True
+
+    monkeypatch.setattr(restarted, "_commit_task_status_change", commit)
+    await restarted.handle_error()
+    assert reasons == [SuppressionReason.REVIEW_TIMEOUT]
+    assert "blocked_reason: review_timeout" in task_path.read_text()
+    assert restarted.state.state == PipelineState.ERROR
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("header", ["guardrail", "missing"])
 async def test_restart_does_not_relabel_other_or_unreadable_error_as_timeout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, header: str,
