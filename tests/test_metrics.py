@@ -78,6 +78,7 @@ def _record(run_id: str, **overrides: Any) -> RunRecord:
         "ended_at": "2026-04-18T10:05:00+00:00",
         "duration_ms": 300000,
         "fix_iterations": 0,
+        "fix_recovery_baseline": 0,
         "tokens_in": 1200,
         "tokens_out": 800,
         "exit_reason": "success_merged",
@@ -233,6 +234,7 @@ async def test_record_serialization() -> None:
         "exit_reason": "success_merged",
         "files_touched_count": 0,
         "fix_iterations": 0,
+        "fix_recovery_baseline": 0,
         "had_merge_conflict": False,
         "invocations": [],
         "languages_touched": [],
@@ -516,6 +518,7 @@ async def test_runrecord_roundtrip_from_old_payload_sets_defaults() -> None:
 
     assert saved is not None
     assert saved.stage == "coder"
+    assert saved.fix_recovery_baseline == 0
     assert saved.files_touched_count == 0
     assert saved.languages_touched == []
     assert saved.diff_lines_added == 0
@@ -541,3 +544,8 @@ def test_runrecord_stage_accepts_planner_reviewer() -> None:
 
     assert planner.stage == "planner"
     assert reviewer.stage == "reviewer"
+
+
+def test_runrecord_rejects_invalid_fix_recovery_baseline() -> None:
+    with pytest.raises(ValueError, match="FIX recovery baseline"):
+        _record("bad-baseline", fix_iterations=1, fix_recovery_baseline=2)

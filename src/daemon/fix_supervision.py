@@ -36,33 +36,25 @@ async def monitor_fix_idle(
     pr_number: int,
     idle_limit: int,
     target: asyncio.Task,  # type: ignore[type-arg]
-    idle_flag: dict[str, bool],
+    idle_flag: dict[str, bool | float],
 ) -> None:
-    """Cancel *target* if no new push is detected within *idle_limit* seconds."""
-    primed = False
+    """Cancel *target* after an active invocation window without a new push.
+
+    The caller records the launch clock in ``idle_flag``. Recreating this
+    monitor with the same invocation flag retains that clock.
+    """
+    started_at = idle_flag.setdefault("started_at", time.monotonic())
+    deadline = idle_flag.setdefault("deadline", started_at + idle_limit)
+    last_observed_push: float | None = None
     try:
-        await asyncio.to_thread(
+        last_observed_push = await asyncio.to_thread(
             gh_prs.get_branch_last_push_time,
             runner.owner_repo, pr_number,
         )
-        primed = True
     except gh_prs.GitHubPollError:
         pass
 
     poll_interval = min(60, idle_limit)
-    now = time.monotonic()
-    head_age = await asyncio.to_thread(
-        gh_prs.get_last_push_age_seconds,
-        runner.owner_repo, pr_number,
-    )
-    # Head ages inside the idle window can represent daemon restart during FIX,
-    # so preserve elapsed FIX time. Ages beyond the window come from unrelated
-    # review/CI/operator quiet periods and should start a fresh FIX deadline.
-    if head_age is not None and head_age < idle_limit:
-        backdate = min(head_age, idle_limit - poll_interval)
-        last_known_push = now - max(0.0, backdate)
-    else:
-        last_known_push = now
     while True:
         await asyncio.sleep(poll_interval)
         try:
@@ -70,10 +62,6 @@ async def monitor_fix_idle(
                 gh_prs.get_branch_last_push_time,
                 runner.owner_repo, pr_number,
             )
-            if not primed:
-                primed = True
-                if latest_push_at is not None:
-                    last_known_push = time.monotonic()
         except gh_prs.GitHubPollError as exc:
             msg = str(exc)
             if "HTTP 304" not in msg:
@@ -81,16 +69,28 @@ async def monitor_fix_idle(
                     f"[FIX] GitHub API poll failed: {exc}, preserving deadline."
                 )
             latest_push_at = None
-        if latest_push_at is not None and latest_push_at > last_known_push:
-            last_known_push = latest_push_at
+        now = time.monotonic()
+        if (
+            latest_push_at is not None
+            and (
+                last_observed_push is None
+                or latest_push_at > last_observed_push
+            )
+        ):
+            deadline = now + idle_limit
+            idle_flag["deadline"] = deadline
             runner.log_event(
                 f"[FIX] [{runner.state.coder or 'coder'}] pushed, "
                 f"resetting idle timer."
             )
-        elapsed = time.monotonic() - last_known_push
-        if elapsed >= idle_limit:
+        if latest_push_at is not None and (
+            last_observed_push is None or latest_push_at > last_observed_push
+        ):
+            last_observed_push = latest_push_at
+        if now >= deadline:
             runner.log_event(
-                f"[FIX] idle timeout ({idle_limit}s since last push), "
+                f"[FIX] idle timeout ({idle_limit}s since invocation start "
+                f"or last observed push), "
                 f"killing."
             )
             idle_flag["timed_out"] = True

@@ -93,7 +93,7 @@ class FixMixin(BreachMixin):
         pr_number: int,
         idle_limit: int,
         target: asyncio.Task,  # type: ignore[type-arg]
-        idle_flag: dict[str, bool],
+        idle_flag: dict[str, bool | float],
     ) -> None:
         """Thin wrapper — see ``fix_supervision.monitor_fix_idle``."""
         await fix_supervision.monitor_fix_idle(
@@ -267,6 +267,86 @@ class FixMixin(BreachMixin):
         self.state.state = PipelineState.FIX
         current_pr = self.state.current_pr
         fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
+        task = self.state.current_task
+        if task is not None and current_pr is not None:
+            if (
+                (task.branch and current_pr.branch != task.branch)
+                or current_pr.pr_id not in (None, task.pr_id)
+                or (not task.branch and current_pr.pr_id != task.pr_id)
+            ):
+                self.log_event("[FIX] Task/PR binding unavailable; deferring dispatch.")
+                self.state.state = PipelineState.WATCH
+                return
+            if self._current_run_record is None:
+                try:
+                    recent = await self._metrics_store.recent(
+                        task_id=task.pr_id, limit=20, repo_name=self.name
+                    )
+                except Exception as exc:
+                    self.log_event(f"[FIX] Run accounting unavailable: {exc}; deferring dispatch.")
+                    self.state.state = PipelineState.WATCH
+                    return
+                self._current_run_record = next(
+                    (item for item in recent if item.task_id == task.pr_id), None
+                )
+            record = self._current_run_record
+            if record is None:
+                if (
+                    self.state.active_invocation is not None
+                    and self.state.active_invocation.phase == "fix"
+                ):
+                    self.log_event("[FIX] Prior FIX accounting missing; deferring dispatch.")
+                    self.state.state = PipelineState.WATCH
+                    return
+                self._start_current_run_record(coder_name, "")
+                record = self._current_run_record
+                assert record is not None
+                record.run_phase = "fix"
+            elif record.task_id != task.pr_id or (
+                record.ended_at is not None and record.exit_reason != "coding_complete"
+            ):
+                self.log_event("[FIX] Completed or unrelated run record; deferring dispatch.")
+                self.state.state = PipelineState.WATCH
+                return
+            elif record.ended_at is not None:
+                if record.fix_iterations - record.fix_recovery_baseline >= fix_iteration_cap:
+                    await self._escalate_fix_iteration_cap(current_pr)
+                    return
+                previous_snapshot = self.state.active_invocation
+                self._current_run_record = self._new_fix_run_record(
+                    record, coder_name=coder_name,
+                    model=plugin.resolve_model(self.app_config.daemon),
+                )
+                try:
+                    await self._checkpoint_current_run_record()
+                except Exception as exc:
+                    self._current_run_record = record
+                    self.state.active_invocation = previous_snapshot
+                    self.log_event(f"[FIX] Could not persist active FIX run: {exc}.")
+                    self.state.state = PipelineState.WATCH
+                    return
+                self.state.active_invocation = None
+        record = self._current_run_record
+        if (
+            record is not None and current_pr is not None
+            and record.fix_iterations - record.fix_recovery_baseline >= fix_iteration_cap
+        ):
+            await self._escalate_fix_iteration_cap(current_pr)
+            return
+        prior = self.state.active_invocation
+        if prior is not None and prior.phase == "fix" and prior.run_id is not None:
+            record = self._current_run_record
+            if (
+                record is None or record.run_id != prior.run_id
+                or record.task_id != getattr(self.state.current_task, "pr_id", None)
+                or record.ended_at is not None
+            ):
+                self.log_event(
+                    "[FIX] Persisted FIX invocation count unavailable; "
+                    "deferring dispatch for operator recovery."
+                )
+                self.state.state = PipelineState.WATCH
+                return
         if current_pr is not None and current_pr.is_escalated:
             await self._clear_error_message_on_recovery(
                 log_prefix="[FIX]",
@@ -348,7 +428,7 @@ class FixMixin(BreachMixin):
 
         breach_dir, breach_run_id = self._breach_env()
         breach_flag: dict[str, bool] = {"breached": False}
-        idle_flag: dict[str, bool] = {"timed_out": False}
+        idle_flag: dict[str, bool | float] = {"timed_out": False}
         external_state_flag: dict[str, str | None] = {"state": None}
 
         plugin_run_kwargs = plugin.build_run_kwargs(
@@ -356,7 +436,6 @@ class FixMixin(BreachMixin):
             breach_dir=breach_dir,
             breach_run_id=breach_run_id,
         )
-
         fix_kwargs: dict[str, object] = {
             **plugin_run_kwargs,
             "on_process_start": self._track_current_coder_process,
@@ -385,12 +464,17 @@ class FixMixin(BreachMixin):
             return
         heartbeat: asyncio.Task[None] | None = None
         run_record = self._current_run_record
+        previous_profile_id = run_record.profile_id if run_record is not None else None
         previous_active_invocation = self.state.active_invocation
         previous_fix_iterations = (
             run_record.fix_iterations if run_record is not None else None
         )
         captured_snapshot = None
         try:
+            if run_record is not None:
+                run_record.profile_id = (
+                    f"{coder_name}:{plugin_run_kwargs['model']}:container"
+                )
             self.log_event(
                 f"[{coder_name}] entering FIX.",
                 tier="state",
@@ -421,6 +505,7 @@ class FixMixin(BreachMixin):
                     )
                 )
             )
+            idle_flag["started_at"] = fix_supervision.time.monotonic()
         except BaseException:
             if captured_snapshot is not None:
                 self.state.active_invocation = previous_active_invocation
@@ -432,6 +517,7 @@ class FixMixin(BreachMixin):
                     run_record.invocations.pop()
                     assert previous_fix_iterations is not None
                     run_record.fix_iterations = previous_fix_iterations
+                    run_record.profile_id = previous_profile_id
                 rollback_writes = [self.publish_state()]
                 if run_record is not None:
                     rollback_writes.append(self._checkpoint_current_run_record())
@@ -673,7 +759,7 @@ class FixMixin(BreachMixin):
             if self.state.current_pr is not None:
                 no_push_policy.reset(self.state.current_pr)
             await self._transition_to_error(
-                f"FIX idle timeout: no push for {idle_limit}s",
+                f"FIX idle timeout: no new push for {idle_limit}s of active FIX time",
                 save_run_record_as=None,
                 publish=False,
                 log_prefix="[FIX]",
@@ -684,6 +770,9 @@ class FixMixin(BreachMixin):
                         "limit_type": "fix_idle",
                         "duration_elapsed_sec": idle_limit,
                         "active_phase": PipelineState.FIX.value,
+                        "pr_number": pr_number,
+                        "branch": self.state.current_pr.branch if self.state.current_pr else "",
+                        "run_id": run_record.run_id if run_record else None,
                     },
                 ),
                 commit_task_status=True,

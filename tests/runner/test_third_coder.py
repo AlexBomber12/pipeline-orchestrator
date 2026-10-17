@@ -403,10 +403,13 @@ def test_configured_plugin_reaches_normal_coding_and_fix_dispatch(
     assert fix_snapshot.model_override == "third-fix"
     assert fix_snapshot.reasoning_effort_override is None
     assert runner._current_run_record is not None
-    assert runner._current_run_record.invocations == [
-        coding_snapshot,
-        fix_snapshot,
-    ]
+    assert runner._current_run_record.invocations == [fix_snapshot]
+    assert runner._current_run_record.profile_id == "third:third-fix:container"
+    historical = asyncio.run(runner._metrics_store.get(coding_snapshot.run_id))
+    assert historical is not None
+    assert historical.invocations == [coding_snapshot]
+    assert historical.ended_at is not None
+    assert historical.exit_reason == "coding_complete"
 
 
 @pytest.mark.parametrize(

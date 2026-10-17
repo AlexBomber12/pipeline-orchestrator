@@ -28,36 +28,16 @@
             {{ repo.state.value }}
         </span>
     </span>
-    <div class="flex w-full flex-wrap items-center gap-2 rounded border border-white/10 bg-surface-3 px-2 py-1 text-xs sm:w-auto sm:flex-nowrap"
-         data-coder-display>
-        <span class="font-mono text-gray-400">Coder</span>
-        <span class="font-mono text-gray-300">
-            Configured: {{ selected_repo_coder_label }}
-        </span>
-        {% if selected_repo_coder == 'any' %}
-        <span class="text-[11px] text-gray-500">
-            Preferred default: {{ inherit_coder_label }}
-        </span>
-        {% endif %}
-        {% set configured_effective_coder = inherit_coder if selected_repo_coder == 'any' else selected_repo_coder %}
-        {% if active_repo_coder and active_repo_coder != configured_effective_coder %}
-        <span class="text-[11px] text-gray-500">
-            Active: {{ active_repo_coder_label }} (via spec pin or bandit)
-        </span>
-        {% endif %}
-        {% if active_invocation %}
-        <span class="text-[11px] text-gray-400"
-              data-invocation-settings
-              title="Parameters passed to the coder plugin; provider execution values are unconfirmed.">
-            Invocation settings — Plugin ID: <span class="font-mono text-gray-300">{{ active_invocation.plugin_id }}</span>;
-            Model override: <span class="font-mono text-gray-300">{{ active_invocation.model_override_label }}</span>;
-            Reasoning effort override: <span class="font-mono text-gray-300">{{ active_invocation.reasoning_effort_override_label }}</span>;
-            {{ active_invocation.phase_label }}{% if active_invocation.attempt_index %}, attempt {{ active_invocation.attempt_index }}{% endif %}{% if active_invocation.fix_iteration %}, FIX iteration {{ active_invocation.fix_iteration }}{% endif %}{% if active_invocation.run_id %}, run {{ active_invocation.run_id }}{% endif %}.
-        </span>
-        {% endif %}
-        <a href="/settings" class="font-mono text-[11px] text-accent hover:text-accent/80">
-            Edit in Settings
-        </a>
+    {% set display_coder_id = active_invocation.plugin_id if active_invocation else effective_coder %}
+    {% set display_plugin = coders | selectattr('name', 'equalto', display_coder_id) | first | default(none) %}
+    {% set display_coder = display_plugin.display_name if display_plugin else (display_coder_id ~ ' (unavailable)' if display_coder_id else 'Not specified') %}
+    {% set display_model = active_invocation.model_override if active_invocation else (display_plugin.resolve_model(daemon) if display_plugin else none) %}
+    {% set display_effort = active_invocation.reasoning_effort_override if active_invocation else (daemon.coder_settings.get(display_coder_id, {}).get('reasoning_effort') if daemon is defined else none) %}
+    <div data-coder-display class="flex w-full flex-wrap items-center gap-x-4 gap-y-1 rounded border border-white/10 bg-surface-3 px-2 py-1 text-xs sm:w-auto"
+         title="Requested parameters; provider execution is unconfirmed.">
+        <span class="min-w-0 max-w-full"><span class="font-mono text-gray-400">Coder</span> <span class="font-mono text-gray-300 break-all">{{ display_coder }}</span></span>
+        <span class="min-w-0 max-w-full"><span class="font-mono text-gray-400">Model</span> <span class="font-mono text-gray-300 break-all">{{ display_model or ('Not specified' if not display_plugin and not active_invocation else 'Default') }}</span></span>
+        <span class="min-w-0 max-w-full"><span class="font-mono text-gray-400">Effort</span> <span class="font-mono text-gray-300 break-all">{{ display_effort or 'Not specified' }}</span></span>
     </div>
     {{ repo_controls(repo, 'w-full justify-start sm:w-auto') }}
     <span class="font-mono text-xs text-gray-500 sm:ml-auto">
