@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 from src.cancellation import (
+    delete_cancellation_cause,
+    get_cancellation_cause,
     get_current_run_started_at,
     task_spec_content_hash,
 )
@@ -17,6 +20,7 @@ from src.daemon import git_ops
 from src.daemon.selector import CoderPurpose, resolve_active_coder
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, derive_active_inhibitors
+from src.metrics import RunRecord
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError
 from src.queue_parser import parse_existing_task_header as parse_task_header
@@ -33,6 +37,7 @@ from src.retry_commands import (
 )
 from src.subsource_registry import SuppressionReason
 from src.suppression.redis_store import RedisSuppressionStore
+from src.task_status import find_matching_open_pr
 
 
 class RetryDispatch(StrEnum):
@@ -58,6 +63,132 @@ _SPEC_CHANGE_REQUIRED = {
 
 class RetryCommandMixin:
     """Consume Retry commands without relying on their pub/sub wake message."""
+
+    async def _admit_fix_idle_timeout(self) -> None:
+        """Resume only the interrupted, bound FIX run after durable admission."""
+        task, bound = self.state.current_task, self.state.current_pr
+        if task is None or bound is None or not task.branch:
+            self.log_event("[RECOVERY] FIX timeout has no bound task/PR; operator Retry required.")
+            return
+        if task.pr_id in self._status_write_failed_task_pr_ids:
+            if not await self._commit_task_status_change(
+                task, "ERROR", "FIX idle timeout", blocked_reason=SuppressionReason.FIX_IDLE_TIMEOUT
+            ):
+                self.log_event("[RECOVERY] FIX timeout status:ERROR write still failing.")
+                return
+            self._status_write_failed_task_pr_ids.discard(task.pr_id)
+            await self._persist_status_write_failed_task_pr_ids()
+        status, reason = self._frontmatter_error_status_for_current_task()
+        try:
+            cause = await get_cancellation_cause(
+                self.redis, self.name, task.pr_id, refresh_ttl=False
+            )
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] FIX timeout evidence unavailable: {exc}; staying ERROR.")
+            return
+        if (status == "error" and reason != SuppressionReason.FIX_IDLE_TIMEOUT) or (
+            cause is not None
+            and cause.payload.get("subsource") != "fix_idle_timeout"
+        ) or status not in {"error", "todo"}:
+            self.log_event("[RECOVERY] FIX timeout admission changed; operator Retry required.")
+            return
+        if status == "error" and cause is None:
+            self.log_event("[RECOVERY] FIX timeout cause missing; operator Retry required.")
+            return
+        if cause is not None and (
+            cause.payload.get("pr_number", bound.number) != bound.number
+            or cause.payload.get("branch", bound.branch) != bound.branch
+        ):
+            self.log_event("[RECOVERY] FIX timeout PR binding changed; operator Retry required.")
+            return
+        if (
+            self._current_run_record is None
+            or self._current_run_record.task_id != task.pr_id
+        ):
+            await self._restore_current_run_record()
+        record = self._current_run_record
+        snapshot = self.state.active_invocation
+        if (
+            record is None or record.task_id != task.pr_id or record.ended_at is not None
+            or not record.invocations or snapshot is None or snapshot.phase != "fix"
+            or snapshot.run_id != record.run_id or record.invocations[-1] != snapshot
+            or snapshot.fix_iteration != record.fix_iterations
+            or (cause is not None and cause.payload.get("run_id", record.run_id) != record.run_id)
+        ):
+            self.log_event("[RECOVERY] FIX invocation evidence incomplete; operator Retry required.")
+            return
+        count = record.fix_iterations - record.fix_recovery_baseline
+        cap = self.app_config.daemon.fix_iteration_cap
+        if status == "error" and (count < 1 or count >= cap):
+            key = (task.pr_id, "fix_idle_exhausted", count, cap)
+            if self._last_error_park_log_key != key:
+                self._last_error_park_log_key = key
+                self.log_event(
+                    f"[RECOVERY] FIX dispatch budget exhausted ({count}/{cap}); "
+                    "staying ERROR. Operator Retry required."
+                )
+            return
+        if (
+            not self.repo_config.active or self.state.user_paused or self._stop_requested
+            or task.pr_id in self._user_stopped_task_pr_ids
+            or self.state.pending_queue_sync_branch is not None
+            or await self._hold_for_coder_cleanup()
+        ):
+            return
+        try:
+            inhibitors = await derive_active_inhibitors(
+                self.state, self.redis, self.app_config.daemon
+            )
+            dirty, detail = self._retry_worktree_dirty()
+            task_path = self._retry_task_path(task)
+            header = parse_task_header(task_path) if task_path is not None else None
+            if (
+                any(item.inhibitor_type != InhibitorType.GITHUB_BUDGET_SLOWDOWN for item in inhibitors)
+                or dirty is not False or header is None
+                or header.pr_id != task.pr_id or header.branch != task.branch
+                or bound.branch != task.branch or bound.pr_id not in (None, task.pr_id)
+            ):
+                self.log_event(f"[RECOVERY] FIX timeout admission deferred ({detail}); staying ERROR.")
+                return
+            open_prs = await asyncio.to_thread(
+                gh_prs.get_open_prs, self.owner_repo,
+                self.repo_config.allow_merge_without_checks,
+            )
+            found = next((pr for pr in open_prs if pr.number == bound.number), None)
+            if found is None:
+                terminal = await asyncio.to_thread(
+                    gh_prs.get_pr_state, self.owner_repo, bound.number
+                )
+                if terminal in {"MERGED", "CLOSED"}:
+                    await self._handle_external_pr_resolution(bound, terminal)
+                else:
+                    self.log_event("[RECOVERY] Bound PR unavailable; staying ERROR.")
+                return
+            if found != find_matching_open_pr(task.pr_id, task.branch, [found]):
+                self.log_event("[RECOVERY] Bound PR identity changed; staying ERROR.")
+                return
+            if status == "error" and not await self._commit_task_status_change(
+                task, "TODO", f"confirmed FIX timeout recovery {count}/{cap}"
+            ):
+                self.log_event("[RECOVERY] FIX timeout status:TODO write failed; staying ERROR.")
+                return
+            if cause is not None:
+                await delete_cancellation_cause(self.redis, self.name, task.pr_id)
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] FIX timeout admission failed: {exc}; staying ERROR.")
+            return
+        self._set_retry_task_snapshot(task)
+        self._crashed_task_pr_ids.discard(task.pr_id)
+        self._last_error_park_log_key = None
+        self.state.current_pr = self._preserve_fix_iteration_count(found)
+        self.state.state = PipelineState.WATCH
+        await self._clear_error_message_on_recovery(
+            log_prefix="[RECOVERY]", reason="confirmed FIX timeout admitted to WATCH"
+        )
+        self.log_event(
+            f"[RECOVERY] FIX timeout retry admitted for {task.pr_id} PR "
+            f"#{found.number}; dispatched FIX invocations {count}/{cap} -> WATCH."
+        )
 
     async def _consume_retry_command(self) -> RetryDispatch:
         try:
@@ -589,6 +720,60 @@ class RetryCommandMixin:
                     f"Status was persisted but acknowledgement failed: {exc}.",
                 )
 
+        if continuation_name == "watch":
+            if (
+                self._current_run_record is None
+                or self._current_run_record.task_id != task.pr_id
+            ):
+                try:
+                    recent = await self._metrics_store.recent(
+                        task_id=task.pr_id, limit=20, repo_name=self.name
+                    )
+                except Exception as exc:
+                    return await self._defer_retry_command(
+                        command, f"Could not restore FIX Retry accounting: {exc}."
+                    )
+                self._current_run_record = next(
+                    (item for item in recent if item.task_id == task.pr_id), None
+                )
+            record = self._current_run_record
+            if record is not None and record.task_id == task.pr_id:
+                old_record = record
+                old_baseline = record.fix_recovery_baseline
+                if record.ended_at is not None:
+                    record = RunRecord(
+                        run_id=str(uuid.uuid4()),
+                        task_id=task.pr_id,
+                        profile_id=record.profile_id,
+                        task_type=record.task_type,
+                        complexity=record.complexity,
+                        started_at=datetime.now(timezone.utc).isoformat(),
+                        ended_at=None,
+                        duration_ms=None,
+                        fix_iterations=record.fix_iterations,
+                        tokens_in=0,
+                        tokens_out=0,
+                        exit_reason="",
+                        operator_intervention=True,
+                        outcome="failed",
+                        cause="CRASH",
+                        run_phase="fix",
+                        attempt_index=record.attempt_index + 1,
+                        coder_session_id=str(uuid.uuid4()),
+                        task_spec_hash=command.task_fingerprint,
+                        repo_name=self.name,
+                    )
+                    self._current_run_record = record
+                record.fix_recovery_baseline = record.fix_iterations
+                try:
+                    await self._checkpoint_current_run_record()
+                except Exception as exc:
+                    self._current_run_record = old_record
+                    old_record.fix_recovery_baseline = old_baseline
+                    return await self._defer_retry_command(
+                        command, f"Could not persist FIX Retry budget baseline: {exc}."
+                    )
+
         try:
             await self._clear_retry_failure_evidence(command)
         except Exception as exc:
@@ -598,6 +783,17 @@ class RetryCommandMixin:
             )
 
         pr, reset_counters = self._reset_retry_local_counters(pr)
+        if self._current_run_record is not None and self._current_run_record.task_id != task.pr_id:
+            self._current_run_record = None
+        self.state.active_invocation = (
+            self._current_run_record.invocations[-1]
+            if continuation_name == "watch" and self._current_run_record is not None
+            and self._current_run_record.task_id == task.pr_id
+            and self._current_run_record.ended_at is None
+            and self._current_run_record.invocations
+            and self._current_run_record.invocations[-1].phase == "fix"
+            else None
+        )
         self._set_retry_task_snapshot(task)
         self.state.error_message = None
         if continuation_name == "watch":
@@ -637,6 +833,27 @@ class RetryCommandMixin:
         if continuation_name == "watch":
             assert pr is not None
             pr, _reset = self._reset_retry_local_counters(pr)
+            if self._current_run_record is not None and self._current_run_record.task_id != task.pr_id:
+                self._current_run_record = None
+            if self._current_run_record is None:
+                try:
+                    recent = await self._metrics_store.recent(
+                        task_id=task.pr_id, limit=20, repo_name=self.name
+                    )
+                except Exception as exc:
+                    return await self._defer_retry_command(
+                        command, f"Could not restore applied Retry accounting: {exc}."
+                    )
+                self._current_run_record = next(
+                    (item for item in recent if item.task_id == task.pr_id), None
+                )
+            record = self._current_run_record
+            self.state.active_invocation = (
+                record.invocations[-1]
+                if record is not None and record.ended_at is None
+                and record.invocations and record.invocations[-1].phase == "fix"
+                else None
+            )
             self._set_retry_task_snapshot(task)
             self.state.current_pr = pr
             self.state.state = PipelineState.WATCH

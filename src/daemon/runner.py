@@ -2410,6 +2410,10 @@ class PipelineRunner(
         if not pr_id:
             return
         self._status_write_failed_task_pr_ids.add(pr_id)
+        if blocked_reason is not None and not self.state.error_message:
+            self.state.error_message = (
+                f"{blocked_reason.value}: status:ERROR write failed; operator Retry required"
+            )
         if ensure_suppression and await self._suppression_record_for_task(pr_id) is None:
             await self._suppress_task(
                 pr_id,
@@ -3552,7 +3556,9 @@ class PipelineRunner(
         elif current == PipelineState.PAUSED:
             await self.handle_paused()
         elif current == PipelineState.ERROR:
-            if self.repo_config.feature_flags.use_single_error_exit:
+            if (self.state.error_message or "").startswith("FIX idle timeout"):
+                await self._admit_fix_idle_timeout()
+            elif self.repo_config.feature_flags.use_single_error_exit:
                 await self._handle_single_error_exit()
             elif self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED

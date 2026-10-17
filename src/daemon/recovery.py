@@ -41,6 +41,7 @@ from src.task_status import (
     MergeStatusUnavailable,
     _resolve_merged_state,
     derive_task_status,
+    find_matching_open_pr,
     get_merged_pr_ids,
 )
 
@@ -261,6 +262,7 @@ class RecoveryMixin:
         still overwrites ``current_task`` from parsed headers, and the
         invocation is used only when its task and unfinished run record match.
         """
+        self._persisted_fix_recovery = None
         try:
             raw = await self.redis.get(pipeline_state(self.name))
         except Exception:
@@ -271,6 +273,24 @@ class RecoveryMixin:
             persisted = RepoState.model_validate_json(raw)
         except Exception:
             return
+        if (
+            persisted.state in {PipelineState.ERROR, PipelineState.WATCH, PipelineState.FIX}
+            and persisted.current_task is not None
+            and persisted.current_pr is not None
+            and (
+                persisted.state == PipelineState.WATCH
+                or (
+                    persisted.active_invocation is not None
+                    and persisted.active_invocation.phase == "fix"
+                    and persisted.active_invocation.run_id is not None
+                    and (
+                        persisted.state == PipelineState.FIX
+                        or (persisted.error_message or "").startswith("FIX idle timeout")
+                    )
+                )
+            )
+        ):
+            self._persisted_fix_recovery = persisted
         if persisted.state != PipelineState.CODING:
             return
         if self.state.current_task is None and persisted.current_task is not None:
@@ -483,6 +503,69 @@ class RecoveryMixin:
                 f"[INFRA] Recovered pending queue-sync branch: "
                 f"{pending_sync.branch}."
             )
+
+        saved = getattr(self, "_persisted_fix_recovery", None)
+        if saved is not None:
+            bound, saved_task = saved.current_pr, saved.current_task
+            queued = next((task for task in tasks if task.pr_id == saved_task.pr_id), None)
+            recovered_state = saved.state
+            confirmed_timeout = False
+            if queued is not None and saved.state != PipelineState.ERROR:
+                if queued.pr_id in self._status_write_failed_task_pr_ids:
+                    recovered_state = PipelineState.ERROR
+                    try:
+                        cause = await get_cancellation_cause(
+                            self.redis, self.name, queued.pr_id, refresh_ttl=False
+                        )
+                    except Exception:
+                        cause = None
+                    confirmed_timeout = (
+                        cause is not None
+                        and cause.payload.get("subsource") == "fix_idle_timeout"
+                        and cause.payload.get("pr_number") == bound.number
+                        and cause.payload.get("branch") == bound.branch
+                        and saved.active_invocation is not None
+                        and cause.payload.get("run_id") == saved.active_invocation.run_id
+                    )
+                elif queued.status == TaskStatus.ERROR:
+                    try:
+                        header = parse_task_header(Path(self.repo_path) / queued.task_file)
+                    except (OSError, QueueValidationError):
+                        header = None
+                    if (
+                        header is not None
+                        and header.pr_id == queued.pr_id
+                        and header.branch == queued.branch
+                        and header.blocked_reason == SuppressionReason.FIX_IDLE_TIMEOUT.value
+                    ):
+                        recovered_state = PipelineState.ERROR
+                        confirmed_timeout = True
+            if (
+                queued is not None and queued.branch == saved_task.branch
+                and bound.branch == queued.branch
+                and find_matching_open_pr(queued.pr_id, queued.branch, [bound]) is bound
+                and queued.status in {TaskStatus.ERROR, TaskStatus.TODO, TaskStatus.DOING}
+                and recovered_state != PipelineState.FIX
+                and (queued.status != TaskStatus.ERROR or recovered_state == PipelineState.ERROR)
+            ):
+                self.state.current_task = queued
+                self.state.current_pr = bound
+                self.state.active_invocation = saved.active_invocation
+                if recovered_state == PipelineState.ERROR and saved.state != PipelineState.ERROR:
+                    self.state.error_message = (
+                        "FIX idle timeout: recovered confirmed timeout"
+                        if confirmed_timeout else saved.error_message
+                        or "status:ERROR write failed; operator Retry required"
+                    )
+                else:
+                    self.state.error_message = saved.error_message
+                self.state.state = recovered_state
+                await self._restore_current_run_record()
+                self.log_event(
+                    f"[RECOVERY] Restored bound FIX PR #{bound.number} for "
+                    f"{queued.pr_id} in {recovered_state.value}."
+                )
+                return
 
         if doing is not None:
             self.state.current_task = doing

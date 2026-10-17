@@ -148,6 +148,27 @@ class ErrorMixin:
         retry_task = self.state.current_task
         retry_task_id = retry_task.pr_id if retry_task is not None else None
 
+        if context.startswith("FIX idle timeout"):
+            await self._admit_fix_idle_timeout()
+            return
+
+        if "status:ERROR write failed; operator Retry required" in context:
+            reason_text = context.partition(":")[0]
+            try:
+                reason = SuppressionReason(reason_text)
+            except ValueError:
+                reason = SuppressionReason.CRASH
+            if retry_task is not None and retry_task_id in self._status_write_failed_task_pr_ids:
+                if not await self._commit_task_status_change(
+                    retry_task, "ERROR", context, blocked_reason=reason
+                ):
+                    self.log_event("[RECOVERY] Status write still failing; operator Retry required.")
+                    return
+                self._status_write_failed_task_pr_ids.discard(retry_task_id)
+                await self._persist_status_write_failed_task_pr_ids()
+            self.log_event("[RECOVERY] Status write failure retained; operator Retry required.")
+            return
+
         if (
             retry_task is not None
             and retry_task_id in self._status_write_failed_task_pr_ids
