@@ -231,6 +231,29 @@ async def test_published_coding_rejects_ineligible_historical_record(
     assert runner._current_run_record.run_id == record.run_id
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["branch", "task_id"])
+async def test_published_coding_rejects_unrelated_fix_pr(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mismatch: str,
+) -> None:
+    runner, _task, pr, _path = await _published_coding_runner(tmp_path, monkeypatch)
+    historical = runner._current_run_record
+    if mismatch == "branch":
+        runner.state.current_pr = pr.model_copy(update={"branch": "fix/pr-999"})
+    else:
+        runner.state.current_pr = pr.model_copy(update={"pr_id": "PR-999"})
+
+    async def allowed(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(runner, "_get_coder", lambda **_kwargs: ("claude", object()))
+    monkeypatch.setattr(runner, "usage_gate", allowed)
+    await runner.handle_fix()
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == historical.run_id
+    assert runner._current_run_record.fix_iterations == 0
+
+
 async def _timeout_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, count: int = 1,
     baseline: int = 0,
