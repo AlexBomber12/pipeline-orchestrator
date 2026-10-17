@@ -1235,12 +1235,18 @@ class PipelineRunner(
         *,
         operator_retry: bool = False,
         task_spec_hash: str | None = None,
+        coder_name: str | None = None,
+        model: str | None = None,
     ) -> RunRecord:
         """Start fresh FIX telemetry while preserving dispatched-attempt accounting."""
         return RunRecord(
             run_id=str(uuid.uuid4()),
             task_id=previous.task_id,
-            profile_id=previous.profile_id,
+            profile_id=(
+                f"{coder_name}:{model}:container"
+                if coder_name is not None and model is not None
+                else previous.profile_id
+            ),
             task_type=previous.task_type,
             complexity=previous.complexity,
             started_at=datetime.now(timezone.utc).isoformat(),
@@ -1261,6 +1267,9 @@ class PipelineRunner(
             attempt_index=previous.attempt_index + 1,
             coder_session_id=str(uuid.uuid4()),
             task_spec_hash=task_spec_hash or previous.task_spec_hash,
+            base_sha=self._git_rev_parse(
+                f"origin/{self.repo_config.branch or 'main'}"
+            ),
             repo_name=self.name,
         )
 

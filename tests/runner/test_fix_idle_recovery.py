@@ -13,6 +13,7 @@ from src.cancellation import (
     record_cancellation_cause,
 )
 from src.coders.claude import claude_cli
+from src import codex_cli
 from src.daemon import retry_commands as retry_module
 from src.daemon.retry_commands import RetryDispatch
 from src.github import prs as gh_prs
@@ -110,6 +111,33 @@ async def test_published_coding_record_allows_two_real_fix_dispatches(
     assert historical.exit_reason == "coding_complete"
     assert historical.fix_iterations == 0
     assert historical.tokens_in == 120 and historical.diff_lines_added == 8
+
+
+@pytest.mark.asyncio
+async def test_published_coding_fix_records_selected_coder_and_base_sha(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, _task, pr, _path = await _published_coding_runner(tmp_path, monkeypatch)
+    coding_record = runner._current_run_record
+    codex = runner._registry.get("codex")
+    runner.app_config.daemon.coder_settings = {"codex": {"model": "gpt-5.4"}}
+    monkeypatch.setattr(runner, "_get_coder", lambda **_kwargs: ("codex", codex))
+    monkeypatch.setattr(runner, "_reserve_coder_credentials", lambda *_a, **_k: True)
+    monkeypatch.setattr(runner, "_git_rev_parse", lambda ref: "b" * 40)
+    calls: list[int] = []
+
+    async def fix(*_args, **kwargs):
+        calls.append(kwargs["pr_id"])
+        return 0, "", ""
+
+    monkeypatch.setattr(codex_cli, "fix_review_async", fix)
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *_a, **_k: None)
+    await _watch_requires_fix(runner, pr, monkeypatch)
+    assert calls == ["PR-458"]
+    record = await runner._metrics_store.get(runner._current_run_record.run_id)
+    assert record.profile_id == f"codex:{codex.resolve_model(runner.app_config.daemon)}:container"
+    assert record.base_sha == "b" * 40
+    assert coding_record.profile_id == "claude:opus:container"
 
 
 @pytest.mark.asyncio

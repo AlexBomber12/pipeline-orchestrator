@@ -313,7 +313,10 @@ class FixMixin(BreachMixin):
                     await self._escalate_fix_iteration_cap(current_pr)
                     return
                 previous_snapshot = self.state.active_invocation
-                self._current_run_record = self._new_fix_run_record(record)
+                self._current_run_record = self._new_fix_run_record(
+                    record, coder_name=coder_name,
+                    model=plugin.resolve_model(self.app_config.daemon),
+                )
                 try:
                     await self._checkpoint_current_run_record()
                 except Exception as exc:
@@ -433,7 +436,6 @@ class FixMixin(BreachMixin):
             breach_dir=breach_dir,
             breach_run_id=breach_run_id,
         )
-
         fix_kwargs: dict[str, object] = {
             **plugin_run_kwargs,
             "on_process_start": self._track_current_coder_process,
@@ -462,12 +464,17 @@ class FixMixin(BreachMixin):
             return
         heartbeat: asyncio.Task[None] | None = None
         run_record = self._current_run_record
+        previous_profile_id = run_record.profile_id if run_record is not None else None
         previous_active_invocation = self.state.active_invocation
         previous_fix_iterations = (
             run_record.fix_iterations if run_record is not None else None
         )
         captured_snapshot = None
         try:
+            if run_record is not None:
+                run_record.profile_id = (
+                    f"{coder_name}:{plugin_run_kwargs['model']}:container"
+                )
             self.log_event(
                 f"[{coder_name}] entering FIX.",
                 tier="state",
@@ -510,6 +517,7 @@ class FixMixin(BreachMixin):
                     run_record.invocations.pop()
                     assert previous_fix_iterations is not None
                     run_record.fix_iterations = previous_fix_iterations
+                    run_record.profile_id = previous_profile_id
                 rollback_writes = [self.publish_state()]
                 if run_record is not None:
                     rollback_writes.append(self._checkpoint_current_run_record())
