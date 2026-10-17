@@ -839,8 +839,9 @@ async def test_watch_retry_defers_when_accounting_restore_is_unavailable(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("continuation", ["watch", "coding"])
 async def test_retry_replaces_unrelated_cached_run_record(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, continuation: str,
 ) -> None:
     runner, command, task, _repo = await _prepared_runner(tmp_path)
     runner._start_current_run_record("codex", "")
@@ -850,16 +851,24 @@ async def test_retry_replaces_unrelated_cached_run_record(
     pr = PRInfo(number=42, branch=task.branch, pr_id=task.pr_id)
     monkeypatch.setattr(runner, "_validate_retry_command", _async_value((object(), task)))
     monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
-    monkeypatch.setattr(runner, "_select_retry_continuation", _async_value(("watch", pr)))
+    monkeypatch.setattr(
+        runner, "_select_retry_continuation",
+        _async_value((continuation, pr if continuation == "watch" else None)),
+    )
+    monkeypatch.setattr(
+        runner, "_ensure_retry_coder_available", _async_value(("codex", object()))
+    )
     monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
     monkeypatch.setattr(runner, "_clear_retry_failure_evidence", _async_value(None))
-    assert await runner._apply_retry_command(command) == RetryDispatch.WATCH
+    expected = RetryDispatch.WATCH if continuation == "watch" else RetryDispatch.CODING
+    assert await runner._apply_retry_command(command) == expected
     assert runner._current_run_record is None
     assert runner.state.active_invocation is None
 
-    runner._current_run_record = unrelated
-    assert await runner._reconcile_applied_retry(command) == RetryDispatch.WATCH
-    assert runner._current_run_record is None
+    if continuation == "watch":
+        runner._current_run_record = unrelated
+        assert await runner._reconcile_applied_retry(command) == RetryDispatch.WATCH
+        assert runner._current_run_record is None
 
 
 @pytest.mark.asyncio
