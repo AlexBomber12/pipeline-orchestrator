@@ -6314,7 +6314,7 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     })
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
-    assert comments.get_latest_codex_feedback("owner/name", 42) is None
+    assert comments.get_latest_codex_feedback("owner/name", 42) == "P1: fix the null check"
 
     body_reactions[0]["created_at"] = "2026-10-17T21:11:00Z"
     reviews.clear_review_status_cache()
@@ -6324,13 +6324,12 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
     body_reactions[0]["created_at"] = "2026-10-17T21:06:00Z"
     reviews.clear_review_status_cache()
-    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
-    body_reactions[0]["created_at"] = "2026-10-17T21:09:00Z"
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    body_reactions.clear()
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
 
     issue_comments.remove(receipt)
-    reviews.clear_review_status_cache()
-    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
-    body_reactions.clear()
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
     assert comments.get_latest_codex_feedback("owner/name", 42) == "P1: fix the null check"
@@ -6346,6 +6345,10 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
     assert comments.get_latest_codex_feedback("owner/name", 42) == "[P1] Fix the no findings empty state"
+    issue_comments[-1]["body"] = "[P1] Fix the review complete callback"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    assert comments.get_latest_codex_feedback("owner/name", 42) == "[P1] Fix the review complete callback"
 
 
 def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
@@ -6362,6 +6365,7 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
         "A general update": "unknown",
         "P2: fix the null check": "finding",
         "[P1] Fix the no findings empty state": "finding",
+        "[P1] Fix the review complete callback": "finding",
     }
     for body, expected in samples.items():
         assert reviews.classify_review_comment({"body": body}) == expected

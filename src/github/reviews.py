@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 REVIEW_FEEDBACK_TRUNCATE_CHARS = 5000
 
 _FINDING = re.compile(r"\b(?:P[0-3]\b|please\b|consider\b|fix\b|missing\b|incorrect\b|bug\b|rename\b|change\b)", re.I)
+_PRIORITY_FINDING = re.compile(r"(?:^|\n)\s*(?:\*\*)?\[?P[0-3]\b", re.I)
 _RECEIPT = re.compile(
     r"^<!-- codex-review-receipt:v1 -->|"
     r"^(?:codex review:\s*)?(?:didn't find any major issues(?:\. delightful!)?|"
@@ -71,6 +72,8 @@ def classify_review_comment(comment: dict, *, inline: bool = False) -> str:
         return "unknown"
     if _RECEIPT.search(body):
         return "receipt"
+    if inline or _PRIORITY_FINDING.search(body):
+        return "finding"
     if _reactions._is_codex_onboarding_comment(comment):
         return "onboarding"
     if _PROVIDER_ERROR.search(body):
@@ -79,7 +82,7 @@ def classify_review_comment(comment: dict, *, inline: bool = False) -> str:
         return "summary"
     if _PROGRESS.search(body):
         return "progress"
-    if inline or _FINDING.search(body):
+    if _FINDING.search(body):
         return "finding"
     return "unknown"
 
@@ -110,7 +113,6 @@ def feedback_from_comments(
     ids: list[int] = []
     sources: list[tuple[str, int, int]] = []
     unknown = False
-    receipt = False
     latest_blocking_at: datetime | None = None
     undated_blocking = False
     for inline, comments in ((False, issue_comments), (True, review_comments)):
@@ -140,13 +142,10 @@ def feedback_from_comments(
                 ))
             elif kind in ("unknown", "provider_error"):
                 unknown = True
-            elif kind == "receipt":
-                receipt = True
     return ReviewFeedback(
         tuple(findings), tuple(ids),
         (
-            "receipt conflicts with current findings" if receipt and findings
-            else "trusted review text has no supported finding shape" if unknown
+            "trusted review text has no supported finding shape" if unknown
             else None
         ),
         tuple(sources),
