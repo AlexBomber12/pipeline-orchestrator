@@ -719,8 +719,21 @@ class RetryCommandMixin:
                 )
 
         if continuation_name == "watch":
-            if self._current_run_record is None:
-                await self._restore_current_run_record()
+            if (
+                self._current_run_record is None
+                or self._current_run_record.task_id != task.pr_id
+            ):
+                try:
+                    recent = await self._metrics_store.recent(
+                        task_id=task.pr_id, limit=20, repo_name=self.name
+                    )
+                except Exception as exc:
+                    return await self._defer_retry_command(
+                        command, f"Could not restore FIX Retry accounting: {exc}."
+                    )
+                self._current_run_record = next(
+                    (item for item in recent if item.task_id == task.pr_id), None
+                )
             record = self._current_run_record
             if record is not None and record.task_id == task.pr_id:
                 old_baseline = record.fix_recovery_baseline

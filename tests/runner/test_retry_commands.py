@@ -812,6 +812,33 @@ async def test_watch_retry_budget_checkpoint_failure_keeps_command_pending(
 
 
 @pytest.mark.asyncio
+async def test_watch_retry_defers_when_accounting_restore_is_unavailable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    text = _task_text()
+    pr = PRInfo(number=42, branch="fix/pr-42", pr_id="PR-42", head_sha="abc123")
+    runner, command, _task, _repo = await _prepared_runner(
+        tmp_path, text=text, command=_command(text, bound_pr=pr)
+    )
+    _allow_validation(monkeypatch, runner, text)
+    monkeypatch.setattr(runner, "_suppression_record_for_task", _none_record)
+    monkeypatch.setattr(retry_module, "derive_active_inhibitors", _async_value([]))
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *args: [pr])
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
+
+    async def metrics_down(**_kwargs):
+        raise RuntimeError("metrics down")
+
+    monkeypatch.setattr(runner._metrics_store, "recent", metrics_down)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored is not None and stored.status == RetryCommandStatus.DEFERRED
+    assert stored.effect_stage == RetryEffectStage.STATUS_COMMITTED
+    assert "accounting" in stored.outcome_reason
+    assert runner.state.state == PipelineState.ERROR
+
+
+@pytest.mark.asyncio
 async def test_retry_replaces_unrelated_cached_run_record(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

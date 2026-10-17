@@ -368,8 +368,36 @@ async def test_restart_with_unavailable_timeout_cause_does_not_admit(
         raise RuntimeError("redis down")
 
     monkeypatch.setattr("src.daemon.recovery.get_cancellation_cause", unavailable)
+    monkeypatch.setattr(retry_module, "get_cancellation_cause", unavailable)
     await restarted._apply_recovery_decisions([task], [pr])
-    assert restarted.state.state != PipelineState.WATCH
+    assert restarted.state.state == PipelineState.ERROR
+    assert restarted.state.current_pr.number == pr.number
+    await restarted.handle_error()
+    assert restarted.state.state == PipelineState.ERROR
+    assert "blocked_reason: fix_idle_timeout" in (tmp_path / task.task_file).read_text()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("header", ["guardrail", "missing"])
+async def test_restart_does_not_relabel_other_or_unreadable_error_as_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, header: str,
+) -> None:
+    runner, task, pr, task_path = await _timeout_runner(tmp_path, monkeypatch)
+    runner.state.state = PipelineState.FIX
+    runner.state.error_message = None
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    if header == "guardrail":
+        write_frontmatter_status(task_path, "ERROR", SuppressionReason.GUARDRAIL)
+    else:
+        task_path.unlink()
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    restarted._metrics_store = runner._metrics_store
+    restarted.repo_path = runner.repo_path
+    await restarted._hydrate_current_task_from_persisted_state()
+    await restarted._apply_recovery_decisions([task], [pr])
+    assert restarted.state.current_pr is None
+    assert restarted.state.state == PipelineState.IDLE
 
 
 @pytest.mark.asyncio

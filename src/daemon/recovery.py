@@ -504,12 +504,15 @@ class RecoveryMixin:
             recovered_state = saved.state
             if queued is not None and queued.status == TaskStatus.ERROR and saved.state != PipelineState.ERROR:
                 try:
-                    cause = await get_cancellation_cause(
-                        self.redis, self.name, queued.pr_id, refresh_ttl=False
-                    )
-                except Exception:
-                    cause = None
-                if cause is not None and cause.payload.get("subsource") == "fix_idle_timeout":
+                    header = parse_task_header(Path(self.repo_path) / queued.task_file)
+                except (OSError, QueueValidationError):
+                    header = None
+                if (
+                    header is not None
+                    and header.pr_id == queued.pr_id
+                    and header.branch == queued.branch
+                    and header.blocked_reason == SuppressionReason.FIX_IDLE_TIMEOUT.value
+                ):
                     recovered_state = PipelineState.ERROR
             if (
                 queued is not None and queued.branch == saved_task.branch
