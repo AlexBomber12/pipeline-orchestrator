@@ -926,6 +926,12 @@ async def test_watch_retry_starts_active_record_after_completed_fix_run(
     completed.fix_iterations = 3
     runner._capture_invocation_snapshot("codex", {}, phase="fix", fix_iteration=3)
     completed.ended_at = NOW.isoformat()
+    completed.exit_reason = "timeout"
+    completed.cause = "TIMEOUT"
+    completed.tokens_in = 120
+    completed.tokens_out = 45
+    completed.head_sha = "a" * 40
+    completed.diff_lines_added = 8
     await runner._checkpoint_current_run_record()
     monkeypatch.setattr(runner, "_validate_retry_command", _async_value((object(), task)))
     monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
@@ -938,6 +944,10 @@ async def test_watch_retry_starts_active_record_after_completed_fix_run(
     assert current.ended_at is None
     assert current.fix_iterations == current.fix_recovery_baseline == 3
     assert current.invocations == []
+    assert current.coder_session_id != completed.coder_session_id
+    assert current.exit_reason == "" and current.cause == "CRASH"
+    assert current.tokens_in == current.tokens_out == 0
+    assert current.head_sha == "" and current.diff_lines_added == 0
     assert runner.state.active_invocation is None
     assert (await runner._metrics_store.get(completed.run_id)).ended_at == NOW.isoformat()
     runner._current_run_record = current

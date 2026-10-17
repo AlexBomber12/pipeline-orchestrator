@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import subprocess
 import uuid
-from dataclasses import replace
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -21,6 +20,7 @@ from src.daemon import git_ops
 from src.daemon.selector import CoderPurpose, resolve_active_coder
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, derive_active_inhibitors
+from src.metrics import RunRecord
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError
 from src.queue_parser import parse_existing_task_header as parse_task_header
@@ -741,16 +741,27 @@ class RetryCommandMixin:
                 old_record = record
                 old_baseline = record.fix_recovery_baseline
                 if record.ended_at is not None:
-                    record = replace(
-                        record,
+                    record = RunRecord(
                         run_id=str(uuid.uuid4()),
+                        task_id=task.pr_id,
+                        profile_id=record.profile_id,
+                        task_type=record.task_type,
+                        complexity=record.complexity,
                         started_at=datetime.now(timezone.utc).isoformat(),
                         ended_at=None,
                         duration_ms=None,
-                        invocations=[],
-                        attempt_index=record.attempt_index + 1,
+                        fix_iterations=record.fix_iterations,
+                        tokens_in=0,
+                        tokens_out=0,
+                        exit_reason="",
                         operator_intervention=True,
+                        outcome="failed",
+                        cause="CRASH",
                         run_phase="fix",
+                        attempt_index=record.attempt_index + 1,
+                        coder_session_id=str(uuid.uuid4()),
+                        task_spec_hash=command.task_fingerprint,
+                        repo_name=self.name,
                     )
                     self._current_run_record = record
                 record.fix_recovery_baseline = record.fix_iterations
