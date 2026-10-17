@@ -163,13 +163,13 @@ def test_coder_escalate_detector_writes_coder_escalate_subsource(
     h._patch_fix_with_stdout(
         monkeypatch,
         stdout="pushed a fix\nESCALATE: cannot resolve\n",
-        head_seq=lambda: next(head_calls),
+        head_seq=lambda: next(head_calls, "bbb111"),
     )
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(number=304, branch="pr-304")
-    runner.state.current_task = _doing_task("PR-CODER-ESC")
+    runner.state.current_pr = PRInfo(number=304, branch="pr-304", pr_id="PR-CODER-ESC")
+    runner.state.current_task = _doing_task("PR-CODER-ESC").model_copy(update={"branch": "pr-304"})
     monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: True)
 
     asyncio.run(runner.handle_fix())
@@ -204,8 +204,8 @@ def test_guardrail_detector_writes_guardrail_subsource(
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(number=305, branch="pr-305")
-    runner.state.current_task = _doing_task("PR-GUARD")
+    runner.state.current_pr = PRInfo(number=305, branch="pr-305", pr_id="PR-GUARD")
+    runner.state.current_task = _doing_task("PR-GUARD").model_copy(update={"branch": "pr-305"})
     monkeypatch.setattr(runner, "_post_codex_review", lambda pr_number: True)
 
     asyncio.run(runner.handle_fix())

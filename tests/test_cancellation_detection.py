@@ -260,13 +260,13 @@ def test_escalate_wiring_writes_reason_text(
     h._patch_fix_with_stdout(
         monkeypatch,
         stdout="pushed a fix\nESCALATE: cannot resolve\n",
-        head_seq=lambda: next(head_calls),
+        head_seq=lambda: next(head_calls, "bbb111"),
     )
 
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(number=304, branch="pr-304")
-    runner.state.current_task = _doing_task("PR-304")
+    runner.state.current_pr = PRInfo(number=304, branch="pr-304", pr_id="PR-304")
+    runner.state.current_task = _doing_task("PR-304").model_copy(update={"branch": "pr-304"})
     monkeypatch.setattr(
         runner, "_post_codex_review", lambda pr_number: True
     )

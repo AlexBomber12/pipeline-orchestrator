@@ -76,6 +76,8 @@ class RunRecord:
     had_merge_conflict: bool = False
     base_branch: str = ""
     invocations: list[InvocationSnapshot] = field(default_factory=list)
+    # Operator Retry starts a new FIX allowance without erasing dispatch history.
+    fix_recovery_baseline: int = 0
 
     def __post_init__(self) -> None:
         self.invocations = [
@@ -104,6 +106,8 @@ class RunRecord:
             raise ValueError(f"invalid run record phase: {self.run_phase}")
         if self.attempt_index < 1:
             raise ValueError("attempt_index must be >= 1")
+        if not 0 <= self.fix_recovery_baseline <= self.fix_iterations:
+            raise ValueError("FIX recovery baseline must be within dispatched invocations")
         if self.cause_subsource is not None and self.cause != "ESCALATE":
             raise ValueError(
                 "cause_subsource only valid when cause == 'ESCALATE'"
