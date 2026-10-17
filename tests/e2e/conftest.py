@@ -44,7 +44,7 @@ def _config_digest() -> str:
     return hashlib.sha256(_shared_config_bytes()).hexdigest()
 
 
-def _daemon_reload_count() -> int:
+def _daemon_log_count(message: str) -> int:
     result = subprocess.run(
         ["docker", "compose", "-f", "docker-compose.test.yml", "logs", "--no-color", "daemon-test"],
         cwd=REPO_DIR,
@@ -53,7 +53,15 @@ def _daemon_reload_count() -> int:
         check=True,
         timeout=15,
     )
-    return result.stdout.count("Config change detected; reconciling runners")
+    return result.stdout.count(message)
+
+
+def _daemon_reload_count() -> int:
+    return _daemon_log_count("Config change detected; reconciling runners")
+
+
+def _runner_apply_count() -> int:
+    return _daemon_log_count(f"[{TESTBED_SLUG}] [INFRA] Applied staged repo config.")
 
 
 def _wait_for_daemon_reload(reloads_before: int) -> None:
@@ -98,6 +106,8 @@ def shared_test_config(reset_testbed, get_state):
     try:
         yield _shared_config_bytes, note_settings_write, wait_for_coder_dispatch
     finally:
+        restored = False
+        applies_before = 0
         try:
             _stop_daemon_and_wait_paused(TESTBED_SLUG)
             reset_testbed_full(TESTBED_SLUG)
@@ -107,6 +117,7 @@ def shared_test_config(reset_testbed, get_state):
                 "shared config changed outside this fixture; refusing to overwrite concurrent changes"
             )
             if baseline != _shared_config_bytes():
+                applies_before = _runner_apply_count()
                 reloads_before = _daemon_reload_count()
                 fd, temporary = tempfile.mkstemp(prefix="config.test.yml.", dir=TEST_DATA_DIR)
                 try:
@@ -119,8 +130,20 @@ def shared_test_config(reset_testbed, get_state):
                         os.unlink(temporary)
                 _wait_for_daemon_reload(reloads_before)
                 assert _shared_config_bytes() == baseline
+                restored = True
         finally:
             _resume_daemon(TESTBED_SLUG)
+        if restored:
+            _wait_for_runner_apply(applies_before)
+
+
+def _wait_for_runner_apply(applies_before: int) -> None:
+    deadline = time.monotonic() + 70
+    while time.monotonic() < deadline:
+        if _runner_apply_count() > applies_before:
+            return
+        time.sleep(0.5)
+    raise AssertionError("runner did not apply restored integration config after resume")
 
 
 # 30 seconds proved insufficient on the shared testbed where dispatch was observed at ~39 seconds.

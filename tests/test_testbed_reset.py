@@ -621,6 +621,64 @@ def test_shared_config_fixture_resets_testbed_after_dispatch() -> None:
     ]
 
 
+def test_shared_config_fixture_waits_for_runner_to_apply_restored_config(tmp_path) -> None:
+    module_name = "tests.e2e.conftest"
+    calls: list[str] = []
+    config_path = tmp_path / "config.test.yml"
+    config_path.write_bytes(b"baseline")
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+
+        with (
+            patch.object(e2e_conftest, "TEST_DATA_DIR", tmp_path),
+            patch.object(e2e_conftest, "SHARED_CONFIG_PATH", config_path),
+            patch.object(e2e_conftest, "_shared_config_bytes", side_effect=config_path.read_bytes),
+            patch.object(e2e_conftest, "_stop_daemon_and_wait_paused", side_effect=lambda _: calls.append("stop")),
+            patch.object(e2e_conftest, "reset_testbed_full", side_effect=lambda _: calls.append("reset")),
+            patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=lambda _: calls.append("clear")),
+            patch.object(e2e_conftest, "_runner_apply_count", side_effect=lambda: 7),
+            patch.object(e2e_conftest, "_daemon_reload_count", return_value=3),
+            patch.object(e2e_conftest, "_wait_for_daemon_reload", side_effect=lambda _: calls.append("reconciled")),
+            patch.object(e2e_conftest, "_resume_daemon", side_effect=lambda _: calls.append("resume")),
+            patch.object(
+                e2e_conftest,
+                "_wait_for_runner_apply",
+                side_effect=lambda count: calls.append(f"applied-after:{count}"),
+            ),
+        ):
+            fixture = e2e_conftest.shared_test_config.__wrapped__(None, lambda: None)
+            _, note_settings_write, _ = next(fixture)
+            config_path.write_bytes(b"codex")
+            note_settings_write()
+            with pytest.raises(StopIteration):
+                next(fixture)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    assert config_path.read_bytes() == b"baseline"
+    assert calls == ["stop", "reset", "clear", "reconciled", "resume", "applied-after:7"]
+
+
+def test_wait_for_runner_apply_requires_new_acknowledgment() -> None:
+    module_name = "tests.e2e.conftest"
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+        with (
+            patch.object(e2e_conftest, "_runner_apply_count", side_effect=[7, 7, 8]) as counts,
+            patch.object(e2e_conftest.time, "sleep") as sleep,
+        ):
+            e2e_conftest._wait_for_runner_apply(7)
+        assert counts.call_count == 3
+        assert sleep.call_count == 2
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_stop_daemon_waits_for_runner_pause_ack() -> None:
     module_name = "tests.e2e.conftest"
     posts: list[tuple[str, int]] = []
