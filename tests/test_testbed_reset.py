@@ -578,6 +578,49 @@ def test_reset_testbed_fixture_resumes_when_stop_wait_fails() -> None:
     assert excinfo.value.__notes__ == ["resume failed after reset setup error: resume failed"]
 
 
+def test_shared_config_fixture_resets_testbed_after_dispatch() -> None:
+    module_name = "tests.e2e.conftest"
+    calls: list[str] = []
+    baseline = b"original config"
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            e2e_conftest = importlib.import_module(module_name)
+
+        with (
+            patch.object(e2e_conftest, "_shared_config_bytes", return_value=baseline),
+            patch.object(
+                e2e_conftest,
+                "_config_digest",
+                return_value=e2e_conftest.hashlib.sha256(baseline).hexdigest(),
+            ),
+            patch.object(
+                e2e_conftest,
+                "_stop_daemon_and_wait_paused",
+                side_effect=lambda slug: calls.append(f"stop:{slug}"),
+            ),
+            patch.object(e2e_conftest, "reset_testbed_full", side_effect=lambda slug: calls.append(f"reset:{slug}")),
+            patch.object(
+                e2e_conftest,
+                "clear_testbed_redis_state",
+                side_effect=lambda slug: calls.append(f"clear:{slug}"),
+            ),
+            patch.object(e2e_conftest, "_resume_daemon", side_effect=lambda slug: calls.append(f"resume:{slug}")),
+        ):
+            fixture = e2e_conftest.shared_test_config.__wrapped__(None, lambda: None)
+            next(fixture)
+            with pytest.raises(StopIteration):
+                next(fixture)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    assert calls == [
+        f"{action}:{e2e_conftest.TESTBED_SLUG}"
+        for action in ("stop", "reset", "clear", "resume")
+    ]
+
+
 def test_stop_daemon_waits_for_runner_pause_ack() -> None:
     module_name = "tests.e2e.conftest"
     posts: list[tuple[str, int]] = []

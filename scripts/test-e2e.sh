@@ -112,6 +112,9 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "$NO_UP" -eq 0 ]]; then
+  python3 scripts/prepare_test_config.py config.test.yml tests/e2e/data/config.test.yml
+  # Host pytest and UID-1000 containers both atomically replace files here.
+  chmod 0777 tests/e2e/data
   bash scripts/init-test-volume.sh
   docker compose -f docker-compose.test.yml up -d --wait
 fi
