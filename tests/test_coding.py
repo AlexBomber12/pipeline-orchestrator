@@ -1762,3 +1762,22 @@ def test_expected_branch_path_resolves_via_git_for_linked_worktree(
 
     runner._cleanup_expected_branch()
     assert not marker.exists()
+
+
+def test_should_skip_codex_review_post_rejects_other_bound_pr(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=43, branch="pr-001", head_sha="a" * 40)
+    _patch_codex_reactions(monkeypatch, eyes_present=True)
+    assert runner._should_skip_codex_review_post(42) is False
+
+
+def test_should_skip_codex_review_post_rejects_empty_bound_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001")
+    _patch_codex_reactions(monkeypatch, eyes_present=True)
+    monkeypatch.setattr(git_ops, "_git", lambda *a, **kw: SimpleNamespace(stdout=""))
+    assert runner._should_skip_codex_review_post(42) is False
