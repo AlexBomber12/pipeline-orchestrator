@@ -53,6 +53,7 @@ class ReviewFeedback:
     sources: tuple[tuple[str, int, int], ...] = ()
     latest_blocking_at: datetime | None = None
     undated_blocking: bool = False
+    latest_finding_at: datetime | None = None
 
 
 def format_review_feedback(findings: tuple[str, ...]) -> str | None:
@@ -115,6 +116,7 @@ def feedback_from_comments(
     unknown = False
     latest_blocking_at: datetime | None = None
     undated_blocking = False
+    latest_finding_at: datetime | None = None
     for inline, comments in ((False, issue_comments), (True, review_comments)):
         for comment in comments:
             if not _reactions._is_codex_user(comment.get("user"), policy=policy):
@@ -133,6 +135,10 @@ def feedback_from_comments(
                 elif latest_blocking_at is None or created > latest_blocking_at:
                     latest_blocking_at = created
             if kind == "finding":
+                if created is not None and (
+                    latest_finding_at is None or created > latest_finding_at
+                ):
+                    latest_finding_at = created
                 findings.append((comment.get("body") or "").strip())
                 comment_id = comment.get("id") or 0
                 ids.append(comment_id)
@@ -151,6 +157,7 @@ def feedback_from_comments(
         tuple(sources),
         latest_blocking_at,
         undated_blocking,
+        latest_finding_at,
     )
 
 
@@ -415,6 +422,8 @@ def _compute_review_status(
             and approved_at > feedback.latest_blocking_at
         ):
             return ReviewStatus.APPROVED
+        if feedback.latest_finding_at is not None and feedback.latest_finding_at > approved_at:
+            return ReviewStatus.CHANGES_REQUESTED
         logger.info("PR #%s review pending: +1 does not supersede current review text", pr_number)
         return ReviewStatus.PENDING
     if body_approved:

@@ -6313,7 +6313,7 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
         "created_at": "2026-10-17T21:10:00Z",
     })
     reviews.clear_review_status_cache()
-    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
     assert comments.get_latest_codex_feedback("owner/name", 42) == "P1: fix the null check"
 
     body_reactions[0]["created_at"] = "2026-10-17T21:11:00Z"
@@ -6321,7 +6321,7 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
     body_reactions[0]["created_at"] = "2026-10-17T21:09:00Z"
     reviews.clear_review_status_cache()
-    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
     body_reactions[0]["created_at"] = "2026-10-17T21:06:00Z"
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
@@ -6358,8 +6358,11 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     assert comments.get_latest_codex_feedback("owner/name", 42) == "[P1] Fix the review complete callback"
     anchor_reactions.append({
         "content": "+1", "user": receipt["user"],
-        "created_at": "2026-10-17T21:13:00Z",
+        "created_at": "2026-10-17T21:11:00Z",
     })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    anchor_reactions[0]["created_at"] = "2026-10-17T21:13:00Z"
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
 
@@ -6396,11 +6399,13 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
     assert evidence.source_ids == (2,)
     assert evidence.sources == (("issue", 2, actor["id"]),)
     assert evidence.latest_blocking_at == datetime(2026, 1, 1, 0, 1, tzinfo=_tz.utc)
+    assert evidence.latest_finding_at == datetime(2026, 1, 1, 0, 1, tzinfo=_tz.utc)
     assert not evidence.undated_blocking
     later = {**finding, "id": 4, "created_at": "2026-01-01T00:03:00Z"}
     undated = {**finding, "id": 5, "created_at": None}
     evidence = reviews.feedback_from_comments([finding, later], [undated], "author", policy)
     assert evidence.latest_blocking_at == datetime(2026, 1, 1, 0, 3, tzinfo=_tz.utc)
+    assert evidence.latest_finding_at == datetime(2026, 1, 1, 0, 3, tzinfo=_tz.utc)
     assert evidence.undated_blocking
     unsupported = {"id": 3, "user": actor, "body": "A general update",
                    "created_at": "2026-01-01T00:02:00Z"}
