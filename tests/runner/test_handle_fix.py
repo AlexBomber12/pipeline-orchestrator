@@ -32,7 +32,9 @@ from src.models import (
     FeedbackCheckResult,
     PipelineState,
     PRInfo,
+    PublicationWatermark,
     QueueTask,
+    RepoState,
     ReviewStatus,
     TaskStatus,
 )
@@ -5725,11 +5727,57 @@ def test_publication_watermark_survives_contextless_unknown_read() -> None:
     ) == (None, "head context unavailable")
     assert runner._publication_high_water_at == newer
     assert runner._validate_publication_observation(42, head, older, None, **context) == (
-        None, "publication time moved backward for unchanged HEAD"
+        None, "publication time moved backward for unchanged branch"
     )
-    # A genuinely new HEAD cannot inherit the previous head's watermark.
+    # An unknown read for a new HEAD cannot erase the branch's safety floor.
     assert runner._validate_publication_observation(42, "b" * 40, None, "unknown") == (None, "unknown")
-    assert runner._publication_high_water_at is None
+    assert runner._publication_high_water_at == newer
+
+
+def test_publication_watermark_rejects_reused_sha_after_force_push() -> None:
+    runner = h._make_runner()
+    first = datetime(2026, 10, 17, 21, 5, tzinfo=timezone.utc)
+    second = datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    context = {"head_repo": "owner/name", "ref": "refs/heads/feature",
+               "observed_repo": runner.owner_repo}
+
+    def observe(sha: str, at: datetime) -> tuple[datetime | None, str | None]:
+        return runner._validate_publication_observation(
+            42, sha, at, None, **context, observed_head_sha=sha,
+        )
+
+    assert observe("a" * 40, first) == (first, None)
+    assert observe("b" * 40, second) == (second, None)
+    assert observe("a" * 40, first) == (
+        None, "publication time moved backward for unchanged branch",
+    )
+    assert runner._publication_high_water_at == second
+    assert runner.state.publication_watermark.head_sha == "b" * 40
+    assert runner.state.publication_watermark.published_at == second
+
+
+def test_recovery_keeps_branch_floor_from_prior_head() -> None:
+    runner = h._make_runner()
+    floor = datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    old = datetime(2026, 10, 17, 21, 5, tzinfo=timezone.utc)
+    current = "a" * 40
+    saved = RepoState(
+        url=runner.state.url, name=runner.name,
+        current_pr=PRInfo(number=42, branch="feature", head_sha=current),
+        publication_watermark=PublicationWatermark(
+            repo=runner.owner_repo, pr_number=42, head_repo=runner.owner_repo,
+            ref="refs/heads/feature", head_sha="b" * 40, published_at=floor,
+        ),
+    )
+
+    runner._restore_publication_watermark(saved)
+
+    assert runner._publication_high_water_at == floor
+    assert runner._validate_publication_observation(
+        42, current, old, None, head_repo=runner.owner_repo,
+        ref="refs/heads/feature", observed_repo=runner.owner_repo,
+        observed_head_sha=current,
+    ) == (None, "publication time moved backward for unchanged branch")
 
 
 def test_no_push_branch_uses_publication_evidence_when_available(
@@ -5781,7 +5829,7 @@ def test_publication_watermark_rejects_unverified_observation_identity(
     ) == (None, reason)
     assert runner._publication_high_water_at == later
     assert runner._validate_publication_observation(42, head, older, None, **context) == (
-        None, "publication time moved backward for unchanged HEAD"
+        None, "publication time moved backward for unchanged branch"
     )
 
 

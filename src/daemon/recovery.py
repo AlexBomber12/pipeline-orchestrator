@@ -331,7 +331,6 @@ class RecoveryMixin:
         if (
             saved is None or pr is None or persisted.name != self.name
             or saved.repo != self.owner_repo or saved.pr_number != pr.number
-            or saved.head_sha != pr.head_sha
             or re.fullmatch(r"[0-9a-fA-F]{40}", saved.head_sha) is None
             or re.fullmatch(r"[^/]+/[^/]+", saved.head_repo) is None
             or saved.ref != f"refs/heads/{pr.branch}"

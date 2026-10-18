@@ -1395,11 +1395,9 @@ class PipelineRunner(
         # incomplete or describe a different HEAD; neither changes that target.
         reported_sha = observed_head_sha or ""
         reported_repo = observed_repo
-        target = (self.owner_repo, pr_number, head_sha)
+        target = (self.owner_repo, pr_number)
         prior_identity = self._publication_high_water_identity
-        if prior_identity is not None and (
-            prior_identity[0], prior_identity[1], prior_identity[4]
-        ) != target:
+        if prior_identity is not None and prior_identity[:2] != target:
             self._publication_high_water_identity = None
             self._publication_high_water_at = None
             self.state.publication_watermark = None
@@ -1440,16 +1438,20 @@ class PipelineRunner(
             and observed_at <= self._publication_recovery_cutoff_at
         ):
             return None, "publication predates recovery without a trusted safety floor"
-        # A complete new head-repository/ref context is a new identity. A
-        # failed read above cannot clear the old floor merely by omitting it.
-        if self._publication_high_water_identity != identity:
-            self._publication_high_water_identity = identity
+        # Keep the floor across SHA changes on the same branch: a force push
+        # can return to an older SHA. Only a verified new branch context can
+        # start a new floor; an incomplete read above cannot clear it.
+        if (
+            self._publication_high_water_identity is not None
+            and self._publication_high_water_identity[:4] != identity[:4]
+        ):
             self._publication_high_water_at = None
         if (
             self._publication_high_water_at is not None
             and observed_at < self._publication_high_water_at
         ):
-            return None, "publication time moved backward for unchanged HEAD"
+            return None, "publication time moved backward for unchanged branch"
+        self._publication_high_water_identity = identity
         self._publication_high_water_at = observed_at
         self._publication_recovery_cutoff_at = None
         self.state.publication_watermark = PublicationWatermark(

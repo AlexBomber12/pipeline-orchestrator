@@ -5722,7 +5722,7 @@ def test_recorded_branch_creation_review_reaches_watch_merge_handoff(
     )
     if case == "backward":
         assert runner.state.current_pr.publication_at is None
-        assert runner.state.current_pr.publication_reason == "publication time moved backward for unchanged HEAD"
+        assert runner.state.current_pr.publication_reason == "publication time moved backward for unchanged branch"
         asyncio.run(runner.handle_watch())
         assert calls == []
         assert runner.state.current_pr.publication_at is None
@@ -5800,7 +5800,7 @@ def test_contextless_failure_cannot_erase_publication_watermark(
         assert runner._publication_high_water_at == floor
         assert runner.state.current_pr.review_status == ReviewStatus.PENDING
     assert runner.state.current_pr.publication_at is None
-    assert runner.state.current_pr.publication_reason == "publication time moved backward for unchanged HEAD"
+    assert runner.state.current_pr.publication_reason == "publication time moved backward for unchanged branch"
 
 
 def _publication_safety_boundary(monkeypatch: pytest.MonkeyPatch):
@@ -5958,7 +5958,7 @@ def test_recovery_restores_publication_floor_before_stale_watch(
 
 
 @pytest.mark.parametrize("damage", [
-    "missing", "wrong_repo", "wrong_pr", "wrong_head", "wrong_ref",
+    "missing", "wrong_repo", "wrong_pr", "malformed_head", "wrong_ref",
     "wrong_head_repo", "missing_context",
     "naive_timestamp", "malformed_timestamp",
 ])
@@ -5985,8 +5985,8 @@ def test_recovery_without_usable_floor_holds_historical_approval(
             watermark["repo"] = "other/repo"
         elif damage == "wrong_pr":
             watermark["pr_number"] = 621
-        elif damage == "wrong_head":
-            watermark["head_sha"] = "b" * 40
+        elif damage == "malformed_head":
+            watermark["head_sha"] = "not-a-sha"
         elif damage == "wrong_ref":
             watermark["ref"] = "refs/heads/other"
         elif damage == "wrong_head_repo":

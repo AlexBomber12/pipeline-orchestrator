@@ -192,7 +192,7 @@ class InvocationSnapshot:
 
 
 class PublicationWatermark(BaseModel):
-    """Durable safety floor for one fully identified PR head publication."""
+    """Durable safety floor for one PR branch across its HEAD changes."""
 
     repo: str
     pr_number: int

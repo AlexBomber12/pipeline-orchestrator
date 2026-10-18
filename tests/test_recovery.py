@@ -715,7 +715,10 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     not lost when the user re-uploads to retry."""
     task = _doing_task()
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
-    monkeypatch.setattr(recovery_module, "scan_pr_diff", lambda diff: [type("V", (), {"category": "large_diff_threshold"})()])
+    monkeypatch.setattr(
+        recovery_module, "scan_pr_diff",
+        lambda diff: [type("V", (), {"category": "large_diff_threshold"})()],
+    )
 
     events: list[str] = []
 
@@ -1743,10 +1746,10 @@ def test_rehydrate_last_push_at_rejects_backward_same_head_observation(
     )
     runner._rehydrate_last_push_at(pr)
     assert runner._last_push_at is None
-    assert runner._push_provenance_reason == "publication time moved backward for unchanged HEAD"
+    assert runner._push_provenance_reason == "publication time moved backward for unchanged branch"
     runner._rehydrate_last_push_at(pr)
     assert runner._last_push_at is None
-    assert runner._push_provenance_reason == "publication time moved backward for unchanged HEAD"
+    assert runner._push_provenance_reason == "publication time moved backward for unchanged branch"
 
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
