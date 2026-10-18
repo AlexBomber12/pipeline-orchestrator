@@ -230,7 +230,8 @@ class RecoveryMixin:
         # startup recovery is always correct: if recovery re-enters
         # CODING through the DOING-with-matching-PR path the next handle
         # cycle rewrites the marker before invoking the coder.
-        self._publication_recovery_cutoff_at = datetime.now(timezone.utc)
+        if self._publication_recovery_cutoff_at is None:
+            self._publication_recovery_cutoff_at = datetime.now(timezone.utc)
         self._cleanup_expected_branch()
         return await self._recover_state_headers()
 

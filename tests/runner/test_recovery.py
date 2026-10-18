@@ -41,10 +41,12 @@ import subprocess
 import time  # noqa: F401
 import types  # noqa: F401
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
+from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
 from src.daemon.handlers import coding as coding_module  # noqa: F401,F811
 from src.daemon.handlers import error as error_module  # noqa: F401,F811
@@ -62,6 +64,43 @@ from src.models import (
 from src.task_status import MergedState
 
 from tests.runner import _helpers as h
+
+
+def test_recovery_retry_keeps_initial_publication_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    monkeypatch.setattr(runner, "_cleanup_expected_branch", lambda: None)
+
+    class RecoveryClock:
+        calls = 0
+
+        @classmethod
+        def now(cls, _tz: timezone) -> datetime:
+            cls.calls += 1
+            return datetime(2026, 10, 18, 19, tzinfo=timezone.utc) + timedelta(
+                minutes=cls.calls,
+            )
+
+    monkeypatch.setattr(recovery_module, "datetime", RecoveryClock)
+
+    async def unavailable() -> bool:
+        return False
+
+    monkeypatch.setattr(runner, "_recover_state_headers", unavailable)
+    assert asyncio.run(runner.recover_state()) is False
+    first_cutoff = runner._publication_recovery_cutoff_at
+    assert first_cutoff is not None
+
+    assert asyncio.run(runner.recover_state()) is False
+    assert runner._publication_recovery_cutoff_at == first_cutoff
+    head = "a" * 40
+    assert runner._validate_publication_observation(
+        42, head, first_cutoff - timedelta(minutes=1), None,
+        head_repo=runner.owner_repo, ref="refs/heads/feature",
+        observed_repo=runner.owner_repo, observed_head_sha=head,
+        review_approval_at=first_cutoff + timedelta(seconds=30),
+    ) == (first_cutoff - timedelta(minutes=1), None)
 
 
 def _merged_state(
