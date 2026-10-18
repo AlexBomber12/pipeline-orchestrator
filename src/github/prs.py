@@ -365,6 +365,7 @@ def get_open_prs(
                 publication_ref=publication.ref,
                 publication_repo=publication.repo,
                 publication_head_sha=publication.head_sha,
+                publication_provenance=publication.provenance,
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),
                 is_escalated=any(
@@ -443,6 +444,7 @@ def _get_open_prs_rest(
                 publication_ref=publication.ref,
                 publication_repo=publication.repo,
                 publication_head_sha=publication.head_sha,
+                publication_provenance=publication.provenance,
                 url=entry.get("html_url", ""),
                 last_activity=_parse_iso(entry.get("updated_at")),
                 is_escalated=any(

@@ -95,6 +95,7 @@ class PRInfo(BaseModel):
     publication_ref: str = ""
     publication_repo: str = ""
     publication_head_sha: str = ""
+    publication_provenance: str = ""
     fix_iteration_count: int = 0
     no_push_fix_count: int = 0
     # OBS-BL (PR-249): WATCH retrigger cycles counted to cap runaway
@@ -200,6 +201,21 @@ class PublicationWatermark(BaseModel):
     ref: str
     head_sha: str
     published_at: datetime
+    provenance: str = "prior-validated-publication"
+
+
+class PublicationMigration(BaseModel):
+    """Upgrade-only proposal bound to the parent snapshot's open PR."""
+
+    repo: str
+    pr_number: int
+    head_repo: str
+    ref: str
+    head_sha: str
+    published_at: datetime | None = None
+    provenance: str = ""
+    reason: str
+    status: Literal["legacy", "blocked"] = "legacy"
 
 
 class RepoState(BaseModel):
@@ -212,6 +228,8 @@ class RepoState(BaseModel):
     current_queue_snapshot_at: datetime | None = None
     current_pr: PRInfo | None = None
     publication_watermark: PublicationWatermark | None = None
+    publication_schema_version: int = 1
+    publication_migration: PublicationMigration | None = None
     error_message: str | None = None
     last_updated: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)

@@ -59,6 +59,9 @@ from src.keyspace import (
 )
 from src.metrics import MetricsStore, RunRecord
 from src.models import InvocationSnapshot, PipelineState, RepoState
+from src.publication_migration import MigrationCommand, migration_binding
+from src.publication_migration import command_key as migration_command_key
+from src.publication_migration import confirmable as migration_confirmable
 from src.sandbox.runtime_state import (
     REDIS_SANDBOX_STATE_KEY,
     SandboxState,
@@ -688,6 +691,17 @@ async def _repo_template_context(
     guardrail_pending = await _build_guardrail_pending_view(
         redis_client, name, state
     )
+    migration_command = None
+    migration_token = None
+    if state.publication_migration is not None:
+        migration_token = migration_binding(state.publication_migration)
+        if redis_client is not None:
+            try:
+                raw_command = await redis_client.get(migration_command_key(name, migration_token))
+                if raw_command:
+                    migration_command = MigrationCommand.model_validate_json(raw_command)
+            except Exception:
+                migration_command = None
     selected_repo_coder = _repo_coder_form_value(repo_config)
     active_repo_coder = _active_repo_coder(state)
     active_invocation = (
@@ -703,6 +717,12 @@ async def _repo_template_context(
         "recent_graphql_burns": recent_graphql_burns,
         "resources": resources,
         "guardrail_pending": guardrail_pending,
+        "publication_migration_binding": migration_token,
+        "publication_migration_confirmable": (
+            migration_confirmable(state.publication_migration)
+            if state.publication_migration is not None else False
+        ),
+        "publication_migration_command": migration_command,
         "repo_config": repo_config,
         "daemon": config.daemon,
         "coders": _selectable_coder_plugins(registry),

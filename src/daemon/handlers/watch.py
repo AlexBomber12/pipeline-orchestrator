@@ -254,6 +254,18 @@ class WatchMixin:
         # failure during ``recover_state`` doesn't permanently leave
         # ``_last_push_at`` unset.
         if found.publication_observed:
+            if self.state.publication_migration is not None:
+                self._offer_publication_migration(
+                    found,
+                    gh_prs.HeadPublicationEvidence(
+                        repo=found.publication_repo, pr_number=found.number,
+                        head_repo=found.publication_head_repo, ref=found.publication_ref,
+                        head_sha=found.publication_head_sha,
+                        published_at=found.publication_at,
+                        provenance=found.publication_provenance,
+                        unknown_reason=found.publication_reason,
+                    ),
+                )
             published_at, reason = self._validate_publication_observation(
                 found.number, found.head_sha,
                 found.publication_at, found.publication_reason,
@@ -261,6 +273,7 @@ class WatchMixin:
                 ref=found.publication_ref,
                 observed_repo=found.publication_repo,
                 observed_head_sha=found.publication_head_sha,
+                provenance=found.publication_provenance,
             )
             found.publication_at = published_at
             found.publication_reason = reason

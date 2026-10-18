@@ -1389,6 +1389,7 @@ class PipelineRunner(
         ref: str = "",
         observed_repo: str = "",
         observed_head_sha: str | None = None,
+        provenance: str = "validated-github-activity",
     ) -> tuple[datetime | None, str | None]:
         """Reject backward reads without using a prior proof as current evidence."""
         # The arguments identify the requested target. The observation may be
@@ -1418,7 +1419,9 @@ class PipelineRunner(
             self.state.publication_watermark = PublicationWatermark(
                 repo=self.owner_repo, pr_number=pr_number, head_repo=head_repo,
                 ref=ref, head_sha=head_sha, published_at=self._last_push_at,
+                provenance=provenance,
             )
+            self.state.publication_migration = None
         if observed_at is None:
             return None, reason
         if observed_at.tzinfo is None:
@@ -1457,7 +1460,9 @@ class PipelineRunner(
         self.state.publication_watermark = PublicationWatermark(
             repo=self.owner_repo, pr_number=pr_number, head_repo=head_repo,
             ref=ref, head_sha=head_sha, published_at=observed_at,
+            provenance=provenance,
         )
+        self.state.publication_migration = None
         return observed_at, None
 
     def _canonical_push_timestamp(self, pr_number: int) -> datetime | None:
@@ -1475,6 +1480,7 @@ class PipelineRunner(
             ref=getattr(evidence, "ref", ""),
             observed_repo=getattr(evidence, "repo", ""),
             observed_head_sha=getattr(evidence, "head_sha", ""),
+            provenance=getattr(evidence, "provenance", ""),
         )
         self._push_provenance_reason = reason
         self._last_push_at_head_sha = pr.head_sha if published_at else None
@@ -3590,6 +3596,8 @@ class PipelineRunner(
         # leaving the browser to infer success from an HTTP response.  Fresh
         # runners recover task/PR state first, then consume on the next cycle.
         if self._recovered:
+            if await self._consume_publication_migration_command():
+                return
             retry_dispatch = await self._consume_retry_command()
             if retry_dispatch != RetryDispatch.NONE:
                 await self.publish_state()

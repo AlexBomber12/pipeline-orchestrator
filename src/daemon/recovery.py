@@ -8,6 +8,7 @@ Mixin methods:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
@@ -30,10 +31,27 @@ from src.keyspace import pipeline_state, recovery_backup_branch
 from src.models import (
     PipelineState,
     PRInfo,
+    PublicationMigration,
     PublicationWatermark,
     QueueTask,
     RepoState,
     TaskStatus,
+)
+from src.publication_migration import (
+    MigrationCommand,
+    migration_binding,
+)
+from src.publication_migration import (
+    command_key as migration_command_key,
+)
+from src.publication_migration import (
+    confirmable as migration_confirmable,
+)
+from src.publication_migration import (
+    matches_state as migration_matches_state,
+)
+from src.publication_migration import (
+    pending_key as migration_pending_key,
 )
 from src.queue_parser import (
     QueueValidationError,
@@ -65,6 +83,157 @@ def _task_pr_sort_key(pr_id: str) -> tuple[int, int | str, str]:
 
 class RecoveryMixin:
     """State recovery on daemon startup."""
+
+    async def _consume_publication_migration_command(self) -> bool:
+        """Apply one exact operator trust anchor; never authorize merge itself."""
+        pointer_key = migration_pending_key(self.name)
+        raw_binding = await self.redis.get(pointer_key)
+        if not raw_binding:
+            return False
+        binding = raw_binding.decode() if isinstance(raw_binding, bytes) else raw_binding
+        key = migration_command_key(self.name, binding)
+        raw = await self.redis.get(key)
+        if not raw:
+            self.log_event("[RECOVERY] Publication migration receipt missing; operator investigation required.")
+            return True
+        command = MigrationCommand.model_validate_json(raw)
+        if command.status == "applied":
+            saved = await self.redis.get(pipeline_state(self.name))
+            if saved:
+                self._restore_publication_watermark(RepoState.model_validate_json(saved))
+            return True
+        if command.status == "failed":
+            return True
+        proposal = self.state.publication_migration
+        reason = None
+        deferred = False
+        if (
+            proposal is None or proposal.status != "legacy"
+            or not migration_matches_state(proposal, self.state)
+            or self.state.url != self.repo_config.url
+            or (proposal.repo, proposal.pr_number, proposal.head_repo,
+                proposal.ref, proposal.head_sha) != (
+                    command.observation.repo, command.observation.pr_number,
+                    command.observation.head_repo, command.observation.ref,
+                    command.observation.head_sha,
+                )
+        ):
+            reason = "Migration target or observation changed; refresh and confirm again."
+        elif proposal.published_at is None:
+            reason = "Current publication evidence is unavailable; waiting to revalidate the bound observation."
+            deferred = True
+        elif (
+            not migration_confirmable(proposal)
+            or migration_binding(proposal) != binding
+        ):
+            reason = "Migration publication observation changed; refresh and confirm again."
+        else:
+            try:
+                prs = gh_prs.get_open_prs(
+                    self.owner_repo, self.repo_config.allow_merge_without_checks
+                )
+                pr = next((item for item in prs if item.number == proposal.pr_number), None)
+                if (
+                    pr is None or pr.head_sha.lower() != proposal.head_sha.lower()
+                    or f"refs/heads/{pr.branch}" != proposal.ref
+                    or (not pr.is_cross_repository and proposal.head_repo != self.owner_repo)
+                ):
+                    reason = "Bound PR, branch, head repository or HEAD changed."
+                else:
+                    evidence = gh_prs.get_pr_head_publication(
+                        self.owner_repo, pr.number, expected_head_sha=proposal.head_sha
+                    )
+                    if (
+                        evidence.repo != proposal.repo or evidence.pr_number != proposal.pr_number
+                        or evidence.head_repo != proposal.head_repo or evidence.ref != proposal.ref
+                        or evidence.head_sha.lower() != proposal.head_sha.lower()
+                    ):
+                        reason = "Publication evidence changed or is unavailable; refresh and confirm again."
+                    elif evidence.unknown_reason is not None or evidence.published_at is None:
+                        reason = (
+                            "Current publication evidence is unavailable; "
+                            "waiting to revalidate the bound observation."
+                        )
+                        deferred = True
+                    elif (
+                        evidence.published_at != proposal.published_at
+                        or evidence.provenance != proposal.provenance
+                    ):
+                        reason = "Publication event changed; refresh and confirm again."
+            except Exception as exc:
+                reason = f"Publication revalidation unavailable: {type(exc).__name__}; waiting to retry."
+                deferred = True
+        watermark = None
+        if reason is None:
+            watermark = PublicationWatermark(
+                repo=proposal.repo, pr_number=proposal.pr_number,
+                head_repo=proposal.head_repo, ref=proposal.ref,
+                head_sha=proposal.head_sha, published_at=proposal.published_at,
+                provenance=proposal.provenance,
+            )
+
+        async def transaction(pipe):
+            stored = MigrationCommand.model_validate_json(await pipe.get(key))
+            state = RepoState.model_validate_json(await pipe.get(pipeline_state(self.name)))
+            current_pointer = await pipe.get(pointer_key)
+            if isinstance(current_pointer, bytes):
+                current_pointer = current_pointer.decode()
+            if stored.status not in ("pending", "deferred") or current_pointer != binding:
+                return False
+            current = state.publication_migration
+            if (
+                current is None or current.status != "legacy"
+                or not migration_matches_state(current, state)
+                or state.url != self.repo_config.url
+                or (current.repo, current.pr_number, current.head_repo,
+                    current.ref, current.head_sha) != (
+                        stored.observation.repo, stored.observation.pr_number,
+                        stored.observation.head_repo, stored.observation.ref,
+                        stored.observation.head_sha,
+                    )
+            ):
+                stored.status = "failed"
+                stored.reason = "Published migration proposal changed before commit."
+            elif current.published_at is None or deferred:
+                stored.status = "deferred"
+                stored.reason = reason or "Current publication evidence is unavailable; waiting to retry."
+            elif migration_binding(current) != binding:
+                stored.status = "failed"
+                stored.reason = "Published migration observation changed before commit."
+            elif reason is not None:
+                stored.status = "failed"
+                stored.reason = reason
+            else:
+                stored.status = "applied"
+                stored.reason = (
+                    "Initial publication floor stored; normal current-evidence, "
+                    "CI and review gates remain active."
+                )
+                state.publication_watermark = watermark
+                state.publication_migration = None
+            pipe.multi()
+            pipe.set(key, stored.model_dump_json())
+            if stored.status != "deferred":
+                pipe.delete(pointer_key)
+            if stored.status == "applied":
+                pipe.set(pipeline_state(self.name), state.model_dump_json())
+            return stored.status == "applied"
+
+        applied = await self.redis.transaction(
+            transaction, key, pointer_key, pipeline_state(self.name), value_from_callable=True
+        )
+        if applied:
+            self._publication_high_water_identity = (
+                watermark.repo, watermark.pr_number, watermark.head_repo,
+                watermark.ref, watermark.head_sha,
+            )
+            self._publication_high_water_at = watermark.published_at
+            self._publication_recovery_cutoff_at = None
+            self.state.publication_watermark = watermark
+            self.state.publication_migration = None
+        else:
+            self.log_event(f"[RECOVERY] Publication migration rejected: {reason or 'state changed'}.")
+        return True
 
     def _parse_tasks_from_headers(self) -> list[QueueTask] | None:
         """Parse structured task headers into a recovered queue snapshot.
@@ -283,8 +452,54 @@ class RecoveryMixin:
         try:
             persisted = RepoState.model_validate_json(raw)
         except Exception:
+            self._publication_snapshot_damaged = True
             return
-        self._restore_publication_watermark(persisted)
+        snapshot = json.loads(raw)
+        pr_snapshot = snapshot.get("current_pr") if isinstance(snapshot, dict) else None
+        legacy = (
+            isinstance(snapshot, dict)
+            and "publication_schema_version" not in snapshot
+            and "publication_watermark" not in snapshot
+            and "publication_migration" not in snapshot
+            and isinstance(pr_snapshot, dict)
+            and not any(key.startswith("publication_") for key in pr_snapshot)
+            and persisted.name == self.name
+            and persisted.url == self.repo_config.url
+            and persisted.current_pr is not None
+            and re.fullmatch(r"[0-9a-fA-F]{40}", persisted.current_pr.head_sha) is not None
+        )
+        incompatible = (
+            isinstance(snapshot, dict)
+            and "publication_schema_version" in snapshot
+            and snapshot["publication_schema_version"] != 1
+        )
+        if incompatible and persisted.current_pr is not None:
+            pr = persisted.current_pr
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                status="blocked",
+                reason="Publication snapshot schema is incompatible; operator investigation required.",
+            )
+        elif legacy:
+            pr = persisted.current_pr
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                reason="Parent-version snapshot has no publication safety floor.",
+            )
+        elif persisted.publication_migration is not None:
+            self.state.publication_migration = persisted.publication_migration
+        elif persisted.current_pr is not None and persisted.publication_watermark is None:
+            pr = persisted.current_pr
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                status="blocked",
+                reason="Newer snapshot has no valid publication floor; operator investigation required.",
+            )
+        if not incompatible:
+            self._restore_publication_watermark(persisted)
         if (
             persisted.state in {PipelineState.ERROR, PipelineState.WATCH, PipelineState.FIX}
             and persisted.current_task is not None
@@ -351,6 +566,7 @@ class RecoveryMixin:
         self._publication_high_water_at = saved.published_at
         self._publication_recovery_cutoff_at = None
         self.state.publication_watermark = saved
+        self.state.publication_migration = None
 
     async def _finalize_interrupted_coding_invocation(self) -> None:
         """Finalize only the exact unfinished CODING checkpoint on recovery."""
@@ -612,6 +828,12 @@ class RecoveryMixin:
                     f"[RECOVERY] Restored bound FIX PR #{bound.number} for "
                     f"{queued.pr_id} in {recovered_state.value}."
                 )
+                if recovered_state == PipelineState.WATCH and any(
+                    item.number == bound.number and item.branch == bound.branch
+                    and item.head_sha.lower() == bound.head_sha.lower()
+                    for item in prs
+                ):
+                    self._rehydrate_last_push_at(bound)
                 return
 
         if doing is not None:
@@ -1274,9 +1496,17 @@ class RecoveryMixin:
 
     def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
         """Refresh the feedback floor from current-head publication evidence."""
+        if getattr(self, "_publication_snapshot_damaged", False):
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                status="blocked",
+                reason="Saved state is corrupt; publication trust cannot be migrated automatically.",
+            )
         evidence = gh_prs.get_pr_head_publication(
             self.owner_repo, pr.number, expected_head_sha=pr.head_sha
         )
+        self._offer_publication_migration(pr, evidence)
         published_at, reason = self._validate_publication_observation(
             pr.number, pr.head_sha, evidence.published_at,
             getattr(evidence, "unknown_reason", None),
@@ -1284,8 +1514,55 @@ class RecoveryMixin:
             ref=getattr(evidence, "ref", ""),
             observed_repo=getattr(evidence, "repo", ""),
             observed_head_sha=getattr(evidence, "head_sha", ""),
+            provenance=getattr(evidence, "provenance", ""),
         )
         self._last_push_at = published_at
         self._last_push_at_pr_number = pr.number
         self._last_push_at_head_sha = pr.head_sha if published_at else None
         self._push_provenance_reason = reason
+
+    def _offer_publication_migration(self, pr: PRInfo, evidence: gh_prs.HeadPublicationEvidence) -> None:
+        """Bootstrap only a proven branch creation from the exact old snapshot."""
+        proposal = self.state.publication_migration
+        if proposal is None or proposal.status != "legacy":
+            return
+        if (
+            proposal.repo != self.owner_repo or proposal.pr_number != pr.number
+            or proposal.ref != f"refs/heads/{pr.branch}"
+            or proposal.head_sha.lower() != pr.head_sha.lower()
+        ):
+            proposal.status = "blocked"
+            proposal.reason = "Recovered PR target changed; original upgrade proposal is invalid."
+            return
+        if (
+            evidence.repo != self.owner_repo or evidence.pr_number != pr.number
+            or evidence.ref != proposal.ref or evidence.head_sha.lower() != pr.head_sha.lower()
+            or re.fullmatch(r"[^/]+/[^/]+", evidence.head_repo) is None
+            or (not pr.is_cross_repository and evidence.head_repo != self.owner_repo)
+            or evidence.published_at is None or evidence.published_at.tzinfo is None
+            or evidence.unknown_reason is not None
+            or not evidence.provenance.startswith("github-activity:")
+        ):
+            proposal.published_at = None
+            proposal.reason = evidence.unknown_reason or "Publication metadata is missing or contradictory."
+            return
+        if proposal.head_repo and proposal.head_repo != evidence.head_repo:
+            proposal.status = "blocked"
+            proposal.reason = "PR head repository changed during migration."
+            return
+        proposal.head_repo = evidence.head_repo
+        proposal.published_at = evidence.published_at
+        proposal.provenance = evidence.provenance
+        proposal.reason = "Historical publication needs an operator trust anchor."
+        if evidence.provenance == "github-activity:branch_creation":
+            self._publication_high_water_identity = (
+                self.owner_repo, pr.number, evidence.head_repo, evidence.ref, pr.head_sha,
+            )
+            self._publication_high_water_at = evidence.published_at
+            self._publication_recovery_cutoff_at = None
+            self.state.publication_watermark = PublicationWatermark(
+                repo=self.owner_repo, pr_number=pr.number, head_repo=evidence.head_repo,
+                ref=evidence.ref, head_sha=pr.head_sha, published_at=evidence.published_at,
+                provenance=evidence.provenance,
+            )
+            self.state.publication_migration = None
