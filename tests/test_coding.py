@@ -614,7 +614,11 @@ def _patch_codex_reactions(
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
-        lambda *args, **kwargs: SimpleNamespace(published_at=gh_runner._parse_iso(last_push_iso), unknown_reason=None),
+        lambda *args, **kwargs: SimpleNamespace(
+            repo="octo/demo", head_repo="octo/demo", ref="refs/heads/pr-001",
+            head_sha=kwargs["expected_head_sha"],
+            published_at=gh_runner._parse_iso(last_push_iso), unknown_reason=None,
+        ),
     )
 
 
@@ -622,7 +626,7 @@ def test_handle_coding_skips_codex_review_when_eyes_already_reacted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """OBS-Z: Codex auto-trigger already landed → skip duplicate mention."""
-    pr = PRInfo(number=42, branch="pr-001")
+    pr = PRInfo(number=42, branch="pr-001", head_sha="a" * 40)
     runner = _runner(monkeypatch, open_prs_initial=[pr])
     _patch_codex_reactions(monkeypatch, eyes_present=True)
     posted: list[int] = []
@@ -674,6 +678,7 @@ def test_should_skip_codex_review_post_reuses_one_reviewer_policy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001", head_sha="a" * 40)
     selected_policy = object()
     observed_policies: list[object | None] = []
 
@@ -715,7 +720,9 @@ def test_should_skip_codex_review_post_reuses_one_reviewer_policy(
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
-        lambda *args, **kwargs: SimpleNamespace(published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
+        lambda *args, **kwargs: SimpleNamespace(repo="octo/demo", head_repo="octo/demo",
+            ref="refs/heads/pr-001", head_sha=kwargs["expected_head_sha"],
+            published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
     )
 
     assert runner._should_skip_codex_review_post(42) is True
@@ -727,6 +734,7 @@ def test_should_skip_codex_review_post_fails_open_on_push_time_error(
 ) -> None:
     """Unresolvable last-push time must not suppress the mention."""
     runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001", head_sha="a" * 40)
 
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
@@ -751,6 +759,7 @@ def test_should_skip_codex_review_post_fails_open_on_missing_push_time(
 ) -> None:
     """A ``None`` last-push time (activity API degraded) must fail open."""
     runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001", head_sha="a" * 40)
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number, policy=None: [
@@ -763,7 +772,9 @@ def test_should_skip_codex_review_post_fails_open_on_missing_push_time(
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
-        lambda *args, **kwargs: SimpleNamespace(published_at=None),
+        lambda *args, **kwargs: SimpleNamespace(repo="octo/demo", head_repo="octo/demo",
+            ref="refs/heads/pr-001", head_sha=kwargs["expected_head_sha"],
+            published_at=None),
     )
     assert runner._should_skip_codex_review_post(42) is False
 
@@ -773,6 +784,7 @@ def test_should_skip_codex_review_post_skips_when_eyes_after_push(
 ) -> None:
     """A fresh EYES reaction (after the last push) suppresses the mention."""
     runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001", head_sha="a" * 40)
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number, policy=None: [
@@ -785,7 +797,9 @@ def test_should_skip_codex_review_post_skips_when_eyes_after_push(
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
-        lambda *args, **kwargs: SimpleNamespace(published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
+        lambda *args, **kwargs: SimpleNamespace(repo="octo/demo", head_repo="octo/demo",
+            ref="refs/heads/pr-001", head_sha=kwargs["expected_head_sha"],
+            published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
     )
     assert runner._should_skip_codex_review_post(42) is True
 
@@ -795,6 +809,7 @@ def test_should_skip_codex_review_post_does_not_skip_when_eyes_predates_push(
 ) -> None:
     """A stale EYES reaction must not suppress review after a new push."""
     runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001", head_sha="a" * 40)
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number, policy=None: [
@@ -807,7 +822,9 @@ def test_should_skip_codex_review_post_does_not_skip_when_eyes_predates_push(
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
-        lambda *args, **kwargs: SimpleNamespace(published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
+        lambda *args, **kwargs: SimpleNamespace(repo="octo/demo", head_repo="octo/demo",
+            ref="refs/heads/pr-001", head_sha=kwargs["expected_head_sha"],
+            published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
     )
     assert runner._should_skip_codex_review_post(42) is False
 
@@ -824,6 +841,7 @@ def test_should_skip_codex_review_post_does_not_skip_on_backdated_head_commit(
     push-time gate must reject it.
     """
     runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001", head_sha="a" * 40)
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number, policy=None: [
@@ -836,7 +854,9 @@ def test_should_skip_codex_review_post_does_not_skip_on_backdated_head_commit(
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
-        lambda *args, **kwargs: SimpleNamespace(published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
+        lambda *args, **kwargs: SimpleNamespace(repo="octo/demo", head_repo="octo/demo",
+            ref="refs/heads/pr-001", head_sha=kwargs["expected_head_sha"],
+            published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
     )
     assert runner._should_skip_codex_review_post(42) is False
 
@@ -850,6 +870,7 @@ def test_should_skip_codex_review_post_normalizes_naive_timestamps(
     from datetime import timezone as _tz
 
     runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001", head_sha="a" * 40)
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number, policy=None: [
@@ -862,7 +883,9 @@ def test_should_skip_codex_review_post_normalizes_naive_timestamps(
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
-        lambda *args, **kwargs: SimpleNamespace(published_at=_dt(2026, 4, 30, 12, 0, 0, tzinfo=_tz.utc)),
+        lambda *args, **kwargs: SimpleNamespace(repo="octo/demo", head_repo="octo/demo",
+            ref="refs/heads/pr-001", head_sha=kwargs["expected_head_sha"],
+            published_at=_dt(2026, 4, 30, 12, 0, 0, tzinfo=_tz.utc)),
     )
     monkeypatch.setattr(
         "src.github.gh_runner._parse_iso",
@@ -877,6 +900,7 @@ def test_should_skip_codex_review_post_ignores_eyes_without_created_at(
 ) -> None:
     """Reaction missing ``created_at`` cannot prove freshness; do not skip."""
     runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001", head_sha="a" * 40)
     monkeypatch.setattr(
         "src.github.reactions._get_codex_issue_reactions",
         lambda repo, number, policy=None: [
@@ -888,7 +912,9 @@ def test_should_skip_codex_review_post_ignores_eyes_without_created_at(
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
-        lambda *args, **kwargs: SimpleNamespace(published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
+        lambda *args, **kwargs: SimpleNamespace(repo="octo/demo", head_repo="octo/demo",
+            ref="refs/heads/pr-001", head_sha=kwargs["expected_head_sha"],
+            published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
     )
     assert runner._should_skip_codex_review_post(42) is False
 
@@ -897,7 +923,7 @@ def test_diagnose_case_c_skips_codex_review_when_eyes_already_reacted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Daemon-created PR (case C) also honors the EYES race-window dedup."""
-    created = PRInfo(number=99, branch="pr-001")
+    created = PRInfo(number=99, branch="pr-001", head_sha="a" * 40)
     runner = _runner(monkeypatch, open_prs_after_create=[created])
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
     _patch_codex_reactions(monkeypatch, eyes_present=True)

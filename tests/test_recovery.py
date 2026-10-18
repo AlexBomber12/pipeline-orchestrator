@@ -1736,7 +1736,10 @@ def test_rehydrate_last_push_at_rejects_backward_same_head_observation(
 
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
-        lambda *_a, **_kw: SimpleNamespace(published_at=older, unknown_reason=None),
+        lambda *_a, **_kw: SimpleNamespace(
+            repo="octo/demo", head_repo="octo/demo", ref="refs/heads/pr-042-inflight",
+            head_sha=pr.head_sha, published_at=older, unknown_reason=None,
+        ),
     )
     runner._rehydrate_last_push_at(pr)
     assert runner._last_push_at is None
@@ -1747,7 +1750,10 @@ def test_rehydrate_last_push_at_rejects_backward_same_head_observation(
 
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
-        lambda *_a, **_kw: SimpleNamespace(published_at=newer, unknown_reason=None),
+        lambda *_a, **_kw: SimpleNamespace(
+            repo="octo/demo", head_repo="octo/demo", ref="refs/heads/pr-042-inflight",
+            head_sha=pr.head_sha, published_at=newer, unknown_reason=None,
+        ),
     )
     runner._rehydrate_last_push_at(pr)
     assert runner._last_push_at == newer

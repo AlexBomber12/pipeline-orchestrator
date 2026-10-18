@@ -5717,6 +5717,10 @@ def test_publication_watermark_survives_contextless_unknown_read() -> None:
                "observed_repo": runner.owner_repo, "observed_head_sha": head}
     assert runner._validate_publication_observation(42, head, newer, None, **context) == (newer, None)
     assert runner._validate_publication_observation(
+        42, head, older, "activity contradictory", **context,
+    ) == (None, "activity contradictory")
+    assert runner._publication_high_water_at == newer
+    assert runner._validate_publication_observation(
         42, head, None, "head context unavailable"
     ) == (None, "head context unavailable")
     assert runner._publication_high_water_at == newer
