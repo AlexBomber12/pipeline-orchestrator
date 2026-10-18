@@ -5722,3 +5722,77 @@ def test_recorded_branch_creation_review_reaches_watch_merge_handoff(
         asyncio.run(runner.handle_watch())
         assert calls == []
         assert runner.state.current_pr.publication_at is None
+
+
+def test_contextless_failure_cannot_erase_publication_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later stale read cannot approve after a contextless transport failure."""
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+    branch = "pr-459-e2e-failure-evidence"
+    created = {
+        "activity_type": "branch_creation", "before": "0" * 40, "after": head,
+        "ref": f"refs/heads/{branch}", "timestamp": "2026-10-17T21:06:35Z",
+    }
+    newer = {**created, "activity_type": "push", "timestamp": "2026-10-17T21:10:00Z"}
+    mode = {"value": "new"}
+
+    def run_gh(args: list[str], **_kw: object) -> object:
+        if "/pulls/" in args[1]:
+            if mode["value"] == "unavailable":
+                raise RuntimeError("transport unavailable")
+            return {"branch": branch, "repo": "octo/demo", "sha": head}
+        if "/activity?" in args[1]:
+            return [newer] if mode["value"] == "new" else [created]
+        raise AssertionError(args)
+
+    actor = {"id": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+    def paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/620/reactions"):
+            return [{"content": "+1", "user": actor,
+                     "created_at": "2026-10-17T21:08:48Z"}]
+        return []
+
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        gh_reviews.clear_review_status_cache()
+        publication = watch_module.gh_prs.get_pr_head_publication(
+            repo, 620, expected_head_sha=head
+        )
+        review = gh_reviews.get_pr_review_status(
+            repo, 620, "author", head, policy=kwargs["reviewer_policy"],
+            publication_evidence=publication,
+        )
+        return [PRInfo(
+            number=620, branch=branch, head_sha=head, ci_status=CIStatus.SUCCESS,
+            review_status=review, diff_scanned_at_sha=head,
+            publication_observed=True, publication_at=publication.published_at,
+            publication_reason=publication.unknown_reason,
+            publication_head_repo=publication.head_repo, publication_ref=publication.ref,
+        )]
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", run_gh)
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", paginated)
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    runner = h._make_runner(auto_merge=True)
+    runner.state.current_pr = PRInfo(number=620, branch=branch, head_sha=head,
+                                     diff_scanned_at_sha=head)
+    runner.state.state = PipelineState.WATCH
+    merged: list[int] = []
+    async def merge() -> None:
+        merged.append(620)
+    async def no_work(*_args: object) -> None:
+        return None
+    monkeypatch.setattr(runner, "handle_merge", merge)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_work)
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_work)
+
+    floor = datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    for value in ("new", "unavailable", "old"):
+        mode["value"] = value
+        asyncio.run(runner.handle_watch())
+        assert merged == []
+        assert runner._publication_high_water_at == floor
+        assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+    assert runner.state.current_pr.publication_at is None
+    assert runner.state.current_pr.publication_reason == "publication time moved backward for unchanged HEAD"

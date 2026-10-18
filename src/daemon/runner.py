@@ -1390,6 +1390,20 @@ class PipelineRunner(
         ):
             self._publication_high_water_identity = identity
             self._publication_high_water_at = self._last_push_at
+        prior_identity = self._publication_high_water_identity
+        if (
+            observed_at is None
+            and prior_identity is not None
+            and prior_identity[0] == self.owner_repo
+            and prior_identity[1] == pr_number
+            and prior_identity[4] == head_sha
+            and (not head_repo or head_repo == prior_identity[2])
+            and (not ref or ref == prior_identity[3])
+        ):
+            # A failed read without complete context cannot disprove a
+            # previous observation. Retain it solely to reject later stale
+            # activity; this poll remains unknown to approval/feedback gates.
+            return None, reason
         if self._publication_high_water_identity != identity:
             self._publication_high_water_identity = identity
             self._publication_high_water_at = None

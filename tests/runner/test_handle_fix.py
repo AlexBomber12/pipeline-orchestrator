@@ -5701,6 +5701,25 @@ def test_publication_watermark_rejects_naive_timestamp() -> None:
     ) == (None, "publication timestamp missing timezone")
 
 
+def test_publication_watermark_survives_contextless_unknown_read() -> None:
+    runner = h._make_runner()
+    head = "a" * 40
+    newer = datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    older = datetime(2026, 10, 17, 21, 6, tzinfo=timezone.utc)
+    context = {"head_repo": "owner/name", "ref": "refs/heads/feature"}
+    assert runner._validate_publication_observation(42, head, newer, None, **context) == (newer, None)
+    assert runner._validate_publication_observation(
+        42, head, None, "head context unavailable"
+    ) == (None, "head context unavailable")
+    assert runner._publication_high_water_at == newer
+    assert runner._validate_publication_observation(42, head, older, None, **context) == (
+        None, "publication time moved backward for unchanged HEAD"
+    )
+    # A genuinely new HEAD cannot inherit the previous head's watermark.
+    assert runner._validate_publication_observation(42, "b" * 40, None, "unknown") == (None, "unknown")
+    assert runner._publication_high_water_at is None
+
+
 def test_no_push_branch_uses_publication_evidence_when_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
