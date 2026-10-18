@@ -68,6 +68,7 @@ class ReviewFeedback:
     latest_blocking_at: datetime | None = None
     undated_blocking: bool = False
     latest_finding_at: datetime | None = None
+    provider_error_only: bool = False
 
 
 def format_review_feedback(findings: tuple[str, ...]) -> str | None:
@@ -144,7 +145,8 @@ def feedback_from_comments(
     findings: list[str] = []
     ids: list[int] = []
     sources: list[tuple[str, int, int]] = []
-    unknown = False
+    unsupported_unknown = False
+    provider_error = False
     latest_blocking_at: datetime | None = None
     undated_blocking = False
     latest_finding_at: datetime | None = None
@@ -177,18 +179,22 @@ def feedback_from_comments(
                     "review" if inline else "issue", comment_id,
                     (comment.get("user") or {}).get("id") or 0,
                 ))
-            elif kind in ("unknown", "provider_error"):
-                unknown = True
+            elif kind == "unknown":
+                unsupported_unknown = True
+            elif kind == "provider_error":
+                provider_error = True
     return ReviewFeedback(
         tuple(findings), tuple(ids),
         (
-            "trusted review text has no supported finding shape" if unknown and not findings
+            "trusted review text has no supported finding shape"
+            if (unsupported_unknown or provider_error) and not findings
             else None
         ),
         tuple(sources),
         latest_blocking_at,
         undated_blocking,
         latest_finding_at,
+        provider_error and not unsupported_unknown,
     )
 
 
@@ -468,6 +474,8 @@ def _compute_review_status(
         default=None,
     )
     if approved_at and (feedback.findings or feedback.unknown_reason):
+        if feedback.provider_error_only and not feedback.findings:
+            return ReviewStatus.APPROVED
         # GitHub timestamps have one-second resolution. A valid +1 wins a tie
         # with earlier blocking text on the same HEAD.
         if (

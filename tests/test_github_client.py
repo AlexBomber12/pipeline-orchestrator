@@ -6312,6 +6312,24 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     )
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    provider_error = {
+        "id": 13, "user": receipt["user"],
+        "body": "Codex Review: unable to complete review. Try again later.",
+        "created_at": "2026-10-17T21:10:00Z",
+    }
+    issue_comments.append(provider_error)
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    malformed_summary = {
+        "id": 14, "user": receipt["user"],
+        "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v2 {} -->",
+        "created_at": "2026-10-17T21:11:00Z",
+    }
+    issue_comments.append(malformed_summary)
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    issue_comments.remove(malformed_summary)
+    issue_comments.remove(provider_error)
 
     body_reactions[0]["created_at"] = "2026-10-17T21:06:00Z"
     reviews.clear_review_status_cache()
