@@ -6350,7 +6350,7 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
     assert comments.get_latest_codex_feedback("owner/name", 42) == "[P1] Fix the review complete callback"
     issue_comments.append({
-        "id": 12, "user": receipt["user"], "body": "I found one issue.",
+        "id": 12, "user": receipt["user"], "body": "",
         "created_at": "2026-10-17T21:12:00Z",
     })
     reviews.clear_review_status_cache()
@@ -6382,9 +6382,13 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
         "create a Codex account and connect to github": "onboarding",
         "Unable to review this PR": "provider_error",
         "Review is in progress": "progress",
-        "Something went wrong while reviewing this PR. Please try again.": "progress",
+        "Something went wrong while reviewing this PR. Please try again.": "provider_error",
         "Summary: review started": "summary",
-        "A general update": "unknown",
+        "Summary: This change correctly handles empty input": "summary",
+        "Summary:\n[P1] Fix the empty input": "finding",
+        "": "unknown",
+        "I found one issue.": "finding",
+        "This dereferences None on empty input": "finding",
         "P2: fix the null check": "finding",
         "[P1] Fix the no findings empty state": "finding",
         "[P1] Fix the review complete callback": "finding",
@@ -6414,7 +6418,7 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
     assert evidence.latest_blocking_at == datetime(2026, 1, 1, 0, 3, tzinfo=_tz.utc)
     assert evidence.latest_finding_at == datetime(2026, 1, 1, 0, 3, tzinfo=_tz.utc)
     assert evidence.undated_blocking
-    unsupported = {"id": 3, "user": actor, "body": "A general update",
+    unsupported = {"id": 3, "user": actor, "body": "",
                    "created_at": "2026-01-01T00:02:00Z"}
     assert reviews.feedback_from_comments(
         [anchor, unsupported], [], "author", policy

@@ -125,7 +125,7 @@ def test_watch_supplies_only_admitted_findings_to_fix_prompt(
         {"id": 12, "user": {"id": 999, "login": "other"},
          "body": "P1: unrelated advice",
          "created_at": (push_time + timedelta(minutes=1, seconds=10)).isoformat()},
-        {"id": 13, "user": actor, "body": "I found one issue.",
+        {"id": 13, "user": actor, "body": "This dereferences None on empty input",
          "created_at": (push_time + timedelta(minutes=1, seconds=15)).isoformat()},
     ]
     monkeypatch.setattr(
@@ -161,7 +161,7 @@ def test_watch_supplies_only_admitted_findings_to_fix_prompt(
     context = captured["kwargs"]["extra_context"]
     assert "Latest review feedback:\nP1: fix the null check" in context
     assert "unrelated advice" not in context
-    assert "I found one issue" not in context
+    assert "This dereferences None on empty input" in context
     if ci_status == CIStatus.FAILURE:
         assert "ci-boom" in context
 

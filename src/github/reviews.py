@@ -27,10 +27,7 @@ from src.models import ReviewStatus
 logger = logging.getLogger(__name__)
 REVIEW_FEEDBACK_TRUNCATE_CHARS = 5000
 
-_FINDING = re.compile(
-    r"\b(?:P[0-3]\b|please\b(?!\s+try\s+again)|consider\b|fix\b|"
-    r"missing\b|incorrect\b|bug\b|rename\b|change\b)", re.I,
-)
+_PRIORITY_FINDING = re.compile(r"(?:^|\n)\s*(?:\*\*)?\[?P[0-3]\b", re.I)
 _RECEIPT = re.compile(
     r"^<!-- codex-review-receipt:v1 -->|"
     r"^(?:codex review:\s*)?(?:didn't find any major issues(?:\. delightful!)?|"
@@ -38,10 +35,13 @@ _RECEIPT = re.compile(
     r"^(?:lgtm|looks good overall)[.!\s]*$", re.I,
 )
 _PROGRESS = re.compile(
-    r"review (?:is )?(?:in progress|started|complete)|reviewing (?:this|your|the) pr|"
-    r"^reviewing now[.!\s]*$", re.I,
+    r"^(?:review (?:is )?(?:in progress|started|complete)|"
+    r"reviewing (?:this|your|the) pr|reviewing now)[.!\s]*$", re.I,
 )
-_PROVIDER_ERROR = re.compile(r"unable to (?:review|complete)|encountered an error", re.I)
+_PROVIDER_ERROR = re.compile(
+    r"^(?:unable to (?:review|complete)\b|encountered an error\b|"
+    r"something went wrong while reviewing\b)", re.I,
+)
 _SUMMARY = re.compile(r"^(?:\*\*)?(?:review )?(?:summary|status update)(?:\*\*)?:", re.I)
 
 
@@ -77,15 +77,15 @@ def classify_review_comment(comment: dict, *, inline: bool = False) -> str:
         return "receipt"
     if _reactions._is_codex_onboarding_comment(comment):
         return "onboarding"
-    if inline or _FINDING.search(body):
+    if inline or _PRIORITY_FINDING.search(body):
         return "finding"
-    if _PROVIDER_ERROR.search(body):
-        return "provider_error"
     if _SUMMARY.search(body):
         return "summary"
+    if _PROVIDER_ERROR.search(body):
+        return "provider_error"
     if _PROGRESS.search(body):
         return "progress"
-    return "unknown"
+    return "finding"
 
 
 def feedback_from_comments(
