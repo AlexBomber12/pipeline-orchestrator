@@ -114,9 +114,9 @@ def test_recovery_retry_keeps_initial_publication_cutoff(
         head_repo=runner.owner_repo, ref="refs/heads/feature",
         observed_repo=runner.owner_repo, observed_head_sha=head,
     ) == (first_cutoff + timedelta(seconds=30), None)
-    assert runner._publication_recovery_cutoff_at is None
+    assert runner._publication_recovery_cutoff_at == first_cutoff
     assert asyncio.run(runner.recover_state()) is False
-    assert runner._publication_recovery_cutoff_at is None
+    assert runner._publication_recovery_cutoff_at == first_cutoff
 
 
 def test_parent_snapshot_620_bootstraps_exact_branch_creation(
@@ -329,6 +329,91 @@ def test_recovery_retries_transient_snapshot_read_before_pr_discovery(
     assert asyncio.run(runner.recover_state()) is True
     assert runner.state.publication_watermark == saved.publication_watermark
     assert runner._last_push_at == publication
+
+
+def test_saved_floor_for_other_pr_keeps_recovery_cutoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """A restored floor for PR A cannot bootstrap historical PR B activity."""
+    repo = "octo/demo"
+    old_head = "a" * 40
+    new_head = "b" * 40
+    event_time = ["2026-04-10T12:00:00Z"]
+    new_pr = PRInfo(number=8, branch="pr-008", head_sha=new_head, pr_id="PR-008")
+
+    def transport(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/8" in args[1]:
+            return {"branch": "pr-008", "repo": repo, "sha": new_head}
+        if "/activity?" in args[1]:
+            return [{"activity_type": "push", "ref": "refs/heads/pr-008",
+                     "before": "c" * 40, "after": new_head,
+                     "timestamp": event_time[0]}]
+        raise AssertionError(args)
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", transport)
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [new_pr])
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    task = QueueTask(pr_id="PR-008", title="test", status=TaskStatus.DOING,
+                     branch="pr-008", task_file="tasks/PR-008.md")
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    old_pr = PRInfo(number=7, branch="pr-007", head_sha=old_head, pr_id="PR-007")
+    saved = RepoState(
+        url=runner.state.url, name=runner.state.name, state=PipelineState.WATCH,
+        current_pr=old_pr,
+        publication_watermark=PublicationWatermark(
+            repo=repo, pr_number=7, head_repo=repo, ref="refs/heads/pr-007",
+            head_sha=old_head, published_at=datetime(2026, 4, 10, 11, tzinfo=timezone.utc),
+            provenance="github-activity:branch_creation",
+        ),
+    )
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.current_pr.number == 8
+    assert runner._publication_recovery_cutoff_at is not None
+    assert runner.state.publication_watermark is None
+    assert runner._last_push_at is None
+    assert runner._canonical_push_timestamp(8) is None
+
+    fresh = runner._publication_recovery_cutoff_at + timedelta(seconds=1)
+    event_time[0] = fresh.isoformat().replace("+00:00", "Z")
+    assert runner._canonical_push_timestamp(8) == fresh
+    assert runner.state.publication_watermark.pr_number == 8
+
+
+def test_pre_cutoff_poll_for_saved_pr_does_not_release_other_pr(
+) -> None:
+    runner = h._make_runner()
+    cutoff = datetime(2026, 4, 11, tzinfo=timezone.utc)
+    old_event = cutoff - timedelta(days=1)
+    runner._publication_recovery_cutoff_at = cutoff
+    old_pr = PRInfo(number=7, branch="pr-007", head_sha="a" * 40)
+    saved = RepoState(
+        url=runner.state.url, name=runner.state.name, current_pr=old_pr,
+        publication_watermark=PublicationWatermark(
+            repo="octo/demo", pr_number=7, head_repo="octo/demo",
+            ref="refs/heads/pr-007", head_sha="a" * 40,
+            published_at=old_event, provenance="github-activity:branch_creation",
+        ),
+    )
+    runner._restore_publication_watermark(saved)
+    assert runner._validate_publication_observation(
+        7, "a" * 40, old_event, None, head_repo="octo/demo",
+        ref="refs/heads/pr-007", observed_repo="octo/demo",
+        observed_head_sha="a" * 40,
+    )[0] == old_event
+    assert runner._publication_recovery_cutoff_at == cutoff
+    assert runner._validate_publication_observation(
+        7, "a" * 40, cutoff + timedelta(seconds=1), None,
+        head_repo="octo/demo", ref="refs/heads/pr-007",
+        observed_repo="octo/demo", observed_head_sha="a" * 40,
+    )[0] == cutoff + timedelta(seconds=1)
+    assert runner._publication_recovery_cutoff_at == cutoff
+    assert runner._validate_publication_observation(
+        8, "b" * 40, old_event, None, head_repo="octo/demo",
+        ref="refs/heads/pr-008", observed_repo="octo/demo",
+        observed_head_sha="b" * 40,
+    )[0] is None
 
 
 @pytest.mark.parametrize("change_evidence", [False, True])

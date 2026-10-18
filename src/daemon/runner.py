@@ -1439,6 +1439,11 @@ class PipelineRunner(
         if (
             self._publication_recovery_cutoff_at is not None
             and observed_at <= self._publication_recovery_cutoff_at
+            and not (
+                prior_identity is not None
+                and prior_identity[:4] == identity[:4]
+                and self._publication_high_water_at is not None
+            )
         ):
             return None, "publication predates recovery without a trusted safety floor"
         # Keep the floor across SHA changes on the same branch: a force push
@@ -1456,7 +1461,6 @@ class PipelineRunner(
             return None, "publication time moved backward for unchanged branch"
         self._publication_high_water_identity = identity
         self._publication_high_water_at = observed_at
-        self._publication_recovery_cutoff_at = None
         self.state.publication_watermark = PublicationWatermark(
             repo=self.owner_repo, pr_number=pr_number, head_repo=head_repo,
             ref=ref, head_sha=head_sha, published_at=observed_at,

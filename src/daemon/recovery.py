@@ -228,7 +228,6 @@ class RecoveryMixin:
                 watermark.ref, watermark.head_sha,
             )
             self._publication_high_water_at = watermark.published_at
-            self._publication_recovery_cutoff_at = None
             self.state.publication_watermark = watermark
             self.state.publication_migration = None
         else:
@@ -568,7 +567,8 @@ class RecoveryMixin:
             saved.head_sha,
         )
         self._publication_high_water_at = saved.published_at
-        self._publication_recovery_cutoff_at = None
+        # Keep the startup cutoff for any different PR selected during recovery.
+        # The saved floor exempts only its own repository/PR/branch identity.
         self.state.publication_watermark = saved
         self.state.publication_migration = None
 
@@ -1595,7 +1595,6 @@ class RecoveryMixin:
                 self.owner_repo, pr.number, evidence.head_repo, evidence.ref, pr.head_sha,
             )
             self._publication_high_water_at = evidence.published_at
-            self._publication_recovery_cutoff_at = None
             self.state.publication_watermark = PublicationWatermark(
                 repo=self.owner_repo, pr_number=pr.number, head_repo=evidence.head_repo,
                 ref=evidence.ref, head_sha=pr.head_sha, published_at=evidence.published_at,
