@@ -273,7 +273,6 @@ def read_review_feedback(
 
 
 _review_status_cache: dict[str, "ReviewStatus"] = {}
-_review_approval_at_cache: dict[str, datetime | None] = {}
 _review_author_cache: dict[str, str] = {}
 _review_feedback_cache: dict[str, ReviewFeedback] = {}
 _review_status_cache_cycle: int | None = None
@@ -291,7 +290,6 @@ def clear_review_status_cache() -> None:
     """Clear the review status cache (used in tests)."""
     global _review_status_cache_cycle, _review_reset_generation
     _review_status_cache.clear()
-    _review_approval_at_cache.clear()
     _review_author_cache.clear()
     _review_feedback_cache.clear()
     _review_repo_cache_cycles.clear()
@@ -304,7 +302,6 @@ def _begin_review_cache_cycle(repo: str | None = None) -> None:
     global _review_status_cache_cycle, _review_reset_generation
     if repo is None:
         _review_status_cache.clear()
-        _review_approval_at_cache.clear()
         _review_author_cache.clear()
         _review_feedback_cache.clear()
         _review_repo_cache_cycles.clear()
@@ -312,10 +309,7 @@ def _begin_review_cache_cycle(repo: str | None = None) -> None:
         _review_reset_generation += 1
         return
     prefix = f"{repo}#"
-    for entries in (
-        _review_status_cache, _review_approval_at_cache,
-        _review_author_cache, _review_feedback_cache,
-    ):
+    for entries in (_review_status_cache, _review_author_cache, _review_feedback_cache):
         for key in tuple(entries):
             if key.startswith(prefix):
                 del entries[key]
@@ -380,15 +374,6 @@ def cached_review_author(
 ) -> str:
     """Use the author and policy snapshot from the PR status poll."""
     return _review_author_cache.get(_cache_key(repo, pr_number, head_sha, policy), "")
-
-
-def cached_review_approval_at(
-    repo: str, pr_number: int, head_sha: str, policy: ReviewerPolicy
-) -> datetime | None:
-    """Return the trusted +1 time observed during this PR status poll."""
-    return _review_approval_at_cache.get(
-        _cache_key(repo, pr_number, head_sha, policy)
-    )
 
 
 def cached_review_feedback(
@@ -560,10 +545,6 @@ def _compute_review_status(
         (t for t in (body_approval_at, anchor_approval_at) if t is not None),
         default=None,
     )
-    if head_sha:
-        _review_approval_at_cache[
-            _cache_key(repo, pr_number, head_sha, reviewer_policy)
-        ] = approved_at
     if approved_at and (feedback.findings or feedback.unknown_reason):
         if feedback.provider_error_only and not feedback.undated_finding and (
             not feedback.findings or (

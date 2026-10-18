@@ -261,10 +261,6 @@ class WatchMixin:
                 ref=found.publication_ref,
                 observed_repo=found.publication_repo,
                 observed_head_sha=found.publication_head_sha,
-                review_approval_at=(
-                    found.review_approval_at
-                    if found.review_status == ReviewStatus.APPROVED else None
-                ),
             )
             found.publication_at = published_at
             found.publication_reason = reason

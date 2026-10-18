@@ -354,9 +354,6 @@ def get_open_prs(
                     policy=reviewer_policy,
                     publication_evidence=publication,
                 ),
-                review_approval_at=reviews.cached_review_approval_at(
-                    repo, number, head_sha, reviewer_policy,
-                ),
                 commits_count=len(commits),
                 push_count=1 if head_sha else 0,
                 observed_head_shas={head_sha} if head_sha else set(),
@@ -391,7 +388,6 @@ def _get_open_prs_rest(
 ) -> list[PRInfo]:
     """Return open PRs via REST when GraphQL status rollup is unavailable."""
 
-    reviewer_policy = reviewer_policy or reviewer_policy_from_config(load_config())
     required_checks = (
         tuple(required_checks) if required_checks is not None else None
     )
@@ -435,9 +431,6 @@ def _get_open_prs_rest(
                     head_sha=head_sha,
                     policy=reviewer_policy,
                     publication_evidence=publication,
-                ),
-                review_approval_at=reviews.cached_review_approval_at(
-                    repo, number, head_sha, reviewer_policy,
                 ),
                 commits_count=1 if head_sha else 0,
                 push_count=1 if head_sha else 0,

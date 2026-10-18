@@ -96,11 +96,13 @@ def test_recovery_retry_keeps_initial_publication_cutoff(
     assert runner._publication_recovery_cutoff_at == first_cutoff
     head = "a" * 40
     assert runner._validate_publication_observation(
-        42, head, first_cutoff - timedelta(minutes=1), None,
+        42, head, first_cutoff + timedelta(seconds=30), None,
         head_repo=runner.owner_repo, ref="refs/heads/feature",
         observed_repo=runner.owner_repo, observed_head_sha=head,
-        review_approval_at=first_cutoff + timedelta(seconds=30),
-    ) == (first_cutoff - timedelta(minutes=1), None)
+    ) == (first_cutoff + timedelta(seconds=30), None)
+    assert runner._publication_recovery_cutoff_at is None
+    assert asyncio.run(runner.recover_state()) is False
+    assert runner._publication_recovery_cutoff_at is None
 
 
 def _merged_state(

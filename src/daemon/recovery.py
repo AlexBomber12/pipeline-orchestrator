@@ -33,7 +33,6 @@ from src.models import (
     PublicationWatermark,
     QueueTask,
     RepoState,
-    ReviewStatus,
     TaskStatus,
 )
 from src.queue_parser import (
@@ -230,7 +229,10 @@ class RecoveryMixin:
         # startup recovery is always correct: if recovery re-enters
         # CODING through the DOING-with-matching-PR path the next handle
         # cycle rewrites the marker before invoking the coder.
-        if self._publication_recovery_cutoff_at is None:
+        if (
+            self._publication_recovery_cutoff_at is None
+            and self._publication_high_water_at is None
+        ):
             self._publication_recovery_cutoff_at = datetime.now(timezone.utc)
         self._cleanup_expected_branch()
         return await self._recover_state_headers()
@@ -1282,10 +1284,6 @@ class RecoveryMixin:
             ref=getattr(evidence, "ref", ""),
             observed_repo=getattr(evidence, "repo", ""),
             observed_head_sha=getattr(evidence, "head_sha", ""),
-            review_approval_at=(
-                pr.review_approval_at
-                if pr.review_status == ReviewStatus.APPROVED else None
-            ),
         )
         self._last_push_at = published_at
         self._last_push_at_pr_number = pr.number

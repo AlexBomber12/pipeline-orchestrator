@@ -5827,22 +5827,16 @@ def _publication_safety_boundary(monkeypatch: pytest.MonkeyPatch):
         return []
     def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
         gh_reviews.clear_review_status_cache()
-        policy = kwargs.get("reviewer_policy") or gh_reviews.reviewer_policy_from_config(
-            gh_reviews.load_config()
-        )
         publication = watch_module.gh_prs.get_pr_head_publication(
             repo, 620, expected_head_sha=head,
         )
         review = gh_reviews.get_pr_review_status(
-            repo, 620, "author", head, policy=policy,
+            repo, 620, "author", head, policy=kwargs.get("reviewer_policy"),
             publication_evidence=publication,
         )
         return [PRInfo(
             number=620, branch=branch, head_sha=head, ci_status=CIStatus.SUCCESS,
             review_status=review, diff_scanned_at_sha=head,
-            review_approval_at=gh_reviews.cached_review_approval_at(
-                repo, 620, head, policy,
-            ),
             publication_observed=True, publication_at=publication.published_at,
             publication_reason=publication.unknown_reason,
             publication_head_repo=publication.head_repo, publication_ref=publication.ref,
@@ -5865,62 +5859,6 @@ def _publication_safety_boundary(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(runner, "_scan_pr_diff_once", no_work)
     monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_work)
     return runner, mode, reaction_at, floor, merged, no_work, head, branch
-
-
-def test_legacy_recovery_accepts_fresh_approval_on_existing_head(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner, mode, reaction_at, _floor, _merged, no_work, _head, branch = (
-        _publication_safety_boundary(monkeypatch)
-    )
-    task = QueueTask(pr_id="PR-459", title="publication safety", status=TaskStatus.DOING,
-                     branch=branch)
-    runner.state.current_task = task
-    asyncio.run(runner.publish_state())
-    key = pipeline_state(runner.name)
-    snapshot = json.loads(asyncio.run(runner.redis.get(key)))
-    snapshot.pop("publication_watermark", None)
-    for field in tuple(snapshot["current_pr"]):
-        if field.startswith("publication_") or field == "review_approval_at":
-            del snapshot["current_pr"][field]
-    asyncio.run(runner.redis.set(key, json.dumps(snapshot)))
-
-    recovered = h._make_runner(auto_merge=True)
-    recovered.redis = runner.redis
-    monkeypatch.setattr(recovered, "_parse_tasks_from_headers", lambda: [task])
-    merged: list[int] = []
-    async def merge() -> None:
-        merged.append(620)
-    monkeypatch.setattr(recovered, "handle_merge", merge)
-    monkeypatch.setattr(recovered, "_scan_pr_diff_once", no_work)
-    monkeypatch.setattr(recovered, "_maybe_reclassify_stuck_pending", no_work)
-    mode["value"] = "old"
-    assert asyncio.run(recovered.recover_state()) is True, (
-        recovered.state.state, recovered.state.error_message, recovered.state.history,
-    )
-    assert recovered.state.state == PipelineState.WATCH
-    assert recovered.state.publication_watermark is None
-    recovered._publication_recovery_cutoff_at = datetime(
-        2026, 10, 17, 21, 9, tzinfo=timezone.utc,
-    )
-
-    asyncio.run(recovered.handle_watch())
-    assert recovered.state.current_pr.review_status == ReviewStatus.PENDING
-    assert recovered.state.current_pr.publication_at is None
-    assert merged == []
-
-    reaction_at["value"] = "2026-10-17T21:11:00Z"
-    asyncio.run(recovered.handle_watch())
-    assert recovered.state.current_pr.review_status == ReviewStatus.APPROVED, (
-        recovered.state.current_pr.review_approval_at,
-        recovered.state.current_pr.publication_at,
-        recovered.state.current_pr.publication_reason,
-        recovered._publication_recovery_cutoff_at,
-    )
-    assert recovered.state.current_pr.publication_at == datetime(
-        2026, 10, 17, 21, 6, 35, tzinfo=timezone.utc,
-    )
-    assert merged == [620]
 
 
 @pytest.mark.parametrize("helper", ["eyes", "author_post"])

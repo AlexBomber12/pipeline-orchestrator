@@ -74,7 +74,6 @@ class PRInfo(BaseModel):
     pr_id: str | None = None
     ci_status: CIStatus = CIStatus.PENDING
     review_status: ReviewStatus = ReviewStatus.PENDING
-    review_approval_at: datetime | None = None
     commits_count: int = 0
     push_count: int = 0
     # Distinct head SHAs the daemon has observed for this PR. ``push_count``
