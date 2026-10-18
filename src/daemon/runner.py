@@ -120,7 +120,6 @@ from src.daemon.selector import (
 )
 from src.events import publish_repo_event
 from src.events.publisher import validate_event_tier
-from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github import rate_limit as gh_rate_limit
 from src.inhibitor import (
@@ -421,6 +420,8 @@ class PipelineRunner(
         self._error_skip_active = False
         self._last_push_at: datetime | None = None
         self._last_push_at_pr_number: int | None = None
+        self._last_push_at_head_sha: str | None = None
+        self._push_provenance_reason: str | None = None
         self._last_codex_review_pr: int | None = None
         self._last_codex_review_head_sha: str | None = None
         self._queue_progress_dirty = False
@@ -1364,45 +1365,25 @@ class PipelineRunner(
             return ""
         return result.stdout.strip()
 
-    def _canonical_push_timestamp(self, pr_number: int) -> datetime:
-        """Return a monotonic baseline timestamp for ``_last_push_at``.
-
-        Reads the GitHub committer date of the PR head via
-        ``gh_prs.get_pr_metadata``. Centralizes writes to
-        ``_last_push_at`` so daemon wall clock drift cannot push the
-        baseline past a Codex review submitted seconds after the actual
-        git push (PR #407 incident).
-
-        To guard against rebases or cherry-picks where the committer
-        date is older than the actual push event, the result never
-        moves below the existing baseline for the same PR — preventing
-        old Codex comments from re-appearing as "new" feedback (Codex
-        P1 on PR #408).
-
-        Falls back to ``datetime.now(timezone.utc)`` only when no
-        canonical value AND no prior baseline are available, preserving
-        liveness of the WATCH cycle when GitHub is unreachable on the
-        first observation.
-        """
-        previous: datetime | None = None
+    def _canonical_push_timestamp(self, pr_number: int) -> datetime | None:
+        """Return proven publication time for the currently observed PR HEAD."""
+        pr = self.state.current_pr
+        if pr is None or pr.number != pr_number or not pr.head_sha:
+            return None
+        evidence = gh_prs.get_pr_head_publication(
+            self.owner_repo, pr_number, expected_head_sha=pr.head_sha
+        )
+        published_at = evidence.published_at
         if (
-            self._last_push_at is not None
+            published_at is not None
+            and self._last_push_at is not None
             and self._last_push_at_pr_number == pr_number
+            and self._last_push_at_head_sha == pr.head_sha
+            and published_at < self._last_push_at
         ):
-            previous = self._last_push_at
-        try:
-            metadata = gh_prs.get_pr_metadata(self.owner_repo, pr_number)
-            head_iso = metadata.get("head_commit_date", "")
-        except Exception:
-            head_iso = ""
-        head_time = gh_runner._parse_iso(head_iso) if head_iso else None
-        if head_time is not None and head_time.tzinfo is None:
-            head_time = head_time.replace(tzinfo=timezone.utc)
-        if head_time is None:
-            return previous if previous is not None else datetime.now(timezone.utc)
-        if previous is not None and head_time < previous:
-            return previous
-        return head_time
+            published_at = None
+        self._last_push_at_head_sha = pr.head_sha if published_at else None
+        return published_at
 
     @staticmethod
     def _attempt_count_key(repo_name: str, task_id: str) -> str:

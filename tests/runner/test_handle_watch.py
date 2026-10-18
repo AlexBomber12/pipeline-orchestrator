@@ -37,6 +37,21 @@ from tests.runner import _helpers as h
 claude_cli = claude_plugin_module.claude_cli
 
 
+def _publication_transport(
+    monkeypatch: pytest.MonkeyPatch, pr: PRInfo, timestamp: str,
+) -> None:
+    """Feed the real publication reader recorded-shape head and activity data."""
+    def run_gh(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/" in args[1]:
+            return {"branch": pr.branch, "repo": "octo/demo", "sha": pr.head_sha}
+        if "/activity?" in args[1]:
+            return [{"activity_type": "branch_creation", "ref": f"refs/heads/{pr.branch}",
+                     "before": "0" * 40, "after": pr.head_sha, "timestamp": timestamp}]
+        raise AssertionError(args)
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", run_gh)
+
+
 @pytest.mark.parametrize(
     ("finding", "ci_status", "expected_feedback", "feedback_unavailable", "missing_poll", "missing_push"),
     [
@@ -369,9 +384,14 @@ def test_watch_supplies_only_admitted_findings_to_fix_prompt(
     monkeypatch.setattr(runner, "_scan_pr_diff_once", no_scan)
     asyncio.run(runner.handle_watch())
     context = captured["kwargs"]["extra_context"]
-    assert "Latest review feedback:\nP1: fix the null check" in context
+    if missing_push:
+        assert "Latest review feedback:" not in context
+        assert "Review evidence limitation: push provenance unavailable" in context
+    else:
+        assert "Latest review feedback:\nP1: fix the null check" in context
     assert "unrelated advice" not in context
-    assert "This dereferences None on empty input" in context
+    if not missing_push:
+        assert "This dereferences None on empty input" in context
     assert comment_reads == ["repos/octo/demo/issues/42/comments"]
     if ci_status == CIStatus.FAILURE:
         assert "ci-boom" in context
@@ -757,7 +777,7 @@ def test_handle_watch_changes_requested_triggers_fix(
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 0
-    assert any("push provenance unavailable" in e["event"] for e in runner.state.history)
+    assert any("Review feedback pending:" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_preserves_fix_iteration_count_for_same_pr(
@@ -989,7 +1009,7 @@ def test_handle_watch_fix_when_ci_success_and_changes_requested(
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 0
-    assert any("push provenance unavailable" in e["event"] for e in runner.state.history)
+    assert any("Review feedback pending:" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_ci_failure_triggers_fix(
@@ -2530,7 +2550,8 @@ def test_handle_watch_retries_rehydrate_last_push_at(
     pr = PRInfo(
         number=42,
         branch="pr-001",
-        ci_status=CIStatus.PENDING,
+        head_sha="a" * 40,
+        ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.PENDING,
         last_activity=datetime.now(timezone.utc),
     )
@@ -2538,15 +2559,15 @@ def test_handle_watch_retries_rehydrate_last_push_at(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": "2026-04-14T18:00:00Z"},
-    )
+    _publication_transport(monkeypatch, pr, "2026-04-14T18:00:00Z")
 
     runner = h._make_runner()
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     assert runner._last_push_at is None
+    async def no_reclassify(_pr: PRInfo) -> None:
+        return None
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_reclassify)
     asyncio.run(runner.handle_watch())
     assert runner._last_push_at is not None
     assert runner._last_push_at.isoformat() == "2026-04-14T18:00:00+00:00"
@@ -2637,14 +2658,11 @@ def test_handle_watch_rehydrates_on_pr_number_mismatch(
     otherwise a transient rehydrate failure on the prior PR switch
     would keep the stale previous-PR timestamp forever."""
     head_iso = "2026-04-14T18:00:00Z"
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
-    )
     pr = PRInfo(
         number=55,
         branch="pr-new",
-        ci_status=CIStatus.PENDING,
+        head_sha="a" * 40,
+        ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.PENDING,
         last_activity=datetime.now(timezone.utc),
     )
@@ -2652,6 +2670,7 @@ def test_handle_watch_rehydrates_on_pr_number_mismatch(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
+    _publication_transport(monkeypatch, pr, head_iso)
 
     runner = h._make_runner()
     # Stale last_push_at from a previously-tracked PR (different number).
@@ -2659,6 +2678,9 @@ def test_handle_watch_rehydrates_on_pr_number_mismatch(
     runner._last_push_at_pr_number = 999
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
+    async def no_reclassify(_pr: PRInfo) -> None:
+        return None
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_reclassify)
     asyncio.run(runner.handle_watch())
 
     assert runner._last_push_at_pr_number == 55
@@ -5607,3 +5629,86 @@ def test_pending_retrigger_cap_permits_exactly_cap_retriggers(
 
     assert len(post_calls) == 3
     assert park_calls == ["watch_retrigger_cap"]
+
+@pytest.mark.parametrize("case", ["creation", "later_push", "wrong_head", "missing", "backward"])
+def test_recorded_branch_creation_review_reaches_watch_merge_handoff(
+    monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    """Only proven publication preceding a trusted +1 reaches WATCH merge."""
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+    branch = "pr-459-e2e-failure-evidence"
+    created = {
+        "activity_type": "branch_creation", "after": head, "before": "0" * 40,
+        "ref": f"refs/heads/{branch}", "timestamp": "2026-10-17T21:06:35Z",
+    }
+    activity = [created]
+    if case == "later_push":
+        activity.insert(0, {**created, "activity_type": "push", "before": head,
+                            "timestamp": "2026-10-17T21:10:00Z"})
+    elif case == "wrong_head":
+        activity[0] = {**created, "after": "b" * 40}
+    elif case == "missing":
+        activity.clear()
+
+    def run_gh(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/" in args[1]:
+            return {"branch": branch, "repo": "octo/demo", "sha": head}
+        if "/activity?" in args[1]:
+            return activity
+        raise AssertionError(args)
+
+    actor = {"id": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+    def paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/620/reactions"):
+            return [{"content": "+1", "user": actor,
+                     "created_at": "2026-10-17T21:08:48Z"}]
+        return []
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", run_gh)
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", paginated)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    gh_reviews.clear_review_status_cache()
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        publication = watch_module.gh_prs.get_pr_head_publication(
+            repo, 620, expected_head_sha=head
+        )
+        review = gh_reviews.get_pr_review_status(
+            repo, 620, "author", head, policy=kwargs["reviewer_policy"],
+            publication_evidence=publication,
+        )
+        return [PRInfo(
+            number=620, branch=branch, head_sha=head, ci_status=CIStatus.SUCCESS,
+            review_status=review, diff_scanned_at_sha=head,
+            publication_observed=True, publication_at=publication.published_at,
+            publication_reason=publication.unknown_reason,
+        )]
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    runner = h._make_runner(
+        auto_merge=True,
+        allow_merge_without_review=case in {"wrong_head", "missing"},
+    )
+    runner.state.current_pr = PRInfo(number=620, branch=branch, head_sha=head,
+                                     diff_scanned_at_sha=head)
+    runner.state.state = PipelineState.WATCH
+    if case == "backward":
+        runner._last_push_at = datetime(2026, 10, 17, 21, 7, tzinfo=timezone.utc)
+        runner._last_push_at_pr_number = 620
+        runner._last_push_at_head_sha = head
+    calls: list[str] = []
+    async def merge() -> None:
+        calls.append("merge")
+    async def scan() -> None:
+        return None
+    async def reclassify(_pr: PRInfo) -> None:
+        return None
+    monkeypatch.setattr(runner, "handle_merge", merge)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", scan)
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", reclassify)
+    asyncio.run(runner.handle_watch())
+    assert calls == (["merge"] if case == "creation" else [])
+    assert runner.state.current_pr.review_status == (
+        ReviewStatus.APPROVED if case in {"creation", "backward"} else ReviewStatus.PENDING
+    )
+    if case == "backward":
+        assert runner.state.current_pr.publication_at is None
+        assert runner.state.current_pr.publication_reason == "publication time moved backward for unchanged HEAD"

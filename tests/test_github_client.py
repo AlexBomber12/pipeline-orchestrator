@@ -97,7 +97,7 @@ def _default_review_push_time(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 1, 1, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 1, 1, tzinfo=_tz.utc),
     )
 
 
@@ -1753,7 +1753,7 @@ def test_body_plus_one_before_latest_push_is_stale_even_if_commit_is_older(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 1, 2, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 1, 2, tzinfo=_tz.utc),
     )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -1816,7 +1816,7 @@ def test_body_plus_one_no_push_time_stays_pending(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: None,
+        lambda repo, pr_number, head_sha="": None,
     )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -1888,7 +1888,7 @@ def test_no_plus_one_does_not_fetch_latest_push_time(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: (_ for _ in ()).throw(
+        lambda repo, pr_number, head_sha="": (_ for _ in ()).throw(
             AssertionError("push-time lookup should not run without +1")
         ),
     )
@@ -2300,6 +2300,31 @@ def test_has_recent_codex_review_request_counts_same_second(
     )
 
 
+def test_review_request_dedup_rejects_invalid_publication_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cache, "_gh_api_paginated", lambda *_: [{
+        "user": {"login": "same-user"}, "body": "@codex review",
+        "created_at": _iso_utc_now_minus(30),
+    }])
+    assert not has_recent_codex_review_request(
+        "owner/name", 42, "same-user", after_iso="not-a-date"
+    )
+
+
+def test_review_request_dedup_normalizes_naive_publication_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = _iso_utc_now_minus(30)
+    monkeypatch.setattr(cache, "_gh_api_paginated", lambda *_: [{
+        "user": {"login": "same-user"}, "body": "@codex review",
+        "created_at": created,
+    }])
+    assert has_recent_codex_review_request(
+        "owner/name", 42, "same-user", after_iso=created.replace("Z", "")
+    )
+
+
 def test_get_pr_head_commit_iso_returns_committer_date(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2390,7 +2415,7 @@ def test_body_plus_one_review_on_head_still_requires_fresh_reaction(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 1, 10, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 1, 10, tzinfo=_tz.utc),
     )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -2433,7 +2458,7 @@ def test_body_plus_one_review_on_head_approves_when_reaction_is_fresh(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 1, 10, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 1, 10, tzinfo=_tz.utc),
     )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -2476,7 +2501,7 @@ def test_body_plus_one_review_on_head_no_push_time_stays_pending(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: None,
+        lambda repo, pr_number, head_sha="": None,
     )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -2519,7 +2544,7 @@ def test_unverifiable_body_plus_one_still_surfaces_current_findings(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: None,
+        lambda repo, pr_number, head_sha="": None,
     )
     actor = _codex_user("chatgpt-codex-connector")
 
@@ -2610,7 +2635,7 @@ def test_anchor_plus_one_requires_verifiable_current_head_freshness(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 2, 1, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 2, 1, tzinfo=_tz.utc),
     )
 
     assert (
@@ -2652,7 +2677,7 @@ def test_anchor_plus_one_with_fresh_timestamp_approves_current_head(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 2, 1, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 2, 1, tzinfo=_tz.utc),
     )
 
     assert (
@@ -2671,7 +2696,7 @@ def test_body_plus_one_same_actor_current_review_with_findings_stays_requested(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 2, 1, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 2, 1, tzinfo=_tz.utc),
     )
     actor = _codex_user("chatgpt-codex-connector")
 
@@ -2735,7 +2760,7 @@ def test_body_plus_one_review_sha_must_match_reacting_actor(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 2, 1, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 2, 1, tzinfo=_tz.utc),
     )
     actor_a = _reviewer_user(TRUSTED_REVIEWER_ID, "chatgpt-codex-connector")
     actor_b = _reviewer_user(SECOND_TRUSTED_REVIEWER_ID, "codex-second-reviewer")
@@ -2810,7 +2835,7 @@ def test_body_plus_one_same_second_as_latest_push_approves(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(
+        lambda repo, pr_number, head_sha="": datetime(
             2026, 1, 2, 12, 34, 56, tzinfo=_tz.utc
         ),
     )
@@ -3343,7 +3368,7 @@ def test_get_open_prs_returns_prinfo_objects(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.APPROVED,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.APPROVED,
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
@@ -3406,7 +3431,7 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
     monkeypatch.setattr("src.github.checks._retrieve_ci_status_evidence", fake_fetch)
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs("owner/name")
@@ -3457,7 +3482,7 @@ def test_get_open_prs_rejects_untrusted_required_check_provenance(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs(
@@ -3494,7 +3519,7 @@ def test_get_open_prs_rest_fetch_failure_follows_allow_merge_without_checks(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
@@ -3536,7 +3561,7 @@ def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
@@ -3592,7 +3617,7 @@ def test_get_open_prs_rest_fallback_requires_complete_ci_retrieval(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
@@ -3649,7 +3674,7 @@ def test_get_open_prs_rest_fallback_rejects_untrusted_required_check_provenance(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs(
@@ -4194,7 +4219,12 @@ def test_get_last_push_age_seconds_returns_computed_age(
         def now(cls, tz: _tz | None = None) -> datetime:
             return cls(2026, 4, 19, 12, 0, 0, tzinfo=tz)
 
-    responses = iter(["feature-branch", "2026-04-19T11:59:30Z", ""])
+    sha = "a" * 40
+    responses = iter([
+        {"branch": "feature-branch", "repo": "owner/name", "sha": sha},
+        [{"activity_type": "branch_creation", "ref": "refs/heads/feature-branch",
+          "after": sha, "timestamp": "2026-04-19T11:59:30Z"}],
+    ])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     monkeypatch.setattr("src.github.prs.datetime", _FakeDateTime)
 
@@ -4204,7 +4234,7 @@ def test_get_last_push_age_seconds_returns_computed_age(
 def test_get_last_push_age_seconds_returns_none_for_empty_push_timestamp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-branch", "", ""])
+    responses = iter([{"branch": "feature-branch", "repo": "owner/name", "sha": "a" * 40}, []])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_last_push_age_seconds("owner/name", 42) is None
 
@@ -4212,7 +4242,9 @@ def test_get_last_push_age_seconds_returns_none_for_empty_push_timestamp(
 def test_get_last_push_age_seconds_returns_none_on_parse_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-branch", "not-a-date"])
+    responses = iter([{"branch": "feature-branch", "repo": "owner/name", "sha": "a" * 40},
+                      [{"activity_type": "push", "ref": "refs/heads/feature-branch",
+                        "after": "a" * 40, "timestamp": "not-a-date"}]])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_last_push_age_seconds("owner/name", 42) is None
 
@@ -4222,9 +4254,9 @@ def test_get_pr_last_push_time_returns_parsed_datetime(
 ) -> None:
     responses = iter(
         [
-            {"branch": "feature-branch", "repo": "fork-owner/fork-repo"},
-            "2026-04-30T11:59:30Z",
-            "",
+            {"branch": "feature-branch", "repo": "fork-owner/fork-repo", "sha": "a" * 40},
+            [{"activity_type": "push", "ref": "refs/heads/feature-branch",
+              "after": "a" * 40, "timestamp": "2026-04-30T11:59:30Z"}],
         ]
     )
     calls: list[list[str]] = []
@@ -4257,6 +4289,21 @@ def test_review_freshness_delegates_to_pr_push_time(
     assert calls == [("owner/name", 42)]
 
 
+def test_review_freshness_validates_observed_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    expected = datetime(2026, 4, 30, 11, 59, 30, tzinfo=_tz.utc)
+    seen: list[str] = []
+    def publication(repo: str, number: int, *, expected_head_sha: str):
+        seen.append(expected_head_sha)
+        return SimpleNamespace(published_at=expected)
+    monkeypatch.setattr(prs, "get_pr_head_publication", publication)
+    assert _REAL_GET_REVIEW_PUSH_TIME("owner/name", 42, "a" * 40) == expected
+    assert seen == ["a" * 40]
+
+
 def test_get_pr_last_push_time_returns_none_without_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4277,7 +4324,7 @@ def test_get_pr_last_push_time_returns_none_without_head_repository(
 def test_get_pr_last_push_time_returns_none_when_activity_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-branch", "", ""])
+    responses = iter([{"branch": "feature-branch", "repo": "owner/name", "sha": "a" * 40}, []])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_pr_last_push_time("owner/name", 42) is None
 
@@ -4285,7 +4332,9 @@ def test_get_pr_last_push_time_returns_none_when_activity_empty(
 def test_get_pr_last_push_time_returns_none_on_parse_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-branch", "not-a-date"])
+    responses = iter([{"branch": "feature-branch", "repo": "owner/name", "sha": "a" * 40},
+                      [{"activity_type": "push", "ref": "refs/heads/feature-branch",
+                        "after": "a" * 40, "timestamp": "not-a-date"}]])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_pr_last_push_time("owner/name", 42) is None
 

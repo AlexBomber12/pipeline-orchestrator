@@ -721,8 +721,10 @@ def _patch_eyes_reaction_present(
         ],
     )
     monkeypatch.setattr(
-        "src.github.prs.get_pr_last_push_time",
-        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
+        "src.github.prs.get_pr_head_publication",
+        lambda *args, **kwargs: type("Evidence", (), {
+            "published_at": gh_runner._parse_iso("2026-04-30T12:00:00Z")
+        })(),
     )
 
 

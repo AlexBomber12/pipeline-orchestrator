@@ -931,13 +931,18 @@ def test_recover_state_rehydrates_last_push_at(
     (tmp_path / "tasks" / "PR-001.md").write_text("# PR-001\n")
 
     head_iso = "2026-04-10T12:00:00Z"
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
-    )
+    head = "a" * 40
+    def publication_transport(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/" in args[1]:
+            return {"branch": "pr-001", "repo": "octo/demo", "sha": head}
+        if "/activity?" in args[1]:
+            return [{"activity_type": "branch_creation", "ref": "refs/heads/pr-001",
+                     "before": "0" * 40, "after": head, "timestamp": head_iso}]
+        raise AssertionError(args)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", publication_transport)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
-        lambda repo, **kw: [PRInfo(number=7, branch="pr-001")],
+        lambda repo, **kw: [PRInfo(number=7, branch="pr-001", head_sha=head)],
     )
 
     runner = h._make_runner()

@@ -87,6 +87,10 @@ class PRInfo(BaseModel):
     # without re-fetching PR metadata. Empty string when the upstream
     # ``gh`` payload omitted the SHA.
     head_sha: str = ""
+    # Transient publication observation from the current GitHub status poll.
+    publication_observed: bool = False
+    publication_at: datetime | None = None
+    publication_reason: str | None = None
     fix_iteration_count: int = 0
     no_push_fix_count: int = 0
     # OBS-BL (PR-249): WATCH retrigger cycles counted to cap runaway

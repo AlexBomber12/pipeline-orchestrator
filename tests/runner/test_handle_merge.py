@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 from src.cancellation import retry_count_key, task_spec_hash_key
@@ -202,6 +204,12 @@ def test_post_codex_review_without_bypass_still_honors_author_dedup(
             "head_sha": "abc123",
             "head_commit_date": "2026-01-01T00:00:00Z",
         },
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_pr_head_publication",
+        lambda *_a, **_kw: SimpleNamespace(
+            published_at=datetime(2026, 1, 1, tzinfo=timezone.utc)
+        ),
     )
     monkeypatch.setattr(
         "src.github.comments.has_recent_codex_review_request",

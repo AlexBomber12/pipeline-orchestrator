@@ -74,6 +74,7 @@ class BranchPublication:
             and _FULL_SHA_RE.fullmatch(self.head_sha) is not None
         )
 
+
     def to_pr_info(self) -> PRInfo:
         """Convert verified publication evidence to WATCH's PR model."""
         return PRInfo(
@@ -87,6 +88,20 @@ class BranchPublication:
             url=self.url,
             is_cross_repository=self.is_cross_repository,
         )
+
+
+@dataclass(frozen=True)
+class HeadPublicationEvidence:
+    """Observed publication of the current PR head, or a bounded unknown reason."""
+
+    repo: str
+    pr_number: int
+    head_repo: str
+    ref: str
+    head_sha: str
+    published_at: datetime | None
+    provenance: str
+    unknown_reason: str | None = None
 
 
 class GitHubPollError(Exception):
@@ -311,6 +326,7 @@ def get_open_prs(
         commits = entry.get("commits") or []
         head_sha = entry.get("headRefOid", "")
         title = entry.get("title", "")
+        publication = get_pr_head_publication(repo, number, expected_head_sha=head_sha)
         ci_retrieval = checks._retrieve_ci_status_evidence(repo, head_sha)
         labels = entry.get("labels") or []
         quarantine_labels = {
@@ -336,11 +352,15 @@ def get_open_prs(
                     pr_author=(entry.get("author") or {}).get("login", ""),
                     head_sha=head_sha,
                     policy=reviewer_policy,
+                    publication_evidence=publication,
                 ),
                 commits_count=len(commits),
                 push_count=1 if head_sha else 0,
                 observed_head_shas={head_sha} if head_sha else set(),
                 head_sha=head_sha,
+                publication_observed=True,
+                publication_at=publication.published_at,
+                publication_reason=publication.unknown_reason,
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),
                 is_escalated=any(
@@ -380,6 +400,7 @@ def _get_open_prs_rest(
         user = entry.get("user") or {}
         title = entry.get("title", "")
         head_sha = head.get("sha", "")
+        publication = get_pr_head_publication(repo, number, expected_head_sha=head_sha)
         ci_retrieval = checks._retrieve_ci_status_evidence(repo, head_sha)
         labels = entry.get("labels") or []
         quarantine_labels = {
@@ -405,11 +426,15 @@ def _get_open_prs_rest(
                     pr_author=user.get("login", ""),
                     head_sha=head_sha,
                     policy=reviewer_policy,
+                    publication_evidence=publication,
                 ),
                 commits_count=1 if head_sha else 0,
                 push_count=1 if head_sha else 0,
                 observed_head_shas={head_sha} if head_sha else set(),
                 head_sha=head_sha,
+                publication_observed=True,
+                publication_at=publication.published_at,
+                publication_reason=publication.unknown_reason,
                 url=entry.get("html_url", ""),
                 last_activity=_parse_iso(entry.get("updated_at")),
                 is_escalated=any(
@@ -774,62 +799,90 @@ def get_branch_last_push_time(repo: str, pr_number: int) -> float | None:
     return None
 
 
-def get_pr_last_push_time(repo: str, pr_number: int) -> datetime | None:
-    """Return the timestamp of the most recent push to the PR's head ref.
+def _publication_from_activity(
+    repo: str, pr_number: int, head_repo: str, ref: str,
+    head_sha: str, raw: object,
+) -> HeadPublicationEvidence:
+    """Parse the newest relevant activity without falling back past contradictions."""
+    def unknown(reason: str) -> HeadPublicationEvidence:
+        return HeadPublicationEvidence(
+            repo, pr_number, head_repo, ref, head_sha, None, "github-activity", reason
+        )
 
-    Uses the GitHub repository activity API, which records the actual
-    push event time. This is distinct from the head commit's committer
-    date: a cherry-picked, amended, or rebased commit can carry a
-    committer date that predates the push that put it on the branch.
-    Anywhere we want "did X happen after this branch's latest push?",
-    push time is the correct anchor.
+    if not isinstance(raw, list):
+        return unknown("activity payload malformed")
+    publication_types = {"branch_creation", "push", "force_push"}
+    relevant = []
+    for event in raw:
+        if not isinstance(event, dict):
+            return unknown("activity event malformed")
+        if event.get("ref") != ref:
+            return unknown("activity ref mismatch")
+        if event.get("activity_type") in publication_types | {"branch_deletion"}:
+            timestamp = gh_runner._parse_iso(event.get("timestamp"))
+            after = event.get("after")
+            if (
+                timestamp is None or timestamp.tzinfo is None
+                or not isinstance(after, str)
+                or _FULL_SHA_RE.fullmatch(after) is None
+            ):
+                return unknown("publication activity incomplete")
+            relevant.append((timestamp, event))
+    if not relevant:
+        return unknown("no publication activity for head ref")
+    latest_time = max(item[0] for item in relevant)
+    latest = [event for time_at, event in relevant if time_at == latest_time]
+    if len(latest) != 1:
+        return unknown("same-second publication order ambiguous")
+    event = latest[0]
+    if event["activity_type"] == "branch_deletion":
+        return unknown("head ref deleted after publication")
+    if event["after"].lower() != head_sha.lower():
+        return unknown("latest publication HEAD differs from observed PR HEAD")
+    return HeadPublicationEvidence(
+        repo, pr_number, head_repo, ref, head_sha, latest_time,
+        f"github-activity:{event['activity_type']}",
+    )
 
-    Resolves activity against the PR head repository so fork-origin
-    branches use the fork's push feed rather than the base repository's.
-    Returns ``None`` on any API or parse failure; callers choose whether
-    missing freshness evidence should fail open or closed.
-    """
+
+def get_pr_head_publication(
+    repo: str, pr_number: int, *, expected_head_sha: str = "",
+) -> HeadPublicationEvidence:
+    """Read bounded GitHub activity proving publication of the observed PR HEAD."""
+    def unknown(reason: str, head_repo: str = "", ref: str = "", sha: str = "") -> HeadPublicationEvidence:
+        return HeadPublicationEvidence(repo, pr_number, head_repo, ref, sha, None, "github-activity", reason)
 
     try:
         head_raw = gh_runner.run_gh([
+            "api", f"repos/{repo}/pulls/{pr_number}", "--jq",
+            '{branch: .head.ref, repo: .head.repo.full_name, sha: .head.sha}',
+        ], timeout=10)
+        if not isinstance(head_raw, dict):
+            return unknown("PR head context unavailable")
+        branch = head_raw.get("branch")
+        head_repo = head_raw.get("repo")
+        sha = head_raw.get("sha")
+        if not isinstance(branch, str) or not _is_valid_branch_name(branch):
+            return unknown("PR head ref unavailable")
+        if not isinstance(head_repo, str) or not re.fullmatch(r"[^/]+/[^/]+", head_repo):
+            return unknown("PR head repository unavailable")
+        ref = f"refs/heads/{branch}"
+        if not isinstance(sha, str) or _FULL_SHA_RE.fullmatch(sha) is None:
+            return unknown("PR HEAD unavailable", head_repo, ref)
+        if expected_head_sha and sha.lower() != expected_head_sha.lower():
+            return unknown("observed PR HEAD changed", head_repo, ref, sha)
+        raw = gh_runner.run_gh([
             "api",
-            f"repos/{repo}/pulls/{pr_number}",
-            "--jq",
-            '{branch: .head.ref, repo: .head.repo.full_name}',
-        ])
-        branch = ""
-        head_repo = ""
-        if isinstance(head_raw, dict):
-            branch_value = head_raw.get("branch")
-            repo_value = head_raw.get("repo")
-            branch = branch_value.strip() if isinstance(branch_value, str) else ""
-            head_repo = repo_value.strip() if isinstance(repo_value, str) else ""
-        elif isinstance(head_raw, str):
-            # Preserve compatibility with simple test doubles and old gh output.
-            branch = head_raw.strip()
-            head_repo = repo
-        if not branch or not head_repo:
-            return None
-        ref = quote(f"refs/heads/{branch}", safe="")
-        push_times: list[datetime] = []
-        for activity_type in ("push", "force_push"):
-            date_raw = gh_runner.run_gh([
-                "api",
-                (
-                    f"repos/{head_repo}/activity?ref={ref}"
-                    f"&activity_type={activity_type}&per_page=1&direction=desc"
-                ),
-                "--jq",
-                ".[0].timestamp",
-            ])
-            date_str = date_raw.strip() if isinstance(date_raw, str) else ""
-            if date_str:
-                push_times.append(
-                    datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-                )
-        return max(push_times, default=None)
-    except Exception:
-        return None
+            f"repos/{head_repo}/activity?ref={quote(ref, safe='')}&per_page=100&direction=desc",
+        ], timeout=10)
+        return _publication_from_activity(repo, pr_number, head_repo, ref, sha, raw)
+    except Exception as exc:
+        return unknown(f"publication read unavailable: {type(exc).__name__}")
+
+
+def get_pr_last_push_time(repo: str, pr_number: int) -> datetime | None:
+    """Compatibility adapter for the proven current-head publication time."""
+    return get_pr_head_publication(repo, pr_number).published_at
 
 
 def get_last_push_age_seconds(repo: str, pr_number: int) -> float | None:

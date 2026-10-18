@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -612,8 +613,8 @@ def _patch_codex_reactions(
         lambda repo, number, policy=None: payload,
     )
     monkeypatch.setattr(
-        "src.github.prs.get_pr_last_push_time",
-        lambda repo, number: gh_runner._parse_iso(last_push_iso),
+        "src.github.prs.get_pr_head_publication",
+        lambda *args, **kwargs: SimpleNamespace(published_at=gh_runner._parse_iso(last_push_iso), unknown_reason=None),
     )
 
 
@@ -713,8 +714,8 @@ def test_should_skip_codex_review_post_reuses_one_reviewer_policy(
         fake_match,
     )
     monkeypatch.setattr(
-        "src.github.prs.get_pr_last_push_time",
-        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
+        "src.github.prs.get_pr_head_publication",
+        lambda *args, **kwargs: SimpleNamespace(published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
     )
 
     assert runner._should_skip_codex_review_post(42) is True
@@ -741,7 +742,7 @@ def test_should_skip_codex_review_post_fails_open_on_push_time_error(
     def boom(*_a: Any, **_kw: Any) -> Any:
         raise RuntimeError("push-time boom")
 
-    monkeypatch.setattr("src.github.prs.get_pr_last_push_time", boom)
+    monkeypatch.setattr("src.github.prs.get_pr_head_publication", boom)
     assert runner._should_skip_codex_review_post(42) is False
 
 
@@ -761,8 +762,8 @@ def test_should_skip_codex_review_post_fails_open_on_missing_push_time(
         ],
     )
     monkeypatch.setattr(
-        "src.github.prs.get_pr_last_push_time",
-        lambda repo, number: None,
+        "src.github.prs.get_pr_head_publication",
+        lambda *args, **kwargs: SimpleNamespace(published_at=None),
     )
     assert runner._should_skip_codex_review_post(42) is False
 
@@ -783,8 +784,8 @@ def test_should_skip_codex_review_post_skips_when_eyes_after_push(
         ],
     )
     monkeypatch.setattr(
-        "src.github.prs.get_pr_last_push_time",
-        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
+        "src.github.prs.get_pr_head_publication",
+        lambda *args, **kwargs: SimpleNamespace(published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
     )
     assert runner._should_skip_codex_review_post(42) is True
 
@@ -805,8 +806,8 @@ def test_should_skip_codex_review_post_does_not_skip_when_eyes_predates_push(
         ],
     )
     monkeypatch.setattr(
-        "src.github.prs.get_pr_last_push_time",
-        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
+        "src.github.prs.get_pr_head_publication",
+        lambda *args, **kwargs: SimpleNamespace(published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
     )
     assert runner._should_skip_codex_review_post(42) is False
 
@@ -834,8 +835,8 @@ def test_should_skip_codex_review_post_does_not_skip_on_backdated_head_commit(
         ],
     )
     monkeypatch.setattr(
-        "src.github.prs.get_pr_last_push_time",
-        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
+        "src.github.prs.get_pr_head_publication",
+        lambda *args, **kwargs: SimpleNamespace(published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
     )
     assert runner._should_skip_codex_review_post(42) is False
 
@@ -859,8 +860,8 @@ def test_should_skip_codex_review_post_normalizes_naive_timestamps(
         ],
     )
     monkeypatch.setattr(
-        "src.github.prs.get_pr_last_push_time",
-        lambda repo, number: _dt(2026, 4, 30, 12, 0, 0),
+        "src.github.prs.get_pr_head_publication",
+        lambda *args, **kwargs: SimpleNamespace(published_at=_dt(2026, 4, 30, 12, 0, 0)),
     )
     monkeypatch.setattr(
         "src.github.gh_runner._parse_iso",
@@ -885,8 +886,8 @@ def test_should_skip_codex_review_post_ignores_eyes_without_created_at(
         ],
     )
     monkeypatch.setattr(
-        "src.github.prs.get_pr_last_push_time",
-        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
+        "src.github.prs.get_pr_head_publication",
+        lambda *args, **kwargs: SimpleNamespace(published_at=gh_runner._parse_iso("2026-04-30T12:00:00Z")),
     )
     assert runner._should_skip_codex_review_post(42) is False
 

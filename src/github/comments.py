@@ -72,10 +72,9 @@ def has_recent_codex_review_request(
     skips when a qualifying trigger already exists within
     ``within_minutes``.
 
-    ``after_iso`` optionally restricts matches to comments created
-    strictly after the given ISO-8601 timestamp. Callers pass the
-    PR's current head-commit time so a trigger posted for an earlier
-    commit does not suppress the fresh anchor the new commit needs —
+    ``after_iso`` optionally restricts matches to comments created at
+    or after the proven current-head publication time. This ensures a
+    trigger posted for an earlier publication cannot suppress a new one —
     this is what keeps the dedup safe when the daemon and PR author
     share a gh identity.
     """
@@ -107,26 +106,26 @@ def get_recent_codex_review_request_time(
         raise
     now = datetime.now(timezone.utc)
     cutoff = within_minutes * 60
+    after = gh_runner._parse_iso(after_iso) if after_iso else None
+    if after_iso and after is None:
+        return None
+    if after is not None and after.tzinfo is None:
+        after = after.replace(tzinfo=timezone.utc)
     for c in reversed(comments):
         author = (c.get("user") or {}).get("login", "")
         if author != pr_author:
             continue
         if "@codex review" not in (c.get("body") or "").lower():
             continue
-        created_raw = c.get("created_at") or ""
-        # Strict-less-than (not <=) lets same-second comments count. GitHub
-        # ISO-8601 timestamps are second-granularity; a coder posting
-        # ``@codex review`` within one second of pushing the commit produces
-        # equal stringified timestamps. PR-239 fixed the regression where
-        # same-second comments were skipped from dedup and daemon posted a
-        # duplicate trigger.
-        if after_iso and (not created_raw or created_raw < after_iso):
-            continue
-        created = gh_runner._parse_iso(created_raw)
+        created = gh_runner._parse_iso(c.get("created_at"))
         if created is None:
             continue
         if created.tzinfo is None:
             created = created.replace(tzinfo=timezone.utc)
+        # Equality is intentional: GitHub activity and comments are often
+        # reported at second precision.
+        if after is not None and created < after:
+            continue
         if (now - created).total_seconds() < cutoff:
             return created
     return None

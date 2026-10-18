@@ -206,7 +206,7 @@ def test_get_open_prs_preserves_quarantine_labels(
     monkeypatch.setattr(
         gh_prs.reviews,
         "get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     [pr] = gh_prs.get_open_prs("octo/demo")
@@ -280,6 +280,7 @@ def test_get_open_prs_snapshots_reviewer_policy_once_per_poll(
         pr_author: str = "",
         head_sha: str = "",
         policy: ReviewerPolicy | None = None,
+        publication_evidence: object | None = None,
     ) -> ReviewStatus:
         observed_policies.append(policy)
         return ReviewStatus.PENDING

@@ -25,7 +25,6 @@ from src.cancellation import (
 )
 from src.daemon import git_ops
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
-from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
@@ -1226,42 +1225,22 @@ class RecoveryMixin:
             )
 
     def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
-        """Seed ``_last_push_at`` from the PR's head commit's committer
-        date when we don't already have a fresher in-memory value.
-
-        Needed on daemon restart (``__init__`` resets
-        ``_last_push_at`` to ``None``) and when ``handle_coding`` hands
-        off to WATCH on a freshly-created PR: without this rehydrate,
-        ``_has_new_codex_feedback_since_last_push`` would hit its
-        ``None`` default and return ``True`` on every cycle, triggering
-        ``handle_fix`` on pre-restart Codex feedback.
-
-        Falling back to ``pr.last_activity`` here is intentionally
-        avoided: ``last_activity`` comes from GitHub's ``updatedAt``,
-        which advances whenever Codex posts a comment, so a transient
-        commit-time fetch failure plus a pending Codex P1/P2 post
-        would seed the baseline to the feedback timestamp and make
-        the next ``_has_new_codex_feedback_since_last_push`` return
-        False, silently skipping the fix. When the fetch fails we
-        leave ``_last_push_at`` unset; ``handle_watch`` calls this
-        helper each cycle so the rehydrate retries naturally on the
-        next poll instead of latching a wrong value.
-        """
-        try:
-            metadata = gh_prs.get_pr_metadata(
-                self.owner_repo, pr.number
-            )
-            head_iso = metadata.get("head_commit_date", "")
-        except Exception:
-            head_iso = ""
-        head_time = gh_runner._parse_iso(head_iso) if head_iso else None
-        if head_time is not None and head_time.tzinfo is None:
-            head_time = head_time.replace(tzinfo=timezone.utc)
-        if self._last_push_at_pr_number != pr.number:
-            self._last_push_at = head_time
-            self._last_push_at_pr_number = pr.number
-            return
-        if head_time is None:
-            return
-        if self._last_push_at is None or head_time > self._last_push_at:
-            self._last_push_at = head_time
+        """Refresh the feedback floor from current-head publication evidence."""
+        evidence = gh_prs.get_pr_head_publication(
+            self.owner_repo, pr.number, expected_head_sha=pr.head_sha
+        )
+        published_at = evidence.published_at
+        reason = evidence.unknown_reason
+        if (
+            published_at is not None
+            and self._last_push_at is not None
+            and self._last_push_at_pr_number == pr.number
+            and self._last_push_at_head_sha == pr.head_sha
+            and published_at < self._last_push_at
+        ):
+            published_at = None
+            reason = "publication time moved backward for unchanged HEAD"
+        self._last_push_at = published_at
+        self._last_push_at_pr_number = pr.number
+        self._last_push_at_head_sha = pr.head_sha if published_at else None
+        self._push_provenance_reason = reason

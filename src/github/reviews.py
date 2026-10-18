@@ -321,10 +321,14 @@ def review_cache_generation(repo: str) -> tuple[int, int]:
     return (_review_reset_generation, _review_repo_cache_cycles.get(repo, 0))
 
 
-def _get_pr_push_time(repo: str, pr_number: int) -> datetime | None:
-    """Return the actual latest push time without creating an import cycle."""
+def _get_pr_push_time(repo: str, pr_number: int, head_sha: str = "") -> datetime | None:
+    """Return current-head publication time without creating an import cycle."""
     from src.github import prs
 
+    if head_sha:
+        return prs.get_pr_head_publication(
+            repo, pr_number, expected_head_sha=head_sha
+        ).published_at
     return prs.get_pr_last_push_time(repo, pr_number)
 
 
@@ -334,6 +338,7 @@ def get_pr_review_status(
     pr_author: str = "",
     head_sha: str = "",
     policy: ReviewerPolicy | None = None,
+    publication_evidence: object | None = None,
 ) -> ReviewStatus:
     """Derive a Codex review status from PR issue comments, review comments, and reactions.
 
@@ -356,7 +361,7 @@ def get_pr_review_status(
             return cached
 
     result = _compute_review_status(
-        repo, pr_number, pr_author, head_sha, reviewer_policy
+        repo, pr_number, pr_author, head_sha, reviewer_policy, publication_evidence
     )
 
     if head_sha:
@@ -384,6 +389,7 @@ def _compute_review_status(
     pr_author: str,
     head_sha: str,
     policy: ReviewerPolicy | None = None,
+    publication_evidence: object | None = None,
 ) -> ReviewStatus:
     """Core review status logic, separated for caching."""
     body_eyes = False
@@ -423,7 +429,11 @@ def _compute_review_status(
                     latest_review_time = review_info["latest_time"]
                     latest_review_sha = review_info["latest_sha"]
                     reaction_time = _parse_iso(plus_one.get("created_at"))
-                    last_push_time = _get_pr_push_time(repo, pr_number)
+                    last_push_time = (
+                        publication_evidence.published_at
+                        if publication_evidence is not None
+                        else _get_pr_push_time(repo, pr_number, head_sha)
+                    )
                     last_push_time_loaded = True
                     if last_push_time is not None:
                         threshold = last_push_time
@@ -490,7 +500,11 @@ def _compute_review_status(
                         saw_plus_one = True
                         if head_sha:
                             if not last_push_time_loaded:
-                                last_push_time = _get_pr_push_time(repo, pr_number)
+                                last_push_time = (
+                                    publication_evidence.published_at
+                                    if publication_evidence is not None
+                                    else _get_pr_push_time(repo, pr_number, head_sha)
+                                )
                                 last_push_time_loaded = True
                             reaction_time = _parse_iso(
                                 anchor_plus_one.get("created_at")
