@@ -407,14 +407,6 @@ def _compute_review_status(
         (t for t in (body_approval_at, anchor_approval_at) if t is not None),
         default=None,
     )
-    if body_eyes or anchor_eyes:
-        if body_approved or anchor_approved:
-            logger.info("PR #%s review pending: conflicting +1 and eyes evidence", pr_number)
-            return ReviewStatus.PENDING
-        return ReviewStatus.EYES
-    if feedback.unknown_reason and approved_at is None:
-        logger.info("PR #%s review pending: %s", pr_number, feedback.unknown_reason)
-        return ReviewStatus.PENDING
     if approved_at and (feedback.findings or feedback.unknown_reason):
         if (
             feedback.latest_blocking_at is not None
@@ -430,6 +422,11 @@ def _compute_review_status(
         return ReviewStatus.APPROVED
     if anchor_approved:
         return ReviewStatus.APPROVED
+    if body_eyes or anchor_eyes:
+        return ReviewStatus.EYES
+    if feedback.unknown_reason:
+        logger.info("PR #%s review pending: %s", pr_number, feedback.unknown_reason)
+        return ReviewStatus.PENDING
 
     if feedback.findings:
         return ReviewStatus.CHANGES_REQUESTED

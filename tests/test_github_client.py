@@ -1412,10 +1412,10 @@ def test_review_status_eyes_wins_over_codex_comment(
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
 
 
-def test_body_eyes_wins_over_anchor_plus_one(
+def test_anchor_plus_one_wins_over_body_eyes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Conflicting PR-body eyes and anchor +1 remain pending."""
+    """A valid anchor +1 wins over a lingering PR-body eyes reaction."""
     import json as _json
 
     clear_review_status_cache()
@@ -1449,13 +1449,13 @@ def test_body_eyes_wins_over_anchor_plus_one(
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setattr(reviews, "_get_pr_push_time", lambda *_: datetime(2026, 1, 1, tzinfo=_tz.utc))
 
-    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="head") == ReviewStatus.PENDING
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="head") == ReviewStatus.APPROVED
 
 
-def test_anchor_eyes_wins_over_body_plus_one(
+def test_body_plus_one_wins_over_anchor_eyes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Conflicting anchor eyes and PR-body +1 remain pending."""
+    """A valid PR-body +1 wins over a lingering anchor eyes reaction."""
     import json as _json
 
     clear_review_status_cache()
@@ -1489,7 +1489,7 @@ def test_anchor_eyes_wins_over_body_plus_one(
     monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setattr(reviews, "_get_pr_push_time", lambda *_: datetime(2026, 1, 1, tzinfo=_tz.utc))
 
-    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="head") == ReviewStatus.PENDING
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="head") == ReviewStatus.APPROVED
 
 
 def test_review_api_with_body_eyes_stays_eyes(
