@@ -3297,6 +3297,12 @@ def test_begin_review_cache_cycle_initializes_and_increments() -> None:
 
     reviews._begin_review_cache_cycle()
     assert reviews._review_status_cache_cycle == 2
+    reviews._begin_review_cache_cycle("owner/name")
+    generation = reviews.review_cache_generation("owner/name")
+    reviews._begin_review_cache_cycle("other/name")
+    assert reviews.review_cache_generation("owner/name") == generation
+    reviews._begin_review_cache_cycle("owner/name")
+    assert reviews.review_cache_generation("owner/name") != generation
 
 
 def test_is_reaction_content_rejects_non_dict() -> None:
@@ -6413,6 +6419,11 @@ def test_structured_summary_reader_and_poll_evidence_identity(
     assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.PENDING
     evidence = reviews.cached_review_feedback("owner/name", 42, head, policy)
     assert evidence is not None and evidence.findings == ()
+    reviews._begin_review_cache_cycle("other/name")
+    assert reviews.cached_review_feedback("owner/name", 42, head, policy) is evidence
+    reviews._begin_review_cache_cycle("owner/name")
+    assert reviews.cached_review_feedback("owner/name", 42, head, policy) is None
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.PENDING
     assert reviews.cached_review_feedback("owner/name", 43, head, policy) is None
     assert reviews.cached_review_feedback("other/name", 42, head, policy) is None
     assert reviews.cached_review_feedback("owner/name", 42, "b" * 40, policy) is None

@@ -573,7 +573,7 @@ def test_ci_fix_rejects_review_evidence_from_changed_poll_identity(
     from src.github import reviews as gh_reviews
 
     origin = [runner.owner_repo, 77, "head", policy.fingerprint,
-              gh_reviews._review_status_cache_cycle]
+              gh_reviews.review_cache_generation(runner.owner_repo)]
     index = {"repo": 0, "pr": 1, "head": 2, "policy": 3, "cycle": 4}[changed]
     origin[index] = "different"
     runner._fix_review_origin = tuple(origin)
@@ -583,6 +583,45 @@ def test_ci_fix_rejects_review_evidence_from_changed_poll_identity(
     assert "ci-boom" in context
     assert "stale review text" not in context
     assert "status-poll review identity changed" in context
+
+
+def test_ci_fix_keeps_review_evidence_during_other_repo_poll(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda *_: "ci-boom")
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": "head"})
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", head_sha="head",
+        ci_status=CIStatus.FAILURE, review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    policy = fix_module.ReviewerPolicy([
+        TrustedReviewerIdentity(user_id=199175422, login="codex")
+    ])
+    from src.github import reviews as gh_reviews
+
+    gh_reviews._begin_review_cache_cycle(runner.owner_repo)
+    runner._fix_feedback_reviewer_policy = policy
+    runner._fix_review_feedback = "P1: current finding"
+    runner._fix_review_head = "head"
+    runner._fix_review_origin = (
+        runner.owner_repo, 77, "head", policy.fingerprint,
+        gh_reviews.review_cache_generation(runner.owner_repo),
+    )
+    refresh = runner._refresh_auth_status_cache
+
+    async def refresh_after_other_repo_poll() -> None:
+        gh_reviews._begin_review_cache_cycle("other/repo")
+        await refresh()
+
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", refresh_after_other_repo_poll)
+    asyncio.run(runner.handle_fix())
+
+    context = captured["kwargs"]["extra_context"]
+    assert "ci-boom" in context
+    assert "P1: current finding" in context
 
 
 def test_handle_fix_omits_extra_context_when_no_signals(

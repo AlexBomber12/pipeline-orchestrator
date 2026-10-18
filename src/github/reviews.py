@@ -212,6 +212,8 @@ _review_status_cache: dict[str, "ReviewStatus"] = {}
 _review_author_cache: dict[str, str] = {}
 _review_feedback_cache: dict[str, ReviewFeedback] = {}
 _review_status_cache_cycle: int | None = None
+_review_repo_cache_cycles: dict[str, int] = {}
+_review_reset_generation = 0
 
 
 def _cache_key(
@@ -222,22 +224,37 @@ def _cache_key(
 
 def clear_review_status_cache() -> None:
     """Clear the review status cache (used in tests)."""
-    global _review_status_cache_cycle
+    global _review_status_cache_cycle, _review_reset_generation
     _review_status_cache.clear()
     _review_author_cache.clear()
     _review_feedback_cache.clear()
+    _review_repo_cache_cycles.clear()
     _review_status_cache_cycle = None
+    _review_reset_generation += 1
 
 
-def _begin_review_cache_cycle() -> None:
-    """Start a new cache cycle, invalidating all previous entries."""
-    global _review_status_cache_cycle
-    _review_status_cache.clear()
-    _review_author_cache.clear()
-    _review_feedback_cache.clear()
-    if _review_status_cache_cycle is None:
-        _review_status_cache_cycle = 0
-    _review_status_cache_cycle += 1
+def _begin_review_cache_cycle(repo: str | None = None) -> None:
+    """Invalidate this repository's poll evidence, or all entries for a reset."""
+    global _review_status_cache_cycle, _review_reset_generation
+    if repo is None:
+        _review_status_cache.clear()
+        _review_author_cache.clear()
+        _review_feedback_cache.clear()
+        _review_repo_cache_cycles.clear()
+        _review_status_cache_cycle = (_review_status_cache_cycle or 0) + 1
+        _review_reset_generation += 1
+        return
+    prefix = f"{repo}#"
+    for entries in (_review_status_cache, _review_author_cache, _review_feedback_cache):
+        for key in tuple(entries):
+            if key.startswith(prefix):
+                del entries[key]
+    _review_repo_cache_cycles[repo] = _review_repo_cache_cycles.get(repo, 0) + 1
+
+
+def review_cache_generation(repo: str) -> tuple[int, int]:
+    """Identity for one repository's current status-poll generation."""
+    return (_review_reset_generation, _review_repo_cache_cycles.get(repo, 0))
 
 
 def _get_pr_push_time(repo: str, pr_number: int) -> datetime | None:

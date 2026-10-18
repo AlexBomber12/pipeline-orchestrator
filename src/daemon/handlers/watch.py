@@ -932,7 +932,8 @@ class WatchMixin:
         self._fix_review_head = current_pr.head_sha
         self._fix_review_origin = (
             self.owner_repo, current_pr.number, current_pr.head_sha,
-            reviewer_policy.fingerprint, gh_reviews._review_status_cache_cycle,
+            reviewer_policy.fingerprint,
+            gh_reviews.review_cache_generation(self.owner_repo),
         )
         return FeedbackCheckResult.NEW
 

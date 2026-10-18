@@ -285,7 +285,7 @@ class FixMixin(BreachMixin):
                 self.owner_repo, current_pr.number, current_pr.head_sha,
                 fix_feedback_reviewer_policy.fingerprint
                 if fix_feedback_reviewer_policy is not None else None,
-                gh_reviews._review_status_cache_cycle,
+                gh_reviews.review_cache_generation(self.owner_repo),
             )
             if review_origin != expected_origin:
                 review_feedback = None
