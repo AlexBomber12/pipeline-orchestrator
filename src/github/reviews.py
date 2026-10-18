@@ -70,6 +70,7 @@ class ReviewFeedback:
     undated_blocking: bool = False
     latest_finding_at: datetime | None = None
     provider_error_only: bool = False
+    undated_finding: bool = False
 
 
 def format_review_feedback(findings: tuple[str, ...]) -> str | None:
@@ -170,6 +171,7 @@ def feedback_from_comments(
     latest_blocking_at: datetime | None = None
     undated_blocking = False
     latest_finding_at: datetime | None = None
+    undated_finding = False
     for inline, comments in ((False, issue_comments), (True, review_comments)):
         for comment in comments:
             if not _reactions._is_codex_user(comment.get("user"), policy=policy):
@@ -212,6 +214,8 @@ def feedback_from_comments(
                 elif latest_blocking_at is None or effective > latest_blocking_at:
                     latest_blocking_at = effective
             if kind == "finding":
+                if created is None:
+                    undated_finding = True
                 if created is not None and (
                     latest_finding_at is None or created > latest_finding_at
                 ):
@@ -247,6 +251,7 @@ def feedback_from_comments(
         undated_blocking,
         latest_finding_at,
         provider_error and not unsupported_unknown and not unresolved_summary,
+        undated_finding,
     )
 
 
@@ -527,7 +532,12 @@ def _compute_review_status(
         default=None,
     )
     if approved_at and (feedback.findings or feedback.unknown_reason):
-        if feedback.provider_error_only and not feedback.findings:
+        if feedback.provider_error_only and not feedback.undated_finding and (
+            not feedback.findings or (
+                feedback.latest_finding_at is not None
+                and approved_at > feedback.latest_finding_at
+            )
+        ):
             return ReviewStatus.APPROVED
         # Equal-second events have no reliable cross-source order.
         if (

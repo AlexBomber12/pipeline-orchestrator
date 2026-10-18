@@ -6543,6 +6543,58 @@ def test_structured_summary_requires_ordered_update_and_current_head(
     ).unknown_reason is None
 
 
+@pytest.mark.parametrize(
+    ("finding_at", "expected"),
+    [
+        ("2026-10-17T21:07:00Z", ReviewStatus.APPROVED),
+        ("2026-10-17T21:08:00Z", ReviewStatus.PENDING),
+        ("2026-10-17T21:09:00Z", ReviewStatus.CHANGES_REQUESTED),
+        (None, ReviewStatus.PENDING),
+    ],
+)
+def test_provider_error_preserves_only_proven_superseded_findings(
+    monkeypatch: pytest.MonkeyPatch,
+    finding_at: str | None,
+    expected: ReviewStatus,
+) -> None:
+    actor = _codex_user("chatgpt-codex-bot")
+    issue_comments = [
+        {"id": 10, "user": {"login": "author"}, "body": "@codex review",
+         "created_at": "2026-10-17T21:05:00Z"},
+        {"id": 11, "user": actor, "body": "P1: fix the null check",
+         "created_at": finding_at},
+        {"id": 12, "user": actor,
+         "body": "Codex Review: unable to complete review. Try again later.",
+         "created_at": "2026-10-17T21:10:00Z"},
+    ]
+    if finding_at is None:
+        issue_comments[0]["created_at"] = None  # No anchor ordering is available.
+
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return issue_comments
+        if path.endswith("/issues/42/reactions"):
+            return [{
+                "content": "+1", "user": actor,
+                "created_at": "2026-10-17T21:08:00Z",
+            }]
+        return []
+
+    monkeypatch.setattr(cache, "_gh_api_paginated", transport)
+    monkeypatch.setattr(
+        reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 10, 17, 21, 4, tzinfo=_tz.utc),
+    )
+    reviews.clear_review_status_cache()
+    head = "a" * 40
+    policy = ReviewerPolicy([
+        TrustedReviewerIdentity(user_id=TRUSTED_REVIEWER_ID, login="codex")
+    ])
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == expected
+    evidence = reviews.cached_review_feedback("owner/name", 42, head, policy)
+    assert evidence is not None and evidence.findings == ("P1: fix the null check",)
+
+
 def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
