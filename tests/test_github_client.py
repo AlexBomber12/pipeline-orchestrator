@@ -1436,7 +1436,10 @@ def test_body_eyes_wins_over_anchor_plus_one(
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif "comments/10/reactions" in path:
-            data = [[{"content": "+1", "user": _codex_user("chatgpt-codex-bot")}]]
+            data = [[{
+                "content": "+1", "user": _codex_user("chatgpt-codex-bot"),
+                "created_at": "2026-01-01T00:02:00Z",
+            }]]
         elif path.endswith("/reactions"):
             data = [[{"content": "eyes", "user": _codex_user("chatgpt-codex-bot")}]]
         else:
@@ -1444,8 +1447,9 @@ def test_body_eyes_wins_over_anchor_plus_one(
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(reviews, "_get_pr_push_time", lambda *_: datetime(2026, 1, 1, tzinfo=_tz.utc))
 
-    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="head") == ReviewStatus.PENDING
 
 
 def test_anchor_eyes_wins_over_body_plus_one(
@@ -1474,14 +1478,18 @@ def test_anchor_eyes_wins_over_body_plus_one(
         elif "comments/10/reactions" in path:
             data = [[{"content": "eyes", "user": _codex_user("chatgpt-codex-bot")}]]
         elif path.endswith("/reactions"):
-            data = [[{"content": "+1", "user": _codex_user("chatgpt-codex-bot")}]]
+            data = [[{
+                "content": "+1", "user": _codex_user("chatgpt-codex-bot"),
+                "created_at": "2026-01-01T00:02:00Z",
+            }]]
         else:
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(reviews, "_get_pr_push_time", lambda *_: datetime(2026, 1, 1, tzinfo=_tz.utc))
 
-    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="head") == ReviewStatus.PENDING
 
 
 def test_review_api_with_body_eyes_stays_eyes(
