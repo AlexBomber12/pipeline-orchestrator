@@ -33,6 +33,7 @@ from src.models import (
     PublicationWatermark,
     QueueTask,
     RepoState,
+    ReviewStatus,
     TaskStatus,
 )
 from src.queue_parser import (
@@ -1280,6 +1281,10 @@ class RecoveryMixin:
             ref=getattr(evidence, "ref", ""),
             observed_repo=getattr(evidence, "repo", ""),
             observed_head_sha=getattr(evidence, "head_sha", ""),
+            review_approval_at=(
+                pr.review_approval_at
+                if pr.review_status == ReviewStatus.APPROVED else None
+            ),
         )
         self._last_push_at = published_at
         self._last_push_at_pr_number = pr.number

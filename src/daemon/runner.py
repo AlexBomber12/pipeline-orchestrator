@@ -1389,6 +1389,7 @@ class PipelineRunner(
         ref: str = "",
         observed_repo: str = "",
         observed_head_sha: str | None = None,
+        review_approval_at: datetime | None = None,
     ) -> tuple[datetime | None, str | None]:
         """Reject backward reads without using a prior proof as current evidence."""
         # The arguments identify the requested target. The observation may be
@@ -1436,6 +1437,11 @@ class PipelineRunner(
         if (
             self._publication_recovery_cutoff_at is not None
             and observed_at <= self._publication_recovery_cutoff_at
+            and (
+                review_approval_at is None
+                or review_approval_at.tzinfo is None
+                or review_approval_at <= self._publication_recovery_cutoff_at
+            )
         ):
             return None, "publication predates recovery without a trusted safety floor"
         # Keep the floor across SHA changes on the same branch: a force push

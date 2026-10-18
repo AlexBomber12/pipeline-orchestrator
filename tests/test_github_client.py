@@ -6344,8 +6344,10 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
         lambda *_: datetime(2026, 10, 17, 21, 7, tzinfo=_tz.utc),
     )
     head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+    policy = reviews.reviewer_policy_from_config(reviews.load_config())
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    assert reviews.cached_review_approval_at("owner/name", 42, head, policy) is None
     assert comments.get_latest_codex_feedback("owner/name", 42) is None
 
     body_reactions.append({
@@ -6361,6 +6363,9 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     )
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    assert reviews.cached_review_approval_at("owner/name", 42, head, policy) == datetime(
+        2026, 10, 17, 21, 9, tzinfo=_tz.utc,
+    )
     provider_error = {
         "id": 13, "user": receipt["user"],
         "body": "Codex Review: unable to complete review. Try again later.",
