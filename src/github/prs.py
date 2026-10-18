@@ -271,7 +271,7 @@ def get_open_prs(
 ) -> list[PRInfo]:
     """Return open PRs for ``repo`` (``owner/repo``) with CI and review status."""
 
-    _begin_review_cache_cycle()
+    _begin_review_cache_cycle(repo)
     reviewer_policy = reviewer_policy or reviewer_policy_from_config(load_config())
     required_checks = (
         tuple(required_checks) if required_checks is not None else None

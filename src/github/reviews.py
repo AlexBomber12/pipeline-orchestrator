@@ -8,8 +8,12 @@ gate (``ReviewStatus.APPROVED`` / ``EYES`` / ``CHANGES_REQUESTED`` /
 
 from __future__ import annotations
 
+import json
 import logging
-from datetime import datetime
+import re
+import subprocess
+from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from src.config import load_config
 from src.github import cache
@@ -22,9 +26,258 @@ from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_conf
 from src.models import ReviewStatus
 
 logger = logging.getLogger(__name__)
+REVIEW_FEEDBACK_TRUNCATE_CHARS = 5000
+CODEX_BOT_ERROR_PATTERNS = (
+    "Something went wrong while reviewing",
+    "Something went wrong. Try again",
+    "error reviewing this PR",
+    "Try again later by commenting",
+    "Please try again",
+    "unable to download your code",
+    "unable to complete review",
+)
+
+_PRIORITY_FINDING = re.compile(r"(?:^|\n)\s*(?:\*\*)?\[?P[0-3]\b", re.I)
+_RECEIPT = re.compile(
+    r"^<!-- codex-review-receipt:v1 -->|"
+    r"^(?:codex review:\s*)?(?:didn't find any major issues(?:\. delightful!)?|"
+    r"no (?:major )?(?:issues|findings))[.!\s]*$|"
+    r"^(?:lgtm|looks good overall)[.!\s]*$", re.I,
+)
+_PROGRESS = re.compile(
+    r"^(?:review (?:is )?(?:in progress|started|complete)|"
+    r"reviewing (?:this|your|the) pr|reviewing now)[.!\s]*$", re.I,
+)
+_PROVIDER_ERROR = re.compile(
+    r"^(?:unable to (?:review|complete)\b|encountered an error\b|"
+    r"something went wrong while reviewing\b)", re.I,
+)
+_SUMMARY = re.compile(r"^(?:\*\*)?(?:review )?(?:summary|status update)(?:\*\*)?:", re.I)
+_STRUCTURED_SUMMARY = "<!-- codex-pull-request-review-summary -->"
+_REVIEW_STATE = re.compile(r"<!-- codex-review-state:v1 (\{[^\n]*\}) -->")
+_COMMIT_SHA = re.compile(r"[0-9a-fA-F]{40}\Z")
+
+
+@dataclass(frozen=True)
+class ReviewFeedback:
+    """Actionable text and source identity from one reviewer-policy snapshot."""
+
+    findings: tuple[str, ...]
+    source_ids: tuple[int, ...]
+    unknown_reason: str | None = None
+    sources: tuple[tuple[str, int, int], ...] = ()
+    latest_blocking_at: datetime | None = None
+    undated_blocking: bool = False
+    latest_finding_at: datetime | None = None
+    provider_error_only: bool = False
+    undated_finding: bool = False
+
+
+def format_review_feedback(findings: tuple[str, ...]) -> str | None:
+    """Bound the exact admitted findings for a coder CLI argument."""
+    if not findings:
+        return None
+    joined = "\n\n".join(findings)
+    if len(joined) > REVIEW_FEEDBACK_TRUNCATE_CHARS:
+        return "[truncated]\n" + joined[-REVIEW_FEEDBACK_TRUNCATE_CHARS:]
+    return joined
+
+
+def _structured_summary_state(body: str) -> tuple[str, str | None]:
+    """Return the supported summary state and its explicit reviewed commit."""
+    state_match = _REVIEW_STATE.search(body)
+    if state_match is None:
+        return "unknown", None
+    try:
+        state = json.loads(state_match.group(1))["code_review"]
+        raw_sha = state.get("commit_sha")
+        commit_sha = (
+            raw_sha.lower() if isinstance(raw_sha, str) and _COMMIT_SHA.fullmatch(raw_sha)
+            else None
+        )
+        if raw_sha is not None and commit_sha is None:
+            return "unknown", None
+        status = state["status"]
+        if status == "in_progress":
+            return "summary", commit_sha
+        if status != "completed" or commit_sha is None:
+            return "unknown", commit_sha
+        has_any = state["has_any_findings"]
+        unresolved = state["has_unresolved_findings"]
+        if not isinstance(has_any, bool) or not isinstance(unresolved, bool):
+            return "unknown", commit_sha
+        if unresolved and not has_any:
+            return "unknown", commit_sha
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return "unknown", None
+    return ("summary_blocking" if unresolved else "summary"), commit_sha
+
+
+def classify_review_comment(comment: dict, *, inline: bool = False) -> str:
+    """Classify trusted reviewer text without treating receipts as findings."""
+    body = (comment.get("body") or "").strip()
+    if not body:
+        return "unknown"
+    if body.startswith(_STRUCTURED_SUMMARY):
+        return _structured_summary_state(body)[0]
+    if _RECEIPT.search(body):
+        return "receipt"
+    if _reactions._is_codex_onboarding_comment(comment):
+        return "onboarding"
+    if inline or _PRIORITY_FINDING.search(body):
+        return "finding"
+    if _SUMMARY.search(body):
+        return "summary"
+    message = re.sub(r"^codex review:\s*", "", body, flags=re.I)
+    if _PROVIDER_ERROR.search(message) or any(
+        message.lower().startswith(pattern.lower()) for pattern in CODEX_BOT_ERROR_PATTERNS
+    ):
+        return "provider_error"
+    if _PROGRESS.search(message):
+        return "progress"
+    return "finding"
+
+
+def feedback_from_comments(
+    issue_comments: list[dict],
+    review_comments: list[dict],
+    pr_author: str,
+    policy: ReviewerPolicy,
+    after: datetime | None = None,
+    head_sha: str = "",
+) -> ReviewFeedback:
+    """Use the latest author anchor and optional push floor for both verdict and FIX."""
+    anchor = next(
+        (
+            c
+            for c in reversed(issue_comments)
+            if (not pr_author or (c.get("user") or {}).get("login") == pr_author)
+            and "@codex review" in (c.get("body") or "").lower()
+        ),
+        None,
+    )
+    anchor_time = _parse_iso(anchor.get("created_at")) if anchor else None
+    if anchor_time is not None and anchor_time.tzinfo is None:
+        anchor_time = anchor_time.replace(tzinfo=timezone.utc)
+    if after is not None and after.tzinfo is None:
+        after = after.replace(tzinfo=timezone.utc)
+    findings: list[str] = []
+    ids: list[int] = []
+    sources: list[tuple[str, int, int]] = []
+    unsupported_unknown = False
+    structured_unknown = False
+    provider_error = False
+    unresolved_summary = False
+    latest_blocking_at: datetime | None = None
+    undated_blocking = False
+    latest_finding_at: datetime | None = None
+    undated_finding = False
+    for inline, comments in ((False, issue_comments), (True, review_comments)):
+        for comment in comments:
+            if not _reactions._is_codex_user(comment.get("user"), policy=policy):
+                continue
+            body = (comment.get("body") or "").strip()
+            structured = not inline and body.startswith(_STRUCTURED_SUMMARY)
+            kind = classify_review_comment(comment, inline=inline)
+            commit_sha: str | None = None
+            if structured:
+                kind, commit_sha = _structured_summary_state(body)
+                if head_sha and commit_sha and commit_sha != head_sha.lower():
+                    continue  # The provider explicitly bound this version to an older HEAD.
+            created = _parse_iso(comment.get("created_at"))
+            if created is not None and created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            effective = created
+            uncertain_version = False
+            if structured:
+                updated = _parse_iso(comment.get("updated_at"))
+                if updated is not None and updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                if updated is not None and created is not None and updated < created:
+                    kind = "unknown"
+                    uncertain_version = True
+                elif updated is not None:
+                    effective = updated
+                elif kind in ("unknown", "summary_blocking"):
+                    uncertain_version = True
+                if kind == "unknown" and commit_sha is None:
+                    uncertain_version = True  # No supported HEAD binding for this version.
+            current_blocking_summary = structured and kind in ("unknown", "summary_blocking")
+            if not current_blocking_summary and (
+                (anchor_time and (effective is None or effective <= anchor_time))
+                or (after and (effective is None or effective <= after))
+            ):
+                continue
+            if kind in ("finding", "unknown", "provider_error", "summary_blocking"):
+                if effective is None or uncertain_version:
+                    undated_blocking = True
+                elif latest_blocking_at is None or effective > latest_blocking_at:
+                    latest_blocking_at = effective
+            if kind == "finding":
+                if created is None:
+                    undated_finding = True
+                if created is not None and (
+                    latest_finding_at is None or created > latest_finding_at
+                ):
+                    latest_finding_at = created
+                findings.append((comment.get("body") or "").strip())
+                comment_id = comment.get("id") or 0
+                ids.append(comment_id)
+                sources.append((
+                    "review" if inline else "issue", comment_id,
+                    (comment.get("user") or {}).get("id") or 0,
+                ))
+            elif kind == "unknown":
+                unsupported_unknown = True
+                structured_unknown = structured_unknown or structured
+            elif kind == "provider_error":
+                provider_error = True
+            elif kind == "summary_blocking":
+                unresolved_summary = True
+    return ReviewFeedback(
+        tuple(findings), tuple(ids),
+        (
+            (
+                "structured review reports unresolved findings without detailed comments"
+                if unresolved_summary else (
+                    "structured review metadata or update provenance unavailable"
+                    if structured_unknown else "trusted review text has no supported finding shape"
+                )
+            ) if (unsupported_unknown or provider_error or unresolved_summary) and not findings
+            else None
+        ),
+        tuple(sources),
+        latest_blocking_at,
+        undated_blocking,
+        latest_finding_at,
+        provider_error and not unsupported_unknown and not unresolved_summary,
+        undated_finding,
+    )
+
+
+def read_review_feedback(
+    repo: str,
+    pr_number: int,
+    pr_author: str,
+    policy: ReviewerPolicy,
+    after: datetime | None = None,
+    head_sha: str = "",
+) -> ReviewFeedback:
+    """Read current actionable evidence; transport failures remain pending."""
+    try:
+        issues = cache._gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
+        inline = cache._gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+        return ReviewFeedback((), (), f"review feedback unavailable: {exc}")
+    return feedback_from_comments(issues, inline, pr_author, policy, after, head_sha)
+
 
 _review_status_cache: dict[str, "ReviewStatus"] = {}
+_review_author_cache: dict[str, str] = {}
+_review_feedback_cache: dict[str, ReviewFeedback] = {}
 _review_status_cache_cycle: int | None = None
+_review_repo_cache_cycles: dict[str, int] = {}
+_review_reset_generation = 0
 
 
 def _cache_key(
@@ -35,18 +288,37 @@ def _cache_key(
 
 def clear_review_status_cache() -> None:
     """Clear the review status cache (used in tests)."""
-    global _review_status_cache_cycle
+    global _review_status_cache_cycle, _review_reset_generation
     _review_status_cache.clear()
+    _review_author_cache.clear()
+    _review_feedback_cache.clear()
+    _review_repo_cache_cycles.clear()
     _review_status_cache_cycle = None
+    _review_reset_generation += 1
 
 
-def _begin_review_cache_cycle() -> None:
-    """Start a new cache cycle, invalidating all previous entries."""
-    global _review_status_cache_cycle
-    _review_status_cache.clear()
-    if _review_status_cache_cycle is None:
-        _review_status_cache_cycle = 0
-    _review_status_cache_cycle += 1
+def _begin_review_cache_cycle(repo: str | None = None) -> None:
+    """Invalidate this repository's poll evidence, or all entries for a reset."""
+    global _review_status_cache_cycle, _review_reset_generation
+    if repo is None:
+        _review_status_cache.clear()
+        _review_author_cache.clear()
+        _review_feedback_cache.clear()
+        _review_repo_cache_cycles.clear()
+        _review_status_cache_cycle = (_review_status_cache_cycle or 0) + 1
+        _review_reset_generation += 1
+        return
+    prefix = f"{repo}#"
+    for entries in (_review_status_cache, _review_author_cache, _review_feedback_cache):
+        for key in tuple(entries):
+            if key.startswith(prefix):
+                del entries[key]
+    _review_repo_cache_cycles[repo] = _review_repo_cache_cycles.get(repo, 0) + 1
+
+
+def review_cache_generation(repo: str) -> tuple[int, int]:
+    """Identity for one repository's current status-poll generation."""
+    return (_review_reset_generation, _review_repo_cache_cycles.get(repo, 0))
 
 
 def _get_pr_push_time(repo: str, pr_number: int) -> datetime | None:
@@ -78,6 +350,7 @@ def get_pr_review_status(
 
     if head_sha:
         ck = _cache_key(repo, pr_number, head_sha, reviewer_policy)
+        _review_author_cache[ck] = pr_author
         cached = _review_status_cache.get(ck)
         if cached is not None:
             return cached
@@ -91,6 +364,20 @@ def get_pr_review_status(
     return result
 
 
+def cached_review_author(
+    repo: str, pr_number: int, head_sha: str, policy: ReviewerPolicy
+) -> str:
+    """Use the author and policy snapshot from the PR status poll."""
+    return _review_author_cache.get(_cache_key(repo, pr_number, head_sha, policy), "")
+
+
+def cached_review_feedback(
+    repo: str, pr_number: int, head_sha: str, policy: ReviewerPolicy
+) -> ReviewFeedback | None:
+    """Return evidence from the current status-poll cycle for this exact identity."""
+    return _review_feedback_cache.get(_cache_key(repo, pr_number, head_sha, policy))
+
+
 def _compute_review_status(
     repo: str,
     pr_number: int,
@@ -101,6 +388,8 @@ def _compute_review_status(
     """Core review status logic, separated for caching."""
     body_eyes = False
     body_approved = False
+    body_approval_at: datetime | None = None
+    saw_plus_one = False
     last_push_time: datetime | None = None
     last_push_time_loaded = False
     reviewer_policy = (
@@ -116,6 +405,7 @@ def _compute_review_status(
                 codex_reactions, policy=reviewer_policy
             )
             if plus_one is not None:
+                saw_plus_one = True
                 if head_sha:
                     try:
                         review_info = _get_codex_review_signals(
@@ -147,6 +437,7 @@ def _compute_review_status(
                             and reaction_time >= threshold
                         ):
                             body_approved = True
+                            body_approval_at = reaction_time
             if not body_approved and any(
                 _reactions._is_reaction_content(
                     reaction, "eyes", policy=reviewer_policy
@@ -154,7 +445,6 @@ def _compute_review_status(
                 for reaction in codex_reactions
             ):
                 body_eyes = True
-                return ReviewStatus.EYES
     except RuntimeError as exc:
         if not _is_http_404_error(exc):
             raise
@@ -182,6 +472,7 @@ def _compute_review_status(
             break
 
     anchor_approved = False
+    anchor_approval_at: datetime | None = None
     anchor_eyes = False
     if anchor is not None:
         cid = anchor.get("id")
@@ -196,6 +487,7 @@ def _compute_review_status(
                         policy=reviewer_policy,
                     )
                     if anchor_plus_one is not None:
+                        saw_plus_one = True
                         if head_sha:
                             if not last_push_time_loaded:
                                 last_push_time = _get_pr_push_time(repo, pr_number)
@@ -208,6 +500,8 @@ def _compute_review_status(
                                 and last_push_time
                                 and reaction_time >= last_push_time
                             )
+                            if anchor_approved:
+                                anchor_approval_at = reaction_time
                     if not anchor_approved and any(
                         _reactions._is_reaction_content(
                             reaction, "eyes", policy=reviewer_policy
@@ -228,24 +522,54 @@ def _compute_review_status(
                 else:
                     raise
 
-    if body_eyes or anchor_eyes:
-        return ReviewStatus.EYES
+    feedback = feedback_from_comments(
+        issue_comments, review_comments, pr_author, reviewer_policy, head_sha=head_sha
+    )
+    if head_sha:
+        _review_feedback_cache[_cache_key(repo, pr_number, head_sha, reviewer_policy)] = feedback
+    approved_at = max(
+        (t for t in (body_approval_at, anchor_approval_at) if t is not None),
+        default=None,
+    )
+    if approved_at and (feedback.findings or feedback.unknown_reason):
+        if feedback.provider_error_only and not feedback.undated_finding and (
+            not feedback.findings or (
+                feedback.latest_finding_at is not None
+                and approved_at > feedback.latest_finding_at
+            )
+        ):
+            return ReviewStatus.APPROVED
+        # Equal-second events have no reliable cross-source order.
+        if (
+            feedback.latest_blocking_at is not None
+            and not feedback.undated_blocking
+            and approved_at > feedback.latest_blocking_at
+        ):
+            return ReviewStatus.APPROVED
+        if feedback.latest_finding_at is not None and feedback.latest_finding_at > approved_at:
+            return ReviewStatus.CHANGES_REQUESTED
+        logger.info(
+            "PR #%s review pending: +1 does not supersede current review text (%s)",
+            pr_number, feedback.unknown_reason or "evidence order is ambiguous",
+        )
+        return ReviewStatus.PENDING
     if body_approved:
         return ReviewStatus.APPROVED
     if anchor_approved:
         return ReviewStatus.APPROVED
+    if body_eyes or anchor_eyes:
+        return ReviewStatus.EYES
+    if feedback.unknown_reason:
+        logger.info("PR #%s review pending: %s", pr_number, feedback.unknown_reason)
+        return ReviewStatus.PENDING
 
-    anchor_ts = (anchor.get("created_at") or "") if anchor else ""
-    for comment in issue_comments + review_comments:
-        if not _reactions._is_codex_user(
-            comment.get("user"), policy=reviewer_policy
-        ):
-            continue
-        if _reactions._is_codex_onboarding_comment(comment):
-            continue
-        if anchor_ts and (comment.get("created_at") or "") <= anchor_ts:
-            continue
+    if feedback.findings:
         return ReviewStatus.CHANGES_REQUESTED
+    if saw_plus_one:
+        logger.info(
+            "PR #%s approval pending: current HEAD push or reaction provenance unavailable or stale",
+            pr_number,
+        )
 
     return ReviewStatus.PENDING
 
