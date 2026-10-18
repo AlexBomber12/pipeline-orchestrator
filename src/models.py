@@ -205,7 +205,7 @@ class PublicationWatermark(BaseModel):
 
 
 class PublicationMigration(BaseModel):
-    """Upgrade-only proposal bound to the parent snapshot's open PR."""
+    """Recovery proposal bound to one observed open PR and publication."""
 
     repo: str
     pr_number: int
@@ -214,6 +214,7 @@ class PublicationMigration(BaseModel):
     head_sha: str
     published_at: datetime | None = None
     provenance: str = ""
+    source: Literal["parent_snapshot", "missing_snapshot"] = "parent_snapshot"
     reason: str
     status: Literal["legacy", "blocked"] = "legacy"
 

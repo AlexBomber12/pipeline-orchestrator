@@ -172,6 +172,72 @@ def test_parent_snapshot_620_bootstraps_exact_branch_creation(
     assert restarted._canonical_push_timestamp(620) is None
 
 
+@pytest.mark.parametrize("activity_available", [True, False])
+def test_missing_snapshot_requires_exact_operator_migration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, activity_available: bool,
+) -> None:
+    """Header/GitHub recovery with no Redis snapshot must offer a bounded route."""
+    repo = "AlexBomber12/pipeline-orchestrator"
+    branch = "pr-459-e2e-failure-evidence"
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+    pr = PRInfo(number=620, branch=branch, title="PR-459: e2e failure evidence",
+                pr_id="PR-459", head_sha=head)
+
+    def transport(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/620" in args[1]:
+            return {"branch": branch, "repo": repo, "sha": head}
+        if "/activity?" in args[1]:
+            if activity_available:
+                return [{"activity_type": "branch_creation", "ref": f"refs/heads/{branch}",
+                         "before": "0" * 40, "after": head,
+                         "timestamp": "2026-10-17T21:06:35Z"}]
+            return []
+        raise AssertionError(args)
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", transport)
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [pr])
+    runner = h._make_runner(url=f"https://github.com/{repo}.git")
+    runner.repo_path = str(tmp_path)
+    runner._parse_tasks_from_headers = lambda: [QueueTask(  # type: ignore[method-assign]
+        pr_id="PR-459", title="e2e-failure-evidence", status=TaskStatus.DOING,
+        branch=branch, task_file="tasks/PR-459.md",
+    )]
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.state == PipelineState.WATCH
+    proposal = runner.state.publication_migration
+    assert proposal is not None and proposal.source == "missing_snapshot"
+    if activity_available:
+        assert "Saved state is absent" in proposal.reason
+    assert runner.state.publication_watermark is None
+    assert runner._canonical_push_timestamp(620) is None
+    if not activity_available:
+        assert proposal.published_at is None
+        return
+    assert proposal.published_at == datetime(2026, 10, 17, 21, 6, 35, tzinfo=timezone.utc)
+    asyncio.run(runner.publish_state())
+    pending_restart = h._make_runner(url=f"https://github.com/{repo}.git")
+    pending_restart.redis = runner.redis
+    pending_restart.repo_path = str(tmp_path)
+    pending_restart._parse_tasks_from_headers = runner._parse_tasks_from_headers  # type: ignore[method-assign]
+    assert asyncio.run(pending_restart.recover_state()) is True
+    assert pending_restart.state.publication_migration is not None
+    assert pending_restart.state.publication_migration.source == "missing_snapshot"
+    assert pending_restart.state.publication_watermark is None
+    runner = pending_restart
+    proposal = runner.state.publication_migration
+    binding = migration_binding(proposal)
+    asyncio.run(enqueue_migration(runner.redis, runner.name, binding))
+    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    assert runner.state.publication_watermark is not None
+
+    restarted = h._make_runner(url=f"https://github.com/{repo}.git")
+    restarted.redis = runner.redis
+    restarted.repo_path = str(tmp_path)
+    restarted._parse_tasks_from_headers = runner._parse_tasks_from_headers  # type: ignore[method-assign]
+    assert asyncio.run(restarted.recover_state()) is True
+    assert restarted.state.publication_watermark == runner.state.publication_watermark
+
+
 @pytest.mark.parametrize("change_evidence", [False, True])
 def test_parent_snapshot_push_requires_exact_operator_command(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, change_evidence: bool,

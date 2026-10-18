@@ -448,7 +448,9 @@ class RecoveryMixin:
         except Exception:
             return
         if not raw:
+            self._publication_snapshot_absent = True
             return
+        self._publication_snapshot_absent = False
         try:
             persisted = RepoState.model_validate_json(raw)
         except Exception:
@@ -1496,6 +1498,16 @@ class RecoveryMixin:
 
     def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
         """Refresh the feedback floor from current-head publication evidence."""
+        if (
+            getattr(self, "_publication_snapshot_absent", False)
+            and self.state.publication_migration is None
+        ):
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                source="missing_snapshot",
+                reason="Saved state is absent; an operator must confirm the observed publication.",
+            )
         if getattr(self, "_publication_snapshot_damaged", False):
             self.state.publication_migration = PublicationMigration(
                 repo=self.owner_repo, pr_number=pr.number, head_repo="",
@@ -1553,8 +1565,15 @@ class RecoveryMixin:
         proposal.head_repo = evidence.head_repo
         proposal.published_at = evidence.published_at
         proposal.provenance = evidence.provenance
-        proposal.reason = "Historical publication needs an operator trust anchor."
-        if evidence.provenance == "github-activity:branch_creation":
+        proposal.reason = (
+            "Saved state is absent; confirm this historical publication as the initial safety floor."
+            if proposal.source == "missing_snapshot"
+            else "Historical publication needs an operator trust anchor."
+        )
+        if (
+            proposal.source == "parent_snapshot"
+            and evidence.provenance == "github-activity:branch_creation"
+        ):
             self._publication_high_water_identity = (
                 self.owner_repo, pr.number, evidence.head_repo, evidence.ref, pr.head_sha,
             )
