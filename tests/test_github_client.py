@@ -6464,6 +6464,54 @@ def test_structured_summary_reader_and_poll_evidence_identity(
     assert evidence is not None and evidence.findings == ("[P1] Fix the empty input",)
 
 
+def test_unresolved_structured_summary_blocks_earlier_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = json.loads(
+        (Path(__file__).parent / "fixtures/review_summary_structured.json").read_text()
+    )
+    summary["body"] = summary["body"].replace(
+        '"has_any_findings":false,"has_unresolved_findings":false',
+        '"has_any_findings":true,"has_unresolved_findings":true',
+    )
+    comments = [
+        {"id": 10, "user": {"login": "author"}, "body": "@codex review",
+         "created_at": "2026-10-17T21:05:00Z"},
+        summary,
+    ]
+    body_reactions = [{
+        "content": "+1", "user": summary["user"],
+        "created_at": "2026-10-17T21:05:30Z",
+    }]
+
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return comments
+        if path.endswith("/issues/42/reactions"):
+            return body_reactions
+        return []
+
+    monkeypatch.setattr(cache, "_gh_api_paginated", transport)
+    monkeypatch.setattr(
+        reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 10, 17, 21, 4, tzinfo=_tz.utc),
+    )
+    policy = ReviewerPolicy([
+        TrustedReviewerIdentity(user_id=TRUSTED_REVIEWER_ID, login="codex")
+    ])
+    head = "a" * 40
+    reviews.clear_review_status_cache()
+    assert reviews.classify_review_comment(summary) == "summary_blocking"
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.PENDING
+    evidence = reviews.cached_review_feedback("owner/name", 42, head, policy)
+    assert evidence is not None and evidence.findings == ()
+    assert "unresolved findings" in (evidence.unknown_reason or "")
+
+    body_reactions[0]["created_at"] = "2026-10-17T21:07:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.APPROVED
+
+
 def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

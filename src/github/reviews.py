@@ -101,6 +101,8 @@ def classify_review_comment(comment: dict, *, inline: bool = False) -> str:
                 return "unknown"
         except (ValueError, KeyError, TypeError):
             return "unknown"
+        if status == "completed" and state["has_unresolved_findings"]:
+            return "summary_blocking"
         return "summary"
     if _RECEIPT.search(body):
         return "receipt"
@@ -147,6 +149,7 @@ def feedback_from_comments(
     sources: list[tuple[str, int, int]] = []
     unsupported_unknown = False
     provider_error = False
+    unresolved_summary = False
     latest_blocking_at: datetime | None = None
     undated_blocking = False
     latest_finding_at: datetime | None = None
@@ -162,7 +165,7 @@ def feedback_from_comments(
             ):
                 continue
             kind = classify_review_comment(comment, inline=inline)
-            if kind in ("finding", "unknown", "provider_error"):
+            if kind in ("finding", "unknown", "provider_error", "summary_blocking"):
                 if created is None:
                     undated_blocking = True
                 elif latest_blocking_at is None or created > latest_blocking_at:
@@ -183,18 +186,22 @@ def feedback_from_comments(
                 unsupported_unknown = True
             elif kind == "provider_error":
                 provider_error = True
+            elif kind == "summary_blocking":
+                unresolved_summary = True
     return ReviewFeedback(
         tuple(findings), tuple(ids),
         (
-            "trusted review text has no supported finding shape"
-            if (unsupported_unknown or provider_error) and not findings
+            (
+                "structured review reports unresolved findings without detailed comments"
+                if unresolved_summary else "trusted review text has no supported finding shape"
+            ) if (unsupported_unknown or provider_error or unresolved_summary) and not findings
             else None
         ),
         tuple(sources),
         latest_blocking_at,
         undated_blocking,
         latest_finding_at,
-        provider_error and not unsupported_unknown,
+        provider_error and not unsupported_unknown and not unresolved_summary,
     )
 
 

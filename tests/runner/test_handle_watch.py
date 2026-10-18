@@ -128,20 +128,38 @@ def test_watch_620_evidence_drives_fix_without_rereading(
         assert any("CI FIX continues" in entry["event"] for entry in runner.state.history)
 
 
+@pytest.mark.parametrize("unresolved", [False, True])
 def test_structured_summary_after_trigger_does_not_dispatch_fix(
     monkeypatch: pytest.MonkeyPatch,
+    unresolved: bool,
 ) -> None:
     summary = json.loads(
         (Path(__file__).parents[1] / "fixtures/review_summary_structured.json").read_text()
     )
+    if unresolved:
+        summary["body"] = summary["body"].replace(
+            '"has_any_findings":false,"has_unresolved_findings":false',
+            '"has_any_findings":true,"has_unresolved_findings":true',
+        )
     comments = [
         {"id": 10, "user": {"login": "author"}, "body": "@codex review",
          "created_at": "2026-10-17T21:05:00Z"},
         summary,
     ]
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return comments
+        if unresolved and path.endswith("/issues/42/reactions"):
+            return [{
+                "content": "+1", "user": summary["user"],
+                "created_at": "2026-10-17T21:05:30Z",
+            }]
+        return []
+
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", transport)
     monkeypatch.setattr(
-        gh_cache, "_gh_api_paginated",
-        lambda path: comments if path.endswith("/issues/42/comments") else [],
+        gh_reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 10, 17, 21, 4, tzinfo=timezone.utc),
     )
     head = "a" * 40
 
