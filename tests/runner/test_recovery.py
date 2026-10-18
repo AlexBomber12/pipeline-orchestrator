@@ -59,6 +59,7 @@ from src.keyspace import pipeline_state
 from src.models import (
     PipelineState,  # noqa: F811
     PRInfo,  # noqa: F811
+    PublicationWatermark,
     QueueTask,  # noqa: F811
     RepoState,
     TaskStatus,  # noqa: F811
@@ -1400,13 +1401,13 @@ def test_dirty_tree_auto_recovery_failure_stays_error(
     assert any("Auto-recovery failed" in e["event"] for e in runner.state.history)
 
 
+@pytest.mark.parametrize("validated_floor", [True, False])
 def test_recover_state_rehydrates_last_push_at(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    validated_floor: bool,
 ) -> None:
-    """recover_state must rehydrate _last_push_at when matching to an
-    in-flight DOING task's open PR so the first post-restart handle_watch
-    does not falsely fire handle_fix on pre-restart Codex feedback."""
+    """Only a validated floor permits a pre-restart publication timestamp."""
     parsed_tasks = [
         QueueTask(
             pr_id="PR-001",
@@ -1437,8 +1438,8 @@ def test_recover_state_rehydrates_last_push_at(
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
     runner._parse_tasks_from_headers = lambda: parsed_tasks  # type: ignore[method-assign]
-    # A legacy checkpoint has no dedicated watermark but does retain a
-    # complete, previously proven publication on its current PR.
+    # A raw PR observation can be saved by _record_pre_pause_pr without
+    # validation. It must not become a safety floor on restart.
     saved = RepoState(
         url=runner.state.url, name=runner.state.name, state=PipelineState.WATCH,
         current_pr=PRInfo(
@@ -1449,14 +1450,26 @@ def test_recover_state_rehydrates_last_push_at(
             ),
             publication_head_repo="octo/demo", publication_ref="refs/heads/pr-001",
         ),
+        publication_watermark=PublicationWatermark(
+            repo="octo/demo", pr_number=7, head_repo="octo/demo",
+            ref="refs/heads/pr-001", head_sha=head,
+            published_at=datetime.fromisoformat(head_iso.replace("Z", "+00:00")),
+            provenance="github-activity:branch_creation",
+        ) if validated_floor else None,
     )
     asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
     assert runner._last_push_at is None
     assert runner._watch_entered_at is None
     asyncio.run(runner.recover_state())
     assert runner.state.state == PipelineState.WATCH
-    assert runner._last_push_at is not None
-    assert runner._last_push_at.isoformat() == "2026-04-10T12:00:00+00:00"
+    if validated_floor:
+        assert runner._last_push_at is not None
+        assert runner._last_push_at.isoformat() == "2026-04-10T12:00:00+00:00"
+    else:
+        assert runner._last_push_at is None
+        assert runner.state.publication_watermark is None
+        assert runner.state.publication_migration is not None
+        assert runner.state.publication_migration.status == "blocked"
     # PR-202: recovery anchors the slow-start window so the first
     # post-restart poll already uses the slow cadence.
     assert runner._watch_entered_at is not None

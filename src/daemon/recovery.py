@@ -539,17 +539,6 @@ class RecoveryMixin:
         saved = persisted.publication_watermark
         pr = persisted.current_pr
         if (
-            saved is None and pr is not None and pr.publication_observed
-            and pr.publication_at is not None
-        ):
-            # Legacy snapshots kept only the last poll's result. It is a
-            # usable safety floor when its full PR/head context is present.
-            saved = PublicationWatermark(
-                repo=self.owner_repo, pr_number=pr.number,
-                head_repo=pr.publication_head_repo, ref=pr.publication_ref,
-                head_sha=pr.head_sha, published_at=pr.publication_at,
-            )
-        if (
             saved is None or pr is None or persisted.name != self.name
             or saved.repo != self.owner_repo or saved.pr_number != pr.number
             or re.fullmatch(r"[0-9a-fA-F]{40}", saved.head_sha) is None
