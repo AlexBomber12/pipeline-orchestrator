@@ -451,10 +451,12 @@ def _compute_review_status(
         default=None,
     )
     if approved_at and (feedback.findings or feedback.unknown_reason):
+        # GitHub timestamps have one-second resolution. A valid +1 wins a tie
+        # with earlier blocking text on the same HEAD.
         if (
             feedback.latest_blocking_at is not None
             and not feedback.undated_blocking
-            and approved_at > feedback.latest_blocking_at
+            and approved_at >= feedback.latest_blocking_at
         ):
             return ReviewStatus.APPROVED
         if feedback.latest_finding_at is not None and feedback.latest_finding_at > approved_at:

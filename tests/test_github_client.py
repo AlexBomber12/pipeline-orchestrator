@@ -6327,6 +6327,9 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     body_reactions[0]["created_at"] = "2026-10-17T21:11:00Z"
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    body_reactions[0]["created_at"] = "2026-10-17T21:10:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
     body_reactions[0]["created_at"] = "2026-10-17T21:09:00Z"
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
@@ -6370,6 +6373,9 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     })
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    anchor_reactions[0]["created_at"] = "2026-10-17T21:12:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
     anchor_reactions[0]["created_at"] = "2026-10-17T21:13:00Z"
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
