@@ -6353,7 +6353,7 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
     body_reactions[0]["created_at"] = "2026-10-17T21:10:00Z"
     reviews.clear_review_status_cache()
-    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
     body_reactions[0]["created_at"] = "2026-10-17T21:09:00Z"
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
@@ -6399,7 +6399,7 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
     anchor_reactions[0]["created_at"] = "2026-10-17T21:12:00Z"
     reviews.clear_review_status_cache()
-    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
     anchor_reactions[0]["created_at"] = "2026-10-17T21:13:00Z"
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
@@ -6512,6 +6512,37 @@ def test_unresolved_structured_summary_blocks_earlier_approval(
     assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.APPROVED
 
 
+@pytest.mark.parametrize("updated_at", [None, "2026-10-17T21:00:00", "2026-10-17T21:08:00"])
+def test_structured_summary_requires_ordered_update_and_current_head(
+    updated_at: str | None,
+) -> None:
+    summary = json.loads(
+        (Path(__file__).parent / "fixtures/review_summary_structured.json").read_text()
+    )
+    summary["created_at"] = "2026-10-17T21:06:00Z"
+    summary["updated_at"] = updated_at
+    summary["body"] = summary["body"].replace(
+        '"has_any_findings":false,"has_unresolved_findings":false',
+        '"has_any_findings":true,"has_unresolved_findings":true',
+    )
+    anchor = {
+        "id": 10, "user": {"login": "author"}, "body": "@codex review",
+        "created_at": "2026-10-17T21:05:00Z",
+    }
+    policy = ReviewerPolicy([
+        TrustedReviewerIdentity(user_id=TRUSTED_REVIEWER_ID, login="codex")
+    ])
+    evidence = reviews.feedback_from_comments(
+        [anchor, summary], [], "author", policy, head_sha="a" * 40,
+    )
+    assert evidence.findings == ()
+    assert evidence.unknown_reason
+    assert evidence.undated_blocking == (updated_at is None or updated_at < summary["created_at"])
+    assert reviews.feedback_from_comments(
+        [anchor, summary], [], "author", policy, head_sha="b" * 40,
+    ).unknown_reason is None
+
+
 def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6531,7 +6562,8 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
         "Summary: This change correctly handles empty input": "summary",
         (
             "<!-- codex-pull-request-review-summary -->\n"
-            '<!-- codex-review-state:v1 {"code_review":{"status":"completed",'
+            '<!-- codex-review-state:v1 {"code_review":{"commit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            '"status":"completed",'
             '"has_any_findings":false,"has_unresolved_findings":false}} -->\n\n'
             "## Codex Review Summary"
         ): "summary",
@@ -6559,6 +6591,14 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
     for state in (
         {"code_review": {"status": "unsupported"}},
         {"code_review": {"status": "completed", "has_any_findings": None}},
+        {"code_review": {
+            "commit_sha": "a" * 40, "status": "completed",
+            "has_any_findings": None, "has_unresolved_findings": False,
+        }},
+        {"code_review": {
+            "commit_sha": "a" * 40, "status": "completed",
+            "has_any_findings": False, "has_unresolved_findings": True,
+        }},
         {"code_review": {
             "status": "completed", "has_any_findings": False,
             "has_unresolved_findings": None,

@@ -200,6 +200,114 @@ def test_structured_summary_after_trigger_does_not_dispatch_fix(
 
 
 @pytest.mark.parametrize(
+    ("summary_created", "summary_updated", "finding_at", "approval_at", "summary_sha", "expected"),
+    [
+        ("21:01:00", "21:09:00", None, "21:08:00", "current", (ReviewStatus.PENDING, [])),
+        ("21:06:00", "21:09:00", None, "21:08:00", "current", (ReviewStatus.PENDING, [])),
+        ("21:06:00", "21:08:00", None, "21:08:00", "current", (ReviewStatus.PENDING, [])),
+        (None, None, "21:08:00", "21:08:00", "current", (ReviewStatus.PENDING, [])),
+        (None, None, "21:07:00", "21:08:00", "current", (ReviewStatus.APPROVED, ["merge"])),
+        (None, None, "21:09:00", "21:08:00", "current", (ReviewStatus.CHANGES_REQUESTED, ["fix"])),
+        ("21:01:00", "21:09:00", None, "21:08:00", "old", (ReviewStatus.APPROVED, ["merge"])),
+        ("21:01:00", "21:09:00", None, "21:08:00", "unsupported", (ReviewStatus.PENDING, [])),
+    ],
+)
+def test_watch_orders_mutable_summary_and_approval_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    summary_created: str | None,
+    summary_updated: str | None,
+    finding_at: str | None,
+    approval_at: str,
+    summary_sha: str,
+    expected: tuple[ReviewStatus, list[str]],
+) -> None:
+    head = "a" * 40
+    actor = {"id": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+    def stamp(value: str) -> str:
+        return f"2026-10-17T{value}Z"
+    issue_comments = [{
+        "id": 10, "user": {"login": "author"}, "body": "@codex review",
+        "created_at": stamp("21:05:00"),
+    }]
+    if summary_created:
+        summary = json.loads(
+            (Path(__file__).parents[1] / "fixtures/review_summary_structured.json").read_text()
+        )
+        summary["created_at"] = stamp(summary_created)
+        summary["updated_at"] = stamp(summary_updated)
+        summary["body"] = summary["body"].replace(
+            '"has_any_findings":false,"has_unresolved_findings":false',
+            '"has_any_findings":true,"has_unresolved_findings":true',
+        )
+        if summary_sha == "old":
+            summary["body"] = summary["body"].replace(head, "b" * 40)
+        elif summary_sha == "unsupported":
+            summary["body"] = summary["body"].replace(head, "unknown")
+        issue_comments.append(summary)
+    if finding_at:
+        issue_comments.append({
+            "id": 12, "user": actor, "body": "P1: repair the null check",
+            "created_at": stamp(finding_at),
+        })
+
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return issue_comments
+        if path.endswith("/issues/42/reactions"):
+            return [{"content": "+1", "user": actor, "created_at": stamp(approval_at)}]
+        return []
+
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", transport)
+    monkeypatch.setattr(
+        gh_reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 10, 17, 21, 4, tzinfo=timezone.utc),
+    )
+
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        return [PRInfo(
+            number=42, branch="pr-459", head_sha=head, ci_status=CIStatus.SUCCESS,
+            diff_scanned_at_sha=head,
+            review_status=gh_reviews.get_pr_review_status(
+                repo, 42, "author", head, policy=kwargs["reviewer_policy"]
+            ),
+        )]
+
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    gh_reviews.clear_review_status_cache()
+    runner = h._make_runner(review_timeout_min=120, auto_merge=True)
+    runner.state.current_pr = PRInfo(number=42, branch="pr-459", head_sha=head, diff_scanned_at_sha=head)
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = datetime(2026, 10, 17, 21, 4, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 42
+    calls: list[str] = []
+
+    async def fake_fix() -> None:
+        calls.append("fix")
+        if finding_at and expected[0] == ReviewStatus.CHANGES_REQUESTED:
+            assert runner._fix_review_feedback == "P1: repair the null check"
+
+    async def fake_merge() -> None:
+        calls.append("merge")
+
+    async def no_scan() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_fix", fake_fix)
+    monkeypatch.setattr(runner, "handle_merge", fake_merge)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_scan)
+    asyncio.run(runner.handle_watch())
+    assert runner.state.current_pr.review_status == expected[0]
+    assert calls == expected[1]
+    if summary_created and summary_sha != "old":
+        evidence = gh_reviews.cached_review_feedback(
+            runner.owner_repo, 42, head, gh_reviews.reviewer_policy_from_config(runner.app_config),
+        )
+        assert evidence is not None and evidence.findings == ()
+        assert evidence.unknown_reason
+
+
+@pytest.mark.parametrize(
     ("ci_status", "missing_push"),
     [(CIStatus.PENDING, False), (CIStatus.FAILURE, False), (CIStatus.FAILURE, True)],
 )

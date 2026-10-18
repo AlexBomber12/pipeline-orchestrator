@@ -910,7 +910,7 @@ class WatchMixin:
                     self.owner_repo, current_pr.number, current_pr.head_sha,
                     reviewer_policy,
                 ),
-                reviewer_policy, last_activity,
+                reviewer_policy, last_activity, head_sha=current_pr.head_sha,
             )
         if evidence is None or evidence.unknown_reason:
             reason = evidence.unknown_reason if evidence else "status-poll evidence unavailable"
