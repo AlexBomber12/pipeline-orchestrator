@@ -26,6 +26,15 @@ from src.models import ReviewStatus
 
 logger = logging.getLogger(__name__)
 REVIEW_FEEDBACK_TRUNCATE_CHARS = 5000
+CODEX_BOT_ERROR_PATTERNS = (
+    "Something went wrong while reviewing",
+    "Something went wrong. Try again",
+    "error reviewing this PR",
+    "Try again later by commenting",
+    "Please try again",
+    "unable to download your code",
+    "unable to complete review",
+)
 
 _PRIORITY_FINDING = re.compile(r"(?:^|\n)\s*(?:\*\*)?\[?P[0-3]\b", re.I)
 _RECEIPT = re.compile(
@@ -81,9 +90,12 @@ def classify_review_comment(comment: dict, *, inline: bool = False) -> str:
         return "finding"
     if _SUMMARY.search(body):
         return "summary"
-    if _PROVIDER_ERROR.search(body):
+    message = re.sub(r"^codex review:\s*", "", body, flags=re.I)
+    if _PROVIDER_ERROR.search(message) or any(
+        message.lower().startswith(pattern.lower()) for pattern in CODEX_BOT_ERROR_PATTERNS
+    ):
         return "provider_error"
-    if _PROGRESS.search(body):
+    if _PROGRESS.search(message):
         return "progress"
     return "finding"
 

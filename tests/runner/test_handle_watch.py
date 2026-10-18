@@ -38,12 +38,13 @@ claude_cli = claude_plugin_module.claude_cli
 
 
 @pytest.mark.parametrize(
-    ("finding", "ci_status", "expected_feedback"),
+    ("finding", "ci_status", "expected_feedback", "feedback_unavailable"),
     [
-        (False, CIStatus.PENDING, []),
-        (True, CIStatus.PENDING, ["P1: fix the null check"]),
-        (False, CIStatus.FAILURE, [None]),
-        (True, CIStatus.FAILURE, ["P1: fix the null check"]),
+        (False, CIStatus.PENDING, [], False),
+        (True, CIStatus.PENDING, ["P1: fix the null check"], False),
+        (False, CIStatus.FAILURE, [None], False),
+        (True, CIStatus.FAILURE, ["P1: fix the null check"], False),
+        (True, CIStatus.FAILURE, [], True),
     ],
 )
 def test_watch_620_evidence_drives_fix_without_rereading(
@@ -51,6 +52,7 @@ def test_watch_620_evidence_drives_fix_without_rereading(
     finding: bool,
     ci_status: CIStatus,
     expected_feedback: list[str | None],
+    feedback_unavailable: bool,
 ) -> None:
     receipt = json.loads(
         (Path(__file__).parents[1] / "fixtures/review_receipt_620.json").read_text()
@@ -75,6 +77,11 @@ def test_watch_620_evidence_drives_fix_without_rereading(
         return []
 
     monkeypatch.setattr(gh_cache, "_gh_api_paginated", transport)
+    if feedback_unavailable:
+        monkeypatch.setattr(
+            gh_reviews, "read_review_feedback",
+            lambda *_: gh_reviews.ReviewFeedback((), (), "feedback unavailable"),
+        )
     head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
 
     def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
@@ -106,6 +113,8 @@ def test_watch_620_evidence_drives_fix_without_rereading(
     asyncio.run(runner.handle_watch())
     assert calls == expected_feedback
     assert runner.state.state == PipelineState.WATCH
+    if feedback_unavailable:
+        assert any("combined FIX deferred" in entry["event"] for entry in runner.state.history)
 
 
 @pytest.mark.parametrize("ci_status", [CIStatus.PENDING, CIStatus.FAILURE])
@@ -3377,10 +3386,18 @@ def test_first_infra_failure_retries_workflow(
     assert "infra retry: re-ran failed jobs" in history
 
 
-@pytest.mark.parametrize("review_status", [ReviewStatus.PENDING, ReviewStatus.CHANGES_REQUESTED])
+@pytest.mark.parametrize(
+    ("review_status", "feedback_result"),
+    [
+        (ReviewStatus.PENDING, FeedbackCheckResult.NEW),
+        (ReviewStatus.CHANGES_REQUESTED, FeedbackCheckResult.NEW),
+        (ReviewStatus.CHANGES_REQUESTED, FeedbackCheckResult.UNKNOWN),
+    ],
+)
 def test_second_infra_failure_routes_to_fix(
     monkeypatch: pytest.MonkeyPatch,
     review_status: ReviewStatus,
+    feedback_result: FeedbackCheckResult,
 ) -> None:
     """PR-251: a second INFRA_FAILURE classification on the same head_sha
     (the prior retry didn't help) routes WATCH straight through
@@ -3408,7 +3425,7 @@ def test_second_infra_failure_routes_to_fix(
 
     def feedback_check(policy: object) -> FeedbackCheckResult:
         feedback_policies.append(policy)
-        return FeedbackCheckResult.NEW
+        return feedback_result
 
     monkeypatch.setattr(runner, "_has_new_codex_feedback_since_last_push", feedback_check)
     # Pre-seed the marker with a wall-clock timestamp older than the
@@ -3428,21 +3445,26 @@ def test_second_infra_failure_routes_to_fix(
     runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
     asyncio.run(runner.handle_watch())
 
-    assert fix_calls == [None]
+    deferred = feedback_result == FeedbackCheckResult.UNKNOWN
+    assert fix_calls == ([] if deferred else [None])
     assert len(feedback_policies) == (1 if review_status == ReviewStatus.CHANGES_REQUESTED else 0)
-    if feedback_policies:
+    if feedback_policies and not deferred:
         assert runner._fix_feedback_reviewer_policy is feedback_policies[0]
     # No workflow rerun calls were made — straight to FIX.
     assert all(args[:2] != ["run", "rerun"] for args in gh_calls)
     history = " ".join(entry.get("event", "") for entry in runner.state.history)
     assert "INFRA_FAILURE persisted after retry" in history
+    if deferred:
+        assert "combined FIX deferred" in history
     # PR-251 follow-up: ``handle_fix`` reads ``ci_status`` to decide
     # whether to inject CI logs into the FIX prompt; the persisted-INFRA
     # path must downgrade to FAILURE before invoking it so the coder
     # actually receives the failure logs the daemon promised in the
     # "effective FAILURE" log line.
     assert runner.state.current_pr is not None
-    assert runner.state.current_pr.ci_status == CIStatus.FAILURE
+    assert runner.state.current_pr.ci_status == (
+        CIStatus.INFRA_FAILURE if deferred else CIStatus.FAILURE
+    )
 
 
 def test_infra_failure_on_fork_pr_logs_no_retry(

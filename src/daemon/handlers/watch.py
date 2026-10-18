@@ -70,15 +70,7 @@ _DETAILS_URL_RUN_RE = re.compile(r"/actions/runs/(\d+)")
 # review_status stays as EYES and the WATCH timeout would otherwise burn
 # 21+ minutes; detecting the pattern lets us re-trigger @codex review
 # immediately.
-CODEX_BOT_ERROR_PATTERNS = (
-    "Something went wrong while reviewing",
-    "Something went wrong. Try again",
-    "error reviewing this PR",
-    "Try again later by commenting",
-    "Please try again",
-    "unable to download your code",
-    "unable to complete review",
-)
+CODEX_BOT_ERROR_PATTERNS = gh_reviews.CODEX_BOT_ERROR_PATTERNS
 
 
 class WatchMixin:
@@ -315,7 +307,14 @@ class WatchMixin:
                 )
         elif ci == CIStatus.FAILURE:
             if review == ReviewStatus.CHANGES_REQUESTED:
-                if self._has_new_codex_feedback_since_last_push(reviewer_policy) == FeedbackCheckResult.NEW:
+                result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
+                if result == FeedbackCheckResult.UNKNOWN:
+                    self.log_event(
+                        f"[WATCH] PR #{found.number} combined FIX deferred: "
+                        "review feedback unavailable."
+                    )
+                    return
+                if result == FeedbackCheckResult.NEW:
                     self._fix_feedback_reviewer_policy = reviewer_policy
             await self.handle_fix()
             return
@@ -346,10 +345,17 @@ class WatchMixin:
                 # on ``ci_status == CIStatus.FAILURE``); leaving it as
                 # INFRA_FAILURE would drop the very logs the coder
                 # needs for the effective-failure handoff.
-                found.ci_status = CIStatus.FAILURE
                 if review == ReviewStatus.CHANGES_REQUESTED:
-                    if self._has_new_codex_feedback_since_last_push(reviewer_policy) == FeedbackCheckResult.NEW:
+                    result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
+                    if result == FeedbackCheckResult.UNKNOWN:
+                        self.log_event(
+                            f"[WATCH] PR #{found.number} combined FIX deferred: "
+                            "review feedback unavailable."
+                        )
+                        return
+                    if result == FeedbackCheckResult.NEW:
                         self._fix_feedback_reviewer_policy = reviewer_policy
+                found.ci_status = CIStatus.FAILURE
                 await self.handle_fix()
                 return
             if marker_exists:
