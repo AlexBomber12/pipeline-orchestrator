@@ -6365,6 +6365,11 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     anchor_reactions[0]["created_at"] = "2026-10-17T21:13:00Z"
     reviews.clear_review_status_cache()
     assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    anchor_reactions.clear()
+    issue_comments[-2]["body"] = "Please fix the review complete callback"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    assert comments.get_latest_codex_feedback("owner/name", 42) == "Please fix the review complete callback"
 
 
 def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
@@ -6377,11 +6382,13 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
         "create a Codex account and connect to github": "onboarding",
         "Unable to review this PR": "provider_error",
         "Review is in progress": "progress",
+        "Something went wrong while reviewing this PR. Please try again.": "progress",
         "Summary: review started": "summary",
         "A general update": "unknown",
         "P2: fix the null check": "finding",
         "[P1] Fix the no findings empty state": "finding",
         "[P1] Fix the review complete callback": "finding",
+        "Please fix the review complete callback": "finding",
     }
     for body, expected in samples.items():
         assert reviews.classify_review_comment({"body": body}) == expected

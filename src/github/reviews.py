@@ -27,8 +27,10 @@ from src.models import ReviewStatus
 logger = logging.getLogger(__name__)
 REVIEW_FEEDBACK_TRUNCATE_CHARS = 5000
 
-_FINDING = re.compile(r"\b(?:P[0-3]\b|please\b|consider\b|fix\b|missing\b|incorrect\b|bug\b|rename\b|change\b)", re.I)
-_PRIORITY_FINDING = re.compile(r"(?:^|\n)\s*(?:\*\*)?\[?P[0-3]\b", re.I)
+_FINDING = re.compile(
+    r"\b(?:P[0-3]\b|please\b(?!\s+try\s+again)|consider\b|fix\b|"
+    r"missing\b|incorrect\b|bug\b|rename\b|change\b)", re.I,
+)
 _RECEIPT = re.compile(
     r"^<!-- codex-review-receipt:v1 -->|"
     r"^(?:codex review:\s*)?(?:didn't find any major issues(?:\. delightful!)?|"
@@ -73,18 +75,16 @@ def classify_review_comment(comment: dict, *, inline: bool = False) -> str:
         return "unknown"
     if _RECEIPT.search(body):
         return "receipt"
-    if inline or _PRIORITY_FINDING.search(body):
-        return "finding"
     if _reactions._is_codex_onboarding_comment(comment):
         return "onboarding"
+    if inline or _FINDING.search(body):
+        return "finding"
     if _PROVIDER_ERROR.search(body):
         return "provider_error"
     if _SUMMARY.search(body):
         return "summary"
     if _PROGRESS.search(body):
         return "progress"
-    if _FINDING.search(body):
-        return "finding"
     return "unknown"
 
 
