@@ -8,11 +8,11 @@ and easy to evolve independently from the runner lifecycle.
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 
-from src.coder_registry import CoderPlugin, CoderRegistry
+from src.coder_registry import AUTH_FAILURE_REASONS, CoderPlugin, CoderRegistry
 from src.config import AppConfig, RepoConfig
 from src.models import RepoState
 
@@ -30,6 +30,7 @@ class SelectionContext:
     # and ``None`` defer to repo / global defaults so unpinned tasks keep
     # the existing auto_fallback behavior.
     task_coder_pin: str | None = None
+    exclusion_reasons: dict[str, str] = field(default_factory=dict)
 
 
 class CoderPurpose(str, Enum):
@@ -61,6 +62,9 @@ def eligible_coders(ctx: SelectionContext) -> list[str]:
     preferred = pinned or ctx.app_config.daemon.coder
     if not ctx.app_config.daemon.auto_fallback:
         return [preferred] if _coder_runtime_ok(preferred, ctx) else []
+
+    if ctx.registry.get_optional(preferred) is None:
+        ctx.exclusion_reasons[preferred] = "plugin_unavailable"
 
     result = [
         name
@@ -113,12 +117,18 @@ def candidate_coders(ctx: SelectionContext) -> list[str]:
 
 def _coder_runtime_ok(name: str, ctx: SelectionContext) -> bool:
     """Return True when *name* passes every per-coder runtime gate."""
-    return (
-        ctx.registry.get_optional(name) is not None
-        and not _is_rate_limited(name, ctx.state)
-        and not _auth_failed(name, ctx.registry, ctx.auth_statuses)
-        and not _is_disabled_for_repo(name, ctx.repo_config)
-    )
+    if ctx.registry.get_optional(name) is None:
+        reason = "plugin_unavailable"
+    elif _is_rate_limited(name, ctx.state):
+        reason = "rate_limited"
+    elif _is_disabled_for_repo(name, ctx.repo_config):
+        reason = "disabled"
+    else:
+        reason = _auth_failure_reason(name, ctx.registry, ctx.auth_statuses)
+    if reason is not None:
+        ctx.exclusion_reasons[name] = reason
+        return False
+    return True
 
 
 def rank_coders(eligible: list[str], ctx: SelectionContext) -> list[str]:
@@ -337,13 +347,29 @@ def _auth_failed(
     registry: CoderRegistry,
     auth_statuses: dict[str, dict[str, str]] | None = None,
 ) -> bool:
+    return _auth_failure_reason(name, registry, auth_statuses) is not None
+
+
+def _auth_failure_reason(
+    name: str,
+    registry: CoderRegistry,
+    auth_statuses: dict[str, dict[str, str]] | None = None,
+) -> str | None:
     if auth_statuses is not None and name in auth_statuses:
-        return auth_statuses[name].get("status") != "ok"
-    try:
-        status = registry.get(name).check_auth()
-    except Exception:
-        return True
-    return status.get("status") != "ok"
+        status = auth_statuses[name]
+    else:
+        try:
+            status = registry.get(name).check_auth()
+        except Exception:
+            return "probe_failed"
+    if status.get("status") == "ok":
+        return None
+    reason = status.get("failure_reason")
+    return (
+        reason
+        if isinstance(reason, str) and reason in AUTH_FAILURE_REASONS
+        else "probe_failed"
+    )
 
 
 def _is_disabled_for_repo(name: str, repo_config: RepoConfig) -> bool:

@@ -266,7 +266,9 @@ def test_invalid_optional_credential_context_fails_closed(
     monkeypatch.setattr(plugin, resolver_name, fail)
     assert runner._reserve_coder_credentials(coder_name) is False
     asyncio.run(runner._refresh_auth_status_cache())
-    assert runner._auth_status_cache[coder_name] == {"status": "error"}
+    assert runner._auth_status_cache[coder_name] == {
+        "status": "error", "failure_reason": "probe_unavailable"
+    }
 
 
 def test_legacy_coder_without_credential_context_remains_unbound() -> None:
@@ -804,7 +806,9 @@ def test_auth_cache_fails_closed_when_credential_environment_is_invalid(
 
     asyncio.run(runner._refresh_auth_status_cache())
 
-    assert runner._auth_status_cache["codex"] == {"status": "error"}
+    assert runner._auth_status_cache["codex"] == {
+        "status": "error", "failure_reason": "probe_unavailable"
+    }
 
 
 @pytest.mark.asyncio
@@ -908,8 +912,8 @@ def test_refresh_auth_status_cache_marks_plugin_probe_errors() -> None:
 
     assert runner._auth_status_cache == {
         "claude": {"status": "ok", "detail": "ready"},
-        "codex": {"status": "error"},
-        "third": {"status": "error"},
+        "codex": {"status": "error", "failure_reason": "probe_failed"},
+        "third": {"status": "error", "failure_reason": "probe_failed"},
     }
     assert runner._auth_status_cache_expires_at is not None
     assert runner._auth_status_cache_expires_at > datetime.now(timezone.utc)

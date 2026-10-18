@@ -1022,18 +1022,57 @@ class PipelineRunner(
         self, *, allow_exploration: bool = True
     ) -> tuple[str, CoderPlugin]:
         """Return the selector's runnable coder without bypassing its gates."""
-        result = self._select_coder(allow_exploration=allow_exploration)
-        if result is not None:
-            self.state.coder = result[0]
-            return result
-        pin = self._active_task_coder_pin()
+        app_config = self.app_config
+        if not allow_exploration and app_config.daemon.exploration_epsilon != 0:
+            daemon_config = app_config.daemon.model_copy(
+                update={"exploration_epsilon": 0.0}
+            )
+            app_config = app_config.model_copy(update={"daemon": daemon_config})
+        ctx = self._selection_context(app_config=app_config)
+        resolution = resolve_active_coder(ctx, purpose=CoderPurpose.DISPATCH)
+        pin = ctx.task_coder_pin
+        preferred = pin if pin and pin != "any" else (
+            self.repo_config.coder or self.app_config.daemon.coder
+        )
+        preferred_plugin = self._registry.get_optional(preferred)
+        preferred_label = preferred_plugin.display_name if preferred_plugin else preferred
+        reason = ctx.exclusion_reasons.get(preferred)
+        reason_labels = {
+            "unrecognized_output": "auth response not recognized",
+            "credentials_missing": "credentials missing",
+            "cli_missing": "CLI unavailable",
+            "probe_failed": "auth probe failed",
+            "probe_timeout": "auth probe timed out",
+            "probe_unavailable": "auth probe unavailable",
+            "daemon_unavailable": "auth daemon unavailable",
+            "rate_limited": "rate limited",
+            "disabled": "disabled for this repository",
+            "plugin_unavailable": "plugin unavailable",
+        }
+        explanation = reason_labels.get(reason, "unavailable")
+        if resolution is not None and resolution.plugin is not None:
+            self.state.coder = resolution.name
+            if resolution.name != preferred and reason is not None:
+                task = self.state.current_task
+                context = f"Task {task.pr_id}: " if task is not None else ""
+                self.log_event(
+                    f"[INFRA] {self.state.state.value}: {context}"
+                    f"Configured {preferred_label} unavailable: "
+                    f"{explanation}; selected {resolution.plugin.display_name} "
+                    "because automatic fallback is enabled."
+                )
+            return resolution.name, resolution.plugin
         if pin and pin != "any":
             raise CoderSelectionUnavailable(
-                f"Task pinned to {pin} but coder unavailable"
+                f"Task pinned to {preferred_label} but coder unavailable: {explanation}"
             )
-        configured = self.repo_config.coder or self.app_config.daemon.coder
+        fallback = (
+            "automatic fallback is disabled"
+            if not self.app_config.daemon.auto_fallback
+            else "no fallback is eligible"
+        )
         raise CoderSelectionUnavailable(
-            f"Configured coder {configured} is unavailable and no fallback is eligible"
+            f"Configured coder {preferred_label} is unavailable: {explanation}; {fallback}"
         )
 
     def _get_auxiliary_coder(self) -> tuple[str, CoderPlugin] | None:
@@ -1100,7 +1139,7 @@ class PipelineRunner(
 
         async def _probe(name: str) -> dict[str, str]:
             if name in invalid_locations:
-                return {"status": "error"}
+                return {"status": "error", "failure_reason": "probe_unavailable"}
             location = credential_locations.get(name)
             reserved = False
             if location is not None and self._credential_reservations is not None:
@@ -1146,7 +1185,7 @@ class PipelineRunner(
                     )
                 return await _threaded_check_auth()
             except Exception:
-                return {"status": "error"}
+                return {"status": "error", "failure_reason": "probe_failed"}
             finally:
                 if reserved and self._credential_reservations is not None:
                     self._credential_reservations.release_coder(location)
