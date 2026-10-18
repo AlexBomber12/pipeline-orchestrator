@@ -59,7 +59,7 @@ def test_publication_migration_confirmation_posts_displayed_binding(
     assert binding in requests[0]
 
 
-def test_publication_migration_command_is_atomic_in_isolated_redis() -> None:
+async def test_publication_migration_command_is_atomic_in_isolated_redis() -> None:
     """Use DB 15 of the e2e Redis container, never the daemon's DB 0."""
     address = subprocess.run(
         ["docker", "inspect", "--format",
@@ -106,4 +106,4 @@ def test_publication_migration_command_is_atomic_in_isolated_redis() -> None:
             await redis.flushdb()
             await redis.aclose()
 
-    asyncio.run(exercise())
+    await exercise()
