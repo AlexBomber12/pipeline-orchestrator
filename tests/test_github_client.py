@@ -6380,6 +6380,55 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     assert comments.get_latest_codex_feedback("owner/name", 42) == "Please fix the review complete callback"
 
 
+def test_structured_summary_reader_and_poll_evidence_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = json.loads(
+        (Path(__file__).parent / "fixtures/review_summary_structured.json").read_text()
+    )
+    anchor = {
+        "id": 10, "user": {"login": "author"}, "body": "@codex review",
+        "created_at": "2026-10-17T21:05:00Z",
+    }
+    issue_comments = [anchor, summary]
+    monkeypatch.setattr(
+        cache, "_gh_api_paginated",
+        lambda path: issue_comments if path.endswith("/issues/42/comments") else [],
+    )
+    policy = ReviewerPolicy([
+        TrustedReviewerIdentity(user_id=TRUSTED_REVIEWER_ID, login="codex")
+    ])
+    other_policy = ReviewerPolicy([
+        TrustedReviewerIdentity(user_id=SECOND_TRUSTED_REVIEWER_ID, login="other")
+    ])
+    head = "a" * 40
+    reviews.clear_review_status_cache()
+    reviews._begin_review_cache_cycle()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.PENDING
+    evidence = reviews.cached_review_feedback("owner/name", 42, head, policy)
+    assert evidence is not None and evidence.findings == ()
+    assert reviews.cached_review_feedback("owner/name", 43, head, policy) is None
+    assert reviews.cached_review_feedback("other/name", 42, head, policy) is None
+    assert reviews.cached_review_feedback("owner/name", 42, "b" * 40, policy) is None
+    assert reviews.cached_review_feedback("owner/name", 42, head, other_policy) is None
+
+    summary["body"] = "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v2 {} -->"
+    reviews._begin_review_cache_cycle()
+    assert reviews.cached_review_feedback("owner/name", 42, head, policy) is None
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.PENDING
+    evidence = reviews.cached_review_feedback("owner/name", 42, head, policy)
+    assert evidence is not None and evidence.unknown_reason is not None
+
+    issue_comments.append({
+        "id": 12, "user": summary["user"], "body": "[P1] Fix the empty input",
+        "created_at": "2026-10-17T21:07:00Z",
+    })
+    reviews._begin_review_cache_cycle()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.CHANGES_REQUESTED
+    evidence = reviews.cached_review_feedback("owner/name", 42, head, policy)
+    assert evidence is not None and evidence.findings == ("[P1] Fix the empty input",)
+
+
 def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6397,6 +6446,22 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
         "Something went wrong while reviewing this PR. Please try again.": "provider_error",
         "Summary: review started": "summary",
         "Summary: This change correctly handles empty input": "summary",
+        (
+            "<!-- codex-pull-request-review-summary -->\n"
+            '<!-- codex-review-state:v1 {"code_review":{"status":"completed",'
+            '"has_any_findings":false,"has_unresolved_findings":false}} -->\n\n'
+            "## Codex Review Summary"
+        ): "summary",
+        (
+            "<!-- codex-pull-request-review-summary -->\n"
+            '<!-- codex-review-state:v1 {"code_review":{"status":"in_progress"}} -->'
+        ): "summary",
+        "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v2 {} -->": "unknown",
+        "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 broken -->": "unknown",
+        (
+            "<!-- codex-pull-request-review-summary -->\n"
+            "<!-- codex-review-state:v1 broken -->\n[P1] metadata text"
+        ): "unknown",
         "Summary:\n[P1] Fix the empty input": "finding",
         "": "unknown",
         "I found one issue.": "finding",
@@ -6408,6 +6473,20 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
     }
     for body, expected in samples.items():
         assert reviews.classify_review_comment({"body": body}) == expected
+    for state in (
+        {"code_review": {"status": "unsupported"}},
+        {"code_review": {"status": "completed", "has_any_findings": None}},
+        {"code_review": {
+            "status": "completed", "has_any_findings": False,
+            "has_unresolved_findings": None,
+        }},
+        {"security_review": {}},
+    ):
+        body = (
+            "<!-- codex-pull-request-review-summary -->\n"
+            f"<!-- codex-review-state:v1 {json.dumps(state)} -->"
+        )
+        assert reviews.classify_review_comment({"body": body}) == "unknown"
     assert reviews.classify_review_comment({"body": "rename this"}, inline=True) == "finding"
 
     anchor = {"id": 1, "user": {"login": "author"}, "body": "@codex review",

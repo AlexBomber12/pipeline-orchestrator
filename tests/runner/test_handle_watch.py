@@ -38,13 +38,15 @@ claude_cli = claude_plugin_module.claude_cli
 
 
 @pytest.mark.parametrize(
-    ("finding", "ci_status", "expected_feedback", "feedback_unavailable"),
+    ("finding", "ci_status", "expected_feedback", "feedback_unavailable", "missing_poll", "missing_push"),
     [
-        (False, CIStatus.PENDING, [], False),
-        (True, CIStatus.PENDING, ["P1: fix the null check"], False),
-        (False, CIStatus.FAILURE, [None], False),
-        (True, CIStatus.FAILURE, ["P1: fix the null check"], False),
-        (True, CIStatus.FAILURE, [], True),
+        (False, CIStatus.PENDING, [], False, False, False),
+        (True, CIStatus.PENDING, ["P1: fix the null check"], False, False, False),
+        (False, CIStatus.FAILURE, [None], False, False, False),
+        (False, CIStatus.FAILURE, [None], False, False, True),
+        (True, CIStatus.FAILURE, ["P1: fix the null check"], False, False, False),
+        (True, CIStatus.FAILURE, ["P1: fix the null check"], True, False, False),
+        (True, CIStatus.FAILURE, [None], False, True, False),
     ],
 )
 def test_watch_620_evidence_drives_fix_without_rereading(
@@ -53,6 +55,8 @@ def test_watch_620_evidence_drives_fix_without_rereading(
     ci_status: CIStatus,
     expected_feedback: list[str | None],
     feedback_unavailable: bool,
+    missing_poll: bool,
+    missing_push: bool,
 ) -> None:
     receipt = json.loads(
         (Path(__file__).parents[1] / "fixtures/review_receipt_620.json").read_text()
@@ -80,17 +84,20 @@ def test_watch_620_evidence_drives_fix_without_rereading(
     if feedback_unavailable:
         monkeypatch.setattr(
             gh_reviews, "read_review_feedback",
-            lambda *_: gh_reviews.ReviewFeedback((), (), "feedback unavailable"),
+            lambda *_: pytest.fail("WATCH must reuse status-poll evidence"),
         )
     head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
 
     def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
-        return [PRInfo(
+        result = PRInfo(
             number=42, branch="pr-459", head_sha=head, ci_status=ci_status,
             review_status=gh_reviews.get_pr_review_status(
                 repo, 42, "author", head, policy=kwargs["reviewer_policy"]
             ),
-        )]
+        )
+        if missing_poll:
+            gh_reviews.clear_review_status_cache()
+        return [result]
 
     monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
     monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
@@ -98,8 +105,10 @@ def test_watch_620_evidence_drives_fix_without_rereading(
     runner = h._make_runner(review_timeout_min=120)
     runner.state.current_pr = PRInfo(number=42, branch="pr-459", head_sha=head)
     runner.state.state = PipelineState.WATCH
-    runner._last_push_at = push_time
+    runner._last_push_at = None if missing_push else push_time
     runner._last_push_at_pr_number = 42
+    if missing_push:
+        monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda *_: None)
     calls: list[str | None] = []
 
     async def fake_fix() -> None:
@@ -114,13 +123,72 @@ def test_watch_620_evidence_drives_fix_without_rereading(
     assert calls == expected_feedback
     assert runner.state.state == PipelineState.WATCH
     if feedback_unavailable:
-        assert any("combined FIX deferred" in entry["event"] for entry in runner.state.history)
+        assert not any("combined FIX deferred" in entry["event"] for entry in runner.state.history)
+    if missing_poll:
+        assert any("CI FIX continues" in entry["event"] for entry in runner.state.history)
 
 
-@pytest.mark.parametrize("ci_status", [CIStatus.PENDING, CIStatus.FAILURE])
+def test_structured_summary_after_trigger_does_not_dispatch_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = json.loads(
+        (Path(__file__).parents[1] / "fixtures/review_summary_structured.json").read_text()
+    )
+    comments = [
+        {"id": 10, "user": {"login": "author"}, "body": "@codex review",
+         "created_at": "2026-10-17T21:05:00Z"},
+        summary,
+    ]
+    monkeypatch.setattr(
+        gh_cache, "_gh_api_paginated",
+        lambda path: comments if path.endswith("/issues/42/comments") else [],
+    )
+    head = "a" * 40
+
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        return [PRInfo(
+            number=42, branch="pr-459", head_sha=head, ci_status=CIStatus.SUCCESS,
+            review_status=gh_reviews.get_pr_review_status(
+                repo, 42, "author", head, policy=kwargs["reviewer_policy"]
+            ),
+        )]
+
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    gh_reviews.clear_review_status_cache()
+    runner = h._make_runner(review_timeout_min=120)
+    runner.state.current_pr = PRInfo(number=42, branch="pr-459", head_sha=head)
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = datetime(2026, 10, 17, 21, 4, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 42
+    calls: list[str] = []
+
+    async def fake_fix() -> None:
+        calls.append("fix")
+
+    async def fake_merge() -> None:
+        calls.append("merge")
+
+    async def no_scan() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_fix", fake_fix)
+    monkeypatch.setattr(runner, "handle_merge", fake_merge)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_scan)
+    asyncio.run(runner.handle_watch())
+    assert calls == []
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+
+
+@pytest.mark.parametrize(
+    ("ci_status", "missing_push"),
+    [(CIStatus.PENDING, False), (CIStatus.FAILURE, False), (CIStatus.FAILURE, True)],
+)
 def test_watch_supplies_only_admitted_findings_to_fix_prompt(
     monkeypatch: pytest.MonkeyPatch,
     ci_status: CIStatus,
+    missing_push: bool,
 ) -> None:
     h._patch_subprocess(monkeypatch)
     captured = h._capture_fix_kwargs(monkeypatch)
@@ -137,10 +205,15 @@ def test_watch_supplies_only_admitted_findings_to_fix_prompt(
         {"id": 13, "user": actor, "body": "This dereferences None on empty input",
          "created_at": (push_time + timedelta(minutes=1, seconds=15)).isoformat()},
     ]
-    monkeypatch.setattr(
-        gh_cache, "_gh_api_paginated",
-        lambda path: issue_comments if path.endswith("/issues/42/comments") else [],
-    )
+    comment_reads: list[str] = []
+
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            comment_reads.append(path)
+            return issue_comments
+        return []
+
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", transport)
     head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
 
     def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
@@ -159,8 +232,10 @@ def test_watch_supplies_only_admitted_findings_to_fix_prompt(
     runner = h._make_runner(review_timeout_min=120)
     runner.state.current_pr = PRInfo(number=42, branch="pr-459", head_sha=head)
     runner.state.state = PipelineState.WATCH
-    runner._last_push_at = push_time
+    runner._last_push_at = None if missing_push else push_time
     runner._last_push_at_pr_number = 42
+    if missing_push:
+        monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda *_: None)
 
     async def no_scan() -> None:
         return None
@@ -171,8 +246,11 @@ def test_watch_supplies_only_admitted_findings_to_fix_prompt(
     assert "Latest review feedback:\nP1: fix the null check" in context
     assert "unrelated advice" not in context
     assert "This dereferences None on empty input" in context
+    assert comment_reads == ["repos/octo/demo/issues/42/comments"]
     if ci_status == CIStatus.FAILURE:
         assert "ci-boom" in context
+    if missing_push:
+        assert "push provenance unavailable" in context
 
 
 def _ci_retrieval(
@@ -242,11 +320,8 @@ def test_handle_watch_reuses_poll_reviewer_policy_for_feedback(
         reviewer_policy: object = None,
     ) -> list[PRInfo]:
         observed_policies.append(reviewer_policy)
-        review_status = (
-            ReviewStatus.CHANGES_REQUESTED
-            if reviewer_policy is not None
-            and reviewer_policy.is_trusted_user({"id": fresh_reviewer_id})
-            else ReviewStatus.PENDING
+        review_status = gh_reviews.get_pr_review_status(
+            repo, 400, "author", "abc123", policy=reviewer_policy
         )
         return [
             PRInfo(
@@ -287,6 +362,7 @@ def test_handle_watch_reuses_poll_reviewer_policy_for_feedback(
     monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *args: "OPEN")
     monkeypatch.setattr(watch_module.gh_cache, "_gh_api_paginated", fake_paginated)
     monkeypatch.setattr(runner, "handle_fix", fake_handle_fix)
+    gh_reviews.clear_review_status_cache()
 
     asyncio.run(runner.handle_watch())
 
@@ -660,13 +736,18 @@ def test_watch_changes_requested_with_pending_ci_triggers_fix(
     pr = PRInfo(
         number=42,
         branch="pr-001",
+        head_sha="abc123",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.CHANGES_REQUESTED,
         last_activity=last_push,
     )
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
-        lambda repo, **kw: [pr],
+        lambda repo, **kw: [pr.model_copy(update={
+            "review_status": gh_reviews.get_pr_review_status(
+                repo, 42, "author", pr.head_sha, policy=kw["reviewer_policy"]
+            )
+        })],
     )
 
     comments = [
@@ -698,6 +779,7 @@ def test_watch_changes_requested_with_pending_ci_triggers_fix(
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     runner.handle_fix = fake_fix  # type: ignore[assignment]
+    gh_reviews.clear_review_status_cache()
     asyncio.run(runner.handle_watch())
 
     assert fix_called == [True]
@@ -713,17 +795,26 @@ def test_watch_changes_requested_with_pending_ci_no_feedback_logs(
     pr = PRInfo(
         number=42,
         branch="pr-001",
+        head_sha="abc123",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.CHANGES_REQUESTED,
         last_activity=last_push,
     )
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
-        lambda repo, **kw: [pr],
+        lambda repo, **kw: [pr.model_copy(update={
+            "review_status": gh_reviews.get_pr_review_status(
+                repo, 42, "author", pr.head_sha, policy=kw["reviewer_policy"]
+            )
+        })],
     )
     monkeypatch.setattr(
         "src.github.cache._gh_api_paginated",
-        lambda path: [],
+        lambda path: [{
+            "user": {"id": 199175422, "login": "chatgpt-codex-connector"},
+            "body": "P1: earlier finding",
+            "created_at": (last_push - timedelta(minutes=1)).isoformat(),
+        }] if path.endswith("/issues/42/comments") else [],
     )
 
     fix_called: list[bool] = []
@@ -737,6 +828,7 @@ def test_watch_changes_requested_with_pending_ci_no_feedback_logs(
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     runner.handle_fix = fake_fix  # type: ignore[assignment]
+    gh_reviews.clear_review_status_cache()
     asyncio.run(runner.handle_watch())
 
     assert fix_called == []
@@ -3445,26 +3537,23 @@ def test_second_infra_failure_routes_to_fix(
     runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
     asyncio.run(runner.handle_watch())
 
-    deferred = feedback_result == FeedbackCheckResult.UNKNOWN
-    assert fix_calls == ([] if deferred else [None])
+    assert fix_calls == [None]
     assert len(feedback_policies) == (1 if review_status == ReviewStatus.CHANGES_REQUESTED else 0)
-    if feedback_policies and not deferred:
+    if feedback_policies and feedback_result == FeedbackCheckResult.NEW:
         assert runner._fix_feedback_reviewer_policy is feedback_policies[0]
     # No workflow rerun calls were made — straight to FIX.
     assert all(args[:2] != ["run", "rerun"] for args in gh_calls)
     history = " ".join(entry.get("event", "") for entry in runner.state.history)
     assert "INFRA_FAILURE persisted after retry" in history
-    if deferred:
-        assert "combined FIX deferred" in history
+    if feedback_result == FeedbackCheckResult.UNKNOWN and feedback_policies:
+        assert "CI FIX continues" in history
     # PR-251 follow-up: ``handle_fix`` reads ``ci_status`` to decide
     # whether to inject CI logs into the FIX prompt; the persisted-INFRA
     # path must downgrade to FAILURE before invoking it so the coder
     # actually receives the failure logs the daemon promised in the
     # "effective FAILURE" log line.
     assert runner.state.current_pr is not None
-    assert runner.state.current_pr.ci_status == (
-        CIStatus.INFRA_FAILURE if deferred else CIStatus.FAILURE
-    )
+    assert runner.state.current_pr.ci_status == CIStatus.FAILURE
 
 
 def test_infra_failure_on_fork_pr_logs_no_retry(

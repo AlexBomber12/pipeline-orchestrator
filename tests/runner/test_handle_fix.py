@@ -550,6 +550,41 @@ def test_ci_fix_drops_stale_review_findings_but_keeps_ci_logs(
     assert "stale finding" not in context
 
 
+@pytest.mark.parametrize("changed", ["repo", "pr", "head", "policy", "cycle"])
+def test_ci_fix_rejects_review_evidence_from_changed_poll_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    changed: str,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda *_: "ci-boom")
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": "head"})
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", head_sha="head",
+        ci_status=CIStatus.FAILURE, review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    policy = fix_module.ReviewerPolicy([
+        TrustedReviewerIdentity(user_id=199175422, login="codex")
+    ])
+    runner._fix_feedback_reviewer_policy = policy
+    runner._fix_review_feedback = "P1: stale review text"
+    runner._fix_review_head = "head"
+    from src.github import reviews as gh_reviews
+
+    origin = [runner.owner_repo, 77, "head", policy.fingerprint,
+              gh_reviews._review_status_cache_cycle]
+    index = {"repo": 0, "pr": 1, "head": 2, "policy": 3, "cycle": 4}[changed]
+    origin[index] = "different"
+    runner._fix_review_origin = tuple(origin)
+    asyncio.run(runner.handle_fix())
+
+    context = captured["kwargs"]["extra_context"]
+    assert "ci-boom" in context
+    assert "stale review text" not in context
+    assert "status-poll review identity changed" in context
+
+
 def test_handle_fix_omits_extra_context_when_no_signals(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

@@ -152,6 +152,11 @@ class WatchMixin:
             return
 
         current_pr = self.state.current_pr
+        # A new poll must not dispatch feedback retained from an earlier query.
+        self._fix_review_feedback = None
+        self._fix_review_head = None
+        self._fix_review_origin = None
+        self._fix_review_limitation = None
         current_number = current_pr.number
         found = next((p for p in prs if p.number == current_number), None)
         if found is not None:
@@ -310,10 +315,9 @@ class WatchMixin:
                 result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
                 if result == FeedbackCheckResult.UNKNOWN:
                     self.log_event(
-                        f"[WATCH] PR #{found.number} combined FIX deferred: "
+                        f"[WATCH] PR #{found.number} CI FIX continues: "
                         "review feedback unavailable."
                     )
-                    return
                 if result == FeedbackCheckResult.NEW:
                     self._fix_feedback_reviewer_policy = reviewer_policy
             await self.handle_fix()
@@ -345,17 +349,16 @@ class WatchMixin:
                 # on ``ci_status == CIStatus.FAILURE``); leaving it as
                 # INFRA_FAILURE would drop the very logs the coder
                 # needs for the effective-failure handoff.
+                found.ci_status = CIStatus.FAILURE
                 if review == ReviewStatus.CHANGES_REQUESTED:
                     result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
                     if result == FeedbackCheckResult.UNKNOWN:
                         self.log_event(
-                            f"[WATCH] PR #{found.number} combined FIX deferred: "
+                            f"[WATCH] PR #{found.number} CI FIX continues: "
                             "review feedback unavailable."
                         )
-                        return
                     if result == FeedbackCheckResult.NEW:
                         self._fix_feedback_reviewer_policy = reviewer_policy
-                found.ci_status = CIStatus.FAILURE
                 await self.handle_fix()
                 return
             if marker_exists:
@@ -877,40 +880,61 @@ class WatchMixin:
         self,
         reviewer_policy: ReviewerPolicy | None = None,
     ) -> FeedbackCheckResult:
-        """Check whether Codex posted any comment after ``self._last_push_at``.
+        """Use findings admitted by this poll, with a push floor when available.
 
         Returns a three-state :class:`FeedbackCheckResult`:
         - ``NEW``     – new Codex feedback exists after last push
         - ``NONE``    – no Codex activity after last push
-        - ``UNKNOWN`` – API call failed; caller should stay in WATCH
+        - ``UNKNOWN`` – evidence or required push provenance is unavailable
         """
         if self.state.current_pr is None:
             return FeedbackCheckResult.NONE
-        last_activity = self._last_push_at
-        if last_activity is None:
-            self.log_event("[WATCH] Review feedback pending: push provenance unavailable.")
-            return FeedbackCheckResult.UNKNOWN
-        if last_activity.tzinfo is None:
-            last_activity = last_activity.replace(tzinfo=timezone.utc)
         reviewer_policy = reviewer_policy or reviewer_policy_from_config(
             self.app_config
         )
-        evidence = gh_reviews.read_review_feedback(
-            self.owner_repo, self.state.current_pr.number,
-            gh_reviews.cached_review_author(
-                self.owner_repo, self.state.current_pr.number,
-                self.state.current_pr.head_sha, reviewer_policy,
-            ),
-            reviewer_policy, last_activity,
-        )
-        if evidence.unknown_reason:
-            self.log_event(f"[WATCH] Review feedback pending: {evidence.unknown_reason}.")
+        current_pr = self.state.current_pr
+        last_activity = self._last_push_at
+        if last_activity is None and current_pr.ci_status != CIStatus.FAILURE:
+            self._fix_review_limitation = "push provenance unavailable"
+            self.log_event("[WATCH] Review feedback pending: push provenance unavailable.")
             return FeedbackCheckResult.UNKNOWN
-        if evidence.findings:
-            self._fix_review_feedback = gh_reviews.format_review_feedback(evidence.findings)
-            self._fix_review_head = self.state.current_pr.head_sha
-            return FeedbackCheckResult.NEW
-        return FeedbackCheckResult.NONE
+        evidence = gh_reviews.cached_review_feedback(
+            self.owner_repo, current_pr.number, current_pr.head_sha, reviewer_policy,
+        )
+        if evidence is None and current_pr.ci_status != CIStatus.FAILURE:
+            # Recovery and legacy callers may enter WATCH without a status-poll
+            # snapshot. Review-only dispatch can still perform a bounded read.
+            evidence = gh_reviews.read_review_feedback(
+                self.owner_repo, current_pr.number,
+                gh_reviews.cached_review_author(
+                    self.owner_repo, current_pr.number, current_pr.head_sha,
+                    reviewer_policy,
+                ),
+                reviewer_policy, last_activity,
+            )
+        if evidence is None or evidence.unknown_reason:
+            reason = evidence.unknown_reason if evidence else "status-poll evidence unavailable"
+            self._fix_review_limitation = reason
+            self.log_event(f"[WATCH] Review feedback pending: {reason}.")
+            return FeedbackCheckResult.UNKNOWN
+        if last_activity is None:
+            self._fix_review_limitation = "push provenance unavailable; findings came from the current status poll"
+        if not evidence.findings:
+            return FeedbackCheckResult.NONE
+        if last_activity is not None and last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        if last_activity is not None and (
+            evidence.latest_finding_at is None
+            or evidence.latest_finding_at <= last_activity
+        ):
+            return FeedbackCheckResult.NONE
+        self._fix_review_feedback = gh_reviews.format_review_feedback(evidence.findings)
+        self._fix_review_head = current_pr.head_sha
+        self._fix_review_origin = (
+            self.owner_repo, current_pr.number, current_pr.head_sha,
+            reviewer_policy.fingerprint, gh_reviews._review_status_cache_cycle,
+        )
+        return FeedbackCheckResult.NEW
 
     async def _maybe_retrigger_stale_review(self, pr_number: int) -> bool:
         """Re-trigger ``@codex review`` when a stale review blocks progress.

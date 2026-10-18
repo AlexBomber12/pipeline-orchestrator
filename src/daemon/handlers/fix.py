@@ -194,6 +194,7 @@ class FixMixin(BreachMixin):
         current_pr: PRInfo,
         reviewer_policy: ReviewerPolicy | None = None,
         review_feedback: str | None = None,
+        review_limitation: str | None = None,
     ) -> str | None:
         """Compose CI failure logs + latest review feedback for the FIX prompt.
 
@@ -219,6 +220,8 @@ class FixMixin(BreachMixin):
         if current_pr.review_status == ReviewStatus.CHANGES_REQUESTED:
             if review_feedback:
                 sections.append("Latest review feedback:\n" + review_feedback)
+            if review_limitation:
+                sections.append("Review evidence limitation: " + review_limitation)
         if not sections:
             return None
         return "\n\n".join(sections)
@@ -230,8 +233,12 @@ class FixMixin(BreachMixin):
         self._fix_feedback_reviewer_policy = None
         review_feedback = getattr(self, "_fix_review_feedback", None)
         review_head = getattr(self, "_fix_review_head", None)
+        review_origin = getattr(self, "_fix_review_origin", None)
+        review_limitation = getattr(self, "_fix_review_limitation", None)
         self._fix_review_feedback = None
         self._fix_review_head = None
+        self._fix_review_origin = None
+        self._fix_review_limitation = None
         # PR-358: a FIX entry begins a new review iteration; clear the
         # single-shot review_timeout repost flag so the next WATCH
         # iteration after this FIX can post one repost again if Codex
@@ -271,6 +278,18 @@ class FixMixin(BreachMixin):
 
         self.state.state = PipelineState.FIX
         current_pr = self.state.current_pr
+        if review_origin is not None and current_pr is not None:
+            from src.github import reviews as gh_reviews
+
+            expected_origin = (
+                self.owner_repo, current_pr.number, current_pr.head_sha,
+                fix_feedback_reviewer_policy.fingerprint
+                if fix_feedback_reviewer_policy is not None else None,
+                gh_reviews._review_status_cache_cycle,
+            )
+            if review_origin != expected_origin:
+                review_feedback = None
+                review_limitation = "status-poll review identity changed before dispatch"
         if (
             current_pr is not None
             and current_pr.ci_status != CIStatus.FAILURE
@@ -470,10 +489,12 @@ class FixMixin(BreachMixin):
                 )
                 if metadata.get("head_sha") != review_head:
                     admitted_feedback = None
+                    review_limitation = "PR HEAD changed before review dispatch"
             extra_context = await self._build_fix_feedback_context(
                 self.state.current_pr,
                 reviewer_policy=fix_feedback_reviewer_policy,
                 review_feedback=admitted_feedback,
+                review_limitation=review_limitation,
             )
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context

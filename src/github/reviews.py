@@ -8,6 +8,7 @@ gate (``ReviewStatus.APPROVED`` / ``EYES`` / ``CHANGES_REQUESTED`` /
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
@@ -52,6 +53,8 @@ _PROVIDER_ERROR = re.compile(
     r"something went wrong while reviewing\b)", re.I,
 )
 _SUMMARY = re.compile(r"^(?:\*\*)?(?:review )?(?:summary|status update)(?:\*\*)?:", re.I)
+_STRUCTURED_SUMMARY = "<!-- codex-pull-request-review-summary -->"
+_REVIEW_STATE = re.compile(r"<!-- codex-review-state:v1 (\{[^\n]*\}) -->")
 
 
 @dataclass(frozen=True)
@@ -82,6 +85,22 @@ def classify_review_comment(comment: dict, *, inline: bool = False) -> str:
     body = (comment.get("body") or "").strip()
     if not body:
         return "unknown"
+    if body.startswith(_STRUCTURED_SUMMARY):
+        state_match = _REVIEW_STATE.search(body)
+        if state_match is None:
+            return "unknown"
+        try:
+            state = json.loads(state_match.group(1))["code_review"]
+            status = state["status"]
+            if status not in ("in_progress", "completed"):
+                return "unknown"
+            if status == "completed" and not isinstance(state["has_any_findings"], bool):
+                return "unknown"
+            if status == "completed" and not isinstance(state["has_unresolved_findings"], bool):
+                return "unknown"
+        except (ValueError, KeyError, TypeError):
+            return "unknown"
+        return "summary"
     if _RECEIPT.search(body):
         return "receipt"
     if _reactions._is_codex_onboarding_comment(comment):
@@ -191,6 +210,7 @@ def read_review_feedback(
 
 _review_status_cache: dict[str, "ReviewStatus"] = {}
 _review_author_cache: dict[str, str] = {}
+_review_feedback_cache: dict[str, ReviewFeedback] = {}
 _review_status_cache_cycle: int | None = None
 
 
@@ -205,6 +225,7 @@ def clear_review_status_cache() -> None:
     global _review_status_cache_cycle
     _review_status_cache.clear()
     _review_author_cache.clear()
+    _review_feedback_cache.clear()
     _review_status_cache_cycle = None
 
 
@@ -213,6 +234,7 @@ def _begin_review_cache_cycle() -> None:
     global _review_status_cache_cycle
     _review_status_cache.clear()
     _review_author_cache.clear()
+    _review_feedback_cache.clear()
     if _review_status_cache_cycle is None:
         _review_status_cache_cycle = 0
     _review_status_cache_cycle += 1
@@ -266,6 +288,13 @@ def cached_review_author(
 ) -> str:
     """Use the author and policy snapshot from the PR status poll."""
     return _review_author_cache.get(_cache_key(repo, pr_number, head_sha, policy), "")
+
+
+def cached_review_feedback(
+    repo: str, pr_number: int, head_sha: str, policy: ReviewerPolicy
+) -> ReviewFeedback | None:
+    """Return evidence from the current status-poll cycle for this exact identity."""
+    return _review_feedback_cache.get(_cache_key(repo, pr_number, head_sha, policy))
 
 
 def _compute_review_status(
@@ -415,6 +444,8 @@ def _compute_review_status(
     feedback = feedback_from_comments(
         issue_comments, review_comments, pr_author, reviewer_policy
     )
+    if head_sha:
+        _review_feedback_cache[_cache_key(repo, pr_number, head_sha, reviewer_policy)] = feedback
     approved_at = max(
         (t for t in (body_approval_at, anchor_approval_at) if t is not None),
         default=None,
