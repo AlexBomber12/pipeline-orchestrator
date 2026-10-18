@@ -254,19 +254,16 @@ class WatchMixin:
         # failure during ``recover_state`` doesn't permanently leave
         # ``_last_push_at`` unset.
         if found.publication_observed:
-            published_at = found.publication_at
-            reason = found.publication_reason
-            if (
-                published_at is not None
-                and self._last_push_at is not None
-                and self._last_push_at_pr_number == found.number
-                and self._last_push_at_head_sha == found.head_sha
-                and published_at < self._last_push_at
-            ):
-                published_at = None
-                reason = "publication time moved backward for unchanged HEAD"
+            published_at, reason = self._validate_publication_observation(
+                found.number, found.head_sha,
+                found.publication_at, found.publication_reason,
+                head_repo=found.publication_head_repo,
+                ref=found.publication_ref,
+            )
             found.publication_at = published_at
             found.publication_reason = reason
+            if published_at is None and found.review_status == ReviewStatus.APPROVED:
+                found.review_status = ReviewStatus.PENDING
             self._last_push_at = published_at
             self._last_push_at_pr_number = found.number
             self._last_push_at_head_sha = (

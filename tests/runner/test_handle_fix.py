@@ -5626,7 +5626,7 @@ def test_record_fix_push_uses_publication_evidence(
     asyncio.run(runner.handle_fix())
     assert runner._last_push_at == expected
     assert runner._last_push_at_pr_number == 407
-    assert seen == ["head-after-def"]
+    assert seen == ["head-after-def", "head-after-def"]
 
 
 def test_record_fix_push_unknown_does_not_fabricate_baseline(
@@ -5671,6 +5671,34 @@ def test_canonical_push_timestamp_rejects_backward_same_head_proof(
     runner._last_push_at_head_sha = "a" * 40
     assert runner._canonical_push_timestamp(407) is None
     assert runner._last_push_at_head_sha is None
+    runner._last_push_at = None
+    assert runner._canonical_push_timestamp(407) is None
+
+
+def test_publication_watermark_is_scoped_to_head_repo_and_ref() -> None:
+    runner = h._make_runner()
+    later = datetime(2026, 5, 10, 2, 30, tzinfo=timezone.utc)
+    earlier = datetime(2026, 5, 10, 1, 50, tzinfo=timezone.utc)
+    head = "a" * 40
+    assert runner._validate_publication_observation(
+        407, head, later, None,
+        head_repo="owner/first", ref="refs/heads/first",
+    ) == (later, None)
+    assert runner._validate_publication_observation(
+        407, head, earlier, None,
+        head_repo="owner/first", ref="refs/heads/second",
+    ) == (earlier, None)
+    assert runner._validate_publication_observation(
+        407, head, earlier, None,
+        head_repo="owner/second", ref="refs/heads/second",
+    ) == (earlier, None)
+
+
+def test_publication_watermark_rejects_naive_timestamp() -> None:
+    runner = h._make_runner()
+    assert runner._validate_publication_observation(
+        407, "a" * 40, datetime(2026, 5, 10, 2, 30), None,
+    ) == (None, "publication timestamp missing timezone")
 
 
 def test_no_push_branch_uses_publication_evidence_when_available(

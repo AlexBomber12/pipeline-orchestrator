@@ -361,6 +361,8 @@ def get_open_prs(
                 publication_observed=True,
                 publication_at=publication.published_at,
                 publication_reason=publication.unknown_reason,
+                publication_head_repo=publication.head_repo,
+                publication_ref=publication.ref,
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),
                 is_escalated=any(
@@ -435,6 +437,8 @@ def _get_open_prs_rest(
                 publication_observed=True,
                 publication_at=publication.published_at,
                 publication_reason=publication.unknown_reason,
+                publication_head_repo=publication.head_repo,
+                publication_ref=publication.ref,
                 url=entry.get("html_url", ""),
                 last_activity=_parse_iso(entry.get("updated_at")),
                 is_escalated=any(
@@ -811,7 +815,9 @@ def _publication_from_activity(
 
     if not isinstance(raw, list):
         return unknown("activity payload malformed")
-    publication_types = {"branch_creation", "push", "force_push"}
+    publication_types = {
+        "branch_creation", "push", "force_push", "pr_merge", "merge_queue_merge",
+    }
     relevant = []
     for event in raw:
         if not isinstance(event, dict):

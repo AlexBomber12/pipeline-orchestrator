@@ -57,7 +57,9 @@ def test_branch_creation_proves_current_head_and_uses_encoded_ref(
     assert get_pr_last_push_time("owner/name", 42) == evidence.published_at
 
 
-@pytest.mark.parametrize("kind", ["push", "force_push", "branch_creation"])
+@pytest.mark.parametrize("kind", [
+    "push", "force_push", "branch_creation", "pr_merge", "merge_queue_merge",
+])
 def test_newer_publication_invalidates_older_head(
     monkeypatch: pytest.MonkeyPatch, kind: str,
 ) -> None:
@@ -77,6 +79,18 @@ def test_newer_recreation_of_same_head_resets_freshness(
     assert get_pr_last_push_time("owner/name", 42) == datetime(
         2026, 10, 17, 21, 10, tzinfo=timezone.utc
     )
+
+
+@pytest.mark.parametrize("kind", ["pr_merge", "merge_queue_merge"])
+def test_merge_activity_proves_current_head_publication(
+    monkeypatch: pytest.MonkeyPatch, kind: str,
+) -> None:
+    merged = {**CREATED, "activity_type": kind,
+              "timestamp": "2026-10-17T21:10:00Z"}
+    _transport(monkeypatch, [merged, CREATED])
+    evidence = get_pr_head_publication("owner/name", 42, expected_head_sha=HEAD)
+    assert evidence.published_at == datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    assert evidence.provenance == f"github-activity:{kind}"
 
 
 @pytest.mark.parametrize("activity", [[], {}, [None],

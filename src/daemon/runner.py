@@ -422,6 +422,10 @@ class PipelineRunner(
         self._last_push_at_pr_number: int | None = None
         self._last_push_at_head_sha: str | None = None
         self._push_provenance_reason: str | None = None
+        # Safety watermark only: a prior proof can reject a backward read,
+        # but never substitutes for the current poll's publication evidence.
+        self._publication_high_water_identity: tuple[str, int, str, str, str] | None = None
+        self._publication_high_water_at: datetime | None = None
         self._last_codex_review_pr: int | None = None
         self._last_codex_review_head_sha: str | None = None
         self._queue_progress_dirty = False
@@ -1365,6 +1369,42 @@ class PipelineRunner(
             return ""
         return result.stdout.strip()
 
+    def _validate_publication_observation(
+        self,
+        pr_number: int,
+        head_sha: str,
+        observed_at: datetime | None,
+        reason: str | None,
+        *,
+        head_repo: str = "",
+        ref: str = "",
+    ) -> tuple[datetime | None, str | None]:
+        """Reject backward reads without using a prior proof as current evidence."""
+        identity = (self.owner_repo, pr_number, head_repo, ref, head_sha)
+        if (
+            self._publication_high_water_identity is None
+            and not head_repo and not ref
+            and self._last_push_at is not None
+            and self._last_push_at_pr_number == pr_number
+            and self._last_push_at_head_sha == head_sha
+        ):
+            self._publication_high_water_identity = identity
+            self._publication_high_water_at = self._last_push_at
+        if self._publication_high_water_identity != identity:
+            self._publication_high_water_identity = identity
+            self._publication_high_water_at = None
+        if observed_at is None:
+            return None, reason
+        if observed_at.tzinfo is None:
+            return None, "publication timestamp missing timezone"
+        if (
+            self._publication_high_water_at is not None
+            and observed_at < self._publication_high_water_at
+        ):
+            return None, "publication time moved backward for unchanged HEAD"
+        self._publication_high_water_at = observed_at
+        return observed_at, None
+
     def _canonical_push_timestamp(self, pr_number: int) -> datetime | None:
         """Return proven publication time for the currently observed PR HEAD."""
         pr = self.state.current_pr
@@ -1373,15 +1413,13 @@ class PipelineRunner(
         evidence = gh_prs.get_pr_head_publication(
             self.owner_repo, pr_number, expected_head_sha=pr.head_sha
         )
-        published_at = evidence.published_at
-        if (
-            published_at is not None
-            and self._last_push_at is not None
-            and self._last_push_at_pr_number == pr_number
-            and self._last_push_at_head_sha == pr.head_sha
-            and published_at < self._last_push_at
-        ):
-            published_at = None
+        published_at, reason = self._validate_publication_observation(
+            pr_number, pr.head_sha, evidence.published_at,
+            getattr(evidence, "unknown_reason", None),
+            head_repo=getattr(evidence, "head_repo", ""),
+            ref=getattr(evidence, "ref", ""),
+        )
+        self._push_provenance_reason = reason
         self._last_push_at_head_sha = pr.head_sha if published_at else None
         return published_at
 

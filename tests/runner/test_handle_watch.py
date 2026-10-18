@@ -5681,6 +5681,8 @@ def test_recorded_branch_creation_review_reaches_watch_merge_handoff(
             review_status=review, diff_scanned_at_sha=head,
             publication_observed=True, publication_at=publication.published_at,
             publication_reason=publication.unknown_reason,
+            publication_head_repo=publication.head_repo,
+            publication_ref=publication.ref,
         )]
     monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
     runner = h._make_runner(
@@ -5691,9 +5693,14 @@ def test_recorded_branch_creation_review_reaches_watch_merge_handoff(
                                      diff_scanned_at_sha=head)
     runner.state.state = PipelineState.WATCH
     if case == "backward":
-        runner._last_push_at = datetime(2026, 10, 17, 21, 7, tzinfo=timezone.utc)
+        floor = datetime(2026, 10, 17, 21, 7, tzinfo=timezone.utc)
+        runner._last_push_at = floor
         runner._last_push_at_pr_number = 620
         runner._last_push_at_head_sha = head
+        runner._publication_high_water_identity = (
+            runner.owner_repo, 620, "octo/demo", f"refs/heads/{branch}", head,
+        )
+        runner._publication_high_water_at = floor
     calls: list[str] = []
     async def merge() -> None:
         calls.append("merge")
@@ -5707,8 +5714,11 @@ def test_recorded_branch_creation_review_reaches_watch_merge_handoff(
     asyncio.run(runner.handle_watch())
     assert calls == (["merge"] if case == "creation" else [])
     assert runner.state.current_pr.review_status == (
-        ReviewStatus.APPROVED if case in {"creation", "backward"} else ReviewStatus.PENDING
+        ReviewStatus.APPROVED if case == "creation" else ReviewStatus.PENDING
     )
     if case == "backward":
         assert runner.state.current_pr.publication_at is None
         assert runner.state.current_pr.publication_reason == "publication time moved backward for unchanged HEAD"
+        asyncio.run(runner.handle_watch())
+        assert calls == []
+        assert runner.state.current_pr.publication_at is None

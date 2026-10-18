@@ -99,16 +99,20 @@ class HungMixin:
             return False
         try:
             current_pr = self.state.current_pr
-            last_push_time = gh_prs.get_pr_head_publication(
+            evidence = gh_prs.get_pr_head_publication(
                 self.owner_repo, pr_number,
                 expected_head_sha=current_pr.head_sha if current_pr else "",
-            ).published_at
+            )
+            last_push_time, _ = self._validate_publication_observation(
+                pr_number, getattr(evidence, "head_sha", ""), evidence.published_at,
+                getattr(evidence, "unknown_reason", None),
+                head_repo=getattr(evidence, "head_repo", ""),
+                ref=getattr(evidence, "ref", ""),
+            )
         except Exception:
             return False
         if last_push_time is None:
             return False
-        if last_push_time.tzinfo is None:
-            last_push_time = last_push_time.replace(tzinfo=timezone.utc)
         for reaction in eyes_reactions:
             reaction_time = gh_runner._parse_iso(
                 reaction.get("created_at")
@@ -153,16 +157,15 @@ class HungMixin:
                 f"posting without PR-author dedup."
             )
         if head_sha:
-            known_at = (
-                self._last_push_at
-                if self._last_push_at_pr_number == pr_number
-                and self._last_push_at_head_sha == head_sha
-                else None
+            evidence = gh_prs.get_pr_head_publication(
+                self.owner_repo, pr_number, expected_head_sha=head_sha
             )
-            if known_at is None:
-                known_at = gh_prs.get_pr_head_publication(
-                    self.owner_repo, pr_number, expected_head_sha=head_sha
-                ).published_at
+            known_at, _ = self._validate_publication_observation(
+                pr_number, getattr(evidence, "head_sha", head_sha), evidence.published_at,
+                getattr(evidence, "unknown_reason", None),
+                head_repo=getattr(evidence, "head_repo", ""),
+                ref=getattr(evidence, "ref", ""),
+            )
             if known_at is not None:
                 publication_iso = known_at.isoformat()
         if head_sha is None:

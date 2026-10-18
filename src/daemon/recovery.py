@@ -1229,17 +1229,12 @@ class RecoveryMixin:
         evidence = gh_prs.get_pr_head_publication(
             self.owner_repo, pr.number, expected_head_sha=pr.head_sha
         )
-        published_at = evidence.published_at
-        reason = evidence.unknown_reason
-        if (
-            published_at is not None
-            and self._last_push_at is not None
-            and self._last_push_at_pr_number == pr.number
-            and self._last_push_at_head_sha == pr.head_sha
-            and published_at < self._last_push_at
-        ):
-            published_at = None
-            reason = "publication time moved backward for unchanged HEAD"
+        published_at, reason = self._validate_publication_observation(
+            pr.number, pr.head_sha, evidence.published_at,
+            getattr(evidence, "unknown_reason", None),
+            head_repo=getattr(evidence, "head_repo", ""),
+            ref=getattr(evidence, "ref", ""),
+        )
         self._last_push_at = published_at
         self._last_push_at_pr_number = pr.number
         self._last_push_at_head_sha = pr.head_sha if published_at else None

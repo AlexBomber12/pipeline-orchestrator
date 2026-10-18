@@ -1741,6 +1741,9 @@ def test_rehydrate_last_push_at_rejects_backward_same_head_observation(
     runner._rehydrate_last_push_at(pr)
     assert runner._last_push_at is None
     assert runner._push_provenance_reason == "publication time moved backward for unchanged HEAD"
+    runner._rehydrate_last_push_at(pr)
+    assert runner._last_push_at is None
+    assert runner._push_provenance_reason == "publication time moved backward for unchanged HEAD"
 
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",

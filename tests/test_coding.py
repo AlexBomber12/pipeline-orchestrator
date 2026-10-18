@@ -847,6 +847,7 @@ def test_should_skip_codex_review_post_normalizes_naive_timestamps(
     """Naive timestamps from upstream parsers are coerced to UTC so the
     comparison still fires correctly."""
     from datetime import datetime as _dt
+    from datetime import timezone as _tz
 
     runner = h._make_runner()
     monkeypatch.setattr(
@@ -861,7 +862,7 @@ def test_should_skip_codex_review_post_normalizes_naive_timestamps(
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
-        lambda *args, **kwargs: SimpleNamespace(published_at=_dt(2026, 4, 30, 12, 0, 0)),
+        lambda *args, **kwargs: SimpleNamespace(published_at=_dt(2026, 4, 30, 12, 0, 0, tzinfo=_tz.utc)),
     )
     monkeypatch.setattr(
         "src.github.gh_runner._parse_iso",

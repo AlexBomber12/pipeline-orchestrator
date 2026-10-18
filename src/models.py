@@ -91,6 +91,8 @@ class PRInfo(BaseModel):
     publication_observed: bool = False
     publication_at: datetime | None = None
     publication_reason: str | None = None
+    publication_head_repo: str = ""
+    publication_ref: str = ""
     fix_iteration_count: int = 0
     no_push_fix_count: int = 0
     # OBS-BL (PR-249): WATCH retrigger cycles counted to cap runaway
