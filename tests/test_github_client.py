@@ -6461,6 +6461,14 @@ def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
     assert reviews.get_pr_review_status(
         "owner/name", 42, "author", "head", policy=policy
     ) == ReviewStatus.EYES
+    body_reactions.append({
+        "content": "+1", "user": actor,
+        "created_at": "2025-12-31T23:59:00Z",
+    })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status(
+        "owner/name", 42, "author", "head", policy=policy
+    ) == ReviewStatus.EYES
 
     def unavailable(path: str) -> list[dict]:
         raise RuntimeError("transport unavailable")

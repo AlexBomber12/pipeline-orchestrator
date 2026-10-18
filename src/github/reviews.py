@@ -408,7 +408,7 @@ def _compute_review_status(
         default=None,
     )
     if body_eyes or anchor_eyes:
-        if saw_plus_one:
+        if body_approved or anchor_approved:
             logger.info("PR #%s review pending: conflicting +1 and eyes evidence", pr_number)
             return ReviewStatus.PENDING
         return ReviewStatus.EYES
