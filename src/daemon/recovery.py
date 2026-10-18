@@ -27,7 +27,14 @@ from src.daemon import git_ops
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
-from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
+from src.models import (
+    PipelineState,
+    PRInfo,
+    PublicationWatermark,
+    QueueTask,
+    RepoState,
+    TaskStatus,
+)
 from src.queue_parser import (
     QueueValidationError,
     UnstructuredLegacyTaskError,
@@ -222,6 +229,7 @@ class RecoveryMixin:
         # startup recovery is always correct: if recovery re-enters
         # CODING through the DOING-with-matching-PR path the next handle
         # cycle rewrites the marker before invoking the coder.
+        self._publication_recovery_cutoff_at = datetime.now(timezone.utc)
         self._cleanup_expected_branch()
         return await self._recover_state_headers()
 
@@ -272,6 +280,7 @@ class RecoveryMixin:
             persisted = RepoState.model_validate_json(raw)
         except Exception:
             return
+        self._restore_publication_watermark(persisted)
         if (
             persisted.state in {PipelineState.ERROR, PipelineState.WATCH, PipelineState.FIX}
             and persisted.current_task is not None
@@ -303,6 +312,42 @@ class RecoveryMixin:
             and persisted.active_invocation is not None
         ):
             self.state.active_invocation = persisted.active_invocation
+
+    def _restore_publication_watermark(self, persisted: RepoState) -> None:
+        """Restore a safety floor, never the current publication observation."""
+        saved = persisted.publication_watermark
+        pr = persisted.current_pr
+        if (
+            saved is None and pr is not None and pr.publication_observed
+            and pr.publication_at is not None
+        ):
+            # Legacy snapshots kept only the last poll's result. It is a
+            # usable safety floor when its full PR/head context is present.
+            saved = PublicationWatermark(
+                repo=self.owner_repo, pr_number=pr.number,
+                head_repo=pr.publication_head_repo, ref=pr.publication_ref,
+                head_sha=pr.head_sha, published_at=pr.publication_at,
+            )
+        if (
+            saved is None or pr is None or persisted.name != self.name
+            or saved.repo != self.owner_repo or saved.pr_number != pr.number
+            or saved.head_sha != pr.head_sha
+            or re.fullmatch(r"[0-9a-fA-F]{40}", saved.head_sha) is None
+            or re.fullmatch(r"[^/]+/[^/]+", saved.head_repo) is None
+            or saved.ref != f"refs/heads/{pr.branch}"
+            or (not pr.is_cross_repository and saved.head_repo != self.owner_repo)
+            or (pr.publication_head_repo and saved.head_repo != pr.publication_head_repo)
+            or (pr.publication_ref and saved.ref != pr.publication_ref)
+            or saved.published_at.tzinfo is None
+        ):
+            return
+        self._publication_high_water_identity = (
+            saved.repo, saved.pr_number, saved.head_repo, saved.ref,
+            saved.head_sha,
+        )
+        self._publication_high_water_at = saved.published_at
+        self._publication_recovery_cutoff_at = None
+        self.state.publication_watermark = saved
 
     async def _finalize_interrupted_coding_invocation(self) -> None:
         """Finalize only the exact unfinished CODING checkpoint on recovery."""
@@ -1234,6 +1279,8 @@ class RecoveryMixin:
             getattr(evidence, "unknown_reason", None),
             head_repo=getattr(evidence, "head_repo", ""),
             ref=getattr(evidence, "ref", ""),
+            observed_repo=getattr(evidence, "repo", ""),
+            observed_head_sha=getattr(evidence, "head_sha", ""),
         )
         self._last_push_at = published_at
         self._last_push_at_pr_number = pr.number

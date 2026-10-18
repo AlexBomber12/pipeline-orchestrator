@@ -723,6 +723,9 @@ def _patch_eyes_reaction_present(
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
         lambda *args, **kwargs: type("Evidence", (), {
+            "repo": "octo/demo", "head_repo": "octo/demo",
+            "ref": "refs/heads/pr-042-fix",
+            "head_sha": kwargs.get("expected_head_sha", ""),
             "published_at": gh_runner._parse_iso("2026-04-30T12:00:00Z")
         })(),
     )

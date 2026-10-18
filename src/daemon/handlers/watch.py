@@ -259,6 +259,8 @@ class WatchMixin:
                 found.publication_at, found.publication_reason,
                 head_repo=found.publication_head_repo,
                 ref=found.publication_ref,
+                observed_repo=found.publication_repo,
+                observed_head_sha=found.publication_head_sha,
             )
             found.publication_at = published_at
             found.publication_reason = reason

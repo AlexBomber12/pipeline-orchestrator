@@ -93,6 +93,8 @@ class PRInfo(BaseModel):
     publication_reason: str | None = None
     publication_head_repo: str = ""
     publication_ref: str = ""
+    publication_repo: str = ""
+    publication_head_sha: str = ""
     fix_iteration_count: int = 0
     no_push_fix_count: int = 0
     # OBS-BL (PR-249): WATCH retrigger cycles counted to cap runaway
@@ -189,6 +191,17 @@ class InvocationSnapshot:
     fix_iteration: int | None = None
 
 
+class PublicationWatermark(BaseModel):
+    """Durable safety floor for one fully identified PR head publication."""
+
+    repo: str
+    pr_number: int
+    head_repo: str
+    ref: str
+    head_sha: str
+    published_at: datetime
+
+
 class RepoState(BaseModel):
     url: str
     name: str
@@ -198,6 +211,7 @@ class RepoState(BaseModel):
     current_queue: list[QueueTask] | None = None
     current_queue_snapshot_at: datetime | None = None
     current_pr: PRInfo | None = None
+    publication_watermark: PublicationWatermark | None = None
     error_message: str | None = None
     last_updated: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)

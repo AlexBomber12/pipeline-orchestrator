@@ -137,7 +137,13 @@ from src.keyspace import (
     upload_pending,
 )
 from src.metrics import MetricsStore, RunRecord
-from src.models import InvocationSnapshot, PipelineState, RepoState, TaskStatus
+from src.models import (
+    InvocationSnapshot,
+    PipelineState,
+    PublicationWatermark,
+    RepoState,
+    TaskStatus,
+)
 from src.process_supervisor import SupervisedProcess
 from src.queue_parser import (
     TYPE_SYNONYMS,
@@ -426,6 +432,9 @@ class PipelineRunner(
         # but never substitutes for the current poll's publication evidence.
         self._publication_high_water_identity: tuple[str, int, str, str, str] | None = None
         self._publication_high_water_at: datetime | None = None
+        # Recovery with no usable snapshot cannot trust historical activity
+        # as a replacement for a safety floor that might have been lost.
+        self._publication_recovery_cutoff_at: datetime | None = None
         self._last_codex_review_pr: int | None = None
         self._last_codex_review_head_sha: str | None = None
         self._queue_progress_dirty = False
@@ -1378,45 +1387,75 @@ class PipelineRunner(
         *,
         head_repo: str = "",
         ref: str = "",
+        observed_repo: str = "",
+        observed_head_sha: str | None = None,
     ) -> tuple[datetime | None, str | None]:
         """Reject backward reads without using a prior proof as current evidence."""
+        # The arguments identify the requested target. The observation may be
+        # incomplete or describe a different HEAD; neither changes that target.
+        reported_sha = observed_head_sha or ""
+        reported_repo = observed_repo
+        target = (self.owner_repo, pr_number, head_sha)
+        prior_identity = self._publication_high_water_identity
+        if prior_identity is not None and (
+            prior_identity[0], prior_identity[1], prior_identity[4]
+        ) != target:
+            self._publication_high_water_identity = None
+            self._publication_high_water_at = None
+            self.state.publication_watermark = None
+            prior_identity = None
         identity = (self.owner_repo, pr_number, head_repo, ref, head_sha)
         if (
-            self._publication_high_water_identity is None
-            and not head_repo and not ref
+            prior_identity is None
+            and head_repo and ref and reported_repo == self.owner_repo
+            and reported_sha == head_sha
+            and self._publication_recovery_cutoff_at is None
             and self._last_push_at is not None
             and self._last_push_at_pr_number == pr_number
             and self._last_push_at_head_sha == head_sha
+            and self._last_push_at.tzinfo is not None
         ):
             self._publication_high_water_identity = identity
             self._publication_high_water_at = self._last_push_at
-        prior_identity = self._publication_high_water_identity
-        if (
-            observed_at is None
-            and prior_identity is not None
-            and prior_identity[0] == self.owner_repo
-            and prior_identity[1] == pr_number
-            and prior_identity[4] == head_sha
-            and (not head_repo or head_repo == prior_identity[2])
-            and (not ref or ref == prior_identity[3])
-        ):
-            # A failed read without complete context cannot disprove a
-            # previous observation. Retain it solely to reject later stale
-            # activity; this poll remains unknown to approval/feedback gates.
-            return None, reason
-        if self._publication_high_water_identity != identity:
-            self._publication_high_water_identity = identity
-            self._publication_high_water_at = None
+            self.state.publication_watermark = PublicationWatermark(
+                repo=self.owner_repo, pr_number=pr_number, head_repo=head_repo,
+                ref=ref, head_sha=head_sha, published_at=self._last_push_at,
+            )
         if observed_at is None:
             return None, reason
         if observed_at.tzinfo is None:
             return None, "publication timestamp missing timezone"
+        if reason is not None:
+            return None, reason
+        if (
+            reported_repo != self.owner_repo
+            or not head_sha or reported_sha.lower() != head_sha.lower()
+            or re.fullmatch(r"[^/]+/[^/]+", head_repo) is None
+            or not ref.startswith("refs/heads/")
+            or len(ref) <= len("refs/heads/")
+        ):
+            return None, reason or "publication identity unavailable or mismatched"
+        if (
+            self._publication_recovery_cutoff_at is not None
+            and observed_at <= self._publication_recovery_cutoff_at
+        ):
+            return None, "publication predates recovery without a trusted safety floor"
+        # A complete new head-repository/ref context is a new identity. A
+        # failed read above cannot clear the old floor merely by omitting it.
+        if self._publication_high_water_identity != identity:
+            self._publication_high_water_identity = identity
+            self._publication_high_water_at = None
         if (
             self._publication_high_water_at is not None
             and observed_at < self._publication_high_water_at
         ):
             return None, "publication time moved backward for unchanged HEAD"
         self._publication_high_water_at = observed_at
+        self._publication_recovery_cutoff_at = None
+        self.state.publication_watermark = PublicationWatermark(
+            repo=self.owner_repo, pr_number=pr_number, head_repo=head_repo,
+            ref=ref, head_sha=head_sha, published_at=observed_at,
+        )
         return observed_at, None
 
     def _canonical_push_timestamp(self, pr_number: int) -> datetime | None:
@@ -1432,6 +1471,8 @@ class PipelineRunner(
             getattr(evidence, "unknown_reason", None),
             head_repo=getattr(evidence, "head_repo", ""),
             ref=getattr(evidence, "ref", ""),
+            observed_repo=getattr(evidence, "repo", ""),
+            observed_head_sha=getattr(evidence, "head_sha", ""),
         )
         self._push_provenance_reason = reason
         self._last_push_at_head_sha = pr.head_sha if published_at else None

@@ -51,6 +51,7 @@ from src.daemon.handlers import error as error_module  # noqa: F401,F811
 from src.daemon.handlers import idle as idle_module  # noqa: F811
 from src.daemon.handlers import merge as merge_module  # noqa: F401,F811
 from src.daemon.handlers import watch as watch_module  # noqa: F401,F811
+from src.keyspace import pipeline_state
 from src.models import (
     PipelineState,  # noqa: F811
     PRInfo,  # noqa: F811
@@ -948,6 +949,20 @@ def test_recover_state_rehydrates_last_push_at(
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
     runner._parse_tasks_from_headers = lambda: parsed_tasks  # type: ignore[method-assign]
+    # A legacy checkpoint has no dedicated watermark but does retain a
+    # complete, previously proven publication on its current PR.
+    saved = RepoState(
+        url=runner.state.url, name=runner.state.name, state=PipelineState.WATCH,
+        current_pr=PRInfo(
+            number=7, branch="pr-001", head_sha=head,
+            publication_observed=True,
+            publication_at=runner_module.datetime.fromisoformat(
+                head_iso.replace("Z", "+00:00")
+            ),
+            publication_head_repo="octo/demo", publication_ref="refs/heads/pr-001",
+        ),
+    )
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
     assert runner._last_push_at is None
     assert runner._watch_entered_at is None
     asyncio.run(runner.recover_state())

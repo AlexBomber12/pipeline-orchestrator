@@ -22,12 +22,14 @@ from src.daemon.handlers import watch as watch_module
 from src.daemon.runner import PipelineRunner
 from src.github import cache as gh_cache
 from src.github import reviews as gh_reviews
+from src.keyspace import pipeline_state
 from src.models import (
     CIStatus,
     FeedbackCheckResult,
     PipelineState,
     PRInfo,
     QueueTask,
+    RepoState,
     ReviewStatus,
     TaskStatus,
 )
@@ -5673,7 +5675,7 @@ def test_recorded_branch_creation_review_reaches_watch_merge_handoff(
             repo, 620, expected_head_sha=head
         )
         review = gh_reviews.get_pr_review_status(
-            repo, 620, "author", head, policy=kwargs["reviewer_policy"],
+            repo, 620, "author", head, policy=kwargs.get("reviewer_policy"),
             publication_evidence=publication,
         )
         return [PRInfo(
@@ -5683,6 +5685,8 @@ def test_recorded_branch_creation_review_reaches_watch_merge_handoff(
             publication_reason=publication.unknown_reason,
             publication_head_repo=publication.head_repo,
             publication_ref=publication.ref,
+            publication_repo=publication.repo,
+            publication_head_sha=publication.head_sha,
         )]
     monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
     runner = h._make_runner(
@@ -5759,7 +5763,7 @@ def test_contextless_failure_cannot_erase_publication_watermark(
             repo, 620, expected_head_sha=head
         )
         review = gh_reviews.get_pr_review_status(
-            repo, 620, "author", head, policy=kwargs["reviewer_policy"],
+            repo, 620, "author", head, policy=kwargs.get("reviewer_policy"),
             publication_evidence=publication,
         )
         return [PRInfo(
@@ -5768,6 +5772,7 @@ def test_contextless_failure_cannot_erase_publication_watermark(
             publication_observed=True, publication_at=publication.published_at,
             publication_reason=publication.unknown_reason,
             publication_head_repo=publication.head_repo, publication_ref=publication.ref,
+            publication_repo=publication.repo, publication_head_sha=publication.head_sha,
         )]
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", run_gh)
@@ -5796,3 +5801,218 @@ def test_contextless_failure_cannot_erase_publication_watermark(
         assert runner.state.current_pr.review_status == ReviewStatus.PENDING
     assert runner.state.current_pr.publication_at is None
     assert runner.state.current_pr.publication_reason == "publication time moved backward for unchanged HEAD"
+
+
+def _publication_safety_boundary(monkeypatch: pytest.MonkeyPatch):
+    """Exercise the real reader, review classifier, WATCH, and recovery boundary."""
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+    branch = "pr-459-e2e-failure-evidence"
+    floor = datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    mode = {"value": "new"}
+    reaction_at = {"value": "2026-10-17T21:08:48Z"}
+    def run_gh(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/" in args[1]:
+            if mode["value"] == "unavailable":
+                raise RuntimeError("transport unavailable")
+            return {"branch": branch, "repo": "octo/demo", "sha": head}
+        if "/activity?" in args[1]:
+            timestamp = "2026-10-17T21:10:00Z" if mode["value"] == "new" else "2026-10-17T21:06:35Z"
+            return [{"activity_type": "branch_creation", "before": "0" * 40,
+                     "after": head, "ref": f"refs/heads/{branch}", "timestamp": timestamp}]
+        raise AssertionError(args)
+    def paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/620/reactions"):
+            return [{"content": "+1", "created_at": reaction_at["value"],
+                     "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"}}]
+        return []
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        gh_reviews.clear_review_status_cache()
+        publication = watch_module.gh_prs.get_pr_head_publication(
+            repo, 620, expected_head_sha=head,
+        )
+        review = gh_reviews.get_pr_review_status(
+            repo, 620, "author", head, policy=kwargs.get("reviewer_policy"),
+            publication_evidence=publication,
+        )
+        return [PRInfo(
+            number=620, branch=branch, head_sha=head, ci_status=CIStatus.SUCCESS,
+            review_status=review, diff_scanned_at_sha=head,
+            publication_observed=True, publication_at=publication.published_at,
+            publication_reason=publication.unknown_reason,
+            publication_head_repo=publication.head_repo, publication_ref=publication.ref,
+            publication_repo=publication.repo, publication_head_sha=publication.head_sha,
+        )]
+    monkeypatch.setattr("src.github.gh_runner.run_gh", run_gh)
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", paginated)
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    runner = h._make_runner(auto_merge=True)
+    runner.state.current_pr = PRInfo(number=620, branch=branch, head_sha=head,
+                                     diff_scanned_at_sha=head)
+    runner.state.state = PipelineState.WATCH
+    merged: list[int] = []
+    async def merge() -> None:
+        merged.append(620)
+    async def no_work(*_args: object) -> None:
+        return None
+    monkeypatch.setattr(runner, "handle_merge", merge)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_work)
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_work)
+    return runner, mode, reaction_at, floor, merged, no_work, head, branch
+
+
+@pytest.mark.parametrize("helper", ["eyes", "author_post"])
+def test_auxiliary_failed_read_keeps_publication_floor(
+    monkeypatch: pytest.MonkeyPatch, helper: str,
+) -> None:
+    from src.daemon import git_ops
+    from src.daemon.handlers import hung as hung_module
+    from src.github import reactions
+
+    runner, mode, _reaction_at, floor, merged, _no_work, head, _branch = (
+        _publication_safety_boundary(monkeypatch)
+    )
+    asyncio.run(runner.handle_watch())
+    assert runner._publication_high_water_at == floor
+    mode["value"] = "unavailable"
+    if helper == "eyes":
+        original_reactions = reactions._get_codex_issue_reactions
+        monkeypatch.setattr(reactions, "_get_codex_issue_reactions", lambda *a, **kw: [
+            {"content": "eyes", "created_at": "2026-10-17T21:08:48Z",
+             "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"}},
+        ])
+        assert runner._should_skip_codex_review_post(620) is False
+        monkeypatch.setattr(reactions, "_get_codex_issue_reactions", original_reactions)
+    else:
+        posted: list[str] = []
+        monkeypatch.setattr(git_ops, "_git", lambda *a, **kw: h._FakeCompletedProcess(
+            args=[], stdout=head + "\n", returncode=0,
+        ))
+        monkeypatch.setattr(watch_module.gh_prs, "get_pr_metadata",
+                            lambda *a: {"author": "author"})
+        monkeypatch.setattr(hung_module.gh_comments, "post_comment",
+                            lambda _repo, _number, body: posted.append(body))
+        assert runner._post_codex_review_result(620)[0] is True
+        assert posted == ["@codex review"]
+    assert runner._publication_high_water_at == floor
+    mode["value"] = "old"
+    for _ in range(2):
+        asyncio.run(runner.handle_watch())
+        assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+        assert runner.state.current_pr.publication_at is None
+        assert runner._publication_high_water_at == floor
+        assert merged == []
+
+
+@pytest.mark.parametrize("unknown_before_save", [False, True])
+def test_recovery_restores_publication_floor_before_stale_watch(
+    monkeypatch: pytest.MonkeyPatch, unknown_before_save: bool,
+) -> None:
+    runner, mode, reaction_at, floor, _merged, no_work, head, branch = (
+        _publication_safety_boundary(monkeypatch)
+    )
+    task = QueueTask(pr_id="PR-459", title="publication safety", status=TaskStatus.DOING,
+                     branch=branch)
+    runner.state.current_task = task
+    asyncio.run(runner.handle_watch())
+    assert runner._publication_high_water_at == floor
+    if unknown_before_save:
+        mode["value"] = "unavailable"
+        asyncio.run(runner.handle_watch())
+        assert runner.state.current_pr.publication_at is None
+    asyncio.run(runner.publish_state())
+    raw = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    persisted = RepoState.model_validate_json(raw)
+    assert persisted.publication_watermark is not None
+    assert persisted.publication_watermark.published_at == floor
+    if unknown_before_save:
+        assert persisted.current_pr.publication_at is None
+    recovered = h._make_runner(auto_merge=True)
+    recovered.redis = runner.redis
+    monkeypatch.setattr(recovered, "_parse_tasks_from_headers", lambda: [task])
+    merged: list[int] = []
+    async def merge() -> None:
+        merged.append(620)
+    monkeypatch.setattr(recovered, "handle_merge", merge)
+    monkeypatch.setattr(recovered, "_scan_pr_diff_once", no_work)
+    monkeypatch.setattr(recovered, "_maybe_reclassify_stuck_pending", no_work)
+    mode["value"] = "old"
+    assert asyncio.run(recovered.recover_state()) is True, (
+        recovered.state.error_message, recovered.state.history,
+    )
+    assert recovered.state.state == PipelineState.WATCH
+    assert recovered._publication_high_water_at == floor
+    assert recovered._last_push_at is None
+    asyncio.run(recovered.handle_watch())
+    assert recovered.state.current_pr.review_status == ReviewStatus.PENDING
+    assert recovered.state.current_pr.publication_at is None
+    assert merged == []
+    # The saved floor is only a veto. A fresh matching publication and a
+    # later reaction can still follow the ordinary merge path.
+    mode["value"] = "new"
+    reaction_at["value"] = "2026-10-17T21:11:00Z"
+    asyncio.run(recovered.handle_watch())
+    assert recovered.state.current_pr.review_status == ReviewStatus.APPROVED
+    assert merged == [620]
+    assert head == recovered.state.current_pr.head_sha
+
+
+@pytest.mark.parametrize("damage", [
+    "missing", "wrong_repo", "wrong_pr", "wrong_head", "wrong_ref",
+    "wrong_head_repo", "missing_context",
+    "naive_timestamp", "malformed_timestamp",
+])
+def test_recovery_without_usable_floor_holds_historical_approval(
+    monkeypatch: pytest.MonkeyPatch, damage: str,
+) -> None:
+    runner, mode, _reaction_at, floor, _merged, no_work, head, branch = (
+        _publication_safety_boundary(monkeypatch)
+    )
+    task = QueueTask(pr_id="PR-459", title="publication safety", status=TaskStatus.DOING,
+                     branch=branch)
+    runner.state.current_task = task
+    asyncio.run(runner.handle_watch())
+    assert runner._publication_high_water_at == floor
+    asyncio.run(runner.publish_state())
+    key = pipeline_state(runner.name)
+    raw = asyncio.run(runner.redis.get(key))
+    snapshot = json.loads(raw)
+    watermark = snapshot["publication_watermark"]
+    if damage == "missing":
+        asyncio.run(runner.redis.delete(key))
+    else:
+        if damage == "wrong_repo":
+            watermark["repo"] = "other/repo"
+        elif damage == "wrong_pr":
+            watermark["pr_number"] = 621
+        elif damage == "wrong_head":
+            watermark["head_sha"] = "b" * 40
+        elif damage == "wrong_ref":
+            watermark["ref"] = "refs/heads/other"
+        elif damage == "wrong_head_repo":
+            watermark["head_repo"] = "other/repo"
+        elif damage == "missing_context":
+            watermark["head_repo"] = ""
+        elif damage == "naive_timestamp":
+            watermark["published_at"] = "2026-10-17T21:10:00"
+        else:
+            watermark["published_at"] = "not a timestamp"
+        snapshot["current_pr"]["publication_at"] = None
+        asyncio.run(runner.redis.set(key, json.dumps(snapshot)))
+    recovered = h._make_runner(auto_merge=True)
+    recovered.redis = runner.redis
+    monkeypatch.setattr(recovered, "_parse_tasks_from_headers", lambda: [task])
+    merged: list[int] = []
+    async def merge() -> None:
+        merged.append(620)
+    monkeypatch.setattr(recovered, "handle_merge", merge)
+    monkeypatch.setattr(recovered, "_scan_pr_diff_once", no_work)
+    monkeypatch.setattr(recovered, "_maybe_reclassify_stuck_pending", no_work)
+    mode["value"] = "old"
+    assert asyncio.run(recovered.recover_state()) is True
+    assert recovered._last_push_at is None
+    assert recovered.state.publication_watermark is None
+    asyncio.run(recovered.handle_watch())
+    assert recovered.state.current_pr.review_status == ReviewStatus.PENDING
+    assert recovered.state.current_pr.publication_at is None
+    assert merged == []

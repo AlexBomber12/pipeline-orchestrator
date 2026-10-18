@@ -99,15 +99,26 @@ class HungMixin:
             return False
         try:
             current_pr = self.state.current_pr
+            if current_pr is None or current_pr.number != pr_number:
+                return False
+            bound_head_sha = current_pr.head_sha
+            if not bound_head_sha:
+                bound_head_sha = git_ops._git(
+                    self.repo_path, "rev-parse", "HEAD"
+                ).stdout.strip()
+            if not bound_head_sha:
+                return False
             evidence = gh_prs.get_pr_head_publication(
                 self.owner_repo, pr_number,
-                expected_head_sha=current_pr.head_sha if current_pr else "",
+                expected_head_sha=bound_head_sha,
             )
             last_push_time, _ = self._validate_publication_observation(
-                pr_number, getattr(evidence, "head_sha", ""), evidence.published_at,
+                pr_number, bound_head_sha, evidence.published_at,
                 getattr(evidence, "unknown_reason", None),
                 head_repo=getattr(evidence, "head_repo", ""),
                 ref=getattr(evidence, "ref", ""),
+                observed_repo=getattr(evidence, "repo", ""),
+                observed_head_sha=getattr(evidence, "head_sha", ""),
             )
         except Exception:
             return False
@@ -157,16 +168,22 @@ class HungMixin:
                 f"posting without PR-author dedup."
             )
         if head_sha:
+            bound_head_sha = (
+                current_pr.head_sha if current_pr is not None
+                and current_pr.number == pr_number and current_pr.head_sha else head_sha
+            )
             evidence = gh_prs.get_pr_head_publication(
-                self.owner_repo, pr_number, expected_head_sha=head_sha
+                self.owner_repo, pr_number, expected_head_sha=bound_head_sha
             )
             known_at, _ = self._validate_publication_observation(
-                pr_number, getattr(evidence, "head_sha", head_sha), evidence.published_at,
+                pr_number, bound_head_sha, evidence.published_at,
                 getattr(evidence, "unknown_reason", None),
                 head_repo=getattr(evidence, "head_repo", ""),
                 ref=getattr(evidence, "ref", ""),
+                observed_repo=getattr(evidence, "repo", ""),
+                observed_head_sha=getattr(evidence, "head_sha", ""),
             )
-            if known_at is not None:
+            if known_at is not None and head_sha == bound_head_sha:
                 publication_iso = known_at.isoformat()
         if head_sha is None:
             self.log_event(

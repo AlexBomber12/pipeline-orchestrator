@@ -207,7 +207,9 @@ def test_post_codex_review_without_bypass_still_honors_author_dedup(
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_head_publication",
-        lambda *_a, **_kw: SimpleNamespace(
+        lambda *_a, **kw: SimpleNamespace(
+            repo="octo/demo", head_repo="octo/demo", ref="refs/heads/pr-42",
+            head_sha=kw["expected_head_sha"],
             published_at=datetime(2026, 1, 1, tzinfo=timezone.utc)
         ),
     )
