@@ -73,6 +73,7 @@ from src.publication_migration import (
 from src.publication_migration import (
     enqueue as enqueue_migration,
 )
+from src.publication_migration import pending_key as migration_pending_key
 from src.task_status import MergedState
 
 from tests.runner import _helpers as h
@@ -332,6 +333,157 @@ def test_operator_command_rejects_changed_target(
     ))
     assert command.status == "failed"
     assert runner.state.publication_watermark is None
+
+
+def _migration_command_runner() -> tuple[runner_module.PipelineRunner, str]:
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=42, branch="feature", head_sha="a" * 40)
+    runner.state.publication_migration = recovery_module.PublicationMigration(
+        repo="octo/demo", pr_number=42, head_repo="octo/demo",
+        ref="refs/heads/feature", head_sha="a" * 40,
+        published_at=datetime(2026, 10, 17, 21, 6, 35, tzinfo=timezone.utc),
+        provenance="github-activity:push", reason="Operator confirmation required.",
+    )
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
+    binding = migration_binding(runner.state.publication_migration)
+    asyncio.run(enqueue_migration(runner.redis, runner.name, binding))
+    return runner, binding
+
+
+@pytest.mark.parametrize("case", [
+    "missing_receipt", "applied_receipt", "failed_receipt", "missing_time",
+    "changed_binding", "changed_pr", "changed_evidence", "unknown_evidence",
+])
+def test_migration_command_revalidates_untrusted_inputs(
+    monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    runner, binding = _migration_command_runner()
+    key = migration_command_key(runner.name, binding)
+    if case == "missing_receipt":
+        runner.redis.store.pop(key)
+    elif case in {"applied_receipt", "failed_receipt"}:
+        command = MigrationCommand.model_validate_json(runner.redis.store[key])
+        command.status = "applied" if case == "applied_receipt" else "failed"
+        runner.redis.store[key] = command.model_dump_json()
+    elif case == "missing_time":
+        runner.state.publication_migration.published_at = None
+        runner.redis.store[pipeline_state(runner.name)] = runner.state.model_dump_json()
+    elif case == "changed_binding":
+        runner.state.publication_migration.published_at += timedelta(seconds=1)
+        runner.redis.store[pipeline_state(runner.name)] = runner.state.model_dump_json()
+    elif case == "changed_pr":
+        monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [])
+    elif case == "changed_evidence":
+        monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [runner.state.current_pr])
+        monkeypatch.setattr(gh_prs, "get_pr_head_publication", lambda *_args, **_kwargs:
+                            gh_prs.HeadPublicationEvidence("other/repo", 42, "octo/demo",
+                                "refs/heads/feature", "a" * 40,
+                                runner.state.publication_migration.published_at,
+                                "github-activity:push"))
+    elif case == "unknown_evidence":
+        monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [runner.state.current_pr])
+        monkeypatch.setattr(gh_prs, "get_pr_head_publication", lambda *_args, **_kwargs:
+                            gh_prs.HeadPublicationEvidence("octo/demo", 42, "octo/demo",
+                                "refs/heads/feature", "a" * 40, None,
+                                "github-activity:push", unknown_reason="activity unavailable"))
+    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    if case == "missing_receipt":
+        assert any("receipt missing" in e["event"] for e in runner.state.history)
+    elif case == "unknown_evidence":
+        assert MigrationCommand.model_validate_json(runner.redis.store[key]).status == "deferred"
+    elif case not in {"applied_receipt", "failed_receipt"}:
+        assert MigrationCommand.model_validate_json(runner.redis.store[key]).status in {"failed", "deferred"}
+        assert runner.state.publication_watermark is None
+
+
+@pytest.mark.parametrize("change", ["pointer_bytes", "command_done", "observation", "target"])
+def test_migration_transaction_checks_snapshot_again(
+    monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    runner, binding = _migration_command_runner()
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [runner.state.current_pr])
+    monkeypatch.setattr(gh_prs, "get_pr_head_publication", lambda *_args, **_kwargs:
+                        gh_prs.HeadPublicationEvidence("octo/demo", 42, "octo/demo",
+                            "refs/heads/feature", "a" * 40,
+                            runner.state.publication_migration.published_at,
+                            "github-activity:push"))
+    original_transaction = runner.redis.transaction
+
+    async def interleaved_transaction(func, *keys, **kwargs):
+        if change == "pointer_bytes":
+            runner.redis.store[migration_pending_key(runner.name)] = binding.encode()
+        elif change == "command_done":
+            key = migration_command_key(runner.name, binding)
+            command = MigrationCommand.model_validate_json(runner.redis.store[key])
+            command.status = "applied"
+            runner.redis.store[key] = command.model_dump_json()
+        else:
+            state = RepoState.model_validate_json(runner.redis.store[pipeline_state(runner.name)])
+            if change == "observation":
+                state.publication_migration.published_at += timedelta(seconds=1)
+            else:
+                state.current_pr.head_sha = "b" * 40
+            runner.redis.store[pipeline_state(runner.name)] = state.model_dump_json()
+        return await original_transaction(func, *keys, **kwargs)
+
+    monkeypatch.setattr(runner.redis, "transaction", interleaved_transaction)
+    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    receipt = MigrationCommand.model_validate_json(
+        runner.redis.store[migration_command_key(runner.name, binding)])
+    assert receipt.status == ("applied" if change in {"pointer_bytes", "command_done"} else "failed")
+
+
+def test_hydration_restores_pending_publication_proposal() -> None:
+    runner, _binding = _migration_command_runner()
+    proposal = runner.state.publication_migration.model_copy(deep=True)
+    runner.state.publication_migration = None
+    asyncio.run(runner._hydrate_current_task_from_persisted_state())
+    assert runner.state.publication_migration == proposal
+
+
+@pytest.mark.parametrize("change", ["target", "head_repo"])
+def test_parent_proposal_blocks_changed_pr_identity(change: str) -> None:
+    runner, _binding = _migration_command_runner()
+    proposal = runner.state.publication_migration
+    pr = runner.state.current_pr
+    evidence = gh_prs.HeadPublicationEvidence(
+        "octo/demo", 42, "octo/demo", "refs/heads/feature", "a" * 40,
+        proposal.published_at, "github-activity:push",
+    )
+    if change == "target":
+        pr = pr.model_copy(update={"head_sha": "b" * 40})
+    else:
+        pr = pr.model_copy(update={"is_cross_repository": True})
+        evidence = gh_prs.HeadPublicationEvidence(
+            "octo/demo", 42, "other/repo", "refs/heads/feature", "a" * 40,
+            proposal.published_at, "github-activity:push",
+        )
+    runner._offer_publication_migration(pr, evidence)
+    assert proposal.status == "blocked"
+
+
+def test_recovered_cycle_consumes_publication_command_before_other_work(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch, stdout="")
+    runner = h._make_runner()
+    runner._recovered = True
+    runner._scaffolded = True
+    calls = []
+
+    async def consume() -> bool:
+        calls.append("publication")
+        return True
+
+    async def retry():
+        calls.append("retry")
+        raise AssertionError("Retry must wait")
+
+    monkeypatch.setattr(runner, "_consume_publication_migration_command", consume)
+    monkeypatch.setattr(runner, "_consume_retry_command", retry)
+    asyncio.run(runner.run_cycle())
+    assert calls == ["publication"]
 
 
 def _merged_state(

@@ -130,3 +130,74 @@ def test_command_rejects_missing_state_and_competing_request() -> None:
     redis.store[pending_key(state.name)] = "b" * 64
     with pytest.raises(MigrationChanged, match="Another publication migration"):
         asyncio.run(enqueue(redis, state.name, binding))
+
+
+def test_confirmation_http_failures_and_durable_wake(
+    client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    http, redis = client
+    name = "example__alpha"
+    path = f"/repos/{name}/publication-migration/confirm"
+    observation = _proposal()
+    binding = migration_binding(observation)
+    assert http.post(path, data={"binding": "bad"}).status_code == 400
+    assert http.post("/repos/unknown__repo/publication-migration/confirm",
+                     data={"binding": binding}).status_code == 404
+    original = http.app.state.redis
+    http.app.state.redis = None
+    assert http.post(path, data={"binding": binding}).status_code == 503
+    http.app.state.redis = original
+
+    state = RepoState(
+        url="https://github.com/example/alpha.git", name=name,
+        state=PipelineState.WATCH, publication_migration=observation,
+        current_pr=PRInfo(number=620, branch="pr-459", head_sha="a" * 40),
+    )
+    redis.store[pipeline_state(name)] = state.model_dump_json()
+
+    async def failed_enqueue(*_args):
+        raise ValueError("redis unavailable")
+
+    monkeypatch.setattr("src.web.routes.repo_control.enqueue_publication_migration", failed_enqueue)
+    assert http.post(path, data={"binding": binding}).status_code == 503
+    monkeypatch.setattr("src.web.routes.repo_control.enqueue_publication_migration", enqueue)
+
+    async def failed_wake(*_args):
+        raise RuntimeError("wake unavailable")
+
+    monkeypatch.setattr(web_app, "publish_wake", failed_wake)
+    assert http.post(path, data={"binding": binding}).status_code == 202
+    assert redis.store[pending_key(name)] == binding
+
+
+def test_summary_displays_receipt_and_survives_redis_read_error(
+    client, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    http, redis = client
+    observation = _proposal()
+    name = "example__alpha"
+    state = RepoState(
+        url="https://github.com/example/alpha.git", name=name,
+        state=PipelineState.WATCH, publication_migration=observation,
+        current_pr=PRInfo(number=620, branch="pr-459", head_sha="a" * 40),
+    )
+    redis.store[pipeline_state(name)] = state.model_dump_json()
+    binding = migration_binding(observation)
+    receipt = MigrationCommand(binding=binding, observation=observation, status="deferred",
+                               reason="Waiting for current evidence.")
+    redis.store[command_key(name, binding)] = receipt.model_dump_json()
+    response = http.get(f"/partials/repo/{name}")
+    assert response.status_code == 200
+    assert "Waiting for current evidence." in response.text
+
+    original_get = redis.get
+
+    async def failed_receipt_read(key: str):
+        if key == command_key(name, binding):
+            raise RuntimeError("temporary outage")
+        return await original_get(key)
+
+    monkeypatch.setattr(redis, "get", failed_receipt_read)
+    response = http.get(f"/partials/repo/{name}")
+    assert response.status_code == 200
+    assert "data-publication-migration" in response.text
