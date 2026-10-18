@@ -406,7 +406,7 @@ class RecoveryMixin:
         self._cleanup_expected_branch()
         return await self._recover_state_headers()
 
-    async def _hydrate_current_task_from_persisted_state(self) -> None:
+    async def _hydrate_current_task_from_persisted_state(self) -> bool:
         """Restore active CODING identity from the published Redis snapshot.
 
         ``publish_state`` writes the live ``RepoState`` to
@@ -437,25 +437,35 @@ class RecoveryMixin:
         lets crash recovery distinguish the current unfinished checkpoint
         from completed records belonging to an earlier retry of the task.
 
-        Best-effort: Redis read errors, missing snapshots, and corrupt
-        payloads leave both fields untouched. ``_apply_recovery_decisions``
+        Redis read errors defer recovery so the saved publication floor is
+        never lost to a transient outage. Missing or corrupt payloads leave
+        both task fields untouched. ``_apply_recovery_decisions``
         still overwrites ``current_task`` from parsed headers, and the
         invocation is used only when its task and unfinished run record match.
         """
         self._persisted_fix_recovery = None
         try:
             raw = await self.redis.get(pipeline_state(self.name))
-        except Exception:
-            return
+        except Exception as exc:
+            self.log_event(f"[INFRA] Publication snapshot read unavailable: {type(exc).__name__}; retrying recovery.")
+            return False
         if not raw:
             self._publication_snapshot_absent = True
-            return
+            return True
         self._publication_snapshot_absent = False
         try:
             persisted = RepoState.model_validate_json(raw)
         except Exception:
             self._publication_snapshot_damaged = True
-            return
+            return True
+        self._publication_snapshot_pr_unbound = (
+            persisted.state == PipelineState.CODING
+            and persisted.current_task is not None
+            and persisted.current_pr is None
+            and persisted.publication_watermark is None
+            and persisted.name == self.name
+            and persisted.url == self.repo_config.url
+        )
         snapshot = json.loads(raw)
         pr_snapshot = snapshot.get("current_pr") if isinstance(snapshot, dict) else None
         legacy = (
@@ -475,6 +485,8 @@ class RecoveryMixin:
             and "publication_schema_version" in snapshot
             and snapshot["publication_schema_version"] != 1
         )
+        if incompatible:
+            self._publication_snapshot_pr_unbound = False
         if incompatible and persisted.current_pr is not None:
             pr = persisted.current_pr
             self.state.publication_migration = PublicationMigration(
@@ -521,7 +533,7 @@ class RecoveryMixin:
         ):
             self._persisted_fix_recovery = persisted
         if persisted.state != PipelineState.CODING:
-            return
+            return True
         if self.state.current_task is None and persisted.current_task is not None:
             self.state.current_task = persisted.current_task
         current = self.state.current_task
@@ -533,6 +545,7 @@ class RecoveryMixin:
             and persisted.active_invocation is not None
         ):
             self.state.active_invocation = persisted.active_invocation
+        return True
 
     def _restore_publication_watermark(self, persisted: RepoState) -> None:
         """Restore a safety floor, never the current publication observation."""
@@ -620,7 +633,8 @@ class RecoveryMixin:
         # Run after the ``get_open_prs`` probe so a transient GitHub
         # outage during recovery still surfaces as ERROR with no
         # current_task.
-        await self._hydrate_current_task_from_persisted_state()
+        if not await self._hydrate_current_task_from_persisted_state():
+            return False
         await self._hydrate_status_write_failed_task_pr_ids()
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery
@@ -1497,6 +1511,16 @@ class RecoveryMixin:
                 source="missing_snapshot",
                 reason="Saved state is absent; an operator must confirm the observed publication.",
             )
+        if (
+            getattr(self, "_publication_snapshot_pr_unbound", False)
+            and self.state.publication_migration is None
+        ):
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                source="pr_undiscovered_snapshot",
+                reason="Saved coding state predates PR discovery; an operator must confirm publication.",
+            )
         if getattr(self, "_publication_snapshot_damaged", False):
             self.state.publication_migration = PublicationMigration(
                 repo=self.owner_repo, pr_number=pr.number, head_repo="",
@@ -1554,11 +1578,15 @@ class RecoveryMixin:
         proposal.head_repo = evidence.head_repo
         proposal.published_at = evidence.published_at
         proposal.provenance = evidence.provenance
-        proposal.reason = (
-            "Saved state is absent; confirm this historical publication as the initial safety floor."
-            if proposal.source == "missing_snapshot"
-            else "Historical publication needs an operator trust anchor."
-        )
+        if proposal.source == "missing_snapshot":
+            proposal.reason = "Saved state is absent; confirm this historical publication as the initial safety floor."
+        elif proposal.source == "pr_undiscovered_snapshot":
+            proposal.reason = (
+                "Saved coding state predates PR discovery; confirm this publication "
+                "as the initial safety floor."
+            )
+        else:
+            proposal.reason = "Historical publication needs an operator trust anchor."
         if (
             proposal.source == "parent_snapshot"
             and evidence.provenance == "github-activity:branch_creation"
