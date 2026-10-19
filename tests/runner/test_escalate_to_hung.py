@@ -571,3 +571,56 @@ def test_status_write_rejects_wrong_origin_and_task_identity(tmp_path: Path) -> 
     task.task_file = "tasks/PR-714.md"
     assert not asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
     assert _remote_task(repo, "PR-713").startswith("---\nstatus: TODO\n")
+
+
+def test_status_write_rejects_invalid_base_and_missing_remote_task(tmp_path: Path) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-714")
+    runner = _status_runner(repo)
+    task = QueueTask(pr_id="PR-714", title="t", status=TaskStatus.DOING,
+                     branch="pr-test", task_file="tasks/PR-714.md")
+    runner.repo_config.branch = "bad..branch"
+    assert not asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    runner.repo_config.branch = "main"
+    # The path has the right identity but is absent from the remote base.
+    task.pr_id = "PR-715"
+    task.task_file = "tasks/PR-715.md"
+    assert not asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    assert _remote_task(repo, "PR-714").startswith("---\nstatus: TODO\n")
+
+
+def test_status_write_no_change_keeps_remote_head(tmp_path: Path) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-716")
+    runner = _status_runner(repo)
+    task = QueueTask(pr_id="PR-716", title="t", status=TaskStatus.DOING,
+                     branch="pr-test", task_file="tasks/PR-716.md")
+    assert asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    head = _git(tmp_path / "remote.git", "rev-parse", "refs/heads/main")
+    assert asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    assert _git(tmp_path / "remote.git", "rev-parse", "refs/heads/main") == head
+
+
+@pytest.mark.parametrize("failure", ["diff", "confirm", "push"])
+def test_status_write_does_not_claim_unconfirmed_commit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-717")
+    runner = _status_runner(repo)
+    task = QueueTask(pr_id="PR-717", title="t", status=TaskStatus.DOING,
+                     branch="pr-test", task_file="tasks/PR-717.md")
+    from src.daemon import git_ops
+
+    real_git = git_ops._git
+
+    def failing_git(path: str, *args: str, **kwargs: Any) -> Any:
+        if failure == "diff" and args[:3] == ("diff", "--cached", "--quiet"):
+            return types.SimpleNamespace(returncode=2)
+        if failure == "confirm" and args[:2] == ("merge-base", "--is-ancestor"):
+            return types.SimpleNamespace(returncode=2)
+        if failure == "push" and args[:2] == ("push", "origin"):
+            return types.SimpleNamespace(returncode=1, stderr="rejected")
+        return real_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops, "_git", failing_git)
+    assert not asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    if failure != "confirm":
+        assert _remote_task(repo, "PR-717").startswith("---\nstatus: TODO\n")

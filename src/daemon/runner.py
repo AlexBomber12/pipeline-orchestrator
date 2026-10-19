@@ -2494,9 +2494,10 @@ class PipelineRunner(
                         return True
                     if confirmed.returncode != 1:
                         raise RuntimeError("could not confirm remote status commit")
-                    if push.returncode != 0 and _attempt == 2:
-                        raise RuntimeError(f"status push failed: {push.stderr.strip()}")
-                raise RuntimeError("base moved during status push")
+                    if _attempt == 2:
+                        raise RuntimeError(
+                            f"status push not confirmed: {push.stderr.strip()}"
+                        )
         except Exception as exc:
             self.log_event(
                 f"[INFRA] Warning: failed to commit {status} status for "

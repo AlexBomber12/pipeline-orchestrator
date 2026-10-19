@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -11,7 +10,7 @@ from src.daemon import runner as runner_module
 from src.daemon.handlers import error as error_module
 from src.daemon.handlers.error import ErrorCategory
 from src.models import PipelineState, QueueTask, TaskStatus
-from src.queue_parser import parse_task_header
+from src.queue_parser import parse_task_header, write_frontmatter_status
 from src.subsource_registry import SuppressionReason, error_category_to_reason
 from src.web import app as web_app
 
@@ -39,15 +38,17 @@ def _stub_publish_and_save(runner: Any) -> None:
     runner._save_current_run_record = _noop  # type: ignore[method-assign]
 
 
-def _stub_git(monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
-    calls: list[list[str]] = []
+def _stub_git(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The transition tests have no Git remote. Supply a confirmed write so
+    # they exercise the transition contract without relying on a worktree edit.
+    async def commit_status(
+        runner: Any, task: QueueTask, status: str, _reason: str,
+        blocked_reason: SuppressionReason | str | None = None,
+    ) -> bool:
+        write_frontmatter_status(Path(runner.repo_path) / task.task_file, status, blocked_reason)
+        return True
 
-    def fake_git(repo_path: str, *args: str, **_kwargs: Any) -> Any:
-        calls.append(list(args))
-        return SimpleNamespace(returncode=1, stdout="", stderr="")
-
-    monkeypatch.setattr(runner_module.git_ops, "_git", fake_git)
-    return calls
+    monkeypatch.setattr(runner_module.PipelineRunner, "_commit_task_status_change", commit_status)
 
 
 def _install_tmp_repo(

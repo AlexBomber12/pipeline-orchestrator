@@ -7,13 +7,13 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from src import codex_cli
 from src.cancellation import (
     CancellationCause,
     cause_key,
     record_cancellation_cause,
 )
 from src.coders.claude import claude_cli
-from src import codex_cli
 from src.daemon import retry_commands as retry_module
 from src.daemon.retry_commands import RetryDispatch
 from src.github import prs as gh_prs
@@ -41,6 +41,15 @@ async def _published_coding_runner(
         "- Depends on: none\n- Priority: 1\n- Coder: claude\n",
         encoding="utf-8",
     )
+    # These recovery tests use an unversioned temporary task file. Model the
+    # confirmed status write without invoking the isolated Git transport.
+    async def commit_status(
+        _self, _task, status, _reason, blocked_reason=None,
+    ) -> bool:
+        write_frontmatter_status(task_path, status, blocked_reason)
+        return True
+
+    monkeypatch.setattr(type(runner), "_commit_task_status_change", commit_status)
     task = QueueTask(
         pr_id="PR-458", title="Recover FIX", status=TaskStatus.DOING,
         task_file="tasks/PR-458.md", branch="fix/pr-458", priority=1,
