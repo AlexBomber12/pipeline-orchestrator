@@ -380,12 +380,66 @@ def test_saved_floor_for_other_pr_keeps_recovery_cutoff(
     assert runner.state.current_pr.number == 8
     assert runner._publication_recovery_cutoff_at is not None
     assert runner.state.publication_watermark is None
+    assert runner.state.publication_migration is not None
+    assert runner.state.publication_migration.source == "rebound_pr"
+    assert runner.state.publication_migration.pr_number == 8
+    assert runner.state.publication_migration.published_at is not None
     assert runner._last_push_at is None
     assert runner._canonical_push_timestamp(8) is None
 
     fresh = runner._publication_recovery_cutoff_at + timedelta(seconds=1)
     event_time[0] = fresh.isoformat().replace("+00:00", "Z")
     assert runner._canonical_push_timestamp(8) == fresh
+    assert runner.state.publication_watermark.pr_number == 8
+
+
+def test_parent_snapshot_rebinds_replacement_pr_for_explicit_migration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    repo = "octo/demo"
+    branch = "pr-007"
+    head = "a" * 40
+    old_pr = PRInfo(number=7, branch=branch, head_sha=head, pr_id="PR-007")
+    new_pr = PRInfo(number=8, branch=branch, head_sha=head, pr_id="PR-007")
+    published = datetime(2026, 4, 10, 12, tzinfo=timezone.utc)
+
+    def transport(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/8" in args[1]:
+            return {"branch": branch, "repo": repo, "sha": head}
+        if "/activity?" in args[1]:
+            return [{"activity_type": "branch_creation", "ref": f"refs/heads/{branch}",
+                     "before": "0" * 40, "after": head,
+                     "timestamp": "2026-04-10T12:00:00Z"}]
+        raise AssertionError(args)
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", transport)
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [new_pr])
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    task = QueueTask(pr_id="PR-007", title="test", status=TaskStatus.DOING,
+                     branch=branch, task_file="tasks/PR-007.md")
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    saved = RepoState(url=runner.state.url, name=runner.state.name,
+                      state=PipelineState.WATCH, current_task=task, current_pr=old_pr)
+    raw = saved.model_dump(mode="json")
+    for key in ("publication_schema_version", "publication_watermark", "publication_migration"):
+        raw.pop(key)
+    for key in list(raw["current_pr"]):
+        if key.startswith("publication_"):
+            raw["current_pr"].pop(key)
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), json.dumps(raw)))
+    assert asyncio.run(runner.recover_state()) is True
+    proposal = runner.state.publication_migration
+    assert proposal is not None and proposal.status == "legacy"
+    assert proposal.source == "rebound_pr"
+    assert proposal.pr_number == 8
+    assert proposal.published_at == published
+    assert runner.state.publication_watermark is None
+    assert runner._canonical_push_timestamp(8) is None
+    asyncio.run(runner.publish_state())
+    binding = migration_binding(proposal)
+    asyncio.run(enqueue_migration(runner.redis, runner.name, binding))
+    assert asyncio.run(runner._consume_publication_migration_command()) is True
     assert runner.state.publication_watermark.pr_number == 8
 
 

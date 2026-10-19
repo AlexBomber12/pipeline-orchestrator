@@ -813,6 +813,11 @@ class RecoveryMixin:
                 and queued.status in {TaskStatus.ERROR, TaskStatus.TODO, TaskStatus.DOING}
                 and recovered_state != PipelineState.FIX
                 and (queued.status != TaskStatus.ERROR or recovered_state == PipelineState.ERROR)
+                and not (
+                    recovered_state == PipelineState.WATCH
+                    and not any(item.number == bound.number for item in prs)
+                    and any(item.branch == bound.branch and item.number != bound.number for item in prs)
+                )
             ):
                 self.state.current_task = queued
                 self.state.current_pr = bound
@@ -1499,6 +1504,18 @@ class RecoveryMixin:
 
     def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
         """Refresh the feedback floor from current-head publication evidence."""
+        saved_floor = self.state.publication_watermark
+        if (
+            saved_floor is not None
+            and saved_floor.pr_number != pr.number
+            and self.state.publication_migration is None
+        ):
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                source="rebound_pr",
+                reason="Recovered live PR differs from the saved publication floor; confirm its publication.",
+            )
         if (
             getattr(self, "_publication_snapshot_absent", False)
             and self.state.publication_migration is None
@@ -1549,8 +1566,16 @@ class RecoveryMixin:
         proposal = self.state.publication_migration
         if proposal is None or proposal.status != "legacy":
             return
-        if (
-            proposal.repo != self.owner_repo or proposal.pr_number != pr.number
+        if proposal.repo == self.owner_repo and proposal.pr_number != pr.number:
+            proposal = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                source="rebound_pr",
+                reason="Recovered live PR differs from the saved proposal; confirm its publication.",
+            )
+            self.state.publication_migration = proposal
+        elif (
+            proposal.repo != self.owner_repo
             or proposal.ref != f"refs/heads/{pr.branch}"
             or proposal.head_sha.lower() != pr.head_sha.lower()
         ):
@@ -1582,6 +1607,11 @@ class RecoveryMixin:
             proposal.reason = (
                 "Saved state predates PR discovery; confirm this publication "
                 "as the initial safety floor."
+            )
+        elif proposal.source == "rebound_pr":
+            proposal.reason = (
+                "Recovered live PR differs from saved state; confirm its publication "
+                "as the initial floor."
             )
         else:
             proposal.reason = "Historical publication needs an operator trust anchor."
