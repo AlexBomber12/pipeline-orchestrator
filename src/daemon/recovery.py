@@ -477,6 +477,30 @@ class RecoveryMixin:
             and persisted.current_pr is not None
             and re.fullmatch(r"[0-9a-fA-F]{40}", persisted.current_pr.head_sha) is not None
         )
+        raw_observation_without_floor = (
+            isinstance(snapshot, dict)
+            and snapshot.get("publication_schema_version") == 1
+            and snapshot.get("publication_watermark") is None
+            and persisted.name == self.name
+            and persisted.url == self.repo_config.url
+            and persisted.current_pr is not None
+            and persisted.current_pr.publication_observed
+            and persisted.current_pr.publication_at is not None
+            and persisted.current_pr.publication_at.tzinfo is not None
+            and persisted.current_pr.publication_reason is None
+            and persisted.current_pr.publication_repo == self.owner_repo
+            and persisted.current_pr.publication_head_sha.lower()
+            == persisted.current_pr.head_sha.lower()
+            and re.fullmatch(r"[0-9a-fA-F]{40}", persisted.current_pr.head_sha) is not None
+            and re.fullmatch(r"[^/]+/[^/]+", persisted.current_pr.publication_head_repo) is not None
+            and (
+                persisted.current_pr.is_cross_repository
+                or persisted.current_pr.publication_head_repo == self.owner_repo
+            )
+            and persisted.current_pr.publication_ref
+            == f"refs/heads/{persisted.current_pr.branch}"
+            and persisted.current_pr.publication_provenance.startswith("github-activity:")
+        )
         incompatible = (
             isinstance(snapshot, dict)
             and "publication_schema_version" in snapshot
@@ -498,6 +522,14 @@ class RecoveryMixin:
                 repo=self.owner_repo, pr_number=pr.number, head_repo="",
                 ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
                 reason="Parent-version snapshot has no publication safety floor.",
+            )
+        elif raw_observation_without_floor:
+            pr = persisted.current_pr
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                source="unvalidated_current_snapshot",
+                reason="Saved PR observation has no validated floor; confirm current publication.",
             )
         elif persisted.publication_migration is not None:
             self.state.publication_migration = persisted.publication_migration
@@ -1562,7 +1594,7 @@ class RecoveryMixin:
         self._push_provenance_reason = reason
 
     def _offer_publication_migration(self, pr: PRInfo, evidence: gh_prs.HeadPublicationEvidence) -> None:
-        """Bootstrap only a proven branch creation from the exact old snapshot."""
+        """Offer an exact operator confirmation after fresh publication lookup."""
         proposal = self.state.publication_migration
         if proposal is None or proposal.status != "legacy":
             return
@@ -1613,19 +1645,10 @@ class RecoveryMixin:
                 "Recovered live PR differs from saved state; confirm its publication "
                 "as the initial floor."
             )
+        elif proposal.source == "unvalidated_current_snapshot":
+            proposal.reason = (
+                "Saved PR observation has no validated floor; confirm this publication "
+                "as the initial floor."
+            )
         else:
             proposal.reason = "Historical publication needs an operator trust anchor."
-        if (
-            proposal.source == "parent_snapshot"
-            and evidence.provenance == "github-activity:branch_creation"
-        ):
-            self._publication_high_water_identity = (
-                self.owner_repo, pr.number, evidence.head_repo, evidence.ref, pr.head_sha,
-            )
-            self._publication_high_water_at = evidence.published_at
-            self.state.publication_watermark = PublicationWatermark(
-                repo=self.owner_repo, pr_number=pr.number, head_repo=evidence.head_repo,
-                ref=evidence.ref, head_sha=pr.head_sha, published_at=evidence.published_at,
-                provenance=evidence.provenance,
-            )
-            self.state.publication_migration = None

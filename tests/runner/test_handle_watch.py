@@ -33,6 +33,8 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
+from src.publication_migration import enqueue as enqueue_migration
+from src.publication_migration import migration_binding
 
 from tests.runner import _helpers as h
 
@@ -5766,7 +5768,7 @@ def test_parent_snapshot_620_recovery_reaches_normal_watch_merge_handoff(
     monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
     gh_reviews.clear_review_status_cache()
 
-    def open_prs(owner: str, **kwargs: object) -> list[PRInfo]:
+    def open_prs(owner: str, *_args: object, **kwargs: object) -> list[PRInfo]:
         publication = watch_module.gh_prs.get_pr_head_publication(
             owner, 620, expected_head_sha=head
         )
@@ -5812,8 +5814,17 @@ def test_parent_snapshot_620_recovery_reaches_normal_watch_merge_handoff(
     monkeypatch.setattr(runner, "_scan_pr_diff_once", scan)
     monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_work)
     assert asyncio.run(runner.recover_state()) is True
-    assert (runner.state.publication_watermark is not None) == (case == "creation")
+    assert runner.state.publication_watermark is None
+    assert runner.state.publication_migration is not None
     asyncio.run(runner.handle_watch())
+    assert merged == []
+    if case == "creation":
+        asyncio.run(runner.publish_state())
+        binding = migration_binding(runner.state.publication_migration)
+        asyncio.run(enqueue_migration(runner.redis, runner.name, binding))
+        assert asyncio.run(runner._consume_publication_migration_command()) is True
+        assert runner.state.publication_watermark is not None, runner.state.history[-3:]
+        asyncio.run(runner.handle_watch())
     assert runner.state.current_pr.review_status == (
         ReviewStatus.APPROVED if case == "creation" else ReviewStatus.PENDING
     )

@@ -215,7 +215,8 @@ class PublicationMigration(BaseModel):
     published_at: datetime | None = None
     provenance: str = ""
     source: Literal[
-        "parent_snapshot", "missing_snapshot", "pr_undiscovered_snapshot", "rebound_pr"
+        "parent_snapshot", "missing_snapshot", "pr_undiscovered_snapshot", "rebound_pr",
+        "unvalidated_current_snapshot",
     ] = "parent_snapshot"
     reason: str
     status: Literal["legacy", "blocked"] = "legacy"

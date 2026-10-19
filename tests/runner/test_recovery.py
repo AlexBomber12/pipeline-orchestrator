@@ -119,7 +119,7 @@ def test_recovery_retry_keeps_initial_publication_cutoff(
     assert runner._publication_recovery_cutoff_at == first_cutoff
 
 
-def test_parent_snapshot_620_bootstraps_exact_branch_creation(
+def test_parent_snapshot_620_requires_confirmation_for_branch_creation(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """Real parent serialization enters recovery before current activity is read."""
@@ -154,11 +154,12 @@ def test_parent_snapshot_620_bootstraps_exact_branch_creation(
     asyncio.run(runner.redis.set(pipeline_state(runner.name), snapshot))
     assert asyncio.run(runner.recover_state()) is True
     assert runner.state.state == PipelineState.WATCH
-    assert runner.state.publication_migration is None
-    assert runner.state.publication_watermark is not None
-    assert runner.state.publication_watermark.published_at == published
-    assert runner.state.publication_watermark.provenance == "github-activity:branch_creation"
-    assert runner._last_push_at == published
+    proposal = runner.state.publication_migration
+    assert proposal is not None and proposal.source == "parent_snapshot"
+    assert proposal.published_at == published
+    assert proposal.provenance == "github-activity:branch_creation"
+    assert runner.state.publication_watermark is None
+    assert runner._last_push_at is None
 
     asyncio.run(runner.publish_state())
     restarted = h._make_runner(url=f"https://github.com/{repo}.git")
@@ -166,7 +167,20 @@ def test_parent_snapshot_620_bootstraps_exact_branch_creation(
     restarted.repo_path = str(tmp_path)
     restarted._parse_tasks_from_headers = runner._parse_tasks_from_headers  # type: ignore[method-assign]
     assert asyncio.run(restarted.recover_state()) is True
-    assert restarted.state.publication_watermark == runner.state.publication_watermark
+    assert restarted.state.publication_migration is not None
+    assert restarted.state.publication_watermark is None
+    binding = migration_binding(restarted.state.publication_migration)
+    asyncio.run(enqueue_migration(restarted.redis, restarted.name, binding))
+    assert asyncio.run(restarted._consume_publication_migration_command()) is True
+    assert restarted.state.publication_watermark is not None
+    assert restarted.state.publication_watermark.published_at == published
+    asyncio.run(restarted.publish_state())
+    confirmed = h._make_runner(url=f"https://github.com/{repo}.git")
+    confirmed.redis = restarted.redis
+    confirmed.repo_path = str(tmp_path)
+    confirmed._parse_tasks_from_headers = runner._parse_tasks_from_headers  # type: ignore[method-assign]
+    assert asyncio.run(confirmed.recover_state()) is True
+    assert confirmed.state.publication_watermark == restarted.state.publication_watermark
 
     # The saved floor cannot replace a failed current activity read.
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *_args, **_kwargs: {})
@@ -1751,7 +1765,7 @@ def test_recover_state_rehydrates_last_push_at(
     monkeypatch.setattr("src.github.gh_runner.run_gh", publication_transport)
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
-        lambda repo, **kw: [PRInfo(number=7, branch="pr-001", head_sha=head)],
+        lambda repo, *args, **kw: [PRInfo(number=7, branch="pr-001", head_sha=head)],
     )
 
     runner = h._make_runner()
@@ -1768,6 +1782,8 @@ def test_recover_state_rehydrates_last_push_at(
                 head_iso.replace("Z", "+00:00")
             ),
             publication_head_repo="octo/demo", publication_ref="refs/heads/pr-001",
+            publication_repo="octo/demo", publication_head_sha=head,
+                publication_provenance="github-activity:branch_creation",
         ),
         publication_watermark=PublicationWatermark(
             repo="octo/demo", pr_number=7, head_repo="octo/demo",
@@ -1788,7 +1804,14 @@ def test_recover_state_rehydrates_last_push_at(
         assert runner._last_push_at is None
         assert runner.state.publication_watermark is None
         assert runner.state.publication_migration is not None
-        assert runner.state.publication_migration.status == "blocked"
+        assert runner.state.publication_migration.status == "legacy"
+        assert runner.state.publication_migration.source == "unvalidated_current_snapshot"
+        assert runner.state.publication_migration.published_at is not None
+        asyncio.run(runner.publish_state())
+        binding = migration_binding(runner.state.publication_migration)
+        asyncio.run(enqueue_migration(runner.redis, runner.name, binding))
+        assert asyncio.run(runner._consume_publication_migration_command()) is True
+        assert runner.state.publication_watermark is not None
     # PR-202: recovery anchors the slow-start window so the first
     # post-restart poll already uses the slow cadence.
     assert runner._watch_entered_at is not None
