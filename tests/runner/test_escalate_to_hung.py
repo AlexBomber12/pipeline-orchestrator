@@ -311,6 +311,39 @@ def test_commit_task_status_change_rejects_symlink_escape(
     )
 
 
+def test_commit_task_status_change_rejects_tracked_task_symlink(
+    tmp_path: Path,
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-706")
+    _git(repo, "mv", "tasks/PR-706.md", "tasks/target.md")
+    (repo / "tasks" / "PR-706.md").symlink_to("target.md")
+    _git(repo, "add", "tasks/PR-706.md")
+    _git(repo, "commit", "-m", "link task to another tracked file")
+    _git(repo, "push", "origin", "main")
+    runner = _status_runner(repo)
+    task = QueueTask(
+        pr_id="PR-706",
+        title="t",
+        status=TaskStatus.DOING,
+        branch="pr-test",
+        task_file="tasks/PR-706.md",
+    )
+
+    result = asyncio.run(
+        runner._commit_task_status_change(task, "ERROR", "failed hard")
+    )
+
+    assert result is False
+    assert _remote_task(repo, "PR-706") == "target.md"
+    assert _git(repo, "show", "FETCH_HEAD:tasks/target.md").startswith(
+        "---\nstatus: TODO\n---\n"
+    )
+    assert any(
+        "task path is a symlink in isolated checkout" in event["event"]
+        for event in runner.state.history
+    )
+
+
 def test_commit_task_status_change_preserves_dirty_pr_branch(
     tmp_path: Path,
 ) -> None:

@@ -2457,7 +2457,10 @@ class PipelineRunner(
                 for _attempt in range(3):
                     git_ops._git(isolated, "fetch", "origin", base, timeout=60)
                     git_ops._git(isolated, "checkout", "--detach", "-f", "FETCH_HEAD")
-                    isolated_task = (Path(isolated) / task_path).resolve()
+                    tracked_task = Path(isolated) / task_path
+                    if tracked_task.is_symlink():
+                        raise ValueError("task path is a symlink in isolated checkout")
+                    isolated_task = tracked_task.resolve()
                     if not isolated_task.is_relative_to(Path(isolated).resolve()) or not isolated_task.is_file():
                         raise ValueError("task path is missing or escapes isolated checkout")
                     git_ops._git(isolated, "ls-files", "--error-unmatch", "--", task_file)
