@@ -3018,6 +3018,10 @@ class PipelineRunner(
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
+        if getattr(self, "_protect_unrecovered_snapshot", False) and not self._recovered:
+            # A failed startup probe must not replace the saved floor (or the
+            # parent snapshot shape) before recovery has read it.
+            return
         self.state.active = self.repo_config.active
         ctx = self._selection_context(task_coder_pin="")
         active_coder = self.state.coder or resolve_pause_coder(ctx).name
@@ -3536,7 +3540,11 @@ class PipelineRunner(
         before_remaining = await self._capture_budget_remaining_for_burn()
         try:
             async with self._cycle_lock:
-                await self._run_cycle_body()
+                self._protect_unrecovered_snapshot = not self._recovered
+                try:
+                    await self._run_cycle_body()
+                finally:
+                    self._protect_unrecovered_snapshot = False
         finally:
             await self._record_cycle_burn(before_remaining)
 

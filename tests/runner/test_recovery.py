@@ -339,6 +339,62 @@ def test_recovery_retries_transient_snapshot_read_before_pr_discovery(
     assert runner._last_push_at == publication
 
 
+def test_failed_github_recovery_preserves_saved_floor_until_retry(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    task = QueueTask(pr_id="PR-007", title="test", status=TaskStatus.DOING,
+                     branch="pr-007", task_file="tasks/PR-007.md")
+    pr = PRInfo(number=7, branch="pr-007", head_sha="a" * 40, pr_id="PR-007")
+    publication = datetime(2026, 4, 10, 12, tzinfo=timezone.utc)
+    saved = RepoState(
+        url=runner.state.url, name=runner.state.name, state=PipelineState.WATCH,
+        current_task=task, current_pr=pr,
+        publication_watermark=PublicationWatermark(
+            repo="octo/demo", pr_number=7, head_repo="octo/demo",
+            ref="refs/heads/pr-007", head_sha="a" * 40,
+            published_at=publication, provenance="github-activity:branch_creation",
+        ),
+    )
+    original = saved.model_dump_json()
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), original))
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    monkeypatch.setattr(runner, "_cleanup_expected_branch", lambda: None)
+
+    async def no_clone() -> None:
+        return None
+
+    async def enough_budget() -> bool:
+        return True
+
+    monkeypatch.setattr(runner, "ensure_repo_cloned", no_clone)
+    monkeypatch.setattr(runner, "_check_github_api_budget", enough_budget)
+    attempts = 0
+
+    def fetch_prs(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary GitHub outage")
+        return [pr]
+
+    monkeypatch.setattr(gh_prs, "get_open_prs", fetch_prs)
+    monkeypatch.setattr(gh_prs, "get_pr_head_publication", lambda *_args, **_kwargs:
+                        gh_prs.HeadPublicationEvidence(
+                            "octo/demo", 7, "octo/demo", "refs/heads/pr-007",
+                            "a" * 40, publication, "github-activity:branch_creation",
+                        ))
+    asyncio.run(runner.run_cycle())
+    assert runner._recovered is False
+    assert asyncio.run(runner.redis.get(pipeline_state(runner.name))) == original
+
+    asyncio.run(runner.run_cycle())
+    assert runner._recovered is True
+    assert runner.state.publication_watermark == saved.publication_watermark
+    assert runner._last_push_at == publication
+
+
 def test_saved_floor_for_other_pr_keeps_recovery_cutoff(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
