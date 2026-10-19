@@ -48,7 +48,10 @@ def _bounded_testbed_state() -> dict:
     return {
         "state": entry.get("state"),
         "current_task": {key: (entry.get("current_task") or {}).get(key) for key in ("pr_id", "branch")},
-        "current_pr": {key: (entry.get("current_pr") or {}).get(key) for key in ("number", "state")},
+        "current_pr": {
+            key: (entry.get("current_pr") or {}).get(key)
+            for key in ("number", "ci_status", "review_status")
+        },
         "history": [
             {key: row.get(key) for key in ("time", "state", "tier", "kind", "count")}
             for row in history[-20:] if isinstance(row, dict)

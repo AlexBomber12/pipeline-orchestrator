@@ -172,6 +172,9 @@ def test_state_snapshot_excludes_event_text_and_secret_fields(monkeypatch):
     payload = [{
         "name": evidence.TESTBED_SLUG, "state": "FIX",
         "current_task": {"pr_id": "PR-900", "branch": "pr-900", "secret": "never-save"},
+        "current_pr": {
+            "number": 42, "ci_status": "FAILURE", "review_status": "CHANGES_REQUESTED", "secret": "never-save"
+        },
         "history": [{"time": "now", "state": "FIX", "event": "secret transcript", "kind": "transition"}],
         "config": "never-save",
     }]
@@ -190,6 +193,9 @@ def test_state_snapshot_excludes_event_text_and_secret_fields(monkeypatch):
     snapshot = evidence._bounded_testbed_state()
     assert snapshot["state"] == "FIX"
     assert snapshot["current_task"]["pr_id"] == "PR-900"
+    assert snapshot["current_pr"] == {
+        "number": 42, "ci_status": "FAILURE", "review_status": "CHANGES_REQUESTED"
+    }
     assert "secret" not in json.dumps(snapshot)
     assert snapshot["history"] == [{"time": "now", "state": "FIX", "tier": None, "kind": "transition", "count": None}]
 
