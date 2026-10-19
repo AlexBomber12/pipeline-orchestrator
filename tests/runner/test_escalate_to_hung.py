@@ -573,6 +573,21 @@ def test_status_write_rejects_wrong_origin_and_task_identity(tmp_path: Path) -> 
     assert _remote_task(repo, "PR-713").startswith("---\nstatus: TODO\n")
 
 
+@pytest.mark.parametrize("status", ["DONE", "ERROR"])
+def test_status_write_accepts_equivalent_origin_url(tmp_path: Path, status: str) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-718")
+    runner = _status_runner(repo)
+    # Runner sync retains this checkout when the configured URL loses .git.
+    # A symlink makes both spellings usable by the real Git clone.
+    (tmp_path / "remote").symlink_to(tmp_path / "remote.git", target_is_directory=True)
+    runner.repo_config.url = str(tmp_path / "remote")
+    task = QueueTask(pr_id="PR-718", title="t", status=TaskStatus.DOING,
+                     branch="pr-test", task_file="tasks/PR-718.md")
+
+    assert asyncio.run(runner._commit_task_status_change(task, status, "completed"))
+    assert _remote_task(repo, "PR-718").startswith(f"---\nstatus: {status}\n")
+
+
 def test_status_write_rejects_invalid_base_and_missing_remote_task(tmp_path: Path) -> None:
     repo = _make_repo_with_task(tmp_path, "PR-714")
     runner = _status_runner(repo)

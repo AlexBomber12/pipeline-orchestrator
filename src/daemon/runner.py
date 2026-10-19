@@ -68,6 +68,7 @@ from src.config import (
     AppConfig,
     RepoConfig,
     load_config,
+    normalize_repo_url,
 )
 from src.daemon import (
     error_rate_tracker,
@@ -2438,7 +2439,7 @@ class PipelineRunner(
 
         try:
             origin = git_ops._git(self.repo_path, "remote", "get-url", "origin")
-            if origin.stdout.strip() != self.repo_config.url:
+            if normalize_repo_url(origin.stdout) != normalize_repo_url(self.repo_config.url):
                 raise ValueError("checkout origin differs from configured repository")
             if not base or base.startswith("-") or git_ops._git(
                 self.repo_path, "check-ref-format", "--branch", base, check=False
