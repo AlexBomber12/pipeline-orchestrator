@@ -27,6 +27,138 @@ SHARED_CONFIG_PATH = TEST_DATA_DIR / "config.test.yml"
 collect_ignore = ["data"]
 
 
+def _tested_sha() -> str:
+    """The checkout under test, even for a failing setup fixture."""
+    result = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=REPO_DIR, capture_output=True,
+        text=True, check=True, timeout=5,
+    )
+    return result.stdout.strip()
+
+
+def _bounded_testbed_state() -> dict:
+    """Allowlist state metadata; event text and config can contain credentials."""
+    with urllib.request.urlopen(f"{TEST_DASHBOARD_URL}/api/states", timeout=3) as response:
+        payload = json.loads(response.read(256_000).decode("utf-8"))
+    entries = payload if isinstance(payload, list) else payload.get("states", [])
+    entry = next((row for row in entries if row.get("name") == TESTBED_SLUG or row.get("slug") == TESTBED_SLUG), None)
+    if entry is None:
+        return {"availability": "testbed state absent"}
+    history = entry.get("history") or []
+    return {
+        "state": entry.get("state"),
+        "current_task": {key: (entry.get("current_task") or {}).get(key) for key in ("pr_id", "branch")},
+        "current_pr": {
+            key: (entry.get("current_pr") or {}).get(key)
+            for key in ("number", "ci_status", "review_status")
+        },
+        "history": [
+            {key: row.get(key) for key in ("time", "state", "tier", "kind", "count")}
+            for row in history[-20:] if isinstance(row, dict)
+        ],
+    }
+
+
+def _browser_evidence(item, record: dict, destination: Path) -> None:
+    page = getattr(item, "funcargs", {}).get("page")
+    if page is None:
+        return
+    record["browser_errors"] = getattr(item, "_evidence_browser_errors", [])[-20:]
+    if page.is_closed() or any(part in page.url.lower() for part in ("login", "oauth", "callback", "authorize")):
+        record["screenshot"] = "skipped: page closed or authentication page"
+        return
+    screenshot = destination.with_suffix(".png")
+    # Settings and other forms may contain credentials; mask every editable control.
+    page.screenshot(
+        path=str(screenshot), full_page=True,
+        mask=[page.locator("input, textarea, select, [contenteditable]")],
+        timeout=3000,
+    )
+    record["screenshot"] = screenshot.name
+
+
+def _write_failure_evidence(item, phase: str) -> None:
+    # Each stage is independent: collection must never replace pytest's failure.
+    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    key = hashlib.sha256(item.nodeid.encode()).hexdigest()[:16]
+    destination = EVIDENCE_DIR / f"failure-{key}-{phase}.json"
+    record = {"test_id": item.nodeid[:300], "phase": phase, "tested_sha": None,
+              "testbed": None, "browser_errors": [], "stack_logs": "stack-logs.txt when available",
+              "collection_errors": []}
+    for label, collect in (("tested_sha", _tested_sha), ("testbed", _bounded_testbed_state)):
+        try:
+            record[label] = collect()
+        except Exception as exc:
+            record["collection_errors"].append(f"{label}: {type(exc).__name__}")
+    if phase == "teardown" and hasattr(item, "_evidence_preteardown"):
+        candidate = item._evidence_preteardown
+        record["browser_errors"] = candidate.get("browser_errors", [])
+        if "screenshot" in candidate:
+            record["screenshot"] = candidate["screenshot"]
+        record["collection_errors"].extend(candidate.get("collection_errors", []))
+    else:
+        try:
+            _browser_evidence(item, record, destination)
+        except Exception as exc:
+            record["collection_errors"].append(f"browser: {type(exc).__name__}")
+    destination.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+
+
+@pytest.fixture(autouse=True)
+def _watch_browser_errors(request):
+    if "page" not in request.fixturenames:
+        yield
+        return
+    page = request.getfixturevalue("page")
+    errors = []
+    request.node._evidence_browser_errors = errors
+
+    def remember(kind):
+        if len(errors) < 20:
+            errors.append(kind)
+
+    # Record event type only. Console text and exception messages may contain secrets.
+    page.on("pageerror", lambda _error: remember("pageerror"))
+    page.on("console", lambda message: remember("console-error") if message.type == "error" else None)
+    yield
+    # The page fixture closes after this dependent fixture finalizes. Keep a
+    # masked candidate until pytest reports whether teardown actually failed.
+    key = hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:16]
+    destination = EVIDENCE_DIR / f"preteardown-{key}.json"
+    candidate = {"browser_errors": errors[-20:]}
+    try:
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        _browser_evidence(request.node, candidate, destination)
+    except Exception as exc:
+        candidate["collection_errors"] = [f"browser: {type(exc).__name__}"]
+    request.node._evidence_preteardown = candidate
+
+
+def pytest_collectreport(report):
+    if report.failed:
+        try:
+            _write_failure_evidence(report, "collect")
+        except Exception as exc:
+            print(f"e2e evidence unavailable for {report.nodeid}: {type(exc).__name__}: {exc}")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_makereport(item, call):
+    outcome = yield
+    report = outcome.get_result()
+    if report.failed:
+        try:
+            _write_failure_evidence(item, report.when)
+        except Exception as exc:
+            # Even a filesystem failure leaves the original report intact.
+            print(f"e2e evidence unavailable for {item.nodeid}: {type(exc).__name__}: {exc}")
+    if report.when == "teardown" and not report.failed:
+        candidate = getattr(item, "_evidence_preteardown", {})
+        screenshot = candidate.get("screenshot", "")
+        if screenshot.endswith(".png"):
+            (EVIDENCE_DIR / screenshot).unlink(missing_ok=True)
+
+
 def _shared_config_bytes() -> bytes:
     """Read through the container that owns Settings' mode-0600 replacements."""
     result = subprocess.run(
