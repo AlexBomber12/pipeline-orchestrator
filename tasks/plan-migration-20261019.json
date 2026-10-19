@@ -1,0 +1,995 @@
+{
+  "schema_version": 1,
+  "repository": "AlexBomber12/pipeline-orchestrator",
+  "base_sha": "7167c2e916a2bbb843ecb6a6ce7fc15795e61802",
+  "audit_version": 14,
+  "preserved_completed_ids": [
+    "PR-393",
+    "PR-394",
+    "PR-395",
+    "PR-396",
+    "PR-397",
+    "PR-400",
+    "PR-409",
+    "PR-418",
+    "PR-458",
+    "PR-467"
+  ],
+  "preserved_active_task": "PR-459",
+  "preserved_active_pr": 620,
+  "new_task_ids": [
+    "PR-468",
+    "PR-469",
+    "PR-470",
+    "PR-471",
+    "PR-472",
+    "PR-473",
+    "PR-474",
+    "PR-475",
+    "PR-476",
+    "PR-477",
+    "PR-478",
+    "PR-479",
+    "PR-480",
+    "PR-481",
+    "PR-482",
+    "PR-483",
+    "PR-484",
+    "PR-485",
+    "PR-486",
+    "PR-487",
+    "PR-488",
+    "PR-489",
+    "PR-490",
+    "PR-491",
+    "PR-492",
+    "PR-493",
+    "PR-494",
+    "PR-495",
+    "PR-496",
+    "PR-497",
+    "PR-498",
+    "PR-499",
+    "PR-500",
+    "PR-501",
+    "PR-502",
+    "PR-503",
+    "PR-504",
+    "PR-505"
+  ],
+  "retired_count": 64,
+  "old_tasks": [
+    {
+      "task_id": "PR-393",
+      "status": "preserve_completed",
+      "baseline_blob": "fa6746654dbc5ce699f08e0ce468f0d345a0f9b6",
+      "sha256": "fd75447b3301f197f14d2813b3f7a8a163b296277727724e290e1202d3f9f255",
+      "replacement_tasks": [],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-394",
+      "status": "preserve_completed",
+      "baseline_blob": "5ebc05ef41f468b8ab5508a53ad94f1153618188",
+      "sha256": "abd30e4fa8d7acf99446d5a33c1851377e7a6c7b5dd91a6c46fe802679109d7a",
+      "replacement_tasks": [],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-395",
+      "status": "preserve_completed",
+      "baseline_blob": "5e6edab57989a55e10d9c38a0bf4fae69c240cb4",
+      "sha256": "16f9975ebaa540c5602b1119d5777002fe8690101b55b55c8b427b00ab2635ef",
+      "replacement_tasks": [],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-396",
+      "status": "preserve_completed",
+      "baseline_blob": "eb67160cd5a67cc7a48993a0af5d59e20f56a750",
+      "sha256": "344d5ecc18714e95f3ace40b490cd3adfbd1baecaa43de2b7471c7745f306eb2",
+      "replacement_tasks": [],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-397",
+      "status": "preserve_completed",
+      "baseline_blob": "4bcb7e73a60d66b3f8bd97f3dd200cb11c70f72a",
+      "sha256": "5ea84f98666a3932b8dc90e8066f4b6e0f38381dcdf09803df4a6b063a6f0606",
+      "replacement_tasks": [],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-398",
+      "status": "retire_replaced",
+      "baseline_blob": "2e0ebc8ebd7f12bc1b1ae5deea322553049ef66c",
+      "sha256": "e29fe43b76179b020fc5b95acb72713bb9e376c4414b627190e6388dbda58d24",
+      "replacement_tasks": [
+        "PR-472"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-399",
+      "status": "retire_replaced",
+      "baseline_blob": "13d6b6229903e05a190debd8a74827bbb1d3aba0",
+      "sha256": "6ee258ecfd239f4909d4ae78e0b158532a9a5e15c22f3ee42355f09ed35632f1",
+      "replacement_tasks": [
+        "PR-473"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-400",
+      "status": "preserve_completed",
+      "baseline_blob": "60a4b9e419d3f0fe894846d3c9415fd74ab3ca99",
+      "sha256": "d83ea18f2f8d47555fed47357f27e3599c300f7ae890d80f320b610f50603a48",
+      "replacement_tasks": [],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-401",
+      "status": "retire_replaced",
+      "baseline_blob": "c1afb20d6eb8492e2b04758e7ce91405ffa222b6",
+      "sha256": "d3ff74c46931b15136fe3bab94e16dc1d90d9552b7789b74afb62dd7aa7a0712",
+      "replacement_tasks": [
+        "PR-474",
+        "PR-475"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-402",
+      "status": "retire_replaced",
+      "baseline_blob": "5d3f39efa8139fc456339981f83eb7d038403696",
+      "sha256": "e9299b3db02e9dc3c980268db685b3d258baae68a4397a387a1a366229a5b4f3",
+      "replacement_tasks": [
+        "PR-474",
+        "PR-475"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-403",
+      "status": "retire_replaced",
+      "baseline_blob": "af837c729042cc0bd66341a8e483b617c8e5d905",
+      "sha256": "4edc3470b1fa6d4993962ddfe024cb33a097d955acabcf6c2c56d99c0fc91e6a",
+      "replacement_tasks": [
+        "PR-475"
+      ],
+      "remaining_scope": "C01",
+      "conditional_followups": [
+        "C01"
+      ]
+    },
+    {
+      "task_id": "PR-404",
+      "status": "retire_replaced",
+      "baseline_blob": "5346b710b60d881ee70f19a224aaba177371afe1",
+      "sha256": "d0570ab9951cee1f6f7f3f362208b5709f74d044f59a680a60b5f5bce18bb575",
+      "replacement_tasks": [
+        "PR-475"
+      ],
+      "remaining_scope": "C01",
+      "conditional_followups": [
+        "C01"
+      ]
+    },
+    {
+      "task_id": "PR-405",
+      "status": "retire_replaced",
+      "baseline_blob": "403928d4df745c3cf2e4083f23b137acc54d308c",
+      "sha256": "fff10af0927d1ea3b05e1d3c8cad2688ff9c1112ce68bc175027df1a36df8d82",
+      "replacement_tasks": [
+        "PR-475"
+      ],
+      "remaining_scope": "C01",
+      "conditional_followups": [
+        "C01"
+      ]
+    },
+    {
+      "task_id": "PR-406",
+      "status": "retire_replaced",
+      "baseline_blob": "9fcef626311bde10fbba8b322cd8d3fc7762f7bd",
+      "sha256": "beeda6840d2c37668d8ec271cbdc5039119ed5bd3e172b5d098f8cdf00a098c8",
+      "replacement_tasks": [
+        "PR-475"
+      ],
+      "remaining_scope": "C01",
+      "conditional_followups": [
+        "C01"
+      ]
+    },
+    {
+      "task_id": "PR-407",
+      "status": "retire_replaced",
+      "baseline_blob": "6ce40bbe1a26a54759b9cc1210ce031b8af36c5f",
+      "sha256": "ac4f7a31f245e3f8efda4de667e9241429dd12c108c7d1f519ee04a6d7a8b90a",
+      "replacement_tasks": [
+        "PR-475"
+      ],
+      "remaining_scope": "C01",
+      "conditional_followups": [
+        "C01"
+      ]
+    },
+    {
+      "task_id": "PR-408",
+      "status": "retire_replaced",
+      "baseline_blob": "dc6da4073ad5a567de68f9c37bc7e7c80024ba7d",
+      "sha256": "012407dd53a006c6907260b72090ca876622100a1bd0f968353267e0220375f5",
+      "replacement_tasks": [
+        "PR-476"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-409",
+      "status": "preserve_completed",
+      "baseline_blob": "67ad02dda584f084d3aa9b6decf0aa5fd25cf7f9",
+      "sha256": "035994b84e8edbf74ee8b3dff4ad42ef0246553cefc421bcde85663f697c20ef",
+      "replacement_tasks": [],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-410",
+      "status": "retire_replaced",
+      "baseline_blob": "d5cb3f4ac638906a85accd2d0034b7cd53f50ce5",
+      "sha256": "acee611b61299389e13c30d17cddc8ce9462355659b32efd9156951e7be50146",
+      "replacement_tasks": [
+        "PR-474"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-411",
+      "status": "retire_replaced",
+      "baseline_blob": "d11a4a512a6a890bebf13382b2782186a8015bea",
+      "sha256": "f31d6255043cfd1cd67e075702c1bf7e70976ec2d0e1b7ef9283efad59b666cc",
+      "replacement_tasks": [
+        "PR-474"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-412",
+      "status": "retire_replaced",
+      "baseline_blob": "807ce9380ad019c960e4c403861c4ca31f04a621",
+      "sha256": "26064bc8b4e158cb0de341d95ad97fe6b0b66c32a3760ca09b5c5cff04cad903",
+      "replacement_tasks": [
+        "PR-469"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-413",
+      "status": "retire_replaced",
+      "baseline_blob": "212a4e4980ab8cd190d3016555a03488a0db781c",
+      "sha256": "d98e4d655965b939016549729804331988b550d2521638830e701bf434f188cd",
+      "replacement_tasks": [
+        "PR-470"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-414",
+      "status": "retire_replaced",
+      "baseline_blob": "1b117c8347f514fb7b08af28bf7f36d44312a624",
+      "sha256": "fe2e1e399de9fcebd342b551ab465be57449aef1b040e5c58fd0d5bc3a294304",
+      "replacement_tasks": [
+        "PR-471"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-415",
+      "status": "retire_replaced",
+      "baseline_blob": "dc3907104df657ad95855b1b8e06c4386e3e8a88",
+      "sha256": "4f9df3a4b1bdefbe46f0d87d7f1bea37f311287e3e41e536dc6b44e07d28d9ae",
+      "replacement_tasks": [
+        "PR-471"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-416",
+      "status": "retire_replaced",
+      "baseline_blob": "5138481a91fbb6dda2ff17236d5dbad1ff88dd80",
+      "sha256": "21f69ec43c037da18139cedfb2b63e4fa07332fbbda4e069b73d65cf2c0abfc9",
+      "replacement_tasks": [
+        "PR-477"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-417",
+      "status": "retire_replaced",
+      "baseline_blob": "1afb18a6b87ffeb574d6a58f2f6479eb86057a6e",
+      "sha256": "be4bf56db4a2a482ab9e961ff77c0d2e76be5bc78749e4b2ecb78e3f4fb6b0fc",
+      "replacement_tasks": [
+        "PR-471"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-418",
+      "status": "preserve_completed",
+      "baseline_blob": "6aff2e7e3e3bf915657762760fe3c8fe013823cb",
+      "sha256": "1ccae4f04c4ce11f50ece80b153a72f856481f8c392ddf8ae3f36a573b7944a0",
+      "replacement_tasks": [],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-419",
+      "status": "retire_replaced",
+      "baseline_blob": "22966b4a86c033b8d17ed6b4cdb3a25a4eed295a",
+      "sha256": "6ce415f3d4d3cb86d8063a835d2f8bd5fb39f0055265f7eea21f4a5d5efed856",
+      "replacement_tasks": [
+        "PR-477"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-420",
+      "status": "retire_replaced",
+      "baseline_blob": "eb8d28e18b2ebbca8c568a93b2cb301a38513f6d",
+      "sha256": "f4c2e49f8561864eca9e2c47a3cdbca5a605180930bff5c077a085faecc02d28",
+      "replacement_tasks": [
+        "PR-477"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-421",
+      "status": "retire_replaced",
+      "baseline_blob": "462dd8a749ca3e5ed522eac222ce03b9c341b5c1",
+      "sha256": "144441d1ea99097e0fc2414b9f916c268df53a5f406e5d4e9b7a575016b4f303",
+      "replacement_tasks": [
+        "PR-477"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-422",
+      "status": "retire_replaced",
+      "baseline_blob": "5101f17e56f76a10b043e19118e2bf47903873e2",
+      "sha256": "deff79486a61a09639049a9c90d8597594ccd01868a3485daa3de50658b9773d",
+      "replacement_tasks": [
+        "PR-477"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-423",
+      "status": "retire_replaced",
+      "baseline_blob": "03e1b8b8e4aba7f95853d9d5d213679cbfe26cd6",
+      "sha256": "715ef861274e8c55e04b5e5ecf34717d498d660442dc118f5138d5478c360211",
+      "replacement_tasks": [
+        "PR-471"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-424",
+      "status": "retire_replaced",
+      "baseline_blob": "650942ba854d07fa5bf70255beb9cafcc0b585cc",
+      "sha256": "1c6b7eb580912fadbdb0da351b5f1b267c8b109d488be4c5f0f97c156c648681",
+      "replacement_tasks": [
+        "PR-471"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-425",
+      "status": "retire_replaced",
+      "baseline_blob": "350f8cf2e46d54cdd45c19c88ae1a0e698b6a2fc",
+      "sha256": "0c16e7e516851a9b6a5d5cd80bd2ed8ea5293a4c6d95d4c868b61e96518d3b6c",
+      "replacement_tasks": [
+        "PR-478"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-426",
+      "status": "retire_replaced",
+      "baseline_blob": "4de0e86c9e4a8c806045a7a10178cbff1805361a",
+      "sha256": "9a970973cb497d9d6297b71139961117f703b319ae010e0eeccffb158f48e130",
+      "replacement_tasks": [
+        "PR-478"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-427",
+      "status": "retire_replaced",
+      "baseline_blob": "39142db48a4de9bf783aa4824278cbee8ae8ef97",
+      "sha256": "a802f0834cdb1395c708f1173bb6a2ec3bbd189532e97f9a421b1ec993c72c15",
+      "replacement_tasks": [
+        "PR-478"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-428",
+      "status": "retire_replaced",
+      "baseline_blob": "515c824b442e5ae499897c594d7d98c7cc9fa4a5",
+      "sha256": "60d49b343f86d97e5cdb8efd38972ab191f658d2bdc09430c36f22601ad8d481",
+      "replacement_tasks": [
+        "PR-478"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-429",
+      "status": "retire_replaced",
+      "baseline_blob": "a5f0d246e0361e3c29c17a135e553332d61250ec",
+      "sha256": "e0cef7ed472f0c9ca6371519af279af49bed43c52fd7856fa881ecc2073333f5",
+      "replacement_tasks": [
+        "PR-468",
+        "PR-478"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-430",
+      "status": "retire_replaced",
+      "baseline_blob": "4a7b4c6a7fedece1d83489c9960e14c4fca9a79b",
+      "sha256": "2f664d4307d5518cd1a78f5c0554a7ba5c8918e7f83e9394bcff81a79da67c1c",
+      "replacement_tasks": [
+        "PR-478"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-431",
+      "status": "retire_replaced",
+      "baseline_blob": "e7f6e154a3e224b4072e4cbd438ce2ad5ae64a45",
+      "sha256": "95f8476ee96f4c106e9a83aaa9c2f7c12356cf6113653804b9918dbb2dbe163a",
+      "replacement_tasks": [
+        "PR-478"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-432",
+      "status": "retire_replaced",
+      "baseline_blob": "3a6c7b0030437c62fc42829059bba8ac73933bd9",
+      "sha256": "16ac8938ce9a01c4fd318ec320ea0d1543df2f8669c31b2a7410a1e1e25b46d7",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-433",
+      "status": "retire_replaced",
+      "baseline_blob": "74cfb67370819122f8b33b670b96bc2048348151",
+      "sha256": "1c3ab35622ba3b5e0a74469bd36f0c678c138f30c73e67734d4e3825e6640b4b",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-434",
+      "status": "retire_replaced",
+      "baseline_blob": "9a12c2d093eea532a81fbbcc56337a87ab260646",
+      "sha256": "a2a8fe22fc22e8d981e90b545bb15a1c243b2f12328bada2f571ca7f9c2415b1",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-435",
+      "status": "retire_replaced",
+      "baseline_blob": "0013f7f01961284cd8a177c10e3f02eb9eb69b2c",
+      "sha256": "68d72f12393266562b687650fb1d75a8d370b8f158d3957acdc208020c01224f",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-436",
+      "status": "retire_replaced",
+      "baseline_blob": "b7bce3254a91c0ab45e00e6c36dcb1a8dae1b0d7",
+      "sha256": "b402b4cb654d72d999a5e2fce528974e944109c14c4a26fae50fec50889ec90b",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-437",
+      "status": "retire_replaced",
+      "baseline_blob": "caa4361b7eeb3761164f9e4654ec7c6fd821455f",
+      "sha256": "517bcb030114434a50c011c8847b0cee94f2d8c7e2fa7eb589e73f2575de84cf",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-438",
+      "status": "retire_replaced",
+      "baseline_blob": "b17291d6f40e2bf1cb4ae35bf6ce237e9c107635",
+      "sha256": "73689c83adaba931e9506c1195871661d4b1a9a373471d76eb28e1f4bed300b6",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-439",
+      "status": "retire_replaced",
+      "baseline_blob": "0c1464bf37c5410e200833bbc3d2ca57f4c0544e",
+      "sha256": "06106aba06352d71515da197dd7df82431ecec3915c7a2a72c6ee856a86f5fc9",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-440",
+      "status": "retire_replaced",
+      "baseline_blob": "e4225417869aafd210c452cc6bb0fd403d43a004",
+      "sha256": "d7dcd431fe094f7bf8199685cfcecd4f1db8e1e0a7fa9413735f3181ad54273e",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-441",
+      "status": "retire_replaced",
+      "baseline_blob": "81f42e8156d04cc1c3e99647850aed8e82685581",
+      "sha256": "a6c01d5842982af26416783b1ed5800f79d460e4eed8e0e44ae57731a434ce04",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-442",
+      "status": "retire_replaced",
+      "baseline_blob": "17258fa8e0de831a7ed223142c596c2743b3daa2",
+      "sha256": "cb869c3aed799ee919409d31cd2d7230180c10d00346703fedc040e01ffe67aa",
+      "replacement_tasks": [
+        "PR-478",
+        "PR-494"
+      ],
+      "remaining_scope": "C02; C03",
+      "conditional_followups": [
+        "C02",
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-443",
+      "status": "retire_replaced",
+      "baseline_blob": "32a24555fffca800465d80a56734b49800fed1b7",
+      "sha256": "b12f9f4b2da0084e5296c39eb5c9e515e482407f4fd2ac316fc6d4b0315b4cad",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-444",
+      "status": "retire_replaced",
+      "baseline_blob": "ed8861c20589796c4d639135fe8f04811476febe",
+      "sha256": "d59766f54f42fc0e2cfd5dd223114c349aae7308b5b0ced136a97383ef44c85b",
+      "replacement_tasks": [
+        "PR-485",
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-445",
+      "status": "retire_replaced",
+      "baseline_blob": "afe99edf9a04cfcb1d0f7a4d1dc8e05a92be76c0",
+      "sha256": "cb5d453cc30090789d02efeb440cb4163bad7a9577919a6ca7f9f5da32e97d11",
+      "replacement_tasks": [
+        "PR-485",
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-446",
+      "status": "retire_replaced",
+      "baseline_blob": "80c8937e540c0497dde35bbf4eddad430d30dfe1",
+      "sha256": "8bab122d031a42afa941de626051fedef68384afe73194cb00cc9540179b3a0e",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-447",
+      "status": "retire_replaced",
+      "baseline_blob": "e24cc84085986c0ab801b930c5f7dcbee31719da",
+      "sha256": "f8f1d7edcb0c0dc5310b2a45ed161372c2e1392d97bb991a198cb6d413ed138c",
+      "replacement_tasks": [
+        "PR-484"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-448",
+      "status": "retire_replaced",
+      "baseline_blob": "31036e9579c88468fd3793fbcdeb06b691db1651",
+      "sha256": "04b6bdbb047347a147043cc7ede04ad3cc94aae7c862e1c69a23e036e0d43093",
+      "replacement_tasks": [
+        "PR-485"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-449",
+      "status": "retire_replaced",
+      "baseline_blob": "163e8f15463b7154847ec06cea82b920ae559e99",
+      "sha256": "87e0a516a48cf0f49f5affbcea97cd3da5b7ee09df89d49cb5d7012eafcafe50",
+      "replacement_tasks": [
+        "PR-486"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-450",
+      "status": "retire_replaced",
+      "baseline_blob": "caa76181a777a244c001f5f310ee7dbb1cfe0972",
+      "sha256": "d34c2460107868073fcc0bd9eb19a1e5ca43c3984713199f369e843dea8be6e2",
+      "replacement_tasks": [
+        "PR-486"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-451",
+      "status": "retire_replaced",
+      "baseline_blob": "a1e638ce6e6641f747b2cfe7e09a3af6d1bf9a25",
+      "sha256": "680f28d6aaece518e0c87fda59a435d60f786472c925528c64559d2865b874f1",
+      "replacement_tasks": [
+        "PR-474"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-452",
+      "status": "retire_replaced",
+      "baseline_blob": "47c828420ad79fef917c1cf5deb3b22af9e95b9e",
+      "sha256": "d393bea1b176f4f69e6e78992e82871dbef69a1a14947c400d88c03a0da30701",
+      "replacement_tasks": [
+        "PR-470"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-453",
+      "status": "retire_replaced",
+      "baseline_blob": "ba0407164c11e5ebdd8e623054bd7cd7aa84f715",
+      "sha256": "62bb58d05da9a1738846ea81907a13715ebea86c481783ad1b1367d90770bc6b",
+      "replacement_tasks": [
+        "PR-471"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-454",
+      "status": "retire_replaced",
+      "baseline_blob": "4340fdc94902f944fe52c331cca50a1ea1a89dc7",
+      "sha256": "481bbc712e1b1d03ef37e12fde9f4f228283c42d7870594760fe1c618613903b",
+      "replacement_tasks": [
+        "PR-477"
+      ],
+      "remaining_scope": "C02",
+      "conditional_followups": [
+        "C02"
+      ]
+    },
+    {
+      "task_id": "PR-455",
+      "status": "retire_replaced",
+      "baseline_blob": "aadc9dc0c4ab8ad11029db7be2c18e064fc065df",
+      "sha256": "d1ef876bd0851493eb2641e603d85b52e967297b0161a84a0ab2c628eb1add3f",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-456",
+      "status": "retire_replaced",
+      "baseline_blob": "68345c8e032267ffced5d8883df817201d4baf09",
+      "sha256": "aa3fb4ff814a0cec51f81fd03c21c897d1e80877382632da054ea596692fc96a",
+      "replacement_tasks": [
+        "PR-494"
+      ],
+      "remaining_scope": "C03",
+      "conditional_followups": [
+        "C03"
+      ]
+    },
+    {
+      "task_id": "PR-457",
+      "status": "retire_replaced",
+      "baseline_blob": "5fc46afc6b48f52b42f7f4164d0c3102b9ee27fd",
+      "sha256": "aa8ed66e1f273e70da97d4a6fe93f95fe74b41ac70074e4aa21ad3b5cafe8775",
+      "replacement_tasks": [
+        "PR-476"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-458",
+      "status": "preserve_completed",
+      "baseline_blob": "6d2eb9e531bd25c768124f9a3dd62f1ad738dffc",
+      "sha256": "3579124aee12268e4ab36c961a0bd63796b58f2960e6aa862810734eb494f40e",
+      "replacement_tasks": [],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-459",
+      "status": "preserve_active",
+      "baseline_blob": "659601174fefa600b44eb94788632a8ffc2c6807",
+      "sha256": "e516384ca8db117efb60de1c1ff8c2f5a8d41a8cbcf91ab1bcb053a39fc72937",
+      "replacement_tasks": [],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-460",
+      "status": "retire_replaced",
+      "baseline_blob": "0fa05172222e4f76589941a82a8d9f8e43d847f7",
+      "sha256": "db912f70670cffaa5b9f970cc63bba52a5a99648c543b903741076293c270fc0",
+      "replacement_tasks": [
+        "PR-495"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-461",
+      "status": "retire_replaced",
+      "baseline_blob": "33b2abe85805143088a81a89d6158ad99159ea51",
+      "sha256": "5bbea7a8aabd4ecf816d39f8bce8ca0f1aae396ebaa0a1d8935a7d5ddb411ee1",
+      "replacement_tasks": [
+        "PR-496"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-462",
+      "status": "retire_replaced",
+      "baseline_blob": "8eea8bf34228b73a9f9aaa0879e8a64581a63073",
+      "sha256": "21c93f527d6b073208aff55bf0580cf1edc573f2e0a0758430b8aa7ed4eeeb03",
+      "replacement_tasks": [
+        "PR-488"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-463",
+      "status": "retire_replaced",
+      "baseline_blob": "b516a6dbcd632894048badb1081b79312d014931",
+      "sha256": "7c73d2f5442f666eca89139bd83cb68be64b9f3589a96e5bac22a0a2b826fbd7",
+      "replacement_tasks": [
+        "PR-500"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-464",
+      "status": "retire_deferred",
+      "baseline_blob": "82c72e6b54891ef8a3c5835bb79e89c7da148f00",
+      "sha256": "99d94276aa38b8b49ca4b47ce3554e01b6c1c27191bd1b41b5f3e83bce4490b2",
+      "replacement_tasks": [],
+      "remaining_scope": "C08",
+      "conditional_followups": [
+        "C08"
+      ]
+    },
+    {
+      "task_id": "PR-465",
+      "status": "retire_replaced",
+      "baseline_blob": "26a24dcb3f1a25e8d7b208b628298e3c6e681304",
+      "sha256": "6934914539edbd5e4ae38a7972ef29430421c54acd138cfd0dc3206ca9033cf2",
+      "replacement_tasks": [
+        "PR-505"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-466",
+      "status": "retire_replaced",
+      "baseline_blob": "7f6de6ade6c8b4f4fdc00759286b08e9c588fd44",
+      "sha256": "813cbbd8387ce4a7dcd272e669f2de0050eaf2c860e1511a473848ebf9e33bd1",
+      "replacement_tasks": [
+        "PR-486"
+      ],
+      "remaining_scope": null,
+      "conditional_followups": []
+    },
+    {
+      "task_id": "PR-467",
+      "status": "preserve_completed",
+      "baseline_blob": "a4463a635882cf573dc74263e4412198b45a9c09",
+      "sha256": "95c864d134c2ac1b1c0bbc7f1b92cc9620ab28eb2d5e1653b7c9458d6659c4fb",
+      "replacement_tasks": [],
+      "remaining_scope": null,
+      "conditional_followups": []
+    }
+  ],
+  "policy_changes": [],
+  "runtime_changes": false,
+  "conditional_followups": {
+    "C01": {
+      "outcome": "Автоматическое восстановление review без технического выбора оператора",
+      "admission_evidence": "PR-475",
+      "traceability": "PR-403–407; IMP-03",
+      "scope": "Реальные request/full-SHA/current-invocation +1 linkage, bounded repost/reconcile, external push/restart. После доказательства переводятся все consumers и удаляется обычная migration panel. Новые implementation tasks оценить по результату, не писать вымышленный API."
+    },
+    "C02": {
+      "outcome": "Полная сохранность и автоматическое продолжение при dirty work/неизвестном restart owner",
+      "admission_evidence": "PR-477, PR-478",
+      "traceability": "PR-416/419/421/422/425–431/442/454; IMP-01/04",
+      "scope": "Выбранные capture/index/local-history/restore и retained ownership, общий scoped допуск, миграция status/sync/error/FIX/merge/web/constructor. PR-468 решает известный status-only loss, PR-498 только подтвержденный clean/quiescent release. Не объявлять их полной реализацией C02."
+    },
+    "C03": {
+      "outcome": "Durable final Reject и единый changed-spec admission",
+      "admission_evidence": "PR-494",
+      "traceability": "PR-432–446/455/456; IMP-05/06",
+      "scope": "Exact intent/attempt/failure/spec, close confirmation и late push, retained fence после Redis loss, consistent upload/direct Git admission/reservation, безопасная branch preparation. Новый PR после final Reject, тот же PR при обычном Retry. Использовать минимум existing stores; количество implementation tasks определить после boundary proof."
+    },
+    "C04": {
+      "outcome": "Недостающие persistence/backup/readiness гарантии",
+      "admission_evidence": "PR-501, PR-504",
+      "traceability": "A16/A38; IMP-10",
+      "scope": "Конкретные выявленные потери данных/intent, off-host доступность, startup identity, health/readiness и state-compatible rollback. Не считать bundle или Up достаточной гарантией. Production drill не входит в AUTO PR."
+    },
+    "C05": {
+      "outcome": "Совместимое исправление применимой form-parsing уязвимости",
+      "admission_evidence": "PR-502",
+      "traceability": "A24; IMP-11",
+      "scope": "Доставить проверенный compatible dependency upgrade или bounded body-limit mitigation с regression actual request.form path. До результата не выбирать вслепую независимый Starlette pin."
+    },
+    "C06": {
+      "outcome": "Остальные guardrail и входные границы",
+      "admission_evidence": "Проверка конкретного usage/perimeter; при изменении Approve использовать PR-492",
+      "traceability": "A20–23/A25/A27; R17–19/R24; IMP-05/11",
+      "scope": "Полный набор нарушений и bounded label text, sensitive excerpts, Origin/JS-context/webhook destination, sandbox mode и build-context regression. Dockerignore/CLI pins уже существуют. Не вводить общую IAM/SSRF блокировку всех LAN webhook без учета фактического продукта. Новая task нужна для конкретно подтвержденного остатка, а не blanket security sprint."
+    },
+    "C07": {
+      "outcome": "Расширения account profiles, metered API budget, обучаемый selector, 20 repo",
+      "admission_evidence": "Реальная потребность в новом transport/account или росте нагрузки",
+      "traceability": "A30/A31/A37; IMP-04/09",
+      "scope": "Отложены. До metered API отдельно задать валюту/период/scope/soft-hard budget и reservations/settlement. Существующие quota/caps не снимать. До роста измерить capacity/fairness, не писать новый scheduler заранее."
+    },
+    "C08": {
+      "outcome": "Дополнительная browser/accessibility/auth/settings приемка и отдельные onboarding остатки",
+      "admission_evidence": "Конкретное изменение соответствующего UI/контракта",
+      "traceability": "PR-464; A17/A19/A33/A34/A40/U01-F01–F12; IMP-07/08/09",
+      "scope": "Login тесты только с synthetic responses; собственный regression включать в меняющийся control. Если PR-488 докажет конкретный effective-config/ACK defect, выделить ограниченный runtime delta, а не считать весь Settings сломанным. Доступность и audit metadata не объявлять закрытыми по task metrics fix."
+    }
+  }
+}
