@@ -214,6 +214,8 @@ class PublicationMigration(BaseModel):
     head_sha: str
     published_at: datetime | None = None
     provenance: str = ""
+    generation: int | None = None
+    last_complete_published_at: datetime | None = None
     source: Literal[
         "parent_snapshot", "missing_snapshot", "pr_undiscovered_snapshot", "rebound_pr",
         "unvalidated_current_snapshot",

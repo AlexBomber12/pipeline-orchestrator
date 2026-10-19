@@ -95,36 +95,37 @@ class RecoveryMixin:
         raw = await self.redis.get(key)
         if not raw:
             self.log_event("[RECOVERY] Publication migration receipt missing; operator investigation required.")
-            return True
+            return False
         command = MigrationCommand.model_validate_json(raw)
         if command.status == "applied":
             saved = await self.redis.get(pipeline_state(self.name))
             if saved:
                 self._restore_publication_watermark(RepoState.model_validate_json(saved))
-            return True
+            return False
         if command.status == "failed":
-            return True
+            return False
         proposal = self.state.publication_migration
+        bound = command.observation
         reason = None
         deferred = False
         if (
             proposal is None or proposal.status != "legacy"
             or not migration_matches_state(proposal, self.state)
             or self.state.url != self.repo_config.url
+            or not migration_confirmable(bound)
+            or migration_binding(bound) != binding
+            or proposal.source != bound.source
+            or proposal.generation != bound.generation
             or (proposal.repo, proposal.pr_number, proposal.head_repo,
                 proposal.ref, proposal.head_sha) != (
-                    command.observation.repo, command.observation.pr_number,
-                    command.observation.head_repo, command.observation.ref,
-                    command.observation.head_sha,
+                    bound.repo, bound.pr_number, bound.head_repo,
+                    bound.ref, bound.head_sha,
                 )
         ):
             reason = "Migration target or observation changed; refresh and confirm again."
-        elif proposal.published_at is None:
-            reason = "Current publication evidence is unavailable; waiting to revalidate the bound observation."
-            deferred = True
         elif (
-            not migration_confirmable(proposal)
-            or migration_binding(proposal) != binding
+            proposal.published_at is not None
+            and migration_binding(proposal) != binding
         ):
             reason = "Migration publication observation changed; refresh and confirm again."
         else:
@@ -132,21 +133,21 @@ class RecoveryMixin:
                 prs = gh_prs.get_open_prs(
                     self.owner_repo, self.repo_config.allow_merge_without_checks
                 )
-                pr = next((item for item in prs if item.number == proposal.pr_number), None)
+                pr = next((item for item in prs if item.number == bound.pr_number), None)
                 if (
-                    pr is None or pr.head_sha.lower() != proposal.head_sha.lower()
-                    or f"refs/heads/{pr.branch}" != proposal.ref
-                    or (not pr.is_cross_repository and proposal.head_repo != self.owner_repo)
+                    pr is None or pr.head_sha.lower() != bound.head_sha.lower()
+                    or f"refs/heads/{pr.branch}" != bound.ref
+                    or (not pr.is_cross_repository and bound.head_repo != self.owner_repo)
                 ):
                     reason = "Bound PR, branch, head repository or HEAD changed."
                 else:
                     evidence = gh_prs.get_pr_head_publication(
-                        self.owner_repo, pr.number, expected_head_sha=proposal.head_sha
+                        self.owner_repo, pr.number, expected_head_sha=bound.head_sha
                     )
                     if (
-                        evidence.repo != proposal.repo or evidence.pr_number != proposal.pr_number
-                        or evidence.head_repo != proposal.head_repo or evidence.ref != proposal.ref
-                        or evidence.head_sha.lower() != proposal.head_sha.lower()
+                        evidence.repo != bound.repo or evidence.pr_number != bound.pr_number
+                        or evidence.head_repo != bound.head_repo or evidence.ref != bound.ref
+                        or evidence.head_sha.lower() != bound.head_sha.lower()
                     ):
                         reason = "Publication evidence changed or is unavailable; refresh and confirm again."
                     elif evidence.unknown_reason is not None or evidence.published_at is None:
@@ -156,8 +157,8 @@ class RecoveryMixin:
                         )
                         deferred = True
                     elif (
-                        evidence.published_at != proposal.published_at
-                        or evidence.provenance != proposal.provenance
+                        evidence.published_at != bound.published_at
+                        or evidence.provenance != bound.provenance
                     ):
                         reason = "Publication event changed; refresh and confirm again."
             except Exception as exc:
@@ -166,10 +167,10 @@ class RecoveryMixin:
         watermark = None
         if reason is None:
             watermark = PublicationWatermark(
-                repo=proposal.repo, pr_number=proposal.pr_number,
-                head_repo=proposal.head_repo, ref=proposal.ref,
-                head_sha=proposal.head_sha, published_at=proposal.published_at,
-                provenance=proposal.provenance,
+                repo=bound.repo, pr_number=bound.pr_number,
+                head_repo=bound.head_repo, ref=bound.ref,
+                head_sha=bound.head_sha, published_at=bound.published_at,
+                provenance=bound.provenance,
             )
 
         async def transaction(pipe):
@@ -185,6 +186,8 @@ class RecoveryMixin:
                 current is None or current.status != "legacy"
                 or not migration_matches_state(current, state)
                 or state.url != self.repo_config.url
+                or current.source != stored.observation.source
+                or current.generation != stored.observation.generation
                 or (current.repo, current.pr_number, current.head_repo,
                     current.ref, current.head_sha) != (
                         stored.observation.repo, stored.observation.pr_number,
@@ -194,12 +197,15 @@ class RecoveryMixin:
             ):
                 stored.status = "failed"
                 stored.reason = "Published migration proposal changed before commit."
-            elif current.published_at is None or deferred:
-                stored.status = "deferred"
-                stored.reason = reason or "Current publication evidence is unavailable; waiting to retry."
-            elif migration_binding(current) != binding:
+            elif current.published_at is not None and migration_binding(current) != binding:
                 stored.status = "failed"
                 stored.reason = "Published migration observation changed before commit."
+            elif current.published_at is None and not deferred and reason is not None:
+                stored.status = "failed"
+                stored.reason = reason
+            elif deferred:
+                stored.status = "deferred"
+                stored.reason = reason or "Current publication evidence is unavailable; waiting to retry."
             elif reason is not None:
                 stored.status = "failed"
                 stored.reason = reason
@@ -217,12 +223,12 @@ class RecoveryMixin:
                 pipe.delete(pointer_key)
             if stored.status == "applied":
                 pipe.set(pipeline_state(self.name), state.model_dump_json())
-            return stored.status == "applied"
+            return stored.status
 
-        applied = await self.redis.transaction(
+        outcome = await self.redis.transaction(
             transaction, key, pointer_key, pipeline_state(self.name), value_from_callable=True
         )
-        if applied:
+        if outcome == "applied":
             self._publication_high_water_identity = (
                 watermark.repo, watermark.pr_number, watermark.head_repo,
                 watermark.ref, watermark.head_sha,
@@ -230,9 +236,9 @@ class RecoveryMixin:
             self._publication_high_water_at = watermark.published_at
             self.state.publication_watermark = watermark
             self.state.publication_migration = None
-        else:
+        elif outcome == "failed":
             self.log_event(f"[RECOVERY] Publication migration rejected: {reason or 'state changed'}.")
-        return True
+        return outcome != "deferred"
 
     def _parse_tasks_from_headers(self) -> list[QueueTask] | None:
         """Parse structured task headers into a recovered queue snapshot.
@@ -852,7 +858,24 @@ class RecoveryMixin:
                 )
             ):
                 self.state.current_task = queued
-                self.state.current_pr = bound
+                live_bound = next(
+                    (item for item in prs if item.number == bound.number and item.branch == bound.branch),
+                    None,
+                ) if recovered_state == PipelineState.WATCH else None
+                if live_bound is not None:
+                    merged_shas, push_count = bound.merge_observed_pushes(live_bound)
+                    live_bound = live_bound.model_copy(update={
+                        "fix_iteration_count": bound.fix_iteration_count,
+                        "no_push_fix_count": bound.no_push_fix_count,
+                        "observed_head_shas": merged_shas,
+                        "push_count": push_count,
+                        "watch_retrigger_count": bound.watch_retrigger_count,
+                        "diff_scanned_at_sha": (
+                            bound.diff_scanned_at_sha
+                            if live_bound.head_sha == bound.head_sha else None
+                        ),
+                    })
+                self.state.current_pr = live_bound or bound
                 self.state.active_invocation = saved.active_invocation
                 if recovered_state == PipelineState.ERROR and saved.state != PipelineState.ERROR:
                     self.state.error_message = (
@@ -868,12 +891,8 @@ class RecoveryMixin:
                     f"[RECOVERY] Restored bound FIX PR #{bound.number} for "
                     f"{queued.pr_id} in {recovered_state.value}."
                 )
-                if recovered_state == PipelineState.WATCH and any(
-                    item.number == bound.number and item.branch == bound.branch
-                    and item.head_sha.lower() == bound.head_sha.lower()
-                    for item in prs
-                ):
-                    self._rehydrate_last_push_at(bound)
+                if live_bound is not None:
+                    self._rehydrate_last_push_at(live_bound)
                 return
 
         if doing is not None:
@@ -1598,22 +1617,29 @@ class RecoveryMixin:
         proposal = self.state.publication_migration
         if proposal is None or proposal.status != "legacy":
             return
-        if proposal.repo == self.owner_repo and proposal.pr_number != pr.number:
+        if proposal.repo != self.owner_repo:
+            proposal.status = "blocked"
+            proposal.reason = "Recovered PR repository changed; original upgrade proposal is invalid."
+            return
+        task = self.state.current_task
+        if task is not None and find_matching_open_pr(task.pr_id, task.branch, [pr]) is None:
+            proposal.status = "blocked"
+            proposal.reason = "Recovered PR no longer matches the current task branch."
+            return
+        target_changed = (
+            proposal.pr_number != pr.number
+            or proposal.ref != f"refs/heads/{pr.branch}"
+            or proposal.head_sha.lower() != pr.head_sha.lower()
+        )
+        if target_changed:
             proposal = PublicationMigration(
                 repo=self.owner_repo, pr_number=pr.number, head_repo="",
                 ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
-                source="rebound_pr",
-                reason="Recovered live PR differs from the saved proposal; confirm its publication.",
+                source="rebound_pr" if proposal.pr_number != pr.number else proposal.source,
+                reason="Recovered live PR target changed; confirm its publication.",
+                generation=(proposal.generation or 0) + 1,
             )
             self.state.publication_migration = proposal
-        elif (
-            proposal.repo != self.owner_repo
-            or proposal.ref != f"refs/heads/{pr.branch}"
-            or proposal.head_sha.lower() != pr.head_sha.lower()
-        ):
-            proposal.status = "blocked"
-            proposal.reason = "Recovered PR target changed; original upgrade proposal is invalid."
-            return
         if (
             evidence.repo != self.owner_repo or evidence.pr_number != pr.number
             or evidence.ref != proposal.ref or evidence.head_sha.lower() != pr.head_sha.lower()
@@ -1623,15 +1649,29 @@ class RecoveryMixin:
             or evidence.unknown_reason is not None
             or not evidence.provenance.startswith("github-activity:")
         ):
+            if proposal.published_at is not None:
+                proposal.last_complete_published_at = proposal.published_at
             proposal.published_at = None
             proposal.reason = evidence.unknown_reason or "Publication metadata is missing or contradictory."
             return
         if proposal.head_repo and proposal.head_repo != evidence.head_repo:
-            proposal.status = "blocked"
-            proposal.reason = "PR head repository changed during migration."
-            return
+            proposal = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                source=proposal.source,
+                reason="PR head repository changed; confirm its publication.",
+                generation=(proposal.generation or 0) + 1,
+            )
+            self.state.publication_migration = proposal
+        prior_event = proposal.last_complete_published_at or proposal.published_at
+        if prior_event is not None and (
+            prior_event != evidence.published_at
+            or proposal.provenance != evidence.provenance
+        ):
+            proposal.generation = (proposal.generation or 0) + 1
         proposal.head_repo = evidence.head_repo
         proposal.published_at = evidence.published_at
+        proposal.last_complete_published_at = evidence.published_at
         proposal.provenance = evidence.provenance
         if proposal.source == "missing_snapshot":
             proposal.reason = "Saved state is absent; confirm this historical publication as the initial safety floor."

@@ -35,7 +35,10 @@ def pending_key(repo: str) -> str:
 
 
 def migration_binding(observation: PublicationMigration) -> str:
-    data = observation.model_dump(mode="json", exclude={"reason", "status"})
+    data = observation.model_dump(
+        mode="json", exclude={"reason", "status", "last_complete_published_at"},
+        exclude_none=True,
+    )
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 

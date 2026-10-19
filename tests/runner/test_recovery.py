@@ -625,7 +625,7 @@ def test_migration_command_retries_transient_github_failure(
         raise RuntimeError("temporary outage")
 
     monkeypatch.setattr(gh_prs, "get_open_prs", unavailable)
-    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    assert asyncio.run(runner._consume_publication_migration_command()) is False
     key = migration_command_key(runner.name, binding)
     assert MigrationCommand.model_validate_json(asyncio.run(runner.redis.get(key))).status == "deferred"
     assert runner.state.publication_watermark is None
@@ -730,6 +730,7 @@ def _migration_command_runner() -> tuple[runner_module.PipelineRunner, str]:
 @pytest.mark.parametrize("case", [
     "missing_receipt", "applied_receipt", "failed_receipt", "missing_time",
     "changed_binding", "changed_pr", "changed_evidence", "unknown_evidence",
+    "tampered_receipt", "missing_bound_time", "changed_source", "changed_generation",
 ])
 def test_migration_command_revalidates_untrusted_inputs(
     monkeypatch: pytest.MonkeyPatch, case: str,
@@ -748,6 +749,19 @@ def test_migration_command_revalidates_untrusted_inputs(
     elif case == "changed_binding":
         runner.state.publication_migration.published_at += timedelta(seconds=1)
         runner.redis.store[pipeline_state(runner.name)] = runner.state.model_dump_json()
+    elif case in {"tampered_receipt", "missing_bound_time"}:
+        command = MigrationCommand.model_validate_json(runner.redis.store[key])
+        if case == "tampered_receipt":
+            command.observation.published_at += timedelta(seconds=1)
+        else:
+            command.observation.published_at = None
+        runner.redis.store[key] = command.model_dump_json()
+    elif case in {"changed_source", "changed_generation"}:
+        if case == "changed_source":
+            runner.state.publication_migration.source = "rebound_pr"
+        else:
+            runner.state.publication_migration.generation = 1
+        runner.redis.store[pipeline_state(runner.name)] = runner.state.model_dump_json()
     elif case == "changed_pr":
         monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [])
     elif case == "changed_evidence":
@@ -763,7 +777,9 @@ def test_migration_command_revalidates_untrusted_inputs(
                             gh_prs.HeadPublicationEvidence("octo/demo", 42, "octo/demo",
                                 "refs/heads/feature", "a" * 40, None,
                                 "github-activity:push", unknown_reason="activity unavailable"))
-    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    assert asyncio.run(runner._consume_publication_migration_command()) is (
+        case not in {"missing_receipt", "applied_receipt", "failed_receipt", "missing_time", "unknown_evidence"}
+    )
     if case == "missing_receipt":
         assert any("receipt missing" in e["event"] for e in runner.state.history)
     elif case == "unknown_evidence":
@@ -843,7 +859,9 @@ def test_hydration_restores_pending_publication_proposal() -> None:
 
 
 @pytest.mark.parametrize("change", ["target", "head_repo"])
-def test_parent_proposal_blocks_changed_pr_identity(change: str) -> None:
+def test_parent_proposal_rebinds_changed_pr_identity(
+    change: str, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     runner, _binding = _migration_command_runner()
     proposal = runner.state.publication_migration
     pr = runner.state.current_pr
@@ -853,6 +871,10 @@ def test_parent_proposal_blocks_changed_pr_identity(change: str) -> None:
     )
     if change == "target":
         pr = pr.model_copy(update={"head_sha": "b" * 40})
+        evidence = gh_prs.HeadPublicationEvidence(
+            "octo/demo", 42, "octo/demo", "refs/heads/feature", "b" * 40,
+            proposal.published_at + timedelta(seconds=1), "github-activity:push",
+        )
     else:
         pr = pr.model_copy(update={"is_cross_repository": True})
         evidence = gh_prs.HeadPublicationEvidence(
@@ -860,7 +882,82 @@ def test_parent_proposal_blocks_changed_pr_identity(change: str) -> None:
             proposal.published_at, "github-activity:push",
         )
     runner._offer_publication_migration(pr, evidence)
-    assert proposal.status == "blocked"
+    refreshed = runner.state.publication_migration
+    assert refreshed is not proposal
+    assert refreshed.status == "legacy"
+    assert refreshed.published_at == evidence.published_at
+    assert migration_binding(refreshed) != _binding
+    runner.state.current_pr = pr
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [pr])
+    monkeypatch.setattr(gh_prs, "get_pr_head_publication", lambda *_args, **_kwargs: evidence)
+    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    assert MigrationCommand.model_validate_json(
+        runner.redis.store[migration_command_key(runner.name, _binding)]
+    ).status == "failed"
+    assert runner.state.publication_watermark is None
+    fresh_binding = migration_binding(refreshed)
+    asyncio.run(enqueue_migration(runner.redis, runner.name, fresh_binding))
+    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    assert MigrationCommand.model_validate_json(
+        runner.redis.store[migration_command_key(runner.name, fresh_binding)]
+    ).status == "applied"
+    assert runner.state.publication_watermark.head_sha == pr.head_sha
+    assert runner.state.publication_watermark.head_repo == evidence.head_repo
+
+
+def test_migration_binding_does_not_revert_after_a_to_b_to_a(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, original_binding = _migration_command_runner()
+    original = runner.state.publication_migration
+    head_a = original.head_sha
+    head_b = "b" * 40
+    event_a = gh_prs.HeadPublicationEvidence(
+        "octo/demo", 42, "octo/demo", "refs/heads/feature", head_a,
+        original.published_at, "github-activity:push",
+    )
+    event_b = gh_prs.HeadPublicationEvidence(
+        "octo/demo", 42, "octo/demo", "refs/heads/feature", head_b,
+        original.published_at + timedelta(seconds=10), "github-activity:push",
+    )
+    pr_b = runner.state.current_pr.model_copy(update={"head_sha": head_b})
+    runner._offer_publication_migration(pr_b, event_b)
+    runner._offer_publication_migration(runner.state.current_pr, event_a)
+    proposal = runner.state.publication_migration
+    assert proposal.head_sha == head_a
+    assert proposal.published_at == original.published_at
+    assert migration_binding(proposal) != original_binding
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [runner.state.current_pr])
+    monkeypatch.setattr(gh_prs, "get_pr_head_publication", lambda *_args, **_kwargs: event_a)
+    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    assert MigrationCommand.model_validate_json(
+        runner.redis.store[migration_command_key(runner.name, original_binding)]
+    ).status == "failed"
+    assert runner.state.publication_watermark is None
+
+
+@pytest.mark.parametrize("foreign_context", ["repo", "task_branch"])
+def test_migration_reconciliation_rejects_foreign_context(foreign_context: str) -> None:
+    runner, _binding = _migration_command_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-42", title="feature", status=TaskStatus.DOING,
+        branch="feature", task_file="tasks/PR-42.md",
+    )
+    proposal = runner.state.publication_migration
+    pr = runner.state.current_pr
+    if foreign_context == "repo":
+        proposal.repo = "other/repo"
+    else:
+        pr = pr.model_copy(update={"branch": "other-branch"})
+    evidence = gh_prs.HeadPublicationEvidence(
+        "octo/demo", 42, "octo/demo", f"refs/heads/{pr.branch}", pr.head_sha,
+        proposal.published_at, "github-activity:push",
+    )
+    runner._offer_publication_migration(pr, evidence)
+    assert runner.state.publication_migration.status == "blocked"
+    assert runner.state.publication_watermark is None
 
 
 def test_recovered_cycle_consumes_publication_command_before_other_work(
