@@ -187,6 +187,174 @@ def test_parent_snapshot_620_requires_confirmation_for_branch_creation(
     assert restarted._canonical_push_timestamp(620) is None
 
 
+@pytest.mark.parametrize("phase", ["pending", "deferred"])
+@pytest.mark.parametrize("change", ["same", "head", "event", "generation"])
+def test_saved_parent_proposal_command_survives_paused_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, phase: str, change: str,
+) -> None:
+    """A raw PR observation must not replace an already authorized proposal."""
+    repo = "AlexBomber12/pipeline-orchestrator"
+    branch = "pr-459-e2e-failure-evidence"
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+    published = datetime(2026, 10, 17, 21, 6, 35, tzinfo=timezone.utc)
+    current = {"activity": True, "head": head, "timestamp": "2026-10-17T21:06:35Z"}
+
+    def transport(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/620" in args[1]:
+            return {"branch": branch, "repo": repo, "sha": current["head"]}
+        if "/activity?" in args[1]:
+            return ([{"activity_type": "branch_creation", "ref": f"refs/heads/{branch}",
+                     "before": "0" * 40, "after": current["head"],
+                     "timestamp": current["timestamp"]}]
+                    if current["activity"] else [])
+        raise AssertionError(args)
+
+    def open_prs(owner: str, *_args: object, **_kwargs: object) -> list[PRInfo]:
+        evidence = gh_prs.get_pr_head_publication(owner, 620, expected_head_sha=current["head"])
+        return [PRInfo(
+            number=620, branch=branch, pr_id="PR-459", head_sha=current["head"],
+            publication_observed=True, publication_at=evidence.published_at,
+            publication_reason=evidence.unknown_reason,
+            publication_repo=evidence.repo, publication_head_repo=evidence.head_repo,
+            publication_ref=evidence.ref, publication_head_sha=evidence.head_sha,
+            publication_provenance=evidence.provenance,
+        )]
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", transport)
+    monkeypatch.setattr(gh_prs, "get_open_prs", open_prs)
+    runner = h._make_runner(url=f"https://github.com/{repo}.git")
+    runner.repo_path = str(tmp_path)
+    task = QueueTask(pr_id="PR-459", title="e2e failure evidence",
+                     status=TaskStatus.DOING, branch=branch,
+                     task_file="tasks/PR-459.md")
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    snapshot = (Path(__file__).parents[1] / "fixtures/recovery/pr_620_parent_snapshot.json").read_text()
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), snapshot))
+    assert asyncio.run(runner.recover_state()) is True
+    proposal = runner.state.publication_migration
+    assert proposal is not None and proposal.source == "parent_snapshot"
+    assert runner.state.current_pr.publication_at == published
+    proposal.generation = 3
+    proposal.last_complete_published_at = published
+    runner.state.user_paused = True
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
+    binding = migration_binding(proposal)
+    asyncio.run(enqueue_migration(runner.redis, runner.name, binding))
+    key = migration_command_key(runner.name, binding)
+
+    if phase == "deferred":
+        current["activity"] = False
+        runner._recovered = True
+
+        async def no_work() -> None:
+            return None
+
+        async def yes() -> bool:
+            return True
+
+        monkeypatch.setattr(runner, "ensure_repo_cloned", no_work)
+        monkeypatch.setattr(runner, "_check_github_api_budget", yes)
+        asyncio.run(runner.run_cycle())
+        assert MigrationCommand.model_validate_json(runner.redis.store[key]).status == "deferred"
+        saved = RepoState.model_validate_json(runner.redis.store[pipeline_state(runner.name)])
+        assert saved.user_paused and saved.publication_watermark is None
+        assert saved.current_pr.publication_at == published
+        assert saved.publication_migration.source == "parent_snapshot"
+        current["activity"] = True
+
+    restarted = h._make_runner(url=f"https://github.com/{repo}.git")
+    restarted.redis = runner.redis
+    restarted.repo_path = str(tmp_path)
+    restarted._parse_tasks_from_headers = runner._parse_tasks_from_headers  # type: ignore[method-assign]
+    assert asyncio.run(restarted.recover_state()) is True
+    restored = restarted.state.publication_migration
+    assert restored is not None
+    assert restored.source == "parent_snapshot"
+    assert restored.generation == 3
+    assert restored.last_complete_published_at == published
+    assert migration_binding(restored) == binding
+    assert restarted.state.publication_watermark is None
+
+    current["activity"] = False
+    assert asyncio.run(restarted._consume_publication_migration_command()) is False
+    assert MigrationCommand.model_validate_json(restarted.redis.store[key]).status == "deferred"
+    assert restarted.state.publication_watermark is None
+    current["activity"] = True
+    if change == "head":
+        current["head"] = "b" * 40
+    elif change == "event":
+        current["timestamp"] = "2026-10-17T21:07:00Z"
+    elif change == "generation":
+        restarted.state.publication_migration.generation += 1
+        asyncio.run(restarted.publish_state())
+    assert asyncio.run(restarted._consume_publication_migration_command()) is True
+    receipt = MigrationCommand.model_validate_json(restarted.redis.store[key])
+    assert receipt.status == ("applied" if change == "same" else "failed")
+    assert (restarted.state.publication_watermark is not None) == (change == "same")
+    assert asyncio.run(restarted.redis.get(migration_pending_key(restarted.name))) is None
+
+
+@pytest.mark.parametrize("kind", [
+    "missing", "blocked", "foreign_repo", "foreign_task", "foreign_url",
+    "incompatible", "corrupt",
+])
+def test_raw_observation_does_not_rescue_invalid_saved_proposal(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, kind: str,
+) -> None:
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    published = datetime(2026, 10, 17, 21, 6, 35, tzinfo=timezone.utc)
+    task = QueueTask(pr_id="PR-42", title="feature", status=TaskStatus.DOING,
+                     branch="feature", task_file="tasks/PR-42.md")
+    pr = PRInfo(
+        number=42, branch="feature", pr_id="PR-42", head_sha="a" * 40,
+        publication_observed=True, publication_at=published,
+        publication_repo="octo/demo", publication_head_repo="octo/demo",
+        publication_ref="refs/heads/feature", publication_head_sha="a" * 40,
+        publication_provenance="github-activity:push",
+    )
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [pr])
+    monkeypatch.setattr(gh_prs, "get_pr_head_publication", lambda *_args, **_kwargs:
+                        gh_prs.HeadPublicationEvidence(
+                            "octo/demo", 42, "octo/demo", "refs/heads/feature",
+                            "a" * 40, published, "github-activity:push"))
+    proposal = recovery_module.PublicationMigration(
+        repo="octo/demo", pr_number=42, head_repo="octo/demo",
+        ref="refs/heads/feature", head_sha="a" * 40,
+        published_at=published, provenance="github-activity:push",
+        source="parent_snapshot", generation=2,
+        reason="Historical publication needs an operator trust anchor.",
+    )
+    saved = RepoState(url=runner.state.url, name=runner.name,
+                      state=PipelineState.WATCH, current_task=task,
+                      current_pr=pr, publication_migration=proposal)
+    raw = saved.model_dump(mode="json")
+    if kind == "missing":
+        raw["publication_migration"] = None
+    elif kind == "blocked":
+        raw["publication_migration"]["status"] = "blocked"
+    elif kind == "foreign_repo":
+        raw["publication_migration"]["repo"] = "other/repo"
+    elif kind == "foreign_task":
+        raw["current_task"]["branch"] = "other-branch"
+    elif kind == "foreign_url":
+        raw["url"] = "https://github.com/other/repo.git"
+    elif kind == "incompatible":
+        raw["publication_schema_version"] = 2
+    else:
+        raw["publication_migration"] = {"repo": "broken"}
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), json.dumps(raw)))
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.publication_watermark is None
+    assert runner.state.publication_migration is not None
+    if kind == "missing":
+        assert runner.state.publication_migration.source == "unvalidated_current_snapshot"
+        assert runner.state.publication_migration.status == "legacy"
+    else:
+        assert runner.state.publication_migration.status == "blocked"
+
+
 @pytest.mark.parametrize("activity_available", [True, False])
 def test_missing_snapshot_requires_exact_operator_migration(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, activity_available: bool,

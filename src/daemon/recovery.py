@@ -529,6 +529,37 @@ class RecoveryMixin:
                 ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
                 reason="Parent-version snapshot has no publication safety floor.",
             )
+        elif persisted.publication_migration is not None:
+            # A durable proposal may coexist with raw current_pr publication
+            # fields after a paused cycle. Keep its binding and generation;
+            # fresh GitHub evidence is reconciled later in recovery.
+            proposal = persisted.publication_migration
+            pr = persisted.current_pr
+            task = persisted.current_task
+            if (
+                persisted.name == self.name
+                and persisted.url == self.repo_config.url
+                and proposal.repo == self.owner_repo
+                and migration_matches_state(proposal, persisted)
+                and re.fullmatch(r"[0-9a-fA-F]{40}", proposal.head_sha) is not None
+                and (
+                    not proposal.head_repo
+                    or (
+                        re.fullmatch(r"[^/]+/[^/]+", proposal.head_repo) is not None
+                        and (pr.is_cross_repository or proposal.head_repo == self.owner_repo)
+                    )
+                )
+                and (
+                    task is None
+                    or find_matching_open_pr(task.pr_id, task.branch, [pr]) is not None
+                )
+            ):
+                self.state.publication_migration = proposal
+            else:
+                self.state.publication_migration = proposal.model_copy(update={
+                    "status": "blocked",
+                    "reason": "Saved publication proposal conflicts with repository or task context.",
+                })
         elif raw_observation_without_floor:
             pr = persisted.current_pr
             self.state.publication_migration = PublicationMigration(
@@ -537,8 +568,6 @@ class RecoveryMixin:
                 source="unvalidated_current_snapshot",
                 reason="Saved PR observation has no validated floor; confirm current publication.",
             )
-        elif persisted.publication_migration is not None:
-            self.state.publication_migration = persisted.publication_migration
         elif persisted.current_pr is not None and persisted.publication_watermark is None:
             pr = persisted.current_pr
             self.state.publication_migration = PublicationMigration(
