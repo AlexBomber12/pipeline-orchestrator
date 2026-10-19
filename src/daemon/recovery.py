@@ -1582,8 +1582,14 @@ class RecoveryMixin:
                 f"{task_id}: {exc}."
             )
 
-    def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
-        """Refresh the feedback floor from current-head publication evidence."""
+    def _initialize_publication_admission(
+        self, pr: PRInfo, evidence: gh_prs.HeadPublicationEvidence | None = None,
+    ) -> None:
+        """Keep WATCH admission's durable migration context in one place.
+
+        A PR poll can carry the current observation. When it does not, leave
+        publication unknown until the normal recovery/poll lookup supplies it.
+        """
         saved_floor = self.state.publication_watermark
         if (
             saved_floor is not None
@@ -1623,6 +1629,26 @@ class RecoveryMixin:
                 status="blocked",
                 reason="Saved state is corrupt; publication trust cannot be migrated automatically.",
             )
+        if evidence is not None:
+            self._offer_publication_migration(pr, evidence)
+
+    def _admit_observed_pr(self, pr: PRInfo) -> None:
+        """Initialize trust context using the PR list's own observation."""
+        evidence = None
+        if pr.publication_observed:
+            evidence = gh_prs.HeadPublicationEvidence(
+                repo=pr.publication_repo, pr_number=pr.number,
+                head_repo=pr.publication_head_repo, ref=pr.publication_ref,
+                head_sha=pr.publication_head_sha,
+                published_at=pr.publication_at,
+                provenance=pr.publication_provenance,
+                unknown_reason=pr.publication_reason,
+            )
+        self._initialize_publication_admission(pr, evidence)
+
+    def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
+        """Refresh the feedback floor from current-head publication evidence."""
+        self._initialize_publication_admission(pr)
         evidence = gh_prs.get_pr_head_publication(
             self.owner_repo, pr.number, expected_head_sha=pr.head_sha
         )
