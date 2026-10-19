@@ -66,6 +66,11 @@ async def enqueue(redis: Any, repo: str, binding: str) -> MigrationCommand:
     key = command_key(repo, binding)
 
     async def transaction(pipe: Any) -> MigrationCommand:
+        # Read the pointer first. If another confirmation commits between
+        # these reads, the following receipt read sees its atomic write.
+        # Reading the receipt first could see it absent, then see the new
+        # pointer and raise before Redis gets a chance to retry the WATCH.
+        prior = await pipe.get(pointer)
         existing = await pipe.get(key)
         if existing:
             receipt = MigrationCommand.model_validate_json(existing)
@@ -80,7 +85,6 @@ async def enqueue(redis: Any, repo: str, binding: str) -> MigrationCommand:
             raise MigrationChanged("Publication observation cannot be confirmed; refresh the page.")
         if migration_binding(observation) != binding or state.name != repo:
             raise MigrationChanged("Displayed publication observation changed; refresh the page.")
-        prior = await pipe.get(pointer)
         if prior:
             raise MigrationChanged("Another publication migration command is pending.")
         command = MigrationCommand(binding=binding, observation=observation.model_copy(deep=True))
