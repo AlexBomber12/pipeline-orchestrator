@@ -253,11 +253,48 @@ class WatchMixin:
         # Retry rehydrate every cycle so a transient commit-time fetch
         # failure during ``recover_state`` doesn't permanently leave
         # ``_last_push_at`` unset.
-        if (
+        if found.publication_observed:
+            if self.state.publication_migration is not None:
+                self._offer_publication_migration(
+                    found,
+                    gh_prs.HeadPublicationEvidence(
+                        repo=found.publication_repo, pr_number=found.number,
+                        head_repo=found.publication_head_repo, ref=found.publication_ref,
+                        head_sha=found.publication_head_sha,
+                        published_at=found.publication_at,
+                        provenance=found.publication_provenance,
+                        unknown_reason=found.publication_reason,
+                    ),
+                )
+            published_at, reason = self._validate_publication_observation(
+                found.number, found.head_sha,
+                found.publication_at, found.publication_reason,
+                head_repo=found.publication_head_repo,
+                ref=found.publication_ref,
+                observed_repo=found.publication_repo,
+                observed_head_sha=found.publication_head_sha,
+                provenance=found.publication_provenance,
+            )
+            found.publication_at = published_at
+            found.publication_reason = reason
+            if published_at is None and found.review_status == ReviewStatus.APPROVED:
+                found.review_status = ReviewStatus.PENDING
+            self._last_push_at = published_at
+            self._last_push_at_pr_number = found.number
+            self._last_push_at_head_sha = (
+                found.head_sha if published_at is not None else None
+            )
+            self._push_provenance_reason = reason
+        elif (
             self._last_push_at is None
             or self._last_push_at_pr_number != found.number
+            or current_pr.head_sha != found.head_sha
         ):
             self._rehydrate_last_push_at(found)
+        else:
+            # Legacy/synthetic PRInfo without a poll observation can reuse
+            # an in-memory baseline only for the unchanged PR and HEAD.
+            self._last_push_at_head_sha = found.head_sha
 
         await self._maybe_reclassify_stuck_pending(found)
         await self._scan_pr_diff_once()
@@ -269,6 +306,8 @@ class WatchMixin:
             self.repo_config.allow_merge_without_review
             and review == ReviewStatus.PENDING
         )
+        if found.publication_observed and found.publication_at is None:
+            review_allows_merge = False
         if ci == CIStatus.SUCCESS and review_allows_merge:
             # PR-290a follow-up: ``_scan_pr_diff_once`` only updates
             # ``diff_scanned_at_sha`` on a successful fetch + scan; a
@@ -894,9 +933,18 @@ class WatchMixin:
         )
         current_pr = self.state.current_pr
         last_activity = self._last_push_at
-        if last_activity is None and current_pr.ci_status != CIStatus.FAILURE:
-            self._fix_review_limitation = "push provenance unavailable"
-            self.log_event("[WATCH] Review feedback pending: push provenance unavailable.")
+        if (
+            self._last_push_at_pr_number != current_pr.number
+            or self._last_push_at_head_sha != current_pr.head_sha
+        ):
+            last_activity = None
+        if last_activity is None:
+            self._fix_review_limitation = getattr(
+                self, "_push_provenance_reason", None
+            ) or "push provenance unavailable"
+            self.log_event(
+                f"[WATCH] Review feedback pending: {self._fix_review_limitation}."
+            )
             return FeedbackCheckResult.UNKNOWN
         evidence = gh_reviews.cached_review_feedback(
             self.owner_repo, current_pr.number, current_pr.head_sha, reviewer_policy,
@@ -917,8 +965,6 @@ class WatchMixin:
             self._fix_review_limitation = reason
             self.log_event(f"[WATCH] Review feedback pending: {reason}.")
             return FeedbackCheckResult.UNKNOWN
-        if last_activity is None:
-            self._fix_review_limitation = "push provenance unavailable; findings came from the current status poll"
         if not evidence.findings:
             return FeedbackCheckResult.NONE
         if last_activity is not None and last_activity.tzinfo is None:
@@ -970,10 +1016,15 @@ class WatchMixin:
                 pr_number, "review-status", f"{prefix}review_status {current_pr.review_status.value} not eligible."
             )
 
-        last_push_age_seconds = gh_prs.get_last_push_age_seconds(
-            self.owner_repo,
-            pr_number,
-        )
+        if current_pr.publication_observed:
+            last_push_age_seconds = (
+                max(0.0, (datetime.now(timezone.utc) - current_pr.publication_at).total_seconds())
+                if current_pr.publication_at is not None else None
+            )
+        else:
+            last_push_age_seconds = gh_prs.get_last_push_age_seconds(
+                self.owner_repo, pr_number,
+            )
         if last_push_age_seconds is None:
             return self._stale_skip(pr_number, "last-push-age", f"{prefix}last_push_age unavailable.")
 

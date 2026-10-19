@@ -16,6 +16,7 @@ from typing import Any
 import pytest
 from src.cancellation import CancellationCause
 from src.cancellation.storage import cause_key, current_run_started_at_key
+from src.keyspace import pipeline_state
 from src.models import PipelineState, QueueTask, TaskStatus
 
 from tests.runner import _helpers as h
@@ -190,6 +191,9 @@ def test_dispatch_redis_failure_falls_back_to_crash_branch(
     runner = _crashed_doing_runner(monkeypatch)
 
     async def boom(key: str) -> Any:
+        # Snapshot hydration must succeed before cancellation cause dispatch.
+        if key == pipeline_state(runner.name):
+            return None
         raise RuntimeError("redis down")
 
     runner.redis.get = boom  # type: ignore[method-assign]

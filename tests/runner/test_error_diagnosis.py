@@ -908,7 +908,7 @@ def test_handle_error_commits_and_pushes_diagnose_fixes(monkeypatch: pytest.Monk
     assert runner.state.current_pr.push_count == 1
     assert runner.state.current_pr.observed_head_shas == {"abc123"}
     assert runner.state.current_pr.last_activity is not None
-    assert runner._last_push_at is not None
+    assert runner._last_push_at is None  # Synthetic SHA has no remote publication proof.
     assert runner._last_push_at_pr_number == 119
     assert review_requests == [119]
     assert [cmd[0] for cmd in calls] == [
@@ -957,7 +957,7 @@ def test_handle_error_errors_when_review_trigger_fails_after_diagnose_push(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.push_count == 1
     assert runner.state.current_pr.observed_head_shas == {"abc123"}
-    assert runner._last_push_at is not None
+    assert runner._last_push_at is None  # Synthetic SHA has no remote publication proof.
     assert runner._last_push_at_pr_number == 119
     assert review_requests == [119]
     assert [cmd[0] for cmd in calls] == [

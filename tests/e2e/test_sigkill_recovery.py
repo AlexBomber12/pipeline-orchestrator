@@ -68,8 +68,26 @@ def test_sigkill_during_coding_recovers_correctly(
         status = upload_zip(zip_path)
         assert status in (200, 201), f"upload failed with status {status}"
 
-        # Shared testbed dispatch was observed at ~39 seconds, so 30 seconds raced CODING.
-        pre_kill_entry = wait_for_state(["CODING"], timeout_sec=60)
+        # GitHub merged-PR lookup can retry after a 30-second timeout, and
+        # the daemon polls every 60 seconds. Wait through both before failing.
+        deadline = time.monotonic() + 150
+        pre_kill_entry = None
+        last_state = None
+        last_task_pr_id = None
+        while time.monotonic() < deadline:
+            entry = get_state()
+            if entry is not None:
+                last_state = entry.get("state")
+                task = entry.get("current_task") or {}
+                last_task_pr_id = task.get("pr_id")
+                if last_state == "CODING" and last_task_pr_id == expected_pr_id:
+                    pre_kill_entry = entry
+                    break
+            time.sleep(1)
+        assert pre_kill_entry is not None, (
+            f"daemon did not enter CODING on {expected_pr_id!r} within 150s; "
+            f"last_state={last_state!r}, last_task_pr_id={last_task_pr_id!r}"
+        )
         pre_kill_last_updated = pre_kill_entry.get("last_updated")
         assert pre_kill_last_updated, (
             f"pre-kill CODING state has no last_updated: {pre_kill_entry!r}"

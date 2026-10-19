@@ -1,0 +1,33 @@
+{% if repo.publication_migration %}
+{% set migration = repo.publication_migration %}
+<section class="mb-6 rounded-lg border border-warn/30 bg-warn/10 p-4" data-publication-migration>
+    <h3 class="text-sm font-semibold text-warn">Publication trust anchor needed</h3>
+    <p class="mt-1 text-xs text-gray-200">{{ migration.reason }}</p>
+    <dl class="mt-3 space-y-1 break-all font-mono text-xs text-gray-300">
+        <div>Repository: {{ migration.repo }}</div>
+        <div>PR: #{{ migration.pr_number }}</div>
+        <div>Head repository: {{ migration.head_repo or 'unavailable' }}</div>
+        <div>Ref: {{ migration.ref }}</div>
+        <div>HEAD: {{ migration.head_sha }}</div>
+        <div>Publication: {{ migration.published_at.isoformat() if migration.published_at else 'unavailable' }}</div>
+        <div>Evidence: {{ migration.provenance or 'unavailable' }}</div>
+    </dl>
+    {% if publication_migration_command %}
+    <p class="mt-3 text-xs text-gray-200" data-migration-command-status="{{ publication_migration_command.status }}">
+        Command {{ publication_migration_command.status }}: {{ publication_migration_command.reason }}
+    </p>
+    {% endif %}
+    {% if publication_migration_confirmable and (not publication_migration_command or publication_migration_command.status == 'failed') %}
+    <button class="secondary-interactive mt-3 rounded border border-warn/50 px-3 py-1 text-xs text-warn"
+            hx-post="/repos/{{ repo.name }}/publication-migration/confirm"
+            hx-vals='{"binding": "{{ publication_migration_binding }}"}'
+            hx-confirm="Accept this exact GitHub publication observation as the initial safety floor for PR #{{ migration.pr_number }}? Current evidence, CI and review checks still apply."
+            hx-target="closest section" hx-swap="outerHTML">
+        Confirm initial publication floor
+    </button>
+    {% elif not publication_migration_command %}
+    <p class="mt-3 text-xs text-warn">Confirmation is unavailable until complete, matching publication evidence is observed.</p>
+    {% endif %}
+</section>
+{% endif %}
+

@@ -32,7 +32,9 @@ from src.models import (
     FeedbackCheckResult,
     PipelineState,
     PRInfo,
+    PublicationWatermark,
     QueueTask,
+    RepoState,
     ReviewStatus,
     TaskStatus,
 )
@@ -2042,7 +2044,7 @@ def test_handle_fix_finishes_push_bookkeeping_before_stop_cancel_pause(
     assert runner.state.current_pr.push_count == 1
     assert runner.state.current_pr.fix_iteration_count == 1
     assert runner.state.current_pr.last_activity is not None
-    assert runner._last_push_at is not None
+    assert runner._last_push_at is None
     assert runner._last_push_at_pr_number == 42
     assert posted == [42]
     assert saved_logs == [("", "", "FIX FEEDBACK output [claude]")]
@@ -2737,7 +2739,7 @@ def test_handle_fix_external_merge_when_coder_exits_during_grace(
     assert any("merged externally during FIX" in e["event"] for e in runner.state.history)
 
 
-def test_handle_fix_records_last_push_at(
+def test_handle_fix_leaves_last_push_unknown_without_remote_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """handle_fix must set ``_last_push_at`` so the next handle_watch can
@@ -2757,12 +2759,9 @@ def test_handle_fix_records_last_push_at(
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=7, branch="pr-001")
-    before = datetime.now(timezone.utc)
     asyncio.run(runner.handle_fix())
-    after = datetime.now(timezone.utc)
 
-    assert runner._last_push_at is not None
-    assert before <= runner._last_push_at <= after
+    assert runner._last_push_at is None
 
 
 def test_handle_fix_uses_async(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2922,16 +2921,13 @@ def test_handle_fix_counts_push_when_head_changes(
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=50, branch="pr-050")
-    before = datetime.now(timezone.utc)
     asyncio.run(runner.handle_fix())
-    after = datetime.now(timezone.utc)
 
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.commits_count == 0
     assert runner.state.current_pr.push_count == 1
-    assert runner._last_push_at is not None
-    assert before <= runner._last_push_at <= after
+    assert runner._last_push_at is None
 
 
 def test_handle_fix_error_on_rev_parse_after_failure(
@@ -4124,9 +4120,16 @@ def test_codex_review_not_reposted_when_author_already_requested_review(
         },
     )
     monkeypatch.setattr(
+        "src.github.prs.get_pr_head_publication",
+        lambda *_a, **_kw: _publication_evidence(
+            datetime(2026, 4, 18, 0, 0, tzinfo=timezone.utc), "head-1"
+        ),
+    )
+    monkeypatch.setattr(
         "src.github.comments.has_recent_codex_review_request",
         lambda repo, number, pr_author, within_minutes=5, after_iso=None: (
-            repo == runner.owner_repo and number == 42 and pr_author == "alice" and after_iso == "2026-04-17T23:14:11Z"
+            repo == runner.owner_repo and number == 42 and pr_author == "alice"
+            and after_iso == "2026-04-18T00:00:00+00:00"
         ),
     )
     monkeypatch.setattr(
@@ -4156,6 +4159,12 @@ def test_codex_review_result_returns_retry_at_for_author_dedup(
             "head_sha": "head-1",
             "head_commit_date": "2026-04-17T23:14:11Z",
         },
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_pr_head_publication",
+        lambda *_a, **_kw: _publication_evidence(
+            datetime(2026, 4, 18, 0, 0, tzinfo=timezone.utc), "head-1"
+        ),
     )
     monkeypatch.setattr(
         hung_module,
@@ -5069,20 +5078,18 @@ def test_maybe_retrigger_stale_review_returns_for_missing_push_age(
     assert runner.state.last_stale_retrigger_at is None
 
 
-def test_rehydrate_last_push_at_from_head_commit(
+def test_rehydrate_last_push_at_from_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Restart recovery must seed ``_last_push_at`` from the head commit
-    committer date so the stale-feedback guard does not immediately
-    trigger FIX on the first post-restart cycle."""
+    """Restart recovery seeds the feedback floor from publication evidence."""
     head_iso = "2026-04-14T20:00:00Z"
     monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
+        "src.github.prs.get_pr_head_publication",
+        lambda *_a, **_kw: _publication_evidence(datetime.fromisoformat(head_iso.replace("Z", "+00:00"))),
     )
     runner = h._make_runner()
     assert runner._last_push_at is None
-    pr = PRInfo(number=99, branch="pr-001")
+    pr = PRInfo(number=99, branch="pr-001", head_sha="a" * 40)
     runner._rehydrate_last_push_at(pr)
     assert runner._last_push_at is not None
     assert runner._last_push_at.isoformat() == "2026-04-14T20:00:00+00:00"
@@ -5096,10 +5103,8 @@ def test_rehydrate_last_push_at_no_fallback_to_last_activity(
     on Codex comments, so using it could seed _last_push_at to AFTER a
     pending P1/P2 comment and silently skip the fix. Leaving it None
     lets handle_watch retry the rehydrate next cycle."""
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": ""},
-    )
+    monkeypatch.setattr("src.github.prs.get_pr_head_publication",
+                        lambda *_a, **_kw: _publication_evidence(None))
     fallback = datetime(2026, 4, 1, 10, 0, tzinfo=timezone.utc)
     pr = PRInfo(number=99, branch="pr-001", last_activity=fallback)
     runner = h._make_runner()
@@ -5116,8 +5121,8 @@ def test_rehydrate_replaces_last_push_at_on_different_pr(
     feedback on the new PR look stale."""
     head_iso = "2026-04-10T12:00:00Z"
     monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
+        "src.github.prs.get_pr_head_publication",
+        lambda *_a, **_kw: _publication_evidence(datetime.fromisoformat(head_iso.replace("Z", "+00:00"))),
     )
     runner = h._make_runner()
     # Simulate a stale last_push_at from a previously-tracked PR (newer
@@ -5125,7 +5130,7 @@ def test_rehydrate_replaces_last_push_at_on_different_pr(
     runner._last_push_at = datetime(2026, 4, 20, tzinfo=timezone.utc)
     runner._last_push_at_pr_number = 999
 
-    runner._rehydrate_last_push_at(PRInfo(number=42, branch="pr-new"))
+    runner._rehydrate_last_push_at(PRInfo(number=42, branch="pr-new", head_sha="a" * 40))
 
     assert runner._last_push_at_pr_number == 42
     assert runner._last_push_at is not None
@@ -5174,6 +5179,8 @@ def test_has_new_feedback_returns_true_for_trusted_comment_after_push(
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
     runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 42
+    runner._last_push_at_head_sha = ""
 
     monkeypatch.setattr(
         "src.github.cache._gh_api_paginated",
@@ -5196,6 +5203,8 @@ def test_has_new_feedback_returns_false_for_old_comments(
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
     runner._last_push_at = datetime(2026, 1, 1, 1, 0, 0, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 42
+    runner._last_push_at_head_sha = ""
 
     monkeypatch.setattr(
         "src.github.cache._gh_api_paginated",
@@ -5217,6 +5226,8 @@ def test_has_new_feedback_normalizes_naive_timestamps(
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
     runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0)
+    runner._last_push_at_pr_number = 42
+    runner._last_push_at_head_sha = ""
 
     monkeypatch.setattr(
         "src.github.cache._gh_api_paginated",
@@ -5239,6 +5250,8 @@ def test_has_new_feedback_ignores_non_codex_users(
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
     runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 42
+    runner._last_push_at_head_sha = ""
 
     monkeypatch.setattr(
         "src.github.cache._gh_api_paginated",
@@ -5260,6 +5273,8 @@ def test_has_new_feedback_skips_unparseable_codex_comment(
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=42, branch="pr-fix")
     runner._last_push_at = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 42
+    runner._last_push_at_head_sha = ""
 
     monkeypatch.setattr(
         "src.github.cache._gh_api_paginated",
@@ -5550,221 +5565,236 @@ def test_verify_pushes_since_returns_false_when_remote_diverged(
     assert result is False
 
 
-def test_canonical_push_timestamp_helper_returns_parsed_iso(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The helper parses the GitHub committer date returned by get_pr_metadata."""
-    head_iso = "2026-05-10T02:32:43Z"
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {
-            "author": "",
-            "head_sha": "abc123",
-            "head_commit_date": head_iso,
-        },
+def _publication_evidence(at: datetime | None, head_sha: str = "a" * 40):
+    from types import SimpleNamespace
+    return SimpleNamespace(
+        repo="octo/demo", pr_number=407, head_repo="octo/demo",
+        ref="refs/heads/pr-407", head_sha=head_sha,
+        published_at=at, unknown_reason=None if at else "unavailable",
     )
 
-    runner = h._make_runner()
-    result = runner._canonical_push_timestamp(407)
 
-    assert result.isoformat() == "2026-05-10T02:32:43+00:00"
-
-
-def test_canonical_push_timestamp_helper_falls_back_to_now_on_failure(
+def test_canonical_push_timestamp_uses_current_head_publication(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When the GitHub fetch raises, the helper returns datetime.now(UTC)."""
-    def raise_runtime(repo: str, number: int) -> dict:
-        raise RuntimeError("github unreachable")
-
-    monkeypatch.setattr("src.github.prs.get_pr_metadata", raise_runtime)
-
+    expected = datetime(2026, 5, 10, 2, 32, 43, tzinfo=timezone.utc)
+    seen: list[str] = []
+    def publication(repo: str, number: int, *, expected_head_sha: str):
+        seen.append(expected_head_sha)
+        return _publication_evidence(expected, expected_head_sha)
+    monkeypatch.setattr("src.github.prs.get_pr_head_publication", publication)
     runner = h._make_runner()
-    before = datetime.now(timezone.utc)
-    result = runner._canonical_push_timestamp(407)
-    after = datetime.now(timezone.utc)
+    runner.state.current_pr = PRInfo(number=407, branch="pr-407", head_sha="a" * 40)
+    assert runner._canonical_push_timestamp(407) == expected
+    assert seen == ["a" * 40]
+    assert runner._last_push_at_head_sha == "a" * 40
 
-    assert before <= result <= after
 
-
-def test_canonical_push_timestamp_helper_attaches_utc_to_naive_datetime(
+def test_canonical_push_timestamp_unknown_does_not_use_wall_clock_or_old_floor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A naive ISO timestamp is normalized to UTC so downstream comparisons
-    against tz-aware Codex comment timestamps don't raise TypeError."""
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {
-            "author": "",
-            "head_sha": "abc123",
-            "head_commit_date": "2026-05-10T02:32:43",
-        },
-    )
-
+    monkeypatch.setattr("src.github.prs.get_pr_head_publication",
+                        lambda *_a, **_kw: _publication_evidence(None))
     runner = h._make_runner()
-    result = runner._canonical_push_timestamp(407)
+    runner.state.current_pr = PRInfo(number=407, branch="pr-407", head_sha="b" * 40)
+    runner._last_push_at = datetime(2026, 5, 10, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 407
+    runner._last_push_at_head_sha = "a" * 40
+    assert runner._canonical_push_timestamp(407) is None
+    assert runner._last_push_at_head_sha is None
 
-    assert result.tzinfo is timezone.utc
-    assert result.isoformat() == "2026-05-10T02:32:43+00:00"
 
-
-def test_record_fix_push_uses_committer_date_when_metadata_available(
+def test_canonical_push_timestamp_refuses_other_pr_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``record_fix_push`` seeds ``_last_push_at`` from the GitHub committer
-    date so a Codex review submitted seconds after the actual push remains
-    visible to ``_has_new_codex_feedback_since_last_push`` (PR #407 bug)."""
+    monkeypatch.setattr("src.github.prs.get_pr_head_publication",
+                        lambda *_a, **_kw: pytest.fail("must not read another PR"))
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=400, branch="pr-400", head_sha="a" * 40)
+    assert runner._canonical_push_timestamp(407) is None
+
+
+def test_record_fix_push_uses_publication_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
-    monkeypatch.setattr(
-        "src.github.comments.post_comment",
-        lambda repo, number, body: None,
-    )
-    head_iso = "2026-05-10T02:32:43Z"
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {
-            "author": "",
-            "head_sha": "head-after-def",
-            "head_commit_date": head_iso,
-        },
-    )
-
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *_: None)
+    expected = datetime(2026, 5, 10, 2, 32, 43, tzinfo=timezone.utc)
+    seen: list[str] = []
+    def publication(repo: str, number: int, *, expected_head_sha: str):
+        seen.append(expected_head_sha)
+        return _publication_evidence(expected, expected_head_sha)
+    monkeypatch.setattr("src.github.prs.get_pr_head_publication", publication)
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=407, branch="pr-407")
-
     asyncio.run(runner.handle_fix())
-
-    assert runner._last_push_at is not None
-    assert runner._last_push_at.isoformat() == "2026-05-10T02:32:43+00:00"
+    assert runner._last_push_at == expected
     assert runner._last_push_at_pr_number == 407
+    assert seen == ["head-after-def", "head-after-def"]
 
 
-def test_record_fix_push_falls_back_to_now_on_metadata_failure(
+def test_record_fix_push_unknown_does_not_fabricate_baseline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If ``get_pr_metadata`` raises during ``record_fix_push`` the daemon
-    keeps the WATCH cycle live by seeding ``_last_push_at`` to now()."""
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        claude_cli, "fix_review_async", h._async_cli_result(0, "", "")
-    )
-    monkeypatch.setattr(
-        "src.github.comments.post_comment",
-        lambda repo, number, body: None,
-    )
-
-    def raise_runtime(repo: str, number: int) -> dict:
-        raise RuntimeError("github unreachable")
-
-    monkeypatch.setattr("src.github.prs.get_pr_metadata", raise_runtime)
-
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *_: None)
+    monkeypatch.setattr("src.github.prs.get_pr_head_publication",
+                        lambda *_a, **_kw: _publication_evidence(None))
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=407, branch="pr-407")
-
-    before = datetime.now(timezone.utc)
     asyncio.run(runner.handle_fix())
-    after = datetime.now(timezone.utc)
-
-    assert runner._last_push_at is not None
-    assert before - timedelta(seconds=2) <= runner._last_push_at <= after + timedelta(seconds=2)
+    assert runner._last_push_at is None
 
 
-def test_canonical_push_timestamp_helper_does_not_move_baseline_backwards(
+def test_canonical_push_timestamp_can_move_backwards_for_new_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Codex P1 on PR #408: a rebase or cherry-pick can produce a HEAD
-    whose committer date predates the actual push. The helper must
-    never move ``_last_push_at`` below the existing baseline for the
-    same PR, otherwise old Codex comments would re-appear as new
-    feedback and cause false FIX retriggers."""
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {
-            "author": "",
-            "head_sha": "rebased",
-            "head_commit_date": "2026-05-10T01:50:00Z",
-        },
+    proven = datetime(2026, 5, 10, 1, 50, tzinfo=timezone.utc)
+    monkeypatch.setattr("src.github.prs.get_pr_head_publication",
+                        lambda *_a, **_kw: _publication_evidence(proven, "b" * 40))
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=407, branch="pr-407", head_sha="b" * 40)
+    runner._last_push_at = datetime(2026, 5, 10, 2, 30, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 407
+    runner._last_push_at_head_sha = "a" * 40
+    assert runner._canonical_push_timestamp(407) == proven
+
+
+def test_canonical_push_timestamp_rejects_backward_same_head_proof(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    older = datetime(2026, 5, 10, 1, 50, tzinfo=timezone.utc)
+    monkeypatch.setattr("src.github.prs.get_pr_head_publication",
+                        lambda *_a, **_kw: _publication_evidence(older))
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=407, branch="pr-407", head_sha="a" * 40)
+    runner._last_push_at = datetime(2026, 5, 10, 2, 30, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 407
+    runner._last_push_at_head_sha = "a" * 40
+    assert runner._canonical_push_timestamp(407) is None
+    assert runner._last_push_at_head_sha is None
+    runner._last_push_at = None
+    assert runner._canonical_push_timestamp(407) is None
+
+
+def test_publication_watermark_is_scoped_to_head_repo_and_ref() -> None:
+    runner = h._make_runner()
+    later = datetime(2026, 5, 10, 2, 30, tzinfo=timezone.utc)
+    earlier = datetime(2026, 5, 10, 1, 50, tzinfo=timezone.utc)
+    head = "a" * 40
+    assert runner._validate_publication_observation(
+        407, head, later, None,
+        head_repo="owner/first", ref="refs/heads/first",
+        observed_repo=runner.owner_repo, observed_head_sha=head,
+    ) == (later, None)
+    assert runner._validate_publication_observation(
+        407, head, earlier, None,
+        head_repo="owner/first", ref="refs/heads/second",
+        observed_repo=runner.owner_repo, observed_head_sha=head,
+    ) == (earlier, None)
+    assert runner._validate_publication_observation(
+        407, head, earlier, None,
+        head_repo="owner/second", ref="refs/heads/second",
+        observed_repo=runner.owner_repo, observed_head_sha=head,
+    ) == (earlier, None)
+
+
+def test_publication_watermark_rejects_naive_timestamp() -> None:
+    runner = h._make_runner()
+    assert runner._validate_publication_observation(
+        407, "a" * 40, datetime(2026, 5, 10, 2, 30), None,
+    ) == (None, "publication timestamp missing timezone")
+
+
+def test_publication_watermark_survives_contextless_unknown_read() -> None:
+    runner = h._make_runner()
+    head = "a" * 40
+    newer = datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    older = datetime(2026, 10, 17, 21, 6, tzinfo=timezone.utc)
+    context = {"head_repo": "owner/name", "ref": "refs/heads/feature",
+               "observed_repo": runner.owner_repo, "observed_head_sha": head}
+    assert runner._validate_publication_observation(42, head, newer, None, **context) == (newer, None)
+    assert runner._validate_publication_observation(
+        42, head, older, "activity contradictory", **context,
+    ) == (None, "activity contradictory")
+    assert runner._publication_high_water_at == newer
+    assert runner._validate_publication_observation(
+        42, head, None, "head context unavailable"
+    ) == (None, "head context unavailable")
+    assert runner._publication_high_water_at == newer
+    assert runner._validate_publication_observation(42, head, older, None, **context) == (
+        None, "publication time moved backward for unchanged branch"
+    )
+    # An unknown read for a new HEAD cannot erase the branch's safety floor.
+    assert runner._validate_publication_observation(42, "b" * 40, None, "unknown") == (None, "unknown")
+    assert runner._publication_high_water_at == newer
+
+
+def test_publication_watermark_rejects_reused_sha_after_force_push() -> None:
+    runner = h._make_runner()
+    first = datetime(2026, 10, 17, 21, 5, tzinfo=timezone.utc)
+    second = datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    context = {"head_repo": "owner/name", "ref": "refs/heads/feature",
+               "observed_repo": runner.owner_repo}
+
+    def observe(sha: str, at: datetime) -> tuple[datetime | None, str | None]:
+        return runner._validate_publication_observation(
+            42, sha, at, None, **context, observed_head_sha=sha,
+        )
+
+    assert observe("a" * 40, first) == (first, None)
+    assert observe("b" * 40, second) == (second, None)
+    assert observe("a" * 40, first) == (
+        None, "publication time moved backward for unchanged branch",
+    )
+    assert runner._publication_high_water_at == second
+    assert runner.state.publication_watermark.head_sha == "b" * 40
+    assert runner.state.publication_watermark.published_at == second
+
+
+def test_recovery_keeps_branch_floor_from_prior_head() -> None:
+    runner = h._make_runner()
+    floor = datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    old = datetime(2026, 10, 17, 21, 5, tzinfo=timezone.utc)
+    current = "a" * 40
+    saved = RepoState(
+        url=runner.state.url, name=runner.name,
+        current_pr=PRInfo(number=42, branch="feature", head_sha=current),
+        publication_watermark=PublicationWatermark(
+            repo=runner.owner_repo, pr_number=42, head_repo=runner.owner_repo,
+            ref="refs/heads/feature", head_sha="b" * 40, published_at=floor,
+        ),
     )
 
-    runner = h._make_runner()
-    runner._last_push_at = datetime(2026, 5, 10, 2, 30, 0, tzinfo=timezone.utc)
-    runner._last_push_at_pr_number = 407
+    runner._restore_publication_watermark(saved)
 
-    result = runner._canonical_push_timestamp(407)
+    assert runner._publication_high_water_at == floor
+    assert runner._validate_publication_observation(
+        42, current, old, None, head_repo=runner.owner_repo,
+        ref="refs/heads/feature", observed_repo=runner.owner_repo,
+        observed_head_sha=current,
+    ) == (None, "publication time moved backward for unchanged branch")
 
-    assert result == datetime(2026, 5, 10, 2, 30, 0, tzinfo=timezone.utc)
 
-
-def test_canonical_push_timestamp_helper_preserves_baseline_on_fetch_failure(
+def test_no_push_branch_uses_publication_evidence_when_available(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When GitHub is unreachable but a same-PR baseline exists, keep
-    the baseline instead of advancing to wall clock — wall clock would
-    re-introduce the PR #407 masking bug."""
-    def raise_runtime(repo: str, number: int) -> dict:
-        raise RuntimeError("github unreachable")
-
-    monkeypatch.setattr("src.github.prs.get_pr_metadata", raise_runtime)
-
-    runner = h._make_runner()
-    baseline = datetime(2026, 5, 10, 2, 30, 0, tzinfo=timezone.utc)
-    runner._last_push_at = baseline
-    runner._last_push_at_pr_number = 407
-
-    result = runner._canonical_push_timestamp(407)
-
-    assert result == baseline
-
-
-def test_canonical_push_timestamp_helper_ignores_baseline_from_other_pr(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A baseline recorded against a different PR must not influence
-    the new PR's timestamp — each PR has its own monotonic timeline."""
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {
-            "author": "",
-            "head_sha": "abc123",
-            "head_commit_date": "2026-05-10T01:00:00Z",
-        },
-    )
-
-    runner = h._make_runner()
-    runner._last_push_at = datetime(2026, 5, 10, 5, 0, 0, tzinfo=timezone.utc)
-    runner._last_push_at_pr_number = 400
-
-    result = runner._canonical_push_timestamp(407)
-
-    assert result == datetime(2026, 5, 10, 1, 0, 0, tzinfo=timezone.utc)
-
-
-def test_no_push_branch_uses_committer_date_when_available(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The no-push fallback also seeds ``_last_push_at`` from the committer
-    date so a wall-clock advance during a no-push FIX cycle cannot mask a
-    pending Codex review on the unchanged head."""
+    """No-push FIX retains the proven remote publication floor."""
     h._patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
-    head_iso = "2026-05-10T02:30:00Z"
+    head_at = datetime(2026, 5, 10, 2, 30, tzinfo=timezone.utc)
     monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {
-            "author": "",
-            "head_sha": "abc123",
-            "head_commit_date": head_iso,
-        },
+        "src.github.prs.get_pr_head_publication",
+        lambda *_a, **_kw: _publication_evidence(head_at, "abc123"),
     )
 
     runner = h._make_runner()
     runner._app_config = h._app_cfg(fix_no_push_cap=3)
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(number=407, branch="pr-407")
+    runner.state.current_pr = PRInfo(number=407, branch="pr-407", head_sha="abc123")
 
     asyncio.run(runner.handle_fix())
 
@@ -5772,4 +5802,51 @@ def test_no_push_branch_uses_committer_date_when_available(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.no_push_fix_count == 1
     assert runner._last_push_at is not None
-    assert runner._last_push_at.isoformat() == "2026-05-10T02:30:00+00:00"
+    assert runner._last_push_at == head_at
+
+
+@pytest.mark.parametrize(
+    ("observation", "reason"),
+    [
+        ({"observed_head_sha": "b" * 40}, "publication identity unavailable or mismatched"),
+        ({"observed_repo": "other/repo"}, "publication identity unavailable or mismatched"),
+        ({"head_repo": ""}, "publication identity unavailable or mismatched"),
+        ({"ref": ""}, "publication identity unavailable or mismatched"),
+    ],
+)
+def test_publication_watermark_rejects_unverified_observation_identity(
+    observation: dict[str, str], reason: str,
+) -> None:
+    runner = h._make_runner()
+    head = "a" * 40
+    later = datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    older = datetime(2026, 10, 17, 21, 6, tzinfo=timezone.utc)
+    context = {"head_repo": "octo/demo", "ref": "refs/heads/feature",
+               "observed_repo": runner.owner_repo, "observed_head_sha": head}
+    assert runner._validate_publication_observation(42, head, later, None, **context) == (later, None)
+    assert runner._validate_publication_observation(
+        42, head, older, None, **(context | observation),
+    ) == (None, reason)
+    assert runner._publication_high_water_at == later
+    assert runner._validate_publication_observation(42, head, older, None, **context) == (
+        None, "publication time moved backward for unchanged branch"
+    )
+
+
+def test_publication_watermark_resets_only_for_bound_target_change() -> None:
+    runner = h._make_runner()
+    later = datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    older = datetime(2026, 10, 17, 21, 6, tzinfo=timezone.utc)
+    first = {"head_repo": "octo/demo", "ref": "refs/heads/first",
+             "observed_repo": runner.owner_repo, "observed_head_sha": "a" * 40}
+    assert runner._validate_publication_observation(42, "a" * 40, later, None, **first) == (later, None)
+    assert runner._validate_publication_observation(43, "a" * 40, older, None, **first) == (older, None)
+    assert runner._validate_publication_observation(
+        43, "b" * 40, older, None, **(first | {"observed_head_sha": "b" * 40})
+    ) == (older, None)
+    assert runner._validate_publication_observation(
+        43, "b" * 40, older, None, head_repo="octo/other", ref="refs/heads/second",
+        observed_repo=runner.owner_repo, observed_head_sha="b" * 40,
+    ) == (older, None)
+    assert runner.state.publication_watermark.head_repo == "octo/other"
+    assert runner.state.publication_watermark.ref == "refs/heads/second"

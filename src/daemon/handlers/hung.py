@@ -21,7 +21,7 @@ def _author_already_requested_review(
     owner_repo: str,
     pr_number: int,
     pr_author: str,
-    head_commit_date: str,
+    publication_iso: str,
 ) -> bool:
     """Treat author-trigger dedup as best-effort and fail open."""
     try:
@@ -29,7 +29,7 @@ def _author_already_requested_review(
             owner_repo,
             pr_number,
             pr_author=pr_author,
-            after_iso=head_commit_date,
+            after_iso=publication_iso,
         )
     except Exception:
         return False
@@ -39,7 +39,7 @@ def _author_recent_review_requested_at(
     owner_repo: str,
     pr_number: int,
     pr_author: str,
-    head_commit_date: str,
+    publication_iso: str,
 ) -> datetime | None:
     """Best-effort timestamp for a recent PR-author trigger on this head."""
     try:
@@ -47,7 +47,7 @@ def _author_recent_review_requested_at(
             owner_repo,
             pr_number,
             pr_author=pr_author,
-            after_iso=head_commit_date,
+            after_iso=publication_iso,
         )
     except Exception:
         return None
@@ -71,7 +71,7 @@ class HungMixin:
         commits routinely carry committer dates older than the push that
         actually published them, so committer-date gating could classify
         a stale EYES reaction as fresh on a brand-new push and silently
-        skip the trigger. The activity API's ``pushed_at`` reflects when
+        skip the trigger. The activity API's ``timestamp`` records when
         the branch was actually updated, which is what the gate needs.
 
         Fails open (returns ``False``) on any GitHub API error or when
@@ -98,15 +98,32 @@ class HungMixin:
         if not eyes_reactions:
             return False
         try:
-            last_push_time = gh_prs.get_pr_last_push_time(
+            current_pr = self.state.current_pr
+            if current_pr is None or current_pr.number != pr_number:
+                return False
+            bound_head_sha = current_pr.head_sha
+            if not bound_head_sha:
+                bound_head_sha = git_ops._git(
+                    self.repo_path, "rev-parse", "HEAD"
+                ).stdout.strip()
+            if not bound_head_sha:
+                return False
+            evidence = gh_prs.get_pr_head_publication(
                 self.owner_repo, pr_number,
+                expected_head_sha=bound_head_sha,
+            )
+            last_push_time, _ = self._validate_publication_observation(
+                pr_number, bound_head_sha, evidence.published_at,
+                getattr(evidence, "unknown_reason", None),
+                head_repo=getattr(evidence, "head_repo", ""),
+                ref=getattr(evidence, "ref", ""),
+                observed_repo=getattr(evidence, "repo", ""),
+                observed_head_sha=getattr(evidence, "head_sha", ""),
             )
         except Exception:
             return False
         if last_push_time is None:
             return False
-        if last_push_time.tzinfo is None:
-            last_push_time = last_push_time.replace(tzinfo=timezone.utc)
         for reaction in eyes_reactions:
             reaction_time = gh_runner._parse_iso(
                 reaction.get("created_at")
@@ -131,7 +148,7 @@ class HungMixin:
         cache_dedup_key = False
         head_sha: str | None = None
         pr_author = ""
-        head_commit_date = ""
+        publication_iso = ""
         try:
             head_sha = git_ops._git(
                 self.repo_path, "rev-parse", "HEAD"
@@ -144,15 +161,30 @@ class HungMixin:
             )
             if isinstance(metadata, dict):
                 pr_author = str(metadata.get("author") or "")
-                head_commit_date = str(
-                    metadata.get("head_commit_date") or ""
-                )
         except Exception as exc:
             self.log_event(
                 f"[INFRA] Warning: failed to load PR metadata for "
                 f"@codex review dedup on PR #{pr_number}: {exc}; "
                 f"posting without PR-author dedup."
             )
+        if head_sha:
+            bound_head_sha = (
+                current_pr.head_sha if current_pr is not None
+                and current_pr.number == pr_number and current_pr.head_sha else head_sha
+            )
+            evidence = gh_prs.get_pr_head_publication(
+                self.owner_repo, pr_number, expected_head_sha=bound_head_sha
+            )
+            known_at, _ = self._validate_publication_observation(
+                pr_number, bound_head_sha, evidence.published_at,
+                getattr(evidence, "unknown_reason", None),
+                head_repo=getattr(evidence, "head_repo", ""),
+                ref=getattr(evidence, "ref", ""),
+                observed_repo=getattr(evidence, "repo", ""),
+                observed_head_sha=getattr(evidence, "head_sha", ""),
+            )
+            if known_at is not None and head_sha == bound_head_sha:
+                publication_iso = known_at.isoformat()
         if head_sha is None:
             self.log_event(
                 f"[INFRA] Warning: failed to resolve HEAD for PR "
@@ -161,12 +193,12 @@ class HungMixin:
         elif (
             not bypass_author_dedup
             and pr_author
-            and head_commit_date
+            and publication_iso
             and _author_already_requested_review(
                 self.owner_repo,
                 pr_number,
                 pr_author,
-                head_commit_date,
+                publication_iso,
             )
         ):
             self._last_codex_review_pr = pr_number
@@ -180,7 +212,7 @@ class HungMixin:
                 self.owner_repo,
                 pr_number,
                 pr_author,
-                head_commit_date,
+                publication_iso,
             )
             retry_at = None
             if requested_at is not None:
