@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import types
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +56,18 @@ def _make_repo_with_task(tmp_path: Path, pr_id: str) -> Path:
     return work
 
 
+def _status_runner(repo: Path) -> Any:
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    runner.repo_config.url = _git(repo, "remote", "get-url", "origin").strip()
+    return runner
+
+
+def _remote_task(repo: Path, pr_id: str) -> str:
+    _git(repo, "fetch", "origin", "main")
+    return _git(repo, "show", f"FETCH_HEAD:tasks/{pr_id}.md")
+
+
 def _commit_pr_branch_task_status(repo: Path, pr_id: str, status: str) -> None:
     _git(repo, "checkout", "pr-test")
     task_file = repo / "tasks" / f"{pr_id}.md"
@@ -100,8 +113,7 @@ def test_merge_writes_status_done_to_file(
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
 
-    runner = h._make_runner()
-    runner.repo_path = str(repo)
+    runner = _status_runner(repo)
     runner.state.state = PipelineState.MERGE
     runner.state.current_pr = PRInfo(number=701, branch="pr-test")
     runner.state.current_task = QueueTask(
@@ -114,13 +126,10 @@ def test_merge_writes_status_done_to_file(
 
     asyncio.run(runner.handle_merge())
 
-    task_text = (repo / "tasks" / "PR-701.md").read_text(encoding="utf-8")
+    task_text = _remote_task(repo, "PR-701")
     assert task_text.startswith("---\nstatus: DONE\n---\n")
     assert "[STATUS] PR-701 marked DONE: PR merged" in _git(
-        repo,
-        "log",
-        "--oneline",
-        "-1",
+        repo, "log", "--oneline", "-1", "FETCH_HEAD"
     )
 
 
@@ -167,8 +176,7 @@ def test_merge_status_commit_ignores_divergent_pr_branch_task_file(
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
 
-    runner = h._make_runner()
-    runner.repo_path = str(repo)
+    runner = _status_runner(repo)
     runner.state.state = PipelineState.MERGE
     runner.state.current_pr = PRInfo(number=701, branch="pr-test")
     runner.state.current_task = QueueTask(
@@ -181,13 +189,14 @@ def test_merge_status_commit_ignores_divergent_pr_branch_task_file(
 
     asyncio.run(runner.handle_merge())
 
-    task_text = (repo / "tasks" / "PR-701.md").read_text(encoding="utf-8")
+    task_text = _remote_task(repo, "PR-701")
     assert task_text.startswith("---\nstatus: DONE\n---\n")
     assert "[STATUS] PR-701 marked DONE: PR merged" in _git(
         repo,
         "log",
         "--oneline",
         "-1",
+        "FETCH_HEAD",
     )
 
 
@@ -195,25 +204,19 @@ def test_commit_task_status_change_push_failure_logs_warning(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    task_dir = tmp_path / "tasks"
-    task_dir.mkdir()
-    (task_dir / "PR-702.md").write_text(
-        "---\nstatus: TODO\n---\n\nBody\n",
-        encoding="utf-8",
-    )
+    repo = _make_repo_with_task(tmp_path, "PR-702")
     calls: list[tuple[str, ...]] = []
 
     def fake_git(repo_path: str, *args: str, **kwargs: Any) -> h._FakeCompletedProcess:
         calls.append(args)
         if args[:1] == ("push",):
             raise RuntimeError("push denied")
-        if args[:3] == ("diff", "--cached", "--quiet"):
-            return h._FakeCompletedProcess(returncode=1)
-        return h._FakeCompletedProcess(returncode=0)
+        return real_git(repo_path, *args, **kwargs)
 
+    from src.daemon import git_ops
+    real_git = git_ops._git
     monkeypatch.setattr("src.daemon.git_ops._git", fake_git)
-    runner = h._make_runner()
-    runner.repo_path = str(tmp_path)
+    runner = _status_runner(repo)
     task = QueueTask(
         pr_id="PR-702",
         title="t",
@@ -224,7 +227,7 @@ def test_commit_task_status_change_push_failure_logs_warning(
 
     asyncio.run(runner._commit_task_status_change(task, "ERROR", "failed hard"))
 
-    assert ("push", "origin", "main") in calls
+    assert any(call[:2] == ("push", "origin") for call in calls)
     assert any(
         "failed to commit ERROR status for tasks/PR-702.md: push denied"
         in event["event"]
@@ -308,7 +311,7 @@ def test_commit_task_status_change_rejects_symlink_escape(
     )
 
 
-def test_commit_task_status_change_force_checkouts_base_with_dirty_pr_branch(
+def test_commit_task_status_change_preserves_dirty_pr_branch(
     tmp_path: Path,
 ) -> None:
     repo = _make_repo_with_task(tmp_path, "PR-707")
@@ -320,8 +323,7 @@ def test_commit_task_status_change_force_checkouts_base_with_dirty_pr_branch(
         ),
         encoding="utf-8",
     )
-    runner = h._make_runner()
-    runner.repo_path = str(repo)
+    runner = _status_runner(repo)
     task = QueueTask(
         pr_id="PR-707",
         title="t",
@@ -332,14 +334,17 @@ def test_commit_task_status_change_force_checkouts_base_with_dirty_pr_branch(
 
     asyncio.run(runner._commit_task_status_change(task, "ERROR", "failed hard"))
 
-    assert (repo / "tasks" / "PR-707.md").read_text(encoding="utf-8").startswith(
+    assert _remote_task(repo, "PR-707").startswith(
         "---\nstatus: ERROR\nblocked_reason: crash\n---\n"
     )
+    assert task_file.read_text(encoding="utf-8").startswith("---\nstatus: DOING\n")
+    assert _git(repo, "branch", "--show-current").strip() == "pr-test"
     assert "[STATUS] PR-707 marked ERROR: failed hard" in _git(
         repo,
         "log",
         "--oneline",
         "-1",
+        "FETCH_HEAD",
     )
 
 
@@ -347,8 +352,7 @@ def test_commit_task_status_change_uses_explicit_blocked_reason(
     tmp_path: Path,
 ) -> None:
     repo = _make_repo_with_task(tmp_path, "PR-708")
-    runner = h._make_runner()
-    runner.repo_path = str(repo)
+    runner = _status_runner(repo)
     task = QueueTask(
         pr_id="PR-708",
         title="t",
@@ -366,7 +370,7 @@ def test_commit_task_status_change_uses_explicit_blocked_reason(
         )
     )
 
-    assert (repo / "tasks" / "PR-708.md").read_text(encoding="utf-8").startswith(
+    assert _remote_task(repo, "PR-708").startswith(
         "---\nstatus: ERROR\nblocked_reason: guardrail\n---\n"
     )
 
@@ -411,24 +415,8 @@ def test_commit_task_status_change_truncates_long_reason(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    task_dir = tmp_path / "tasks"
-    task_dir.mkdir()
-    (task_dir / "PR-705.md").write_text(
-        "---\nstatus: TODO\n---\n\nBody\n",
-        encoding="utf-8",
-    )
-    commit_messages: list[str] = []
-
-    def fake_git(repo_path: str, *args: str, **kwargs: Any) -> h._FakeCompletedProcess:
-        if args[:3] == ("diff", "--cached", "--quiet"):
-            return h._FakeCompletedProcess(returncode=1)
-        if args[:1] == ("commit",):
-            commit_messages.append(args[2])
-        return h._FakeCompletedProcess(returncode=0)
-
-    monkeypatch.setattr("src.daemon.git_ops._git", fake_git)
-    runner = h._make_runner()
-    runner.repo_path = str(tmp_path)
+    repo = _make_repo_with_task(tmp_path, "PR-705")
+    runner = _status_runner(repo)
     task = QueueTask(
         pr_id="705",
         title="t",
@@ -441,6 +429,145 @@ def test_commit_task_status_change_truncates_long_reason(
         runner._commit_task_status_change(task, "ERROR", "x" * 90)
     )
 
-    assert commit_messages == [
+    _remote_task(repo, "PR-705")
+    assert _git(repo, "log", "-1", "--format=%B", "FETCH_HEAD").strip() == (
         f"[STATUS] PR-705 marked ERROR: {'x' * 77}...\n\n[skip ci]"
-    ]
+    )
+
+
+@pytest.mark.parametrize("detached", [False, True])
+def test_status_write_preserves_coder_checkout_and_index(
+    tmp_path: Path, detached: bool
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-709")
+    tracked = repo / "coder.txt"
+    tracked.write_text("committed\n", encoding="utf-8")
+    _git(repo, "add", "coder.txt")
+    _git(repo, "commit", "-m", "local coder commit")
+    if detached:
+        _git(repo, "checkout", "--detach")
+    tracked.write_text("staged\n", encoding="utf-8")
+    _git(repo, "add", "coder.txt")
+    tracked.write_text("unstaged\n", encoding="utf-8")
+    binary = repo / "draft.bin"
+    binary.write_bytes(b"\x00\xff\x01")
+    index = (repo / ".git" / "index").read_bytes()
+    before = (
+        _git(repo, "rev-parse", "HEAD"),
+        _git(repo, "symbolic-ref", "-q", "HEAD") if not detached else "detached",
+        _git(repo, "status", "--porcelain"),
+    )
+    runner = _status_runner(repo)
+    task = QueueTask(pr_id="PR-709", title="t", status=TaskStatus.DOING,
+                     branch="pr-test", task_file="tasks/PR-709.md")
+
+    assert asyncio.run(runner._commit_task_status_change(task, "ERROR", "crash"))
+
+    after = (
+        _git(repo, "rev-parse", "HEAD"),
+        _git(repo, "symbolic-ref", "-q", "HEAD") if not detached else "detached",
+        _git(repo, "status", "--porcelain"),
+    )
+    assert after == before
+    assert (repo / ".git" / "index").read_bytes() == index
+    assert tracked.read_text(encoding="utf-8") == "unstaged\n"
+    assert binary.read_bytes() == b"\x00\xff\x01"
+    assert _remote_task(repo, "PR-709").startswith("---\nstatus: ERROR\n")
+
+
+def test_status_write_retries_concurrent_base_advance(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-710")
+    runner = _status_runner(repo)
+    from src.daemon import git_ops
+
+    real_git = git_ops._git
+    advanced = False
+
+    def racing_git(path: str, *args: str, **kwargs: Any) -> Any:
+        nonlocal advanced
+        if args[:2] == ("push", "origin") and not advanced:
+            advanced = True
+            other = tmp_path / "other"
+            _git(tmp_path, "clone", str(tmp_path / "remote.git"), str(other))
+            _git(other, "checkout", "main")
+            _git(other, "config", "user.email", "test@example.com")
+            _git(other, "config", "user.name", "Test User")
+            (other / "concurrent.txt").write_text("another writer\n")
+            _git(other, "add", "concurrent.txt")
+            _git(other, "commit", "-m", "concurrent")
+            _git(other, "push", "origin", "main")
+        return real_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops, "_git", racing_git)
+    task = QueueTask(pr_id="PR-710", title="t", status=TaskStatus.DOING,
+                     branch="pr-test", task_file="tasks/PR-710.md")
+
+    assert asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    assert advanced
+    assert _remote_task(repo, "PR-710").startswith("---\nstatus: DONE\n")
+    assert _git(repo, "show", "FETCH_HEAD:concurrent.txt") == "another writer\n"
+
+
+def test_status_write_confirms_ambiguous_push(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-711")
+    runner = _status_runner(repo)
+    from src.daemon import git_ops
+
+    real_git = git_ops._git
+
+    def uncertain_git(path: str, *args: str, **kwargs: Any) -> Any:
+        result = real_git(path, *args, **kwargs)
+        if args[:2] == ("push", "origin"):
+            return types.SimpleNamespace(returncode=1, stderr="response lost")
+        return result
+
+    monkeypatch.setattr(git_ops, "_git", uncertain_git)
+    task = QueueTask(pr_id="PR-711", title="t", status=TaskStatus.DOING,
+                     branch="pr-test", task_file="tasks/PR-711.md")
+
+    assert asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    assert _remote_task(repo, "PR-711").startswith("---\nstatus: DONE\n")
+
+
+def test_failed_commit_does_not_report_status_or_touch_coder_work(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-712")
+    runner = _status_runner(repo)
+    task = QueueTask(pr_id="PR-712", title="t", status=TaskStatus.DOING,
+                     branch="pr-test", task_file="tasks/PR-712.md")
+    coder_file = repo / "coder.bin"
+    coder_file.write_bytes(b"\x00\xff")
+    head = _git(repo, "rev-parse", "HEAD")
+    from src.daemon import git_ops
+
+    real_git = git_ops._git
+
+    def failed_commit(path: str, *args: str, **kwargs: Any) -> Any:
+        if "commit" in args:
+            raise RuntimeError("commit denied")
+        return real_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops, "_git", failed_commit)
+
+    assert not asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    assert _git(repo, "rev-parse", "HEAD") == head
+    assert coder_file.read_bytes() == b"\x00\xff"
+    assert _remote_task(repo, "PR-712").startswith("---\nstatus: TODO\n")
+
+
+def test_status_write_rejects_wrong_origin_and_task_identity(tmp_path: Path) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-713")
+    runner = _status_runner(repo)
+    task = QueueTask(pr_id="PR-713", title="t", status=TaskStatus.DOING,
+                     branch="pr-test", task_file="tasks/PR-713.md")
+    runner.repo_config.url = str(tmp_path / "different.git")
+    assert not asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    runner.repo_config.url = _git(repo, "remote", "get-url", "origin").strip()
+    task.task_file = "tasks/PR-714.md"
+    assert not asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    assert _remote_task(repo, "PR-713").startswith("---\nstatus: TODO\n")

@@ -27,6 +27,7 @@ import os
 import random
 import re
 import subprocess
+import tempfile
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -2400,7 +2401,12 @@ class PipelineRunner(
             return False
 
         task_path = Path(task_file)
-        if task_path.is_absolute() or ".." in task_path.parts:
+        bound_pr_id = pr_id if str(pr_id).startswith("PR-") else f"PR-{pr_id}"
+        if (
+            task_path.is_absolute()
+            or ".." in task_path.parts
+            or task_path.parts != ("tasks", f"{bound_pr_id}.md")
+        ):
             self.log_event(
                 f"[INFRA] Warning: refusing to commit unsafe task path "
                 f"{task_file!r}."
@@ -2431,44 +2437,66 @@ class PipelineRunner(
         )
 
         try:
-            git_ops._git(self.repo_path, "fetch", "origin", base, timeout=60)
-            git_ops._git(self.repo_path, "checkout", "-f", base, timeout=60)
-            git_ops._git(
-                self.repo_path,
-                "reset",
-                "--hard",
-                f"origin/{base}",
-                timeout=60,
-            )
-            write_frontmatter_status(
-                Path(self.repo_path) / task_file,
-                status,
-                blocked_reason,
-            )
-            git_ops._git(self.repo_path, "add", "--", task_file, timeout=30)
-            diff = git_ops._git(
-                self.repo_path,
-                "diff",
-                "--cached",
-                "--quiet",
-                "--",
-                task_file,
-                check=False,
-            )
-            if diff.returncode == 0:
-                self.log_event(
-                    f"[MERGE] No task status change to commit for {task_file}."
+            origin = git_ops._git(self.repo_path, "remote", "get-url", "origin")
+            if origin.stdout.strip() != self.repo_config.url:
+                raise ValueError("checkout origin differs from configured repository")
+            if not base or base.startswith("-") or git_ops._git(
+                self.repo_path, "check-ref-format", "--branch", base, check=False
+            ).returncode != 0:
+                raise ValueError("invalid configured base branch")
+
+            # A clone owns its own worktree, index and refs. Even a failed Git
+            # operation here cannot move or discard the coder's checkout.
+            with tempfile.TemporaryDirectory(prefix="task-status-") as temporary:
+                isolated = str(Path(temporary) / "repo")
+                git_ops._git(
+                    temporary, "clone", "--no-checkout", "--origin", "origin",
+                    "--", self.repo_config.url, isolated, timeout=60,
                 )
-                return True
-            git_ops._git(
-                self.repo_path,
-                "commit",
-                "-m",
-                message,
-                timeout=60,
-            )
-            git_ops._git(self.repo_path, "push", "origin", base, timeout=60)
-            return True
+                for _attempt in range(3):
+                    git_ops._git(isolated, "fetch", "origin", base, timeout=60)
+                    git_ops._git(isolated, "checkout", "--detach", "-f", "FETCH_HEAD")
+                    isolated_task = (Path(isolated) / task_path).resolve()
+                    if not isolated_task.is_relative_to(Path(isolated).resolve()) or not isolated_task.is_file():
+                        raise ValueError("task path is missing or escapes isolated checkout")
+                    git_ops._git(isolated, "ls-files", "--error-unmatch", "--", task_file)
+                    write_frontmatter_status(isolated_task, status, blocked_reason)
+                    git_ops._git(isolated, "add", "--", task_file)
+                    diff = git_ops._git(
+                        isolated, "diff", "--cached", "--quiet", "--", task_file,
+                        check=False,
+                    )
+                    if diff.returncode == 0:
+                        self.log_event(
+                            f"[MERGE] No task status change to commit for {task_file}."
+                        )
+                        return True
+                    if diff.returncode != 1:
+                        raise RuntimeError("task status diff failed")
+                    git_ops._git(
+                        isolated, "-c", "user.name=pipeline-orchestrator",
+                        "-c", "user.email=pipeline-orchestrator@localhost",
+                        "commit", "-m", message, timeout=60,
+                    )
+                    commit = git_ops._git(isolated, "rev-parse", "HEAD").stdout.strip()
+                    push = git_ops._git(
+                        isolated, "push", "origin", f"HEAD:refs/heads/{base}",
+                        timeout=60, check=False,
+                    )
+                    # A lost push response and a concurrent base advance are
+                    # both resolved by reading the remote ref again.
+                    git_ops._git(isolated, "fetch", "origin", base, timeout=60)
+                    confirmed = git_ops._git(
+                        isolated, "merge-base", "--is-ancestor", commit,
+                        "FETCH_HEAD", check=False,
+                    )
+                    if confirmed.returncode == 0:
+                        return True
+                    if confirmed.returncode != 1:
+                        raise RuntimeError("could not confirm remote status commit")
+                    if push.returncode != 0 and _attempt == 2:
+                        raise RuntimeError(f"status push failed: {push.stderr.strip()}")
+                raise RuntimeError("base moved during status push")
         except Exception as exc:
             self.log_event(
                 f"[INFRA] Warning: failed to commit {status} status for "
