@@ -443,7 +443,9 @@ def _make_runner(**repo_overrides: Any) -> PipelineRunner:
 
 
 def _allow_all_coder_auth(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(selector_module, "_auth_failed", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        selector_module, "_auth_failure_reason", lambda *args, **kwargs: None
+    )
 
 
 def _patch_subprocess(
@@ -719,8 +721,13 @@ def _patch_eyes_reaction_present(
         ],
     )
     monkeypatch.setattr(
-        "src.github.prs.get_pr_last_push_time",
-        lambda repo, number: gh_runner._parse_iso("2026-04-30T12:00:00Z"),
+        "src.github.prs.get_pr_head_publication",
+        lambda *args, **kwargs: type("Evidence", (), {
+            "repo": "octo/demo", "head_repo": "octo/demo",
+            "ref": "refs/heads/pr-042-fix",
+            "head_sha": kwargs.get("expected_head_sha", ""),
+            "published_at": gh_runner._parse_iso("2026-04-30T12:00:00Z")
+        })(),
     )
 
 

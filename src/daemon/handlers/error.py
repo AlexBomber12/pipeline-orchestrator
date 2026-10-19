@@ -487,8 +487,6 @@ class ErrorMixin:
                     )
                     if self.state.current_pr is not None:
                         push_time = datetime.now(timezone.utc)
-                        self._last_push_at = push_time
-                        self._last_push_at_pr_number = self.state.current_pr.number
                         head_after = ""
                         try:
                             head_after = git_ops._git(
@@ -501,6 +499,11 @@ class ErrorMixin:
                         ):
                             pass
                         self.state.current_pr.record_observed_head(head_after)
+                        self.state.current_pr.head_sha = head_after
+                        self._last_push_at = self._canonical_push_timestamp(
+                            self.state.current_pr.number
+                        )
+                        self._last_push_at_pr_number = self.state.current_pr.number
                         self.state.current_pr.last_activity = push_time
                         if not self._post_codex_review(self.state.current_pr.number):
                             await self._transition_to_error(

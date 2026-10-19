@@ -23,7 +23,12 @@ from src.daemon.main_commit_audit import (
     mark_shas_audited_in_redis,
     record_audit_findings_in_redis,
 )
-from src.daemon.selector import SelectionContext, candidate_coders, resolve_pause_coder
+from src.daemon.selector import (
+    CoderSelectionUnavailable,
+    SelectionContext,
+    candidate_coders,
+    resolve_pause_coder,
+)
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, WorkInhibitor, is_work_inhibited
@@ -926,13 +931,12 @@ class IdleMixin:
         pin = self._active_task_coder_pin()
         if pin and pin != "any":
             await self._refresh_auth_status_cache()
-            if self._select_coder(allow_exploration=False) is None:
+            try:
+                self._get_coder(allow_exploration=False)
+            except CoderSelectionUnavailable as exc:
                 self.state.current_pr = None
-                message = (
-                    f"Task {task.pr_id} pinned to {pin} but coder unavailable"
-                )
                 await self._commit_and_park_in_error(
-                    message,
+                    str(exc).replace("Task pinned", f"Task {task.pr_id} pinned", 1),
                     subsource="infra_failure",
                 )
                 return

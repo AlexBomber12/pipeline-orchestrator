@@ -23,6 +23,7 @@ from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
+from src.github import reviews as gh_reviews
 from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
@@ -69,15 +70,7 @@ _DETAILS_URL_RUN_RE = re.compile(r"/actions/runs/(\d+)")
 # review_status stays as EYES and the WATCH timeout would otherwise burn
 # 21+ minutes; detecting the pattern lets us re-trigger @codex review
 # immediately.
-CODEX_BOT_ERROR_PATTERNS = (
-    "Something went wrong while reviewing",
-    "Something went wrong. Try again",
-    "error reviewing this PR",
-    "Try again later by commenting",
-    "Please try again",
-    "unable to download your code",
-    "unable to complete review",
-)
+CODEX_BOT_ERROR_PATTERNS = gh_reviews.CODEX_BOT_ERROR_PATTERNS
 
 
 class WatchMixin:
@@ -159,6 +152,11 @@ class WatchMixin:
             return
 
         current_pr = self.state.current_pr
+        # A new poll must not dispatch feedback retained from an earlier query.
+        self._fix_review_feedback = None
+        self._fix_review_head = None
+        self._fix_review_origin = None
+        self._fix_review_limitation = None
         current_number = current_pr.number
         found = next((p for p in prs if p.number == current_number), None)
         if found is not None:
@@ -255,11 +253,37 @@ class WatchMixin:
         # Retry rehydrate every cycle so a transient commit-time fetch
         # failure during ``recover_state`` doesn't permanently leave
         # ``_last_push_at`` unset.
-        if (
+        if found.publication_observed:
+            self._admit_observed_pr(found)
+            published_at, reason = self._validate_publication_observation(
+                found.number, found.head_sha,
+                found.publication_at, found.publication_reason,
+                head_repo=found.publication_head_repo,
+                ref=found.publication_ref,
+                observed_repo=found.publication_repo,
+                observed_head_sha=found.publication_head_sha,
+                provenance=found.publication_provenance,
+            )
+            found.publication_at = published_at
+            found.publication_reason = reason
+            if published_at is None and found.review_status == ReviewStatus.APPROVED:
+                found.review_status = ReviewStatus.PENDING
+            self._last_push_at = published_at
+            self._last_push_at_pr_number = found.number
+            self._last_push_at_head_sha = (
+                found.head_sha if published_at is not None else None
+            )
+            self._push_provenance_reason = reason
+        elif (
             self._last_push_at is None
             or self._last_push_at_pr_number != found.number
+            or current_pr.head_sha != found.head_sha
         ):
             self._rehydrate_last_push_at(found)
+        else:
+            # Legacy/synthetic PRInfo without a poll observation can reuse
+            # an in-memory baseline only for the unchanged PR and HEAD.
+            self._last_push_at_head_sha = found.head_sha
 
         await self._maybe_reclassify_stuck_pending(found)
         await self._scan_pr_diff_once()
@@ -271,6 +295,8 @@ class WatchMixin:
             self.repo_config.allow_merge_without_review
             and review == ReviewStatus.PENDING
         )
+        if found.publication_observed and found.publication_at is None:
+            review_allows_merge = False
         if ci == CIStatus.SUCCESS and review_allows_merge:
             # PR-290a follow-up: ``_scan_pr_diff_once`` only updates
             # ``diff_scanned_at_sha`` on a successful fetch + scan; a
@@ -313,6 +339,15 @@ class WatchMixin:
                     f"waiting for review timeout."
                 )
         elif ci == CIStatus.FAILURE:
+            if review == ReviewStatus.CHANGES_REQUESTED:
+                result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
+                if result == FeedbackCheckResult.UNKNOWN:
+                    self.log_event(
+                        f"[WATCH] PR #{found.number} CI FIX continues: "
+                        "review feedback unavailable."
+                    )
+                if result == FeedbackCheckResult.NEW:
+                    self._fix_feedback_reviewer_policy = reviewer_policy
             await self.handle_fix()
             return
         elif ci == CIStatus.INFRA_FAILURE:
@@ -343,6 +378,15 @@ class WatchMixin:
                 # INFRA_FAILURE would drop the very logs the coder
                 # needs for the effective-failure handoff.
                 found.ci_status = CIStatus.FAILURE
+                if review == ReviewStatus.CHANGES_REQUESTED:
+                    result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
+                    if result == FeedbackCheckResult.UNKNOWN:
+                        self.log_event(
+                            f"[WATCH] PR #{found.number} CI FIX continues: "
+                            "review feedback unavailable."
+                        )
+                    if result == FeedbackCheckResult.NEW:
+                        self._fix_feedback_reviewer_policy = reviewer_policy
                 await self.handle_fix()
                 return
             if marker_exists:
@@ -864,51 +908,69 @@ class WatchMixin:
         self,
         reviewer_policy: ReviewerPolicy | None = None,
     ) -> FeedbackCheckResult:
-        """Check whether Codex posted any comment after ``self._last_push_at``.
+        """Use findings admitted by this poll, with a push floor when available.
 
         Returns a three-state :class:`FeedbackCheckResult`:
         - ``NEW``     – new Codex feedback exists after last push
         - ``NONE``    – no Codex activity after last push
-        - ``UNKNOWN`` – API call failed; caller should stay in WATCH
+        - ``UNKNOWN`` – evidence or required push provenance is unavailable
         """
         if self.state.current_pr is None:
             return FeedbackCheckResult.NONE
-        last_activity = self._last_push_at
-        if last_activity is None:
-            return FeedbackCheckResult.NEW
-        if last_activity.tzinfo is None:
-            last_activity = last_activity.replace(tzinfo=timezone.utc)
-        try:
-            comments = gh_cache._gh_api_paginated(
-                f"repos/{self.owner_repo}/issues/"
-                f"{self.state.current_pr.number}/comments"
-            ) or []
-            review_comments = gh_cache._gh_api_paginated(
-                f"repos/{self.owner_repo}/pulls/"
-                f"{self.state.current_pr.number}/comments"
-            ) or []
-        except Exception:
-            logger.warning(
-                "GitHub API error checking Codex feedback for PR #%s; "
-                "returning UNKNOWN",
-                self.state.current_pr.number,
-                exc_info=True,
-            )
-            return FeedbackCheckResult.UNKNOWN
         reviewer_policy = reviewer_policy or reviewer_policy_from_config(
             self.app_config
         )
-        for c in reversed(comments + review_comments):
-            if not reviewer_policy.is_trusted_user(c.get("user")):
-                continue
-            created = gh_runner._parse_iso(c.get("created_at"))
-            if created is None:
-                continue
-            if created.tzinfo is None:
-                created = created.replace(tzinfo=timezone.utc)
-            if created > last_activity:
-                return FeedbackCheckResult.NEW
-        return FeedbackCheckResult.NONE
+        current_pr = self.state.current_pr
+        last_activity = self._last_push_at
+        if (
+            self._last_push_at_pr_number != current_pr.number
+            or self._last_push_at_head_sha != current_pr.head_sha
+        ):
+            last_activity = None
+        if last_activity is None:
+            self._fix_review_limitation = getattr(
+                self, "_push_provenance_reason", None
+            ) or "push provenance unavailable"
+            self.log_event(
+                f"[WATCH] Review feedback pending: {self._fix_review_limitation}."
+            )
+            return FeedbackCheckResult.UNKNOWN
+        evidence = gh_reviews.cached_review_feedback(
+            self.owner_repo, current_pr.number, current_pr.head_sha, reviewer_policy,
+        )
+        if evidence is None and current_pr.ci_status != CIStatus.FAILURE:
+            # Recovery and legacy callers may enter WATCH without a status-poll
+            # snapshot. Review-only dispatch can still perform a bounded read.
+            evidence = gh_reviews.read_review_feedback(
+                self.owner_repo, current_pr.number,
+                gh_reviews.cached_review_author(
+                    self.owner_repo, current_pr.number, current_pr.head_sha,
+                    reviewer_policy,
+                ),
+                reviewer_policy, last_activity, head_sha=current_pr.head_sha,
+            )
+        if evidence is None or evidence.unknown_reason:
+            reason = evidence.unknown_reason if evidence else "status-poll evidence unavailable"
+            self._fix_review_limitation = reason
+            self.log_event(f"[WATCH] Review feedback pending: {reason}.")
+            return FeedbackCheckResult.UNKNOWN
+        if not evidence.findings:
+            return FeedbackCheckResult.NONE
+        if last_activity is not None and last_activity.tzinfo is None:
+            last_activity = last_activity.replace(tzinfo=timezone.utc)
+        if last_activity is not None and (
+            evidence.latest_finding_at is None
+            or evidence.latest_finding_at <= last_activity
+        ):
+            return FeedbackCheckResult.NONE
+        self._fix_review_feedback = gh_reviews.format_review_feedback(evidence.findings)
+        self._fix_review_head = current_pr.head_sha
+        self._fix_review_origin = (
+            self.owner_repo, current_pr.number, current_pr.head_sha,
+            reviewer_policy.fingerprint,
+            gh_reviews.review_cache_generation(self.owner_repo),
+        )
+        return FeedbackCheckResult.NEW
 
     async def _maybe_retrigger_stale_review(self, pr_number: int) -> bool:
         """Re-trigger ``@codex review`` when a stale review blocks progress.
@@ -943,10 +1005,15 @@ class WatchMixin:
                 pr_number, "review-status", f"{prefix}review_status {current_pr.review_status.value} not eligible."
             )
 
-        last_push_age_seconds = gh_prs.get_last_push_age_seconds(
-            self.owner_repo,
-            pr_number,
-        )
+        if current_pr.publication_observed:
+            last_push_age_seconds = (
+                max(0.0, (datetime.now(timezone.utc) - current_pr.publication_at).total_seconds())
+                if current_pr.publication_at is not None else None
+            )
+        else:
+            last_push_age_seconds = gh_prs.get_last_push_age_seconds(
+                self.owner_repo, pr_number,
+            )
         if last_push_age_seconds is None:
             return self._stale_skip(pr_number, "last-push-age", f"{prefix}last_push_age unavailable.")
 

@@ -7,9 +7,11 @@ tests/test_runner.py and are referenced via the ``h`` alias.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 import types
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -18,18 +20,394 @@ from src.config import AppConfig, DaemonConfig, RepoConfig, TrustedReviewerIdent
 from src.daemon import runner as runner_module
 from src.daemon.handlers import watch as watch_module
 from src.daemon.runner import PipelineRunner
+from src.github import cache as gh_cache
+from src.github import reviews as gh_reviews
+from src.keyspace import pipeline_state
 from src.models import (
     CIStatus,
+    FeedbackCheckResult,
     PipelineState,
     PRInfo,
+    PublicationMigration,
     QueueTask,
+    RepoState,
     ReviewStatus,
     TaskStatus,
 )
+from src.publication_migration import (
+    MigrationCommand,
+    migration_binding,
+)
+from src.publication_migration import (
+    command_key as migration_command_key,
+)
+from src.publication_migration import enqueue as enqueue_migration
 
 from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
+
+
+def _publication_transport(
+    monkeypatch: pytest.MonkeyPatch, pr: PRInfo, timestamp: str,
+) -> None:
+    """Feed the real publication reader recorded-shape head and activity data."""
+    def run_gh(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/" in args[1]:
+            return {"branch": pr.branch, "repo": "octo/demo", "sha": pr.head_sha}
+        if "/activity?" in args[1]:
+            return [{"activity_type": "branch_creation", "ref": f"refs/heads/{pr.branch}",
+                     "before": "0" * 40, "after": pr.head_sha, "timestamp": timestamp}]
+        raise AssertionError(args)
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", run_gh)
+
+
+@pytest.mark.parametrize(
+    ("finding", "ci_status", "expected_feedback", "feedback_unavailable", "missing_poll", "missing_push"),
+    [
+        (False, CIStatus.PENDING, [], False, False, False),
+        (True, CIStatus.PENDING, ["P1: fix the null check"], False, False, False),
+        (False, CIStatus.FAILURE, [None], False, False, False),
+        (False, CIStatus.FAILURE, [None], False, False, True),
+        (True, CIStatus.FAILURE, ["P1: fix the null check"], False, False, False),
+        (True, CIStatus.FAILURE, ["P1: fix the null check"], True, False, False),
+        (True, CIStatus.FAILURE, [None], False, True, False),
+    ],
+)
+def test_watch_620_evidence_drives_fix_without_rereading(
+    monkeypatch: pytest.MonkeyPatch,
+    finding: bool,
+    ci_status: CIStatus,
+    expected_feedback: list[str | None],
+    feedback_unavailable: bool,
+    missing_poll: bool,
+    missing_push: bool,
+) -> None:
+    receipt = json.loads(
+        (Path(__file__).parents[1] / "fixtures/review_receipt_620.json").read_text()
+    )
+    push_time = datetime.now(timezone.utc) - timedelta(minutes=2)
+    receipt["created_at"] = (push_time + timedelta(minutes=1)).isoformat()
+    issue_comments = [
+        {"id": 10, "user": {"login": "author"}, "body": "@codex review",
+         "created_at": (push_time + timedelta(seconds=10)).isoformat()},
+        receipt,
+    ]
+    if finding:
+        issue_comments.remove(receipt)
+        issue_comments.append({
+            "id": 11, "user": receipt["user"], "body": "P1: fix the null check",
+            "created_at": (push_time + timedelta(minutes=1, seconds=10)).isoformat(),
+        })
+
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return issue_comments
+        return []
+
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", transport)
+    if feedback_unavailable:
+        monkeypatch.setattr(
+            gh_reviews, "read_review_feedback",
+            lambda *_: pytest.fail("WATCH must reuse status-poll evidence"),
+        )
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        result = PRInfo(
+            number=42, branch="pr-459", head_sha=head, ci_status=ci_status,
+            review_status=gh_reviews.get_pr_review_status(
+                repo, 42, "author", head, policy=kwargs["reviewer_policy"]
+            ),
+        )
+        if missing_poll:
+            gh_reviews.clear_review_status_cache()
+        return [result]
+
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    gh_reviews.clear_review_status_cache()
+    runner = h._make_runner(review_timeout_min=120)
+    runner.state.current_pr = PRInfo(number=42, branch="pr-459", head_sha=head)
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = None if missing_push else push_time
+    runner._last_push_at_pr_number = 42
+    if missing_push:
+        monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda *_: None)
+    calls: list[str | None] = []
+
+    async def fake_fix() -> None:
+        calls.append(getattr(runner, "_fix_review_feedback", None))
+
+    async def no_scan() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_fix", fake_fix)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_scan)
+    asyncio.run(runner.handle_watch())
+    assert calls == expected_feedback
+    assert runner.state.state == PipelineState.WATCH
+    if feedback_unavailable:
+        assert not any("combined FIX deferred" in entry["event"] for entry in runner.state.history)
+    if missing_poll:
+        assert any("CI FIX continues" in entry["event"] for entry in runner.state.history)
+
+
+@pytest.mark.parametrize("unresolved", [False, True])
+def test_structured_summary_after_trigger_does_not_dispatch_fix(
+    monkeypatch: pytest.MonkeyPatch,
+    unresolved: bool,
+) -> None:
+    summary = json.loads(
+        (Path(__file__).parents[1] / "fixtures/review_summary_structured.json").read_text()
+    )
+    if unresolved:
+        summary["body"] = summary["body"].replace(
+            '"has_any_findings":false,"has_unresolved_findings":false',
+            '"has_any_findings":true,"has_unresolved_findings":true',
+        )
+    comments = [
+        {"id": 10, "user": {"login": "author"}, "body": "@codex review",
+         "created_at": "2026-10-17T21:05:00Z"},
+        summary,
+    ]
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return comments
+        if unresolved and path.endswith("/issues/42/reactions"):
+            return [{
+                "content": "+1", "user": summary["user"],
+                "created_at": "2026-10-17T21:05:30Z",
+            }]
+        return []
+
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", transport)
+    monkeypatch.setattr(
+        gh_reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 10, 17, 21, 4, tzinfo=timezone.utc),
+    )
+    head = "a" * 40
+
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        return [PRInfo(
+            number=42, branch="pr-459", head_sha=head, ci_status=CIStatus.SUCCESS,
+            review_status=gh_reviews.get_pr_review_status(
+                repo, 42, "author", head, policy=kwargs["reviewer_policy"]
+            ),
+        )]
+
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    gh_reviews.clear_review_status_cache()
+    runner = h._make_runner(review_timeout_min=120)
+    runner.state.current_pr = PRInfo(number=42, branch="pr-459", head_sha=head)
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = datetime(2026, 10, 17, 21, 4, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 42
+    calls: list[str] = []
+
+    async def fake_fix() -> None:
+        calls.append("fix")
+
+    async def fake_merge() -> None:
+        calls.append("merge")
+
+    async def no_scan() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_fix", fake_fix)
+    monkeypatch.setattr(runner, "handle_merge", fake_merge)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_scan)
+    asyncio.run(runner.handle_watch())
+    assert calls == []
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+
+
+@pytest.mark.parametrize(
+    ("summary_created", "summary_updated", "finding_at", "approval_at", "summary_sha", "expected"),
+    [
+        ("21:01:00", "21:09:00", None, "21:08:00", "current", (ReviewStatus.PENDING, [])),
+        ("21:06:00", "21:09:00", None, "21:08:00", "current", (ReviewStatus.PENDING, [])),
+        ("21:06:00", "21:08:00", None, "21:08:00", "current", (ReviewStatus.PENDING, [])),
+        (None, None, "21:08:00", "21:08:00", "current", (ReviewStatus.PENDING, [])),
+        (None, None, "21:07:00", "21:08:00", "current", (ReviewStatus.APPROVED, ["merge"])),
+        (None, None, "21:09:00", "21:08:00", "current", (ReviewStatus.CHANGES_REQUESTED, ["fix"])),
+        ("21:01:00", "21:09:00", None, "21:08:00", "old", (ReviewStatus.APPROVED, ["merge"])),
+        ("21:01:00", "21:09:00", None, "21:08:00", "unsupported", (ReviewStatus.PENDING, [])),
+    ],
+)
+def test_watch_orders_mutable_summary_and_approval_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    summary_created: str | None,
+    summary_updated: str | None,
+    finding_at: str | None,
+    approval_at: str,
+    summary_sha: str,
+    expected: tuple[ReviewStatus, list[str]],
+) -> None:
+    head = "a" * 40
+    actor = {"id": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+    def stamp(value: str) -> str:
+        return f"2026-10-17T{value}Z"
+    issue_comments = [{
+        "id": 10, "user": {"login": "author"}, "body": "@codex review",
+        "created_at": stamp("21:05:00"),
+    }]
+    if summary_created:
+        summary = json.loads(
+            (Path(__file__).parents[1] / "fixtures/review_summary_structured.json").read_text()
+        )
+        summary["created_at"] = stamp(summary_created)
+        summary["updated_at"] = stamp(summary_updated)
+        summary["body"] = summary["body"].replace(
+            '"has_any_findings":false,"has_unresolved_findings":false',
+            '"has_any_findings":true,"has_unresolved_findings":true',
+        )
+        if summary_sha == "old":
+            summary["body"] = summary["body"].replace(head, "b" * 40)
+        elif summary_sha == "unsupported":
+            summary["body"] = summary["body"].replace(head, "unknown")
+        issue_comments.append(summary)
+    if finding_at:
+        issue_comments.append({
+            "id": 12, "user": actor, "body": "P1: repair the null check",
+            "created_at": stamp(finding_at),
+        })
+
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return issue_comments
+        if path.endswith("/issues/42/reactions"):
+            return [{"content": "+1", "user": actor, "created_at": stamp(approval_at)}]
+        return []
+
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", transport)
+    monkeypatch.setattr(
+        gh_reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 10, 17, 21, 4, tzinfo=timezone.utc),
+    )
+
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        return [PRInfo(
+            number=42, branch="pr-459", head_sha=head, ci_status=CIStatus.SUCCESS,
+            diff_scanned_at_sha=head,
+            review_status=gh_reviews.get_pr_review_status(
+                repo, 42, "author", head, policy=kwargs["reviewer_policy"]
+            ),
+        )]
+
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    gh_reviews.clear_review_status_cache()
+    runner = h._make_runner(review_timeout_min=120, auto_merge=True)
+    runner.state.current_pr = PRInfo(number=42, branch="pr-459", head_sha=head, diff_scanned_at_sha=head)
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = datetime(2026, 10, 17, 21, 4, tzinfo=timezone.utc)
+    runner._last_push_at_pr_number = 42
+    calls: list[str] = []
+
+    async def fake_fix() -> None:
+        calls.append("fix")
+        if finding_at and expected[0] == ReviewStatus.CHANGES_REQUESTED:
+            assert runner._fix_review_feedback == "P1: repair the null check"
+
+    async def fake_merge() -> None:
+        calls.append("merge")
+
+    async def no_scan() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "handle_fix", fake_fix)
+    monkeypatch.setattr(runner, "handle_merge", fake_merge)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_scan)
+    asyncio.run(runner.handle_watch())
+    assert runner.state.current_pr.review_status == expected[0]
+    assert calls == expected[1]
+    if summary_created and summary_sha != "old":
+        evidence = gh_reviews.cached_review_feedback(
+            runner.owner_repo, 42, head, gh_reviews.reviewer_policy_from_config(runner.app_config),
+        )
+        assert evidence is not None and evidence.findings == ()
+        assert evidence.unknown_reason
+
+
+@pytest.mark.parametrize(
+    ("ci_status", "missing_push"),
+    [(CIStatus.PENDING, False), (CIStatus.FAILURE, False), (CIStatus.FAILURE, True)],
+)
+def test_watch_supplies_only_admitted_findings_to_fix_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+    ci_status: CIStatus,
+    missing_push: bool,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    captured = h._capture_fix_kwargs(monkeypatch)
+    push_time = datetime.now(timezone.utc) - timedelta(minutes=2)
+    actor = {"id": 199175422, "login": "chatgpt-codex-connector[bot]"}
+    issue_comments = [
+        {"id": 10, "user": {"login": "author"}, "body": "@codex review",
+         "created_at": (push_time + timedelta(seconds=10)).isoformat()},
+        {"id": 11, "user": actor, "body": "P1: fix the null check",
+         "created_at": (push_time + timedelta(minutes=1)).isoformat()},
+        {"id": 12, "user": {"id": 999, "login": "other"},
+         "body": "P1: unrelated advice",
+         "created_at": (push_time + timedelta(minutes=1, seconds=10)).isoformat()},
+        {"id": 13, "user": actor, "body": "This dereferences None on empty input",
+         "created_at": (push_time + timedelta(minutes=1, seconds=15)).isoformat()},
+    ]
+    comment_reads: list[str] = []
+
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            comment_reads.append(path)
+            return issue_comments
+        return []
+
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", transport)
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        return [PRInfo(
+            number=42, branch="pr-459", head_sha=head, ci_status=ci_status,
+            review_status=gh_reviews.get_pr_review_status(
+                repo, 42, "author", head, policy=kwargs["reviewer_policy"]
+            ),
+        )]
+
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": head})
+    monkeypatch.setattr("src.daemon.handlers.fix._fetch_failed_ci_logs", lambda *_: "ci-boom")
+    gh_reviews.clear_review_status_cache()
+    runner = h._make_runner(review_timeout_min=120)
+    runner.state.current_pr = PRInfo(number=42, branch="pr-459", head_sha=head)
+    runner.state.state = PipelineState.WATCH
+    runner._last_push_at = None if missing_push else push_time
+    runner._last_push_at_pr_number = 42
+    if missing_push:
+        monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda *_: None)
+
+    async def no_scan() -> None:
+        return None
+
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_scan)
+    asyncio.run(runner.handle_watch())
+    context = captured["kwargs"]["extra_context"]
+    if missing_push:
+        assert "Latest review feedback:" not in context
+        assert "Review evidence limitation: push provenance unavailable" in context
+    else:
+        assert "Latest review feedback:\nP1: fix the null check" in context
+    assert "unrelated advice" not in context
+    if not missing_push:
+        assert "This dereferences None on empty input" in context
+    assert comment_reads == ["repos/octo/demo/issues/42/comments"]
+    if ci_status == CIStatus.FAILURE:
+        assert "ci-boom" in context
+    if missing_push:
+        assert "push provenance unavailable" in context
 
 
 def _ci_retrieval(
@@ -99,11 +477,8 @@ def test_handle_watch_reuses_poll_reviewer_policy_for_feedback(
         reviewer_policy: object = None,
     ) -> list[PRInfo]:
         observed_policies.append(reviewer_policy)
-        review_status = (
-            ReviewStatus.CHANGES_REQUESTED
-            if reviewer_policy is not None
-            and reviewer_policy.is_trusted_user({"id": fresh_reviewer_id})
-            else ReviewStatus.PENDING
+        review_status = gh_reviews.get_pr_review_status(
+            repo, 400, "author", "abc123", policy=reviewer_policy
         )
         return [
             PRInfo(
@@ -120,6 +495,7 @@ def test_handle_watch_reuses_poll_reviewer_policy_for_feedback(
             return [
                 {
                     "user": {"id": fresh_reviewer_id, "login": "fresh-codex[bot]"},
+                    "body": "P1: fix the missing guard",
                     "created_at": "2026-01-01T00:00:02Z",
                 }
             ]
@@ -143,6 +519,7 @@ def test_handle_watch_reuses_poll_reviewer_policy_for_feedback(
     monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *args: "OPEN")
     monkeypatch.setattr(watch_module.gh_cache, "_gh_api_paginated", fake_paginated)
     monkeypatch.setattr(runner, "handle_fix", fake_handle_fix)
+    gh_reviews.clear_review_status_cache()
 
     asyncio.run(runner.handle_watch())
 
@@ -410,8 +787,8 @@ def test_handle_watch_changes_requested_triggers_fix(
 
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
-    assert runner.state.current_pr.push_count == 1
-    assert any("Fix pushed" in e["event"] for e in runner.state.history)
+    assert runner.state.current_pr.push_count == 0
+    assert any("Review feedback pending:" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_preserves_fix_iteration_count_for_same_pr(
@@ -516,13 +893,18 @@ def test_watch_changes_requested_with_pending_ci_triggers_fix(
     pr = PRInfo(
         number=42,
         branch="pr-001",
+        head_sha="abc123",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.CHANGES_REQUESTED,
         last_activity=last_push,
     )
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
-        lambda repo, **kw: [pr],
+        lambda repo, **kw: [pr.model_copy(update={
+            "review_status": gh_reviews.get_pr_review_status(
+                repo, 42, "author", pr.head_sha, policy=kw["reviewer_policy"]
+            )
+        })],
     )
 
     comments = [
@@ -554,6 +936,7 @@ def test_watch_changes_requested_with_pending_ci_triggers_fix(
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     runner.handle_fix = fake_fix  # type: ignore[assignment]
+    gh_reviews.clear_review_status_cache()
     asyncio.run(runner.handle_watch())
 
     assert fix_called == [True]
@@ -569,17 +952,26 @@ def test_watch_changes_requested_with_pending_ci_no_feedback_logs(
     pr = PRInfo(
         number=42,
         branch="pr-001",
+        head_sha="abc123",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.CHANGES_REQUESTED,
         last_activity=last_push,
     )
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
-        lambda repo, **kw: [pr],
+        lambda repo, **kw: [pr.model_copy(update={
+            "review_status": gh_reviews.get_pr_review_status(
+                repo, 42, "author", pr.head_sha, policy=kw["reviewer_policy"]
+            )
+        })],
     )
     monkeypatch.setattr(
         "src.github.cache._gh_api_paginated",
-        lambda path: [],
+        lambda path: [{
+            "user": {"id": 199175422, "login": "chatgpt-codex-connector"},
+            "body": "P1: earlier finding",
+            "created_at": (last_push - timedelta(minutes=1)).isoformat(),
+        }] if path.endswith("/issues/42/comments") else [],
     )
 
     fix_called: list[bool] = []
@@ -593,6 +985,7 @@ def test_watch_changes_requested_with_pending_ci_no_feedback_logs(
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     runner.handle_fix = fake_fix  # type: ignore[assignment]
+    gh_reviews.clear_review_status_cache()
     asyncio.run(runner.handle_watch())
 
     assert fix_called == []
@@ -626,8 +1019,8 @@ def test_handle_watch_fix_when_ci_success_and_changes_requested(
 
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
-    assert runner.state.current_pr.push_count == 1
-    assert any("Fix pushed" in e["event"] for e in runner.state.history)
+    assert runner.state.current_pr.push_count == 0
+    assert any("Review feedback pending:" in e["event"] for e in runner.state.history)
 
 
 def test_handle_watch_ci_failure_triggers_fix(
@@ -2168,7 +2561,8 @@ def test_handle_watch_retries_rehydrate_last_push_at(
     pr = PRInfo(
         number=42,
         branch="pr-001",
-        ci_status=CIStatus.PENDING,
+        head_sha="a" * 40,
+        ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.PENDING,
         last_activity=datetime.now(timezone.utc),
     )
@@ -2176,15 +2570,15 @@ def test_handle_watch_retries_rehydrate_last_push_at(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": "2026-04-14T18:00:00Z"},
-    )
+    _publication_transport(monkeypatch, pr, "2026-04-14T18:00:00Z")
 
     runner = h._make_runner()
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
     assert runner._last_push_at is None
+    async def no_reclassify(_pr: PRInfo) -> None:
+        return None
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_reclassify)
     asyncio.run(runner.handle_watch())
     assert runner._last_push_at is not None
     assert runner._last_push_at.isoformat() == "2026-04-14T18:00:00+00:00"
@@ -2275,14 +2669,11 @@ def test_handle_watch_rehydrates_on_pr_number_mismatch(
     otherwise a transient rehydrate failure on the prior PR switch
     would keep the stale previous-PR timestamp forever."""
     head_iso = "2026-04-14T18:00:00Z"
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {"author": "", "head_sha": "", "head_commit_date": head_iso},
-    )
     pr = PRInfo(
         number=55,
         branch="pr-new",
-        ci_status=CIStatus.PENDING,
+        head_sha="a" * 40,
+        ci_status=CIStatus.SUCCESS,
         review_status=ReviewStatus.PENDING,
         last_activity=datetime.now(timezone.utc),
     )
@@ -2290,6 +2681,7 @@ def test_handle_watch_rehydrates_on_pr_number_mismatch(
         "src.github.prs.get_open_prs",
         lambda repo, **kw: [pr],
     )
+    _publication_transport(monkeypatch, pr, head_iso)
 
     runner = h._make_runner()
     # Stale last_push_at from a previously-tracked PR (different number).
@@ -2297,6 +2689,9 @@ def test_handle_watch_rehydrates_on_pr_number_mismatch(
     runner._last_push_at_pr_number = 999
     runner.state.current_pr = pr
     runner.state.state = PipelineState.WATCH
+    async def no_reclassify(_pr: PRInfo) -> None:
+        return None
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_reclassify)
     asyncio.run(runner.handle_watch())
 
     assert runner._last_push_at_pr_number == 55
@@ -3242,13 +3637,24 @@ def test_first_infra_failure_retries_workflow(
     assert "infra retry: re-ran failed jobs" in history
 
 
+@pytest.mark.parametrize(
+    ("review_status", "feedback_result"),
+    [
+        (ReviewStatus.PENDING, FeedbackCheckResult.NEW),
+        (ReviewStatus.CHANGES_REQUESTED, FeedbackCheckResult.NEW),
+        (ReviewStatus.CHANGES_REQUESTED, FeedbackCheckResult.UNKNOWN),
+    ],
+)
 def test_second_infra_failure_routes_to_fix(
     monkeypatch: pytest.MonkeyPatch,
+    review_status: ReviewStatus,
+    feedback_result: FeedbackCheckResult,
 ) -> None:
     """PR-251: a second INFRA_FAILURE classification on the same head_sha
     (the prior retry didn't help) routes WATCH straight through
     ``handle_fix`` without issuing another ``gh run rerun``."""
     pr = _patch_infra_failure_pr(monkeypatch, pr_number=78, head_sha="d00df00d")
+    pr.review_status = review_status
 
     gh_calls: list[list[str]] = []
 
@@ -3266,6 +3672,13 @@ def test_second_infra_failure_routes_to_fix(
     monkeypatch.setattr(runner_module.PipelineRunner, "handle_fix", fake_handle_fix)
 
     runner = h._make_runner()
+    feedback_policies: list[object] = []
+
+    def feedback_check(policy: object) -> FeedbackCheckResult:
+        feedback_policies.append(policy)
+        return feedback_result
+
+    monkeypatch.setattr(runner, "_has_new_codex_feedback_since_last_push", feedback_check)
     # Pre-seed the marker with a wall-clock timestamp older than the
     # grace window so the next cycle treats the retry as "elapsed
     # enough to escalate." A legacy "1" marker would also work (it's
@@ -3284,10 +3697,15 @@ def test_second_infra_failure_routes_to_fix(
     asyncio.run(runner.handle_watch())
 
     assert fix_calls == [None]
+    assert len(feedback_policies) == (1 if review_status == ReviewStatus.CHANGES_REQUESTED else 0)
+    if feedback_policies and feedback_result == FeedbackCheckResult.NEW:
+        assert runner._fix_feedback_reviewer_policy is feedback_policies[0]
     # No workflow rerun calls were made — straight to FIX.
     assert all(args[:2] != ["run", "rerun"] for args in gh_calls)
     history = " ".join(entry.get("event", "") for entry in runner.state.history)
     assert "INFRA_FAILURE persisted after retry" in history
+    if feedback_result == FeedbackCheckResult.UNKNOWN and feedback_policies:
+        assert "CI FIX continues" in history
     # PR-251 follow-up: ``handle_fix`` reads ``ci_status`` to decide
     # whether to inject CI logs into the FIX prompt; the persisted-INFRA
     # path must downgrade to FAILURE before invoking it so the coder
@@ -5222,3 +5640,672 @@ def test_pending_retrigger_cap_permits_exactly_cap_retriggers(
 
     assert len(post_calls) == 3
     assert park_calls == ["watch_retrigger_cap"]
+
+@pytest.mark.parametrize("case", ["creation", "later_push", "wrong_head", "missing", "backward"])
+def test_recorded_branch_creation_review_reaches_watch_merge_handoff(
+    monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    """Only proven publication preceding a trusted +1 reaches WATCH merge."""
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+    branch = "pr-459-e2e-failure-evidence"
+    created = {
+        "activity_type": "branch_creation", "after": head, "before": "0" * 40,
+        "ref": f"refs/heads/{branch}", "timestamp": "2026-10-17T21:06:35Z",
+    }
+    activity = [created]
+    if case == "later_push":
+        activity.insert(0, {**created, "activity_type": "push", "before": head,
+                            "timestamp": "2026-10-17T21:10:00Z"})
+    elif case == "wrong_head":
+        activity[0] = {**created, "after": "b" * 40}
+    elif case == "missing":
+        activity.clear()
+
+    def run_gh(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/" in args[1]:
+            return {"branch": branch, "repo": "octo/demo", "sha": head}
+        if "/activity?" in args[1]:
+            return activity
+        raise AssertionError(args)
+
+    actor = {"id": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+    def paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/620/reactions"):
+            return [{"content": "+1", "user": actor,
+                     "created_at": "2026-10-17T21:08:48Z"}]
+        return []
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", run_gh)
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", paginated)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    gh_reviews.clear_review_status_cache()
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        publication = watch_module.gh_prs.get_pr_head_publication(
+            repo, 620, expected_head_sha=head
+        )
+        review = gh_reviews.get_pr_review_status(
+            repo, 620, "author", head, policy=kwargs.get("reviewer_policy"),
+            publication_evidence=publication,
+        )
+        return [PRInfo(
+            number=620, branch=branch, head_sha=head, ci_status=CIStatus.SUCCESS,
+            review_status=review, diff_scanned_at_sha=head,
+            publication_observed=True, publication_at=publication.published_at,
+            publication_reason=publication.unknown_reason,
+            publication_head_repo=publication.head_repo,
+            publication_ref=publication.ref,
+            publication_repo=publication.repo,
+            publication_head_sha=publication.head_sha,
+        )]
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    runner = h._make_runner(
+        auto_merge=True,
+        allow_merge_without_review=case in {"wrong_head", "missing"},
+    )
+    runner.state.current_pr = PRInfo(number=620, branch=branch, head_sha=head,
+                                     diff_scanned_at_sha=head)
+    runner.state.state = PipelineState.WATCH
+    if case == "backward":
+        floor = datetime(2026, 10, 17, 21, 7, tzinfo=timezone.utc)
+        runner._last_push_at = floor
+        runner._last_push_at_pr_number = 620
+        runner._last_push_at_head_sha = head
+        runner._publication_high_water_identity = (
+            runner.owner_repo, 620, "octo/demo", f"refs/heads/{branch}", head,
+        )
+        runner._publication_high_water_at = floor
+    calls: list[str] = []
+    async def merge() -> None:
+        calls.append("merge")
+    async def scan() -> None:
+        return None
+    async def reclassify(_pr: PRInfo) -> None:
+        return None
+    monkeypatch.setattr(runner, "handle_merge", merge)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", scan)
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", reclassify)
+    asyncio.run(runner.handle_watch())
+    assert calls == (["merge"] if case == "creation" else [])
+    assert runner.state.current_pr.review_status == (
+        ReviewStatus.APPROVED if case == "creation" else ReviewStatus.PENDING
+    )
+    if case == "backward":
+        assert runner.state.current_pr.publication_at is None
+        assert runner.state.current_pr.publication_reason == "publication time moved backward for unchanged branch"
+        asyncio.run(runner.handle_watch())
+        assert calls == []
+        assert runner.state.current_pr.publication_at is None
+
+
+@pytest.mark.parametrize("case", ["creation", "advanced", "missing", "contradictory"])
+def test_parent_snapshot_620_recovery_reaches_normal_watch_merge_handoff(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str,
+) -> None:
+    """Upgrade, current activity, trusted reaction and green CI compose."""
+    repo = "AlexBomber12/pipeline-orchestrator"
+    branch = "pr-459-e2e-failure-evidence"
+    saved_head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+    head = "b" * 40 if case == "advanced" else saved_head
+    snapshot = (Path(__file__).parents[1] / "fixtures/recovery/pr_620_parent_snapshot.json").read_text()
+    activity = [{
+        "activity_type": "branch_creation", "after": head, "before": "0" * 40,
+        "ref": f"refs/heads/{branch}", "timestamp": "2026-10-17T21:06:35Z",
+    }]
+    if case == "missing":
+        activity.clear()
+    elif case == "advanced":
+        activity[0].update(
+            activity_type="push", before=saved_head, timestamp="2026-10-17T21:07:00Z"
+        )
+    elif case == "contradictory":
+        activity[0]["after"] = "b" * 40
+
+    def run_gh(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/" in args[1]:
+            return {"branch": branch, "repo": repo, "sha": head}
+        if "/activity?" in args[1]:
+            return activity
+        raise AssertionError(args)
+
+    actor = {"id": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+
+    def paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/620/reactions"):
+            return [{"content": "+1", "user": actor,
+                     "created_at": "2026-10-17T21:08:48Z"}]
+        return []
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", run_gh)
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", paginated)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    gh_reviews.clear_review_status_cache()
+
+    def open_prs(owner: str, *_args: object, **kwargs: object) -> list[PRInfo]:
+        publication = watch_module.gh_prs.get_pr_head_publication(
+            owner, 620, expected_head_sha=head
+        )
+        review = gh_reviews.get_pr_review_status(
+            owner, 620, "author", head, policy=kwargs.get("reviewer_policy"),
+            publication_evidence=publication,
+        )
+        return [PRInfo(
+            number=620, branch=branch, title="PR-459: e2e failure evidence",
+            pr_id="PR-459", head_sha=head, ci_status=CIStatus.SUCCESS,
+            review_status=review, publication_observed=True,
+            diff_scanned_at_sha=head,
+            publication_at=publication.published_at,
+            publication_reason=publication.unknown_reason,
+            publication_head_repo=publication.head_repo,
+            publication_ref=publication.ref, publication_repo=publication.repo,
+            publication_head_sha=publication.head_sha,
+            publication_provenance=publication.provenance,
+        )]
+
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    runner = h._make_runner(
+        url=f"https://github.com/{repo}.git", auto_merge=True,
+        allow_merge_without_review=case not in {"creation", "advanced"},
+    )
+    runner.repo_path = str(tmp_path)
+    task = QueueTask(pr_id="PR-459", title="e2e failure evidence", status=TaskStatus.DOING,
+                     branch=branch, task_file="tasks/PR-459.md")
+    monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [task])
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), snapshot))
+    merged: list[int] = []
+
+    async def merge() -> None:
+        merged.append(620)
+
+    async def no_work(*_args: object) -> None:
+        return None
+
+    async def scan() -> None:
+        runner.state.current_pr.diff_scanned_at_sha = head
+
+    monkeypatch.setattr(runner, "handle_merge", merge)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", scan)
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_work)
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.publication_watermark is None
+    assert runner.state.publication_migration is not None
+    if case == "advanced":
+        assert runner.state.publication_migration.head_sha == head
+        assert runner.state.publication_migration.published_at == datetime(
+            2026, 10, 17, 21, 7, tzinfo=timezone.utc
+        )
+    asyncio.run(runner.handle_watch())
+    assert merged == []
+    if case in {"creation", "advanced"}:
+        asyncio.run(runner.publish_state())
+        binding = migration_binding(runner.state.publication_migration)
+        asyncio.run(enqueue_migration(runner.redis, runner.name, binding))
+        assert asyncio.run(runner._consume_publication_migration_command()) is True
+        assert runner.state.publication_watermark is not None, runner.state.history[-3:]
+        asyncio.run(runner.handle_watch())
+    assert runner.state.current_pr.review_status == (
+        ReviewStatus.APPROVED if case in {"creation", "advanced"} else ReviewStatus.PENDING
+    )
+    assert merged == ([620] if case in {"creation", "advanced"} else []), (
+        runner.state.state, runner.state.current_pr.ci_status,
+        runner.state.current_pr.publication_at, runner.state.current_pr.publication_reason,
+        [item["event"] for item in runner.state.history[-5:]],
+    )
+
+
+@pytest.mark.parametrize("change", ["same", "restart", "head", "ref", "head_repo", "event"])
+def test_deferred_publication_command_survives_unknown_watch_poll(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, change: str,
+) -> None:
+    """A queued exact command makes progress through ordinary runner cycles."""
+    from src.github import prs as gh_prs
+
+    repo = "AlexBomber12/pipeline-orchestrator"
+    branch = "pr-459-e2e-failure-evidence"
+    head = "a" * 40
+    published = datetime(2026, 10, 17, 21, 6, 35, tzinfo=timezone.utc)
+    current = {
+        "activity": False, "ci": CIStatus.SUCCESS, "watch_polls": 0,
+        "head": head, "branch": branch, "head_repo": repo,
+        "timestamp": "2026-10-17T21:06:35Z",
+    }
+
+    def run_gh(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/620" in args[1]:
+            return {"branch": current["branch"], "repo": current["head_repo"],
+                    "sha": current["head"]}
+        if "/activity?" in args[1]:
+            return ([{"activity_type": "push", "ref": f"refs/heads/{current['branch']}",
+                     "before": "0" * 40, "after": current["head"],
+                     "timestamp": current["timestamp"]}]
+                    if current["activity"] else [])
+        raise AssertionError(args)
+
+    def open_prs(owner: str, *_args: object, **_kwargs: object) -> list[PRInfo]:
+        current["watch_polls"] += 1
+        evidence = gh_prs.get_pr_head_publication(
+            owner, 620, expected_head_sha=current["head"]
+        )
+        return [PRInfo(
+            number=620, branch=current["branch"], pr_id="PR-459", head_sha=current["head"],
+            ci_status=current["ci"], review_status=ReviewStatus.APPROVED,
+            is_cross_repository=current["head_repo"] != repo,
+            publication_observed=True, publication_at=evidence.published_at,
+            publication_reason=evidence.unknown_reason,
+            publication_head_repo=evidence.head_repo, publication_ref=evidence.ref,
+            publication_repo=evidence.repo, publication_head_sha=evidence.head_sha,
+            publication_provenance=evidence.provenance,
+        )]
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", run_gh)
+    monkeypatch.setattr(gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(gh_prs, "get_pr_state", lambda *_args: "OPEN")
+    runner = h._make_runner(url=f"https://github.com/{repo}.git",
+                            auto_merge=True, allow_merge_without_review=True)
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_task = QueueTask(
+        pr_id="PR-459", title="e2e failure evidence", status=TaskStatus.DOING,
+        branch=branch, task_file="tasks/PR-459.md",
+    )
+    runner.state.current_pr = open_prs(repo)[0]
+    runner.state.publication_migration = PublicationMigration(
+        repo=repo, pr_number=620, head_repo=repo, ref=f"refs/heads/{branch}",
+        head_sha=head, published_at=published, provenance="github-activity:push",
+        reason="Confirm initial publication.",
+    )
+    runner._publication_recovery_cutoff_at = datetime.now(timezone.utc)
+    runner._recovered = True
+    binding = migration_binding(runner.state.publication_migration)
+    asyncio.run(runner.publish_state())
+    original_publish = runner.publish_state
+    queued = False
+
+    async def publish_with_interleaved_confirmation() -> None:
+        nonlocal queued
+        if not queued and runner.state.publication_migration.published_at is None:
+            queued = True
+            await enqueue_migration(runner.redis, runner.name, binding)
+        await original_publish()
+
+    async def no_work(*_args: object) -> None:
+        return None
+
+    async def yes() -> bool:
+        return True
+
+    fixes: list[str] = []
+    retry_checks: list[str] = []
+
+    async def fix() -> None:
+        fixes.append("ci")
+
+    async def retry() -> runner_module.RetryDispatch:
+        retry_checks.append("checked")
+        return runner_module.RetryDispatch.NONE
+
+    monkeypatch.setattr(runner, "publish_state", publish_with_interleaved_confirmation)
+    monkeypatch.setattr(runner, "ensure_repo_cloned", no_work)
+    monkeypatch.setattr(runner, "_check_github_api_budget", yes)
+    monkeypatch.setattr(runner, "preflight", yes)
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_work)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_work)
+    monkeypatch.setattr(runner, "handle_fix", fix)
+    monkeypatch.setattr(runner, "_consume_retry_command", retry)
+    monkeypatch.setattr(runner, "handle_merge", lambda: (_ for _ in ()).throw(AssertionError("merge")))
+
+    asyncio.run(runner.run_cycle())
+    assert queued
+    assert runner.state.publication_migration.published_at is None
+    key = migration_command_key(runner.name, binding)
+    assert MigrationCommand.model_validate_json(runner.redis.store[key]).status == "pending"
+    current["ci"] = CIStatus.FAILURE
+    polls_before = current["watch_polls"]
+    retry_checks_before = len(retry_checks)
+    asyncio.run(runner.run_cycle())
+    assert MigrationCommand.model_validate_json(runner.redis.store[key]).status == "deferred"
+    assert current["watch_polls"] > polls_before
+    assert len(retry_checks) > retry_checks_before
+    assert fixes == ["ci"]
+    assert runner.state.publication_watermark is None
+    asyncio.run(runner.run_cycle())
+    assert MigrationCommand.model_validate_json(runner.redis.store[key]).status == "deferred"
+    assert fixes == ["ci", "ci"]
+    assert runner.state.publication_watermark is None
+
+    if change == "restart":
+        restarted = h._make_runner(url=f"https://github.com/{repo}.git")
+        restarted.redis = runner.redis
+        restarted.repo_path = str(tmp_path)
+        restarted._parse_tasks_from_headers = lambda: [runner.state.current_task]  # type: ignore[method-assign]
+        assert asyncio.run(restarted.recover_state()) is True
+        assert restarted.state.publication_migration is not None
+        assert restarted.state.publication_migration.published_at is None
+        runner = restarted
+    current["activity"] = True
+    current["ci"] = CIStatus.SUCCESS
+    if change == "head":
+        current["head"] = "b" * 40
+        current["timestamp"] = "2026-10-17T21:07:00Z"
+    elif change == "ref":
+        current["branch"] = "other-branch"
+    elif change == "head_repo":
+        current["head_repo"] = "other/repo"
+    elif change == "event":
+        current["timestamp"] = "2026-10-17T21:07:00Z"
+    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    receipt = MigrationCommand.model_validate_json(runner.redis.store[key])
+    if change in {"same", "restart"}:
+        assert receipt.status == "applied"
+        assert runner.state.publication_watermark is not None
+        assert runner.state.publication_watermark.published_at == published
+    else:
+        assert receipt.status == "failed"
+        assert runner.state.publication_watermark is None
+        if change != "restart":
+            asyncio.run(runner.run_cycle())
+            proposal = runner.state.publication_migration
+            if change == "ref":
+                assert proposal.status == "blocked"
+            else:
+                assert proposal.status == "legacy"
+                assert proposal.published_at is not None
+                replacement_binding = migration_binding(proposal)
+                assert replacement_binding != binding
+                asyncio.run(enqueue_migration(runner.redis, runner.name, replacement_binding))
+                assert asyncio.run(runner._consume_publication_migration_command()) is True
+                assert runner.state.publication_watermark is not None
+                assert runner.state.publication_watermark.head_sha == current["head"]
+                assert runner.state.publication_watermark.head_repo == current["head_repo"]
+                assert MigrationCommand.model_validate_json(
+                    runner.redis.store[migration_command_key(runner.name, replacement_binding)]
+                ).status == "applied"
+
+
+def test_contextless_failure_cannot_erase_publication_watermark(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A later stale read cannot approve after a contextless transport failure."""
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+    branch = "pr-459-e2e-failure-evidence"
+    created = {
+        "activity_type": "branch_creation", "before": "0" * 40, "after": head,
+        "ref": f"refs/heads/{branch}", "timestamp": "2026-10-17T21:06:35Z",
+    }
+    newer = {**created, "activity_type": "push", "timestamp": "2026-10-17T21:10:00Z"}
+    mode = {"value": "new"}
+
+    def run_gh(args: list[str], **_kw: object) -> object:
+        if "/pulls/" in args[1]:
+            if mode["value"] == "unavailable":
+                raise RuntimeError("transport unavailable")
+            return {"branch": branch, "repo": "octo/demo", "sha": head}
+        if "/activity?" in args[1]:
+            return [newer] if mode["value"] == "new" else [created]
+        raise AssertionError(args)
+
+    actor = {"id": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+    def paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/620/reactions"):
+            return [{"content": "+1", "user": actor,
+                     "created_at": "2026-10-17T21:08:48Z"}]
+        return []
+
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        gh_reviews.clear_review_status_cache()
+        publication = watch_module.gh_prs.get_pr_head_publication(
+            repo, 620, expected_head_sha=head
+        )
+        review = gh_reviews.get_pr_review_status(
+            repo, 620, "author", head, policy=kwargs.get("reviewer_policy"),
+            publication_evidence=publication,
+        )
+        return [PRInfo(
+            number=620, branch=branch, head_sha=head, ci_status=CIStatus.SUCCESS,
+            review_status=review, diff_scanned_at_sha=head,
+            publication_observed=True, publication_at=publication.published_at,
+            publication_reason=publication.unknown_reason,
+            publication_head_repo=publication.head_repo, publication_ref=publication.ref,
+            publication_repo=publication.repo, publication_head_sha=publication.head_sha,
+        )]
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", run_gh)
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", paginated)
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    runner = h._make_runner(auto_merge=True)
+    runner.state.current_pr = PRInfo(number=620, branch=branch, head_sha=head,
+                                     diff_scanned_at_sha=head)
+    runner.state.state = PipelineState.WATCH
+    merged: list[int] = []
+    async def merge() -> None:
+        merged.append(620)
+    async def no_work(*_args: object) -> None:
+        return None
+    monkeypatch.setattr(runner, "handle_merge", merge)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_work)
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_work)
+
+    floor = datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    for value in ("new", "unavailable", "old"):
+        mode["value"] = value
+        asyncio.run(runner.handle_watch())
+        assert merged == []
+        assert runner._publication_high_water_at == floor
+        assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+    assert runner.state.current_pr.publication_at is None
+    assert runner.state.current_pr.publication_reason == "publication time moved backward for unchanged branch"
+
+
+def _publication_safety_boundary(monkeypatch: pytest.MonkeyPatch):
+    """Exercise the real reader, review classifier, WATCH, and recovery boundary."""
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+    branch = "pr-459-e2e-failure-evidence"
+    floor = datetime(2026, 10, 17, 21, 10, tzinfo=timezone.utc)
+    mode = {"value": "new"}
+    reaction_at = {"value": "2026-10-17T21:08:48Z"}
+    def run_gh(args: list[str], **_kwargs: object) -> object:
+        if "/pulls/" in args[1]:
+            if mode["value"] == "unavailable":
+                raise RuntimeError("transport unavailable")
+            return {"branch": branch, "repo": "octo/demo", "sha": head}
+        if "/activity?" in args[1]:
+            timestamp = "2026-10-17T21:10:00Z" if mode["value"] == "new" else "2026-10-17T21:06:35Z"
+            return [{"activity_type": "branch_creation", "before": "0" * 40,
+                     "after": head, "ref": f"refs/heads/{branch}", "timestamp": timestamp}]
+        raise AssertionError(args)
+    def paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/620/reactions"):
+            return [{"content": "+1", "created_at": reaction_at["value"],
+                     "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"}}]
+        return []
+    def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
+        gh_reviews.clear_review_status_cache()
+        publication = watch_module.gh_prs.get_pr_head_publication(
+            repo, 620, expected_head_sha=head,
+        )
+        review = gh_reviews.get_pr_review_status(
+            repo, 620, "author", head, policy=kwargs.get("reviewer_policy"),
+            publication_evidence=publication,
+        )
+        return [PRInfo(
+            number=620, branch=branch, head_sha=head, ci_status=CIStatus.SUCCESS,
+            review_status=review, diff_scanned_at_sha=head,
+            publication_observed=True, publication_at=publication.published_at,
+            publication_reason=publication.unknown_reason,
+            publication_head_repo=publication.head_repo, publication_ref=publication.ref,
+            publication_repo=publication.repo, publication_head_sha=publication.head_sha,
+        )]
+    monkeypatch.setattr("src.github.gh_runner.run_gh", run_gh)
+    monkeypatch.setattr(gh_cache, "_gh_api_paginated", paginated)
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(watch_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    runner = h._make_runner(auto_merge=True)
+    runner.state.current_pr = PRInfo(number=620, branch=branch, head_sha=head,
+                                     diff_scanned_at_sha=head)
+    runner.state.state = PipelineState.WATCH
+    merged: list[int] = []
+    async def merge() -> None:
+        merged.append(620)
+    async def no_work(*_args: object) -> None:
+        return None
+    monkeypatch.setattr(runner, "handle_merge", merge)
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", no_work)
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_work)
+    return runner, mode, reaction_at, floor, merged, no_work, head, branch
+
+
+@pytest.mark.parametrize("helper", ["eyes", "author_post"])
+def test_auxiliary_failed_read_keeps_publication_floor(
+    monkeypatch: pytest.MonkeyPatch, helper: str,
+) -> None:
+    from src.daemon import git_ops
+    from src.daemon.handlers import hung as hung_module
+    from src.github import reactions
+
+    runner, mode, _reaction_at, floor, merged, _no_work, head, _branch = (
+        _publication_safety_boundary(monkeypatch)
+    )
+    asyncio.run(runner.handle_watch())
+    assert runner._publication_high_water_at == floor
+    mode["value"] = "unavailable"
+    if helper == "eyes":
+        original_reactions = reactions._get_codex_issue_reactions
+        monkeypatch.setattr(reactions, "_get_codex_issue_reactions", lambda *a, **kw: [
+            {"content": "eyes", "created_at": "2026-10-17T21:08:48Z",
+             "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"}},
+        ])
+        assert runner._should_skip_codex_review_post(620) is False
+        monkeypatch.setattr(reactions, "_get_codex_issue_reactions", original_reactions)
+    else:
+        posted: list[str] = []
+        monkeypatch.setattr(git_ops, "_git", lambda *a, **kw: h._FakeCompletedProcess(
+            args=[], stdout=head + "\n", returncode=0,
+        ))
+        monkeypatch.setattr(watch_module.gh_prs, "get_pr_metadata",
+                            lambda *a: {"author": "author"})
+        monkeypatch.setattr(hung_module.gh_comments, "post_comment",
+                            lambda _repo, _number, body: posted.append(body))
+        assert runner._post_codex_review_result(620)[0] is True
+        assert posted == ["@codex review"]
+    assert runner._publication_high_water_at == floor
+    mode["value"] = "old"
+    for _ in range(2):
+        asyncio.run(runner.handle_watch())
+        assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+        assert runner.state.current_pr.publication_at is None
+        assert runner._publication_high_water_at == floor
+        assert merged == []
+
+
+@pytest.mark.parametrize("unknown_before_save", [False, True])
+def test_recovery_restores_publication_floor_before_stale_watch(
+    monkeypatch: pytest.MonkeyPatch, unknown_before_save: bool,
+) -> None:
+    runner, mode, reaction_at, floor, _merged, no_work, head, branch = (
+        _publication_safety_boundary(monkeypatch)
+    )
+    task = QueueTask(pr_id="PR-459", title="publication safety", status=TaskStatus.DOING,
+                     branch=branch)
+    runner.state.current_task = task
+    asyncio.run(runner.handle_watch())
+    assert runner._publication_high_water_at == floor
+    if unknown_before_save:
+        mode["value"] = "unavailable"
+        asyncio.run(runner.handle_watch())
+        assert runner.state.current_pr.publication_at is None
+    asyncio.run(runner.publish_state())
+    raw = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    persisted = RepoState.model_validate_json(raw)
+    assert persisted.publication_watermark is not None
+    assert persisted.publication_watermark.published_at == floor
+    if unknown_before_save:
+        assert persisted.current_pr.publication_at is None
+    recovered = h._make_runner(auto_merge=True)
+    recovered.redis = runner.redis
+    monkeypatch.setattr(recovered, "_parse_tasks_from_headers", lambda: [task])
+    merged: list[int] = []
+    async def merge() -> None:
+        merged.append(620)
+    monkeypatch.setattr(recovered, "handle_merge", merge)
+    monkeypatch.setattr(recovered, "_scan_pr_diff_once", no_work)
+    monkeypatch.setattr(recovered, "_maybe_reclassify_stuck_pending", no_work)
+    mode["value"] = "old"
+    assert asyncio.run(recovered.recover_state()) is True, (
+        recovered.state.error_message, recovered.state.history,
+    )
+    assert recovered.state.state == PipelineState.WATCH
+    assert recovered._publication_high_water_at == floor
+    assert recovered._last_push_at is None
+    asyncio.run(recovered.handle_watch())
+    assert recovered.state.current_pr.review_status == ReviewStatus.PENDING
+    assert recovered.state.current_pr.publication_at is None
+    assert merged == []
+    # The saved floor is only a veto. A fresh matching publication and a
+    # later reaction can still follow the ordinary merge path.
+    mode["value"] = "new"
+    reaction_at["value"] = "2026-10-17T21:11:00Z"
+    asyncio.run(recovered.handle_watch())
+    assert recovered.state.current_pr.review_status == ReviewStatus.APPROVED
+    assert merged == [620]
+    assert head == recovered.state.current_pr.head_sha
+
+
+@pytest.mark.parametrize("damage", [
+    "missing", "wrong_repo", "wrong_pr", "malformed_head", "wrong_ref",
+    "wrong_head_repo", "missing_context",
+    "naive_timestamp", "malformed_timestamp",
+])
+def test_recovery_without_usable_floor_holds_historical_approval(
+    monkeypatch: pytest.MonkeyPatch, damage: str,
+) -> None:
+    runner, mode, _reaction_at, floor, _merged, no_work, head, branch = (
+        _publication_safety_boundary(monkeypatch)
+    )
+    task = QueueTask(pr_id="PR-459", title="publication safety", status=TaskStatus.DOING,
+                     branch=branch)
+    runner.state.current_task = task
+    asyncio.run(runner.handle_watch())
+    assert runner._publication_high_water_at == floor
+    asyncio.run(runner.publish_state())
+    key = pipeline_state(runner.name)
+    raw = asyncio.run(runner.redis.get(key))
+    snapshot = json.loads(raw)
+    watermark = snapshot["publication_watermark"]
+    if damage == "missing":
+        asyncio.run(runner.redis.delete(key))
+    else:
+        if damage == "wrong_repo":
+            watermark["repo"] = "other/repo"
+        elif damage == "wrong_pr":
+            watermark["pr_number"] = 621
+        elif damage == "malformed_head":
+            watermark["head_sha"] = "not-a-sha"
+        elif damage == "wrong_ref":
+            watermark["ref"] = "refs/heads/other"
+        elif damage == "wrong_head_repo":
+            watermark["head_repo"] = "other/repo"
+        elif damage == "missing_context":
+            watermark["head_repo"] = ""
+        elif damage == "naive_timestamp":
+            watermark["published_at"] = "2026-10-17T21:10:00"
+        else:
+            watermark["published_at"] = "not a timestamp"
+        snapshot["current_pr"]["publication_at"] = None
+        asyncio.run(runner.redis.set(key, json.dumps(snapshot)))
+    recovered = h._make_runner(auto_merge=True)
+    recovered.redis = runner.redis
+    monkeypatch.setattr(recovered, "_parse_tasks_from_headers", lambda: [task])
+    merged: list[int] = []
+    async def merge() -> None:
+        merged.append(620)
+    monkeypatch.setattr(recovered, "handle_merge", merge)
+    monkeypatch.setattr(recovered, "_scan_pr_diff_once", no_work)
+    monkeypatch.setattr(recovered, "_maybe_reclassify_stuck_pending", no_work)
+    mode["value"] = "old"
+    assert asyncio.run(recovered.recover_state()) is True
+    assert recovered._last_push_at is None
+    assert recovered.state.publication_watermark is None
+    asyncio.run(recovered.handle_watch())
+    assert recovered.state.current_pr.review_status == ReviewStatus.PENDING
+    assert recovered.state.current_pr.publication_at is None
+    assert merged == []

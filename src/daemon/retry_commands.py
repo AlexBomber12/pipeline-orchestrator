@@ -779,6 +779,7 @@ class RetryCommandMixin:
         if continuation_name == "watch":
             assert pr is not None
             self.state.current_pr = pr
+            self._admit_observed_pr(pr)
             self.state.state = PipelineState.WATCH
         else:
             self.state.current_pr = None
@@ -836,6 +837,7 @@ class RetryCommandMixin:
             )
             self._set_retry_task_snapshot(task)
             self.state.current_pr = pr
+            self._admit_observed_pr(pr)
             self.state.state = PipelineState.WATCH
             return RetryDispatch.WATCH
 

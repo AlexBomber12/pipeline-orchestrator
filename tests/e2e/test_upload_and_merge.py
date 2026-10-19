@@ -31,7 +31,7 @@ def test_full_happy_path_via_shim_succeeds(
         assert status in (200, 201), f"upload failed with status {status}"
 
         # Shared testbed dispatch was observed at ~39 seconds, so 30 seconds raced CODING.
-        coding_entry = wait_for_state(["CODING"], timeout_sec=60)
+        coding_entry = wait_for_state(["CODING"], timeout_sec=150)
         coding_task = coding_entry.get("current_task") or {}
         assert coding_task.get("pr_id") == expected_pr_id, (
             f"CODING was for current_task={coding_task!r}, "

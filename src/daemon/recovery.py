@@ -8,6 +8,7 @@ Mixin methods:
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
@@ -25,10 +26,33 @@ from src.cancellation import (
 )
 from src.daemon import git_ops
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
-from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
-from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
+from src.models import (
+    PipelineState,
+    PRInfo,
+    PublicationMigration,
+    PublicationWatermark,
+    QueueTask,
+    RepoState,
+    TaskStatus,
+)
+from src.publication_migration import (
+    MigrationCommand,
+    migration_binding,
+)
+from src.publication_migration import (
+    command_key as migration_command_key,
+)
+from src.publication_migration import (
+    confirmable as migration_confirmable,
+)
+from src.publication_migration import (
+    matches_state as migration_matches_state,
+)
+from src.publication_migration import (
+    pending_key as migration_pending_key,
+)
 from src.queue_parser import (
     QueueValidationError,
     UnstructuredLegacyTaskError,
@@ -59,6 +83,162 @@ def _task_pr_sort_key(pr_id: str) -> tuple[int, int | str, str]:
 
 class RecoveryMixin:
     """State recovery on daemon startup."""
+
+    async def _consume_publication_migration_command(self) -> bool:
+        """Apply one exact operator trust anchor; never authorize merge itself."""
+        pointer_key = migration_pending_key(self.name)
+        raw_binding = await self.redis.get(pointer_key)
+        if not raw_binding:
+            return False
+        binding = raw_binding.decode() if isinstance(raw_binding, bytes) else raw_binding
+        key = migration_command_key(self.name, binding)
+        raw = await self.redis.get(key)
+        if not raw:
+            self.log_event("[RECOVERY] Publication migration receipt missing; operator investigation required.")
+            return False
+        command = MigrationCommand.model_validate_json(raw)
+        if command.status == "applied":
+            saved = await self.redis.get(pipeline_state(self.name))
+            if saved:
+                self._restore_publication_watermark(RepoState.model_validate_json(saved))
+            return False
+        if command.status == "failed":
+            return False
+        proposal = self.state.publication_migration
+        bound = command.observation
+        reason = None
+        deferred = False
+        if (
+            proposal is None or proposal.status != "legacy"
+            or not migration_matches_state(proposal, self.state)
+            or self.state.url != self.repo_config.url
+            or not migration_confirmable(bound)
+            or migration_binding(bound) != binding
+            or proposal.source != bound.source
+            or proposal.generation != bound.generation
+            or (proposal.repo, proposal.pr_number, proposal.head_repo,
+                proposal.ref, proposal.head_sha) != (
+                    bound.repo, bound.pr_number, bound.head_repo,
+                    bound.ref, bound.head_sha,
+                )
+        ):
+            reason = "Migration target or observation changed; refresh and confirm again."
+        elif (
+            proposal.published_at is not None
+            and migration_binding(proposal) != binding
+        ):
+            reason = "Migration publication observation changed; refresh and confirm again."
+        else:
+            try:
+                prs = gh_prs.get_open_prs(
+                    self.owner_repo, self.repo_config.allow_merge_without_checks
+                )
+                pr = next((item for item in prs if item.number == bound.pr_number), None)
+                if (
+                    pr is None or pr.head_sha.lower() != bound.head_sha.lower()
+                    or f"refs/heads/{pr.branch}" != bound.ref
+                    or (not pr.is_cross_repository and bound.head_repo != self.owner_repo)
+                ):
+                    reason = "Bound PR, branch, head repository or HEAD changed."
+                else:
+                    evidence = gh_prs.get_pr_head_publication(
+                        self.owner_repo, pr.number, expected_head_sha=bound.head_sha
+                    )
+                    if (
+                        evidence.repo != bound.repo or evidence.pr_number != bound.pr_number
+                        or evidence.head_repo != bound.head_repo or evidence.ref != bound.ref
+                        or evidence.head_sha.lower() != bound.head_sha.lower()
+                    ):
+                        reason = "Publication evidence changed or is unavailable; refresh and confirm again."
+                    elif evidence.unknown_reason is not None or evidence.published_at is None:
+                        reason = (
+                            "Current publication evidence is unavailable; "
+                            "waiting to revalidate the bound observation."
+                        )
+                        deferred = True
+                    elif (
+                        evidence.published_at != bound.published_at
+                        or evidence.provenance != bound.provenance
+                    ):
+                        reason = "Publication event changed; refresh and confirm again."
+            except Exception as exc:
+                reason = f"Publication revalidation unavailable: {type(exc).__name__}; waiting to retry."
+                deferred = True
+        watermark = None
+        if reason is None:
+            watermark = PublicationWatermark(
+                repo=bound.repo, pr_number=bound.pr_number,
+                head_repo=bound.head_repo, ref=bound.ref,
+                head_sha=bound.head_sha, published_at=bound.published_at,
+                provenance=bound.provenance,
+            )
+
+        async def transaction(pipe):
+            stored = MigrationCommand.model_validate_json(await pipe.get(key))
+            state = RepoState.model_validate_json(await pipe.get(pipeline_state(self.name)))
+            current_pointer = await pipe.get(pointer_key)
+            if isinstance(current_pointer, bytes):
+                current_pointer = current_pointer.decode()
+            if stored.status not in ("pending", "deferred") or current_pointer != binding:
+                return False
+            current = state.publication_migration
+            if (
+                current is None or current.status != "legacy"
+                or not migration_matches_state(current, state)
+                or state.url != self.repo_config.url
+                or current.source != stored.observation.source
+                or current.generation != stored.observation.generation
+                or (current.repo, current.pr_number, current.head_repo,
+                    current.ref, current.head_sha) != (
+                        stored.observation.repo, stored.observation.pr_number,
+                        stored.observation.head_repo, stored.observation.ref,
+                        stored.observation.head_sha,
+                    )
+            ):
+                stored.status = "failed"
+                stored.reason = "Published migration proposal changed before commit."
+            elif current.published_at is not None and migration_binding(current) != binding:
+                stored.status = "failed"
+                stored.reason = "Published migration observation changed before commit."
+            elif current.published_at is None and not deferred and reason is not None:
+                stored.status = "failed"
+                stored.reason = reason
+            elif deferred:
+                stored.status = "deferred"
+                stored.reason = reason or "Current publication evidence is unavailable; waiting to retry."
+            elif reason is not None:
+                stored.status = "failed"
+                stored.reason = reason
+            else:
+                stored.status = "applied"
+                stored.reason = (
+                    "Initial publication floor stored; normal current-evidence, "
+                    "CI and review gates remain active."
+                )
+                state.publication_watermark = watermark
+                state.publication_migration = None
+            pipe.multi()
+            pipe.set(key, stored.model_dump_json())
+            if stored.status != "deferred":
+                pipe.delete(pointer_key)
+            if stored.status == "applied":
+                pipe.set(pipeline_state(self.name), state.model_dump_json())
+            return stored.status
+
+        outcome = await self.redis.transaction(
+            transaction, key, pointer_key, pipeline_state(self.name), value_from_callable=True
+        )
+        if outcome == "applied":
+            self._publication_high_water_identity = (
+                watermark.repo, watermark.pr_number, watermark.head_repo,
+                watermark.ref, watermark.head_sha,
+            )
+            self._publication_high_water_at = watermark.published_at
+            self.state.publication_watermark = watermark
+            self.state.publication_migration = None
+        elif outcome == "failed":
+            self.log_event(f"[RECOVERY] Publication migration rejected: {reason or 'state changed'}.")
+        return outcome != "deferred"
 
     def _parse_tasks_from_headers(self) -> list[QueueTask] | None:
         """Parse structured task headers into a recovered queue snapshot.
@@ -223,10 +403,15 @@ class RecoveryMixin:
         # startup recovery is always correct: if recovery re-enters
         # CODING through the DOING-with-matching-PR path the next handle
         # cycle rewrites the marker before invoking the coder.
+        if (
+            self._publication_recovery_cutoff_at is None
+            and self._publication_high_water_at is None
+        ):
+            self._publication_recovery_cutoff_at = datetime.now(timezone.utc)
         self._cleanup_expected_branch()
         return await self._recover_state_headers()
 
-    async def _hydrate_current_task_from_persisted_state(self) -> None:
+    async def _hydrate_current_task_from_persisted_state(self) -> bool:
         """Restore active CODING identity from the published Redis snapshot.
 
         ``publish_state`` writes the live ``RepoState`` to
@@ -257,22 +442,142 @@ class RecoveryMixin:
         lets crash recovery distinguish the current unfinished checkpoint
         from completed records belonging to an earlier retry of the task.
 
-        Best-effort: Redis read errors, missing snapshots, and corrupt
-        payloads leave both fields untouched. ``_apply_recovery_decisions``
+        Redis read errors defer recovery so the saved publication floor is
+        never lost to a transient outage. Missing or corrupt payloads leave
+        both task fields untouched. ``_apply_recovery_decisions``
         still overwrites ``current_task`` from parsed headers, and the
         invocation is used only when its task and unfinished run record match.
         """
         self._persisted_fix_recovery = None
         try:
             raw = await self.redis.get(pipeline_state(self.name))
-        except Exception:
-            return
+        except Exception as exc:
+            self.log_event(f"[INFRA] Publication snapshot read unavailable: {type(exc).__name__}; retrying recovery.")
+            return False
         if not raw:
-            return
+            self._publication_snapshot_absent = True
+            return True
+        self._publication_snapshot_absent = False
         try:
             persisted = RepoState.model_validate_json(raw)
         except Exception:
-            return
+            self._publication_snapshot_damaged = True
+            return True
+        self._publication_snapshot_pr_unbound = (
+            persisted.current_pr is None
+            and persisted.publication_watermark is None
+            and persisted.name == self.name
+            and persisted.url == self.repo_config.url
+        )
+        snapshot = json.loads(raw)
+        pr_snapshot = snapshot.get("current_pr") if isinstance(snapshot, dict) else None
+        legacy = (
+            isinstance(snapshot, dict)
+            and "publication_schema_version" not in snapshot
+            and "publication_watermark" not in snapshot
+            and "publication_migration" not in snapshot
+            and isinstance(pr_snapshot, dict)
+            and not any(key.startswith("publication_") for key in pr_snapshot)
+            and persisted.name == self.name
+            and persisted.url == self.repo_config.url
+            and persisted.current_pr is not None
+            and re.fullmatch(r"[0-9a-fA-F]{40}", persisted.current_pr.head_sha) is not None
+        )
+        raw_observation_without_floor = (
+            isinstance(snapshot, dict)
+            and snapshot.get("publication_schema_version") == 1
+            and snapshot.get("publication_watermark") is None
+            and persisted.name == self.name
+            and persisted.url == self.repo_config.url
+            and persisted.current_pr is not None
+            and persisted.current_pr.publication_observed
+            and persisted.current_pr.publication_at is not None
+            and persisted.current_pr.publication_at.tzinfo is not None
+            and persisted.current_pr.publication_reason is None
+            and persisted.current_pr.publication_repo == self.owner_repo
+            and persisted.current_pr.publication_head_sha.lower()
+            == persisted.current_pr.head_sha.lower()
+            and re.fullmatch(r"[0-9a-fA-F]{40}", persisted.current_pr.head_sha) is not None
+            and re.fullmatch(r"[^/]+/[^/]+", persisted.current_pr.publication_head_repo) is not None
+            and (
+                persisted.current_pr.is_cross_repository
+                or persisted.current_pr.publication_head_repo == self.owner_repo
+            )
+            and persisted.current_pr.publication_ref
+            == f"refs/heads/{persisted.current_pr.branch}"
+            and persisted.current_pr.publication_provenance.startswith("github-activity:")
+        )
+        incompatible = (
+            isinstance(snapshot, dict)
+            and "publication_schema_version" in snapshot
+            and snapshot["publication_schema_version"] != 1
+        )
+        if incompatible:
+            self._publication_snapshot_pr_unbound = False
+        if incompatible and persisted.current_pr is not None:
+            pr = persisted.current_pr
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                status="blocked",
+                reason="Publication snapshot schema is incompatible; operator investigation required.",
+            )
+        elif legacy:
+            pr = persisted.current_pr
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                reason="Parent-version snapshot has no publication safety floor.",
+            )
+        elif persisted.publication_migration is not None:
+            # A durable proposal may coexist with raw current_pr publication
+            # fields after a paused cycle. Keep its binding and generation;
+            # fresh GitHub evidence is reconciled later in recovery.
+            proposal = persisted.publication_migration
+            pr = persisted.current_pr
+            task = persisted.current_task
+            if (
+                persisted.name == self.name
+                and persisted.url == self.repo_config.url
+                and proposal.repo == self.owner_repo
+                and migration_matches_state(proposal, persisted)
+                and re.fullmatch(r"[0-9a-fA-F]{40}", proposal.head_sha) is not None
+                and (
+                    not proposal.head_repo
+                    or (
+                        re.fullmatch(r"[^/]+/[^/]+", proposal.head_repo) is not None
+                        and (pr.is_cross_repository or proposal.head_repo == self.owner_repo)
+                    )
+                )
+                and (
+                    task is None
+                    or find_matching_open_pr(task.pr_id, task.branch, [pr]) is not None
+                )
+            ):
+                self.state.publication_migration = proposal
+            else:
+                self.state.publication_migration = proposal.model_copy(update={
+                    "status": "blocked",
+                    "reason": "Saved publication proposal conflicts with repository or task context.",
+                })
+        elif raw_observation_without_floor:
+            pr = persisted.current_pr
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                source="unvalidated_current_snapshot",
+                reason="Saved PR observation has no validated floor; confirm current publication.",
+            )
+        elif persisted.current_pr is not None and persisted.publication_watermark is None:
+            pr = persisted.current_pr
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                status="blocked",
+                reason="Newer snapshot has no valid publication floor; operator investigation required.",
+            )
+        if not incompatible:
+            self._restore_publication_watermark(persisted)
         if (
             persisted.state in {PipelineState.ERROR, PipelineState.WATCH, PipelineState.FIX}
             and persisted.current_task is not None
@@ -292,7 +597,7 @@ class RecoveryMixin:
         ):
             self._persisted_fix_recovery = persisted
         if persisted.state != PipelineState.CODING:
-            return
+            return True
         if self.state.current_task is None and persisted.current_task is not None:
             self.state.current_task = persisted.current_task
         current = self.state.current_task
@@ -304,6 +609,33 @@ class RecoveryMixin:
             and persisted.active_invocation is not None
         ):
             self.state.active_invocation = persisted.active_invocation
+        return True
+
+    def _restore_publication_watermark(self, persisted: RepoState) -> None:
+        """Restore a safety floor, never the current publication observation."""
+        saved = persisted.publication_watermark
+        pr = persisted.current_pr
+        if (
+            saved is None or pr is None or persisted.name != self.name
+            or saved.repo != self.owner_repo or saved.pr_number != pr.number
+            or re.fullmatch(r"[0-9a-fA-F]{40}", saved.head_sha) is None
+            or re.fullmatch(r"[^/]+/[^/]+", saved.head_repo) is None
+            or saved.ref != f"refs/heads/{pr.branch}"
+            or (not pr.is_cross_repository and saved.head_repo != self.owner_repo)
+            or (pr.publication_head_repo and saved.head_repo != pr.publication_head_repo)
+            or (pr.publication_ref and saved.ref != pr.publication_ref)
+            or saved.published_at.tzinfo is None
+        ):
+            return
+        self._publication_high_water_identity = (
+            saved.repo, saved.pr_number, saved.head_repo, saved.ref,
+            saved.head_sha,
+        )
+        self._publication_high_water_at = saved.published_at
+        # Keep the startup cutoff for any different PR selected during recovery.
+        # The saved floor exempts only its own repository/PR/branch identity.
+        self.state.publication_watermark = saved
+        self.state.publication_migration = None
 
     async def _finalize_interrupted_coding_invocation(self) -> None:
         """Finalize only the exact unfinished CODING checkpoint on recovery."""
@@ -366,7 +698,8 @@ class RecoveryMixin:
         # Run after the ``get_open_prs`` probe so a transient GitHub
         # outage during recovery still surfaces as ERROR with no
         # current_task.
-        await self._hydrate_current_task_from_persisted_state()
+        if not await self._hydrate_current_task_from_persisted_state():
+            return False
         await self._hydrate_status_write_failed_task_pr_ids()
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery
@@ -547,9 +880,31 @@ class RecoveryMixin:
                 and queued.status in {TaskStatus.ERROR, TaskStatus.TODO, TaskStatus.DOING}
                 and recovered_state != PipelineState.FIX
                 and (queued.status != TaskStatus.ERROR or recovered_state == PipelineState.ERROR)
+                and not (
+                    recovered_state == PipelineState.WATCH
+                    and not any(item.number == bound.number for item in prs)
+                    and any(item.branch == bound.branch and item.number != bound.number for item in prs)
+                )
             ):
                 self.state.current_task = queued
-                self.state.current_pr = bound
+                live_bound = next(
+                    (item for item in prs if item.number == bound.number and item.branch == bound.branch),
+                    None,
+                ) if recovered_state == PipelineState.WATCH else None
+                if live_bound is not None:
+                    merged_shas, push_count = bound.merge_observed_pushes(live_bound)
+                    live_bound = live_bound.model_copy(update={
+                        "fix_iteration_count": bound.fix_iteration_count,
+                        "no_push_fix_count": bound.no_push_fix_count,
+                        "observed_head_shas": merged_shas,
+                        "push_count": push_count,
+                        "watch_retrigger_count": bound.watch_retrigger_count,
+                        "diff_scanned_at_sha": (
+                            bound.diff_scanned_at_sha
+                            if live_bound.head_sha == bound.head_sha else None
+                        ),
+                    })
+                self.state.current_pr = live_bound or bound
                 self.state.active_invocation = saved.active_invocation
                 if recovered_state == PipelineState.ERROR and saved.state != PipelineState.ERROR:
                     self.state.error_message = (
@@ -565,6 +920,8 @@ class RecoveryMixin:
                     f"[RECOVERY] Restored bound FIX PR #{bound.number} for "
                     f"{queued.pr_id} in {recovered_state.value}."
                 )
+                if live_bound is not None:
+                    self._rehydrate_last_push_at(live_bound)
                 return
 
         if doing is not None:
@@ -1225,43 +1582,170 @@ class RecoveryMixin:
                 f"{task_id}: {exc}."
             )
 
-    def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
-        """Seed ``_last_push_at`` from the PR's head commit's committer
-        date when we don't already have a fresher in-memory value.
+    def _initialize_publication_admission(
+        self, pr: PRInfo, evidence: gh_prs.HeadPublicationEvidence | None = None,
+    ) -> None:
+        """Keep WATCH admission's durable migration context in one place.
 
-        Needed on daemon restart (``__init__`` resets
-        ``_last_push_at`` to ``None``) and when ``handle_coding`` hands
-        off to WATCH on a freshly-created PR: without this rehydrate,
-        ``_has_new_codex_feedback_since_last_push`` would hit its
-        ``None`` default and return ``True`` on every cycle, triggering
-        ``handle_fix`` on pre-restart Codex feedback.
-
-        Falling back to ``pr.last_activity`` here is intentionally
-        avoided: ``last_activity`` comes from GitHub's ``updatedAt``,
-        which advances whenever Codex posts a comment, so a transient
-        commit-time fetch failure plus a pending Codex P1/P2 post
-        would seed the baseline to the feedback timestamp and make
-        the next ``_has_new_codex_feedback_since_last_push`` return
-        False, silently skipping the fix. When the fetch fails we
-        leave ``_last_push_at`` unset; ``handle_watch`` calls this
-        helper each cycle so the rehydrate retries naturally on the
-        next poll instead of latching a wrong value.
+        A PR poll can carry the current observation. When it does not, leave
+        publication unknown until the normal recovery/poll lookup supplies it.
         """
-        try:
-            metadata = gh_prs.get_pr_metadata(
-                self.owner_repo, pr.number
+        saved_floor = self.state.publication_watermark
+        if (
+            saved_floor is not None
+            and saved_floor.pr_number != pr.number
+            and self.state.publication_migration is None
+        ):
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                source="rebound_pr",
+                reason="Recovered live PR differs from the saved publication floor; confirm its publication.",
             )
-            head_iso = metadata.get("head_commit_date", "")
-        except Exception:
-            head_iso = ""
-        head_time = gh_runner._parse_iso(head_iso) if head_iso else None
-        if head_time is not None and head_time.tzinfo is None:
-            head_time = head_time.replace(tzinfo=timezone.utc)
-        if self._last_push_at_pr_number != pr.number:
-            self._last_push_at = head_time
-            self._last_push_at_pr_number = pr.number
+        if (
+            getattr(self, "_publication_snapshot_absent", False)
+            and saved_floor is None
+            and self.state.publication_migration is None
+        ):
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                source="missing_snapshot",
+                reason="Saved state is absent; an operator must confirm the observed publication.",
+            )
+        if (
+            getattr(self, "_publication_snapshot_pr_unbound", False)
+            and saved_floor is None
+            and self.state.publication_migration is None
+        ):
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                source="pr_undiscovered_snapshot",
+                reason="Saved state predates PR discovery; an operator must confirm publication.",
+            )
+        if getattr(self, "_publication_snapshot_damaged", False):
+            self.state.publication_migration = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                status="blocked",
+                reason="Saved state is corrupt; publication trust cannot be migrated automatically.",
+            )
+        if evidence is not None:
+            self._offer_publication_migration(pr, evidence)
+
+    def _admit_observed_pr(self, pr: PRInfo) -> None:
+        """Initialize trust context using the PR list's own observation."""
+        evidence = None
+        if pr.publication_observed:
+            evidence = gh_prs.HeadPublicationEvidence(
+                repo=pr.publication_repo, pr_number=pr.number,
+                head_repo=pr.publication_head_repo, ref=pr.publication_ref,
+                head_sha=pr.publication_head_sha,
+                published_at=pr.publication_at,
+                provenance=pr.publication_provenance,
+                unknown_reason=pr.publication_reason,
+            )
+        self._initialize_publication_admission(pr, evidence)
+
+    def _rehydrate_last_push_at(self, pr: PRInfo) -> None:
+        """Refresh the feedback floor from current-head publication evidence."""
+        self._initialize_publication_admission(pr)
+        evidence = gh_prs.get_pr_head_publication(
+            self.owner_repo, pr.number, expected_head_sha=pr.head_sha
+        )
+        self._offer_publication_migration(pr, evidence)
+        published_at, reason = self._validate_publication_observation(
+            pr.number, pr.head_sha, evidence.published_at,
+            getattr(evidence, "unknown_reason", None),
+            head_repo=getattr(evidence, "head_repo", ""),
+            ref=getattr(evidence, "ref", ""),
+            observed_repo=getattr(evidence, "repo", ""),
+            observed_head_sha=getattr(evidence, "head_sha", ""),
+            provenance=getattr(evidence, "provenance", ""),
+        )
+        self._last_push_at = published_at
+        self._last_push_at_pr_number = pr.number
+        self._last_push_at_head_sha = pr.head_sha if published_at else None
+        self._push_provenance_reason = reason
+
+    def _offer_publication_migration(self, pr: PRInfo, evidence: gh_prs.HeadPublicationEvidence) -> None:
+        """Offer an exact operator confirmation after fresh publication lookup."""
+        proposal = self.state.publication_migration
+        if proposal is None or proposal.status != "legacy":
             return
-        if head_time is None:
+        if proposal.repo != self.owner_repo:
+            proposal.status = "blocked"
+            proposal.reason = "Recovered PR repository changed; original upgrade proposal is invalid."
             return
-        if self._last_push_at is None or head_time > self._last_push_at:
-            self._last_push_at = head_time
+        task = self.state.current_task
+        if task is not None and find_matching_open_pr(task.pr_id, task.branch, [pr]) is None:
+            proposal.status = "blocked"
+            proposal.reason = "Recovered PR no longer matches the current task branch."
+            return
+        target_changed = (
+            proposal.pr_number != pr.number
+            or proposal.ref != f"refs/heads/{pr.branch}"
+            or proposal.head_sha.lower() != pr.head_sha.lower()
+        )
+        if target_changed:
+            proposal = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                source="rebound_pr" if proposal.pr_number != pr.number else proposal.source,
+                reason="Recovered live PR target changed; confirm its publication.",
+                generation=(proposal.generation or 0) + 1,
+            )
+            self.state.publication_migration = proposal
+        if (
+            evidence.repo != self.owner_repo or evidence.pr_number != pr.number
+            or evidence.ref != proposal.ref or evidence.head_sha.lower() != pr.head_sha.lower()
+            or re.fullmatch(r"[^/]+/[^/]+", evidence.head_repo) is None
+            or (not pr.is_cross_repository and evidence.head_repo != self.owner_repo)
+            or evidence.published_at is None or evidence.published_at.tzinfo is None
+            or evidence.unknown_reason is not None
+            or not evidence.provenance.startswith("github-activity:")
+        ):
+            if proposal.published_at is not None:
+                proposal.last_complete_published_at = proposal.published_at
+            proposal.published_at = None
+            proposal.reason = evidence.unknown_reason or "Publication metadata is missing or contradictory."
+            return
+        if proposal.head_repo and proposal.head_repo != evidence.head_repo:
+            proposal = PublicationMigration(
+                repo=self.owner_repo, pr_number=pr.number, head_repo="",
+                ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
+                source=proposal.source,
+                reason="PR head repository changed; confirm its publication.",
+                generation=(proposal.generation or 0) + 1,
+            )
+            self.state.publication_migration = proposal
+        prior_event = proposal.last_complete_published_at or proposal.published_at
+        if prior_event is not None and (
+            prior_event != evidence.published_at
+            or proposal.provenance != evidence.provenance
+        ):
+            proposal.generation = (proposal.generation or 0) + 1
+        proposal.head_repo = evidence.head_repo
+        proposal.published_at = evidence.published_at
+        proposal.last_complete_published_at = evidence.published_at
+        proposal.provenance = evidence.provenance
+        if proposal.source == "missing_snapshot":
+            proposal.reason = "Saved state is absent; confirm this historical publication as the initial safety floor."
+        elif proposal.source == "pr_undiscovered_snapshot":
+            proposal.reason = (
+                "Saved state predates PR discovery; confirm this publication "
+                "as the initial safety floor."
+            )
+        elif proposal.source == "rebound_pr":
+            proposal.reason = (
+                "Recovered live PR differs from saved state; confirm its publication "
+                "as the initial floor."
+            )
+        elif proposal.source == "unvalidated_current_snapshot":
+            proposal.reason = (
+                "Saved PR observation has no validated floor; confirm this publication "
+                "as the initial floor."
+            )
+        else:
+            proposal.reason = "Historical publication needs an operator trust anchor."

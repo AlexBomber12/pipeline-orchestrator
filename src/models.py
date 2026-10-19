@@ -87,6 +87,15 @@ class PRInfo(BaseModel):
     # without re-fetching PR metadata. Empty string when the upstream
     # ``gh`` payload omitted the SHA.
     head_sha: str = ""
+    # Transient publication observation from the current GitHub status poll.
+    publication_observed: bool = False
+    publication_at: datetime | None = None
+    publication_reason: str | None = None
+    publication_head_repo: str = ""
+    publication_ref: str = ""
+    publication_repo: str = ""
+    publication_head_sha: str = ""
+    publication_provenance: str = ""
     fix_iteration_count: int = 0
     no_push_fix_count: int = 0
     # OBS-BL (PR-249): WATCH retrigger cycles counted to cap runaway
@@ -183,6 +192,38 @@ class InvocationSnapshot:
     fix_iteration: int | None = None
 
 
+class PublicationWatermark(BaseModel):
+    """Durable safety floor for one PR branch across its HEAD changes."""
+
+    repo: str
+    pr_number: int
+    head_repo: str
+    ref: str
+    head_sha: str
+    published_at: datetime
+    provenance: str = "prior-validated-publication"
+
+
+class PublicationMigration(BaseModel):
+    """Recovery proposal bound to one observed open PR and publication."""
+
+    repo: str
+    pr_number: int
+    head_repo: str
+    ref: str
+    head_sha: str
+    published_at: datetime | None = None
+    provenance: str = ""
+    generation: int | None = None
+    last_complete_published_at: datetime | None = None
+    source: Literal[
+        "parent_snapshot", "missing_snapshot", "pr_undiscovered_snapshot", "rebound_pr",
+        "unvalidated_current_snapshot",
+    ] = "parent_snapshot"
+    reason: str
+    status: Literal["legacy", "blocked"] = "legacy"
+
+
 class RepoState(BaseModel):
     url: str
     name: str
@@ -192,6 +233,9 @@ class RepoState(BaseModel):
     current_queue: list[QueueTask] | None = None
     current_queue_snapshot_at: datetime | None = None
     current_pr: PRInfo | None = None
+    publication_watermark: PublicationWatermark | None = None
+    publication_schema_version: int = 1
+    publication_migration: PublicationMigration | None = None
     error_message: str | None = None
     last_updated: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)

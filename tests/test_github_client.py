@@ -7,6 +7,7 @@ import logging
 import subprocess
 from datetime import datetime, timedelta
 from datetime import timezone as _tz
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -96,7 +97,7 @@ def _default_review_push_time(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 1, 1, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 1, 1, tzinfo=_tz.utc),
     )
 
 
@@ -1411,10 +1412,10 @@ def test_review_status_eyes_wins_over_codex_comment(
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
 
 
-def test_body_eyes_wins_over_anchor_plus_one(
+def test_anchor_plus_one_wins_over_body_eyes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A PR-body eyes signal should beat an anchor +1 while review is in progress."""
+    """A valid anchor +1 wins over a lingering PR-body eyes reaction."""
     import json as _json
 
     clear_review_status_cache()
@@ -1435,7 +1436,10 @@ def test_body_eyes_wins_over_anchor_plus_one(
         elif "pulls" in path and path.endswith("/comments"):
             data = []
         elif "comments/10/reactions" in path:
-            data = [[{"content": "+1", "user": _codex_user("chatgpt-codex-bot")}]]
+            data = [[{
+                "content": "+1", "user": _codex_user("chatgpt-codex-bot"),
+                "created_at": "2026-01-01T00:02:00Z",
+            }]]
         elif path.endswith("/reactions"):
             data = [[{"content": "eyes", "user": _codex_user("chatgpt-codex-bot")}]]
         else:
@@ -1443,14 +1447,15 @@ def test_body_eyes_wins_over_anchor_plus_one(
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(reviews, "_get_pr_push_time", lambda *_: datetime(2026, 1, 1, tzinfo=_tz.utc))
 
-    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="head") == ReviewStatus.APPROVED
 
 
-def test_anchor_eyes_wins_over_body_plus_one(
+def test_body_plus_one_wins_over_anchor_eyes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An anchor eyes signal should beat a PR-body +1 while review is in progress."""
+    """A valid PR-body +1 wins over a lingering anchor eyes reaction."""
     import json as _json
 
     clear_review_status_cache()
@@ -1473,14 +1478,18 @@ def test_anchor_eyes_wins_over_body_plus_one(
         elif "comments/10/reactions" in path:
             data = [[{"content": "eyes", "user": _codex_user("chatgpt-codex-bot")}]]
         elif path.endswith("/reactions"):
-            data = [[{"content": "+1", "user": _codex_user("chatgpt-codex-bot")}]]
+            data = [[{
+                "content": "+1", "user": _codex_user("chatgpt-codex-bot"),
+                "created_at": "2026-01-01T00:02:00Z",
+            }]]
         else:
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
     monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(reviews, "_get_pr_push_time", lambda *_: datetime(2026, 1, 1, tzinfo=_tz.utc))
 
-    assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
+    assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="head") == ReviewStatus.APPROVED
 
 
 def test_review_api_with_body_eyes_stays_eyes(
@@ -1744,7 +1753,7 @@ def test_body_plus_one_before_latest_push_is_stale_even_if_commit_is_older(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 1, 2, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 1, 2, tzinfo=_tz.utc),
     )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -1807,7 +1816,7 @@ def test_body_plus_one_no_push_time_stays_pending(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: None,
+        lambda repo, pr_number, head_sha="": None,
     )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -1879,7 +1888,7 @@ def test_no_plus_one_does_not_fetch_latest_push_time(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: (_ for _ in ()).throw(
+        lambda repo, pr_number, head_sha="": (_ for _ in ()).throw(
             AssertionError("push-time lookup should not run without +1")
         ),
     )
@@ -1914,10 +1923,10 @@ def test_no_plus_one_does_not_fetch_latest_push_time(
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="deadbeef") == ReviewStatus.PENDING
 
 
-def test_body_eyes_returns_before_comment_fetches(
+def test_body_eyes_without_conflicting_comments_stays_eyes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A body-level eyes signal should not depend on later comment API calls."""
+    """A body-level eyes signal remains in progress with no other evidence."""
     import json as _json
 
     clear_review_status_cache()
@@ -1926,10 +1935,8 @@ def test_body_eyes_returns_before_comment_fetches(
         path = _find_api_path(cmd)
         if path.endswith("/pulls/42/reviews"):
             raise AssertionError("review lookup should not run for body eyes only")
-        if "issues" in path and path.endswith("/comments"):
-            raise AssertionError("issue comments should not be fetched after body eyes")
-        if "pulls" in path and path.endswith("/comments"):
-            raise AssertionError("review comments should not be fetched after body eyes")
+        if path.endswith("/comments"):
+            return _FakeCompletedProcess(stdout=_json.dumps([]))
         if path.endswith("/reactions"):
             data = [[{"content": "eyes", "user": _codex_user("chatgpt-codex-bot")}]]
         else:
@@ -2293,6 +2300,31 @@ def test_has_recent_codex_review_request_counts_same_second(
     )
 
 
+def test_review_request_dedup_rejects_invalid_publication_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cache, "_gh_api_paginated", lambda *_: [{
+        "user": {"login": "same-user"}, "body": "@codex review",
+        "created_at": _iso_utc_now_minus(30),
+    }])
+    assert not has_recent_codex_review_request(
+        "owner/name", 42, "same-user", after_iso="not-a-date"
+    )
+
+
+def test_review_request_dedup_normalizes_naive_publication_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = _iso_utc_now_minus(30)
+    monkeypatch.setattr(cache, "_gh_api_paginated", lambda *_: [{
+        "user": {"login": "same-user"}, "body": "@codex review",
+        "created_at": created,
+    }])
+    assert has_recent_codex_review_request(
+        "owner/name", 42, "same-user", after_iso=created.replace("Z", "")
+    )
+
+
 def test_get_pr_head_commit_iso_returns_committer_date(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2383,7 +2415,7 @@ def test_body_plus_one_review_on_head_still_requires_fresh_reaction(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 1, 10, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 1, 10, tzinfo=_tz.utc),
     )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -2426,7 +2458,7 @@ def test_body_plus_one_review_on_head_approves_when_reaction_is_fresh(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 1, 10, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 1, 10, tzinfo=_tz.utc),
     )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -2469,7 +2501,7 @@ def test_body_plus_one_review_on_head_no_push_time_stays_pending(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: None,
+        lambda repo, pr_number, head_sha="": None,
     )
 
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
@@ -2512,7 +2544,7 @@ def test_unverifiable_body_plus_one_still_surfaces_current_findings(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: None,
+        lambda repo, pr_number, head_sha="": None,
     )
     actor = _codex_user("chatgpt-codex-connector")
 
@@ -2603,7 +2635,7 @@ def test_anchor_plus_one_requires_verifiable_current_head_freshness(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 2, 1, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 2, 1, tzinfo=_tz.utc),
     )
 
     assert (
@@ -2645,7 +2677,7 @@ def test_anchor_plus_one_with_fresh_timestamp_approves_current_head(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 2, 1, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 2, 1, tzinfo=_tz.utc),
     )
 
     assert (
@@ -2664,7 +2696,7 @@ def test_body_plus_one_same_actor_current_review_with_findings_stays_requested(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 2, 1, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 2, 1, tzinfo=_tz.utc),
     )
     actor = _codex_user("chatgpt-codex-connector")
 
@@ -2728,7 +2760,7 @@ def test_body_plus_one_review_sha_must_match_reacting_actor(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(2026, 2, 1, tzinfo=_tz.utc),
+        lambda repo, pr_number, head_sha="": datetime(2026, 2, 1, tzinfo=_tz.utc),
     )
     actor_a = _reviewer_user(TRUSTED_REVIEWER_ID, "chatgpt-codex-connector")
     actor_b = _reviewer_user(SECOND_TRUSTED_REVIEWER_ID, "codex-second-reviewer")
@@ -2803,7 +2835,7 @@ def test_body_plus_one_same_second_as_latest_push_approves(
     monkeypatch.setattr(
         reviews,
         "_get_pr_push_time",
-        lambda repo, pr_number: datetime(
+        lambda repo, pr_number, head_sha="": datetime(
             2026, 1, 2, 12, 34, 56, tzinfo=_tz.utc
         ),
     )
@@ -3290,6 +3322,12 @@ def test_begin_review_cache_cycle_initializes_and_increments() -> None:
 
     reviews._begin_review_cache_cycle()
     assert reviews._review_status_cache_cycle == 2
+    reviews._begin_review_cache_cycle("owner/name")
+    generation = reviews.review_cache_generation("owner/name")
+    reviews._begin_review_cache_cycle("other/name")
+    assert reviews.review_cache_generation("owner/name") == generation
+    reviews._begin_review_cache_cycle("owner/name")
+    assert reviews.review_cache_generation("owner/name") != generation
 
 
 def test_is_reaction_content_rejects_non_dict() -> None:
@@ -3330,7 +3368,7 @@ def test_get_open_prs_returns_prinfo_objects(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.APPROVED,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.APPROVED,
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
@@ -3393,7 +3431,7 @@ def test_get_open_prs_invokes_rest_helper_with_head_sha(
     monkeypatch.setattr("src.github.checks._retrieve_ci_status_evidence", fake_fetch)
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs("owner/name")
@@ -3444,7 +3482,7 @@ def test_get_open_prs_rejects_untrusted_required_check_provenance(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs(
@@ -3481,7 +3519,7 @@ def test_get_open_prs_rest_fetch_failure_follows_allow_merge_without_checks(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
@@ -3523,7 +3561,7 @@ def test_get_open_prs_falls_back_to_rest_on_graphql_rate_limit(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
@@ -3579,7 +3617,7 @@ def test_get_open_prs_rest_fallback_requires_complete_ci_retrieval(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs("owner/name", allow_merge_without_checks=True)
@@ -3636,7 +3674,7 @@ def test_get_open_prs_rest_fallback_rejects_untrusted_required_check_provenance(
     )
     monkeypatch.setattr(
         "src.github.reviews.get_pr_review_status",
-        lambda repo, number, pr_author, head_sha, policy=None: ReviewStatus.PENDING,
+        lambda repo, number, pr_author, head_sha, policy=None, publication_evidence=None: ReviewStatus.PENDING,
     )
 
     prs = get_open_prs(
@@ -4181,7 +4219,12 @@ def test_get_last_push_age_seconds_returns_computed_age(
         def now(cls, tz: _tz | None = None) -> datetime:
             return cls(2026, 4, 19, 12, 0, 0, tzinfo=tz)
 
-    responses = iter(["feature-branch", "2026-04-19T11:59:30Z", ""])
+    sha = "a" * 40
+    responses = iter([
+        {"branch": "feature-branch", "repo": "owner/name", "sha": sha},
+        [{"activity_type": "branch_creation", "ref": "refs/heads/feature-branch",
+          "after": sha, "timestamp": "2026-04-19T11:59:30Z"}],
+    ])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     monkeypatch.setattr("src.github.prs.datetime", _FakeDateTime)
 
@@ -4191,7 +4234,7 @@ def test_get_last_push_age_seconds_returns_computed_age(
 def test_get_last_push_age_seconds_returns_none_for_empty_push_timestamp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-branch", "", ""])
+    responses = iter([{"branch": "feature-branch", "repo": "owner/name", "sha": "a" * 40}, []])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_last_push_age_seconds("owner/name", 42) is None
 
@@ -4199,7 +4242,9 @@ def test_get_last_push_age_seconds_returns_none_for_empty_push_timestamp(
 def test_get_last_push_age_seconds_returns_none_on_parse_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-branch", "not-a-date"])
+    responses = iter([{"branch": "feature-branch", "repo": "owner/name", "sha": "a" * 40},
+                      [{"activity_type": "push", "ref": "refs/heads/feature-branch",
+                        "after": "a" * 40, "timestamp": "not-a-date"}]])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_last_push_age_seconds("owner/name", 42) is None
 
@@ -4209,9 +4254,9 @@ def test_get_pr_last_push_time_returns_parsed_datetime(
 ) -> None:
     responses = iter(
         [
-            {"branch": "feature-branch", "repo": "fork-owner/fork-repo"},
-            "2026-04-30T11:59:30Z",
-            "",
+            {"branch": "feature-branch", "repo": "fork-owner/fork-repo", "sha": "a" * 40},
+            [{"activity_type": "push", "ref": "refs/heads/feature-branch",
+              "after": "a" * 40, "timestamp": "2026-04-30T11:59:30Z"}],
         ]
     )
     calls: list[list[str]] = []
@@ -4244,6 +4289,21 @@ def test_review_freshness_delegates_to_pr_push_time(
     assert calls == [("owner/name", 42)]
 
 
+def test_review_freshness_validates_observed_head(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    expected = datetime(2026, 4, 30, 11, 59, 30, tzinfo=_tz.utc)
+    seen: list[str] = []
+    def publication(repo: str, number: int, *, expected_head_sha: str):
+        seen.append(expected_head_sha)
+        return SimpleNamespace(published_at=expected)
+    monkeypatch.setattr(prs, "get_pr_head_publication", publication)
+    assert _REAL_GET_REVIEW_PUSH_TIME("owner/name", 42, "a" * 40) == expected
+    assert seen == ["a" * 40]
+
+
 def test_get_pr_last_push_time_returns_none_without_branch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -4264,7 +4324,7 @@ def test_get_pr_last_push_time_returns_none_without_head_repository(
 def test_get_pr_last_push_time_returns_none_when_activity_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-branch", "", ""])
+    responses = iter([{"branch": "feature-branch", "repo": "owner/name", "sha": "a" * 40}, []])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_pr_last_push_time("owner/name", 42) is None
 
@@ -4272,7 +4332,9 @@ def test_get_pr_last_push_time_returns_none_when_activity_empty(
 def test_get_pr_last_push_time_returns_none_on_parse_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    responses = iter(["feature-branch", "not-a-date"])
+    responses = iter([{"branch": "feature-branch", "repo": "owner/name", "sha": "a" * 40},
+                      [{"activity_type": "push", "ref": "refs/heads/feature-branch",
+                        "after": "a" * 40, "timestamp": "not-a-date"}]])
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: next(responses))
     assert get_pr_last_push_time("owner/name", 42) is None
 
@@ -6249,6 +6311,489 @@ def test_get_latest_codex_feedback_collects_post_anchor_codex_comments(
     assert out == "P1: rename foo\n\nP2: extract helper"
 
 
+def test_recorded_620_receipt_requires_current_plus_one_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Production readers agree on the sanitized receipt and body reaction."""
+    receipt = json.loads(
+        (Path(__file__).parent / "fixtures/review_receipt_620.json").read_text()
+    )
+    anchor = {
+        "id": 10, "user": {"login": "author"}, "body": "@codex review",
+        "created_at": "2026-10-17T21:07:00Z",
+    }
+    body_reactions: list[dict] = []
+    anchor_reactions: list[dict] = []
+    issue_comments = [anchor, receipt]
+
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/reactions"):
+            return body_reactions
+        if path.endswith("/issues/42/comments"):
+            return issue_comments
+        if path.endswith("/pulls/42/comments") or path.endswith("/pulls/42/reviews"):
+            return []
+        if path.endswith("/issues/comments/10/reactions"):
+            return anchor_reactions
+        raise AssertionError(path)
+
+    monkeypatch.setattr(cache, "_gh_api_paginated", transport)
+    monkeypatch.setattr(prs, "get_pr_author", lambda *_: "author")
+    monkeypatch.setattr(
+        reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 10, 17, 21, 7, tzinfo=_tz.utc),
+    )
+    head = "63f07ef48a035c9aa31c37e0fbf3dc215ba0045e"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    assert comments.get_latest_codex_feedback("owner/name", 42) is None
+
+    body_reactions.append({
+        "content": "+1", "user": receipt["user"],
+        "created_at": "2026-10-17T21:09:00Z",
+    })
+    monkeypatch.setattr(reviews, "_get_pr_push_time", lambda *_: None)
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    monkeypatch.setattr(
+        reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 10, 17, 21, 7, tzinfo=_tz.utc),
+    )
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    provider_error = {
+        "id": 13, "user": receipt["user"],
+        "body": "Codex Review: unable to complete review. Try again later.",
+        "created_at": "2026-10-17T21:10:00Z",
+    }
+    issue_comments.append(provider_error)
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    malformed_summary = {
+        "id": 14, "user": receipt["user"],
+        "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v2 {} -->",
+        "created_at": "2026-10-17T21:11:00Z",
+    }
+    issue_comments.append(malformed_summary)
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    issue_comments.remove(malformed_summary)
+    issue_comments.remove(provider_error)
+
+    body_reactions[0]["created_at"] = "2026-10-17T21:06:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    body_reactions[0]["user"] = {"id": 987654, "login": "other-bot"}
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+
+    body_reactions[0]["user"] = receipt["user"]
+    body_reactions[0]["created_at"] = "2026-10-17T21:09:00Z"
+    issue_comments.append({
+        "id": 11, "user": receipt["user"], "body": "P1: fix the null check",
+        "created_at": "2026-10-17T21:10:00Z",
+    })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    assert comments.get_latest_codex_feedback("owner/name", 42) == "P1: fix the null check"
+
+    body_reactions[0]["created_at"] = "2026-10-17T21:11:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    body_reactions[0]["created_at"] = "2026-10-17T21:10:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    body_reactions[0]["created_at"] = "2026-10-17T21:09:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    body_reactions[0]["created_at"] = "2026-10-17T21:06:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    body_reactions.clear()
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+
+    issue_comments.remove(receipt)
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    assert comments.get_latest_codex_feedback("owner/name", 42) == "P1: fix the null check"
+
+    anchor_reactions.append({
+        "content": "+1", "user": receipt["user"],
+        "created_at": "2026-10-17T21:11:00Z",
+    })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    anchor_reactions.clear()
+    issue_comments[-1]["body"] = "[P1] Fix the no findings empty state"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    assert comments.get_latest_codex_feedback("owner/name", 42) == "[P1] Fix the no findings empty state"
+    issue_comments[-1]["body"] = "[P1] Fix the review complete callback"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    assert comments.get_latest_codex_feedback("owner/name", 42) == "[P1] Fix the review complete callback"
+    issue_comments.append({
+        "id": 12, "user": receipt["user"], "body": "",
+        "created_at": "2026-10-17T21:12:00Z",
+    })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    assert comments.get_latest_codex_feedback("owner/name", 42) == "[P1] Fix the review complete callback"
+    anchor_reactions.append({
+        "content": "+1", "user": receipt["user"],
+        "created_at": "2026-10-17T21:11:00Z",
+    })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    anchor_reactions[0]["created_at"] = "2026-10-17T21:12:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.PENDING
+    anchor_reactions[0]["created_at"] = "2026-10-17T21:13:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.APPROVED
+    anchor_reactions.clear()
+    issue_comments[-2]["body"] = "Please fix the review complete callback"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head) == ReviewStatus.CHANGES_REQUESTED
+    assert comments.get_latest_codex_feedback("owner/name", 42) == "Please fix the review complete callback"
+
+
+def test_structured_summary_reader_and_poll_evidence_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = json.loads(
+        (Path(__file__).parent / "fixtures/review_summary_structured.json").read_text()
+    )
+    anchor = {
+        "id": 10, "user": {"login": "author"}, "body": "@codex review",
+        "created_at": "2026-10-17T21:05:00Z",
+    }
+    issue_comments = [anchor, summary]
+    monkeypatch.setattr(
+        cache, "_gh_api_paginated",
+        lambda path: issue_comments if path.endswith("/issues/42/comments") else [],
+    )
+    policy = ReviewerPolicy([
+        TrustedReviewerIdentity(user_id=TRUSTED_REVIEWER_ID, login="codex")
+    ])
+    other_policy = ReviewerPolicy([
+        TrustedReviewerIdentity(user_id=SECOND_TRUSTED_REVIEWER_ID, login="other")
+    ])
+    head = "a" * 40
+    reviews.clear_review_status_cache()
+    reviews._begin_review_cache_cycle()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.PENDING
+    evidence = reviews.cached_review_feedback("owner/name", 42, head, policy)
+    assert evidence is not None and evidence.findings == ()
+    reviews._begin_review_cache_cycle("other/name")
+    assert reviews.cached_review_feedback("owner/name", 42, head, policy) is evidence
+    reviews._begin_review_cache_cycle("owner/name")
+    assert reviews.cached_review_feedback("owner/name", 42, head, policy) is None
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.PENDING
+    assert reviews.cached_review_feedback("owner/name", 43, head, policy) is None
+    assert reviews.cached_review_feedback("other/name", 42, head, policy) is None
+    assert reviews.cached_review_feedback("owner/name", 42, "b" * 40, policy) is None
+    assert reviews.cached_review_feedback("owner/name", 42, head, other_policy) is None
+
+    summary["body"] = "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v2 {} -->"
+    reviews._begin_review_cache_cycle()
+    assert reviews.cached_review_feedback("owner/name", 42, head, policy) is None
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.PENDING
+    evidence = reviews.cached_review_feedback("owner/name", 42, head, policy)
+    assert evidence is not None and evidence.unknown_reason is not None
+
+    issue_comments.append({
+        "id": 12, "user": summary["user"], "body": "[P1] Fix the empty input",
+        "created_at": "2026-10-17T21:07:00Z",
+    })
+    reviews._begin_review_cache_cycle()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.CHANGES_REQUESTED
+    evidence = reviews.cached_review_feedback("owner/name", 42, head, policy)
+    assert evidence is not None and evidence.findings == ("[P1] Fix the empty input",)
+
+
+def test_unresolved_structured_summary_blocks_earlier_approval(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    summary = json.loads(
+        (Path(__file__).parent / "fixtures/review_summary_structured.json").read_text()
+    )
+    summary["body"] = summary["body"].replace(
+        '"has_any_findings":false,"has_unresolved_findings":false',
+        '"has_any_findings":true,"has_unresolved_findings":true',
+    )
+    comments = [
+        {"id": 10, "user": {"login": "author"}, "body": "@codex review",
+         "created_at": "2026-10-17T21:05:00Z"},
+        summary,
+    ]
+    body_reactions = [{
+        "content": "+1", "user": summary["user"],
+        "created_at": "2026-10-17T21:05:30Z",
+    }]
+
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return comments
+        if path.endswith("/issues/42/reactions"):
+            return body_reactions
+        return []
+
+    monkeypatch.setattr(cache, "_gh_api_paginated", transport)
+    monkeypatch.setattr(
+        reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 10, 17, 21, 4, tzinfo=_tz.utc),
+    )
+    policy = ReviewerPolicy([
+        TrustedReviewerIdentity(user_id=TRUSTED_REVIEWER_ID, login="codex")
+    ])
+    head = "a" * 40
+    reviews.clear_review_status_cache()
+    assert reviews.classify_review_comment(summary) == "summary_blocking"
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.PENDING
+    evidence = reviews.cached_review_feedback("owner/name", 42, head, policy)
+    assert evidence is not None and evidence.findings == ()
+    assert "unresolved findings" in (evidence.unknown_reason or "")
+
+    body_reactions[0]["created_at"] = "2026-10-17T21:07:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == ReviewStatus.APPROVED
+
+
+@pytest.mark.parametrize("updated_at", [None, "2026-10-17T21:00:00", "2026-10-17T21:08:00"])
+def test_structured_summary_requires_ordered_update_and_current_head(
+    updated_at: str | None,
+) -> None:
+    summary = json.loads(
+        (Path(__file__).parent / "fixtures/review_summary_structured.json").read_text()
+    )
+    summary["created_at"] = "2026-10-17T21:06:00Z"
+    summary["updated_at"] = updated_at
+    summary["body"] = summary["body"].replace(
+        '"has_any_findings":false,"has_unresolved_findings":false',
+        '"has_any_findings":true,"has_unresolved_findings":true',
+    )
+    anchor = {
+        "id": 10, "user": {"login": "author"}, "body": "@codex review",
+        "created_at": "2026-10-17T21:05:00Z",
+    }
+    policy = ReviewerPolicy([
+        TrustedReviewerIdentity(user_id=TRUSTED_REVIEWER_ID, login="codex")
+    ])
+    evidence = reviews.feedback_from_comments(
+        [anchor, summary], [], "author", policy, head_sha="a" * 40,
+    )
+    assert evidence.findings == ()
+    assert evidence.unknown_reason
+    assert evidence.undated_blocking == (updated_at is None or updated_at < summary["created_at"])
+    assert reviews.feedback_from_comments(
+        [anchor, summary], [], "author", policy, head_sha="b" * 40,
+    ).unknown_reason is None
+
+
+@pytest.mark.parametrize(
+    ("finding_at", "expected"),
+    [
+        ("2026-10-17T21:07:00Z", ReviewStatus.APPROVED),
+        ("2026-10-17T21:08:00Z", ReviewStatus.PENDING),
+        ("2026-10-17T21:09:00Z", ReviewStatus.CHANGES_REQUESTED),
+        (None, ReviewStatus.PENDING),
+    ],
+)
+def test_provider_error_preserves_only_proven_superseded_findings(
+    monkeypatch: pytest.MonkeyPatch,
+    finding_at: str | None,
+    expected: ReviewStatus,
+) -> None:
+    actor = _codex_user("chatgpt-codex-bot")
+    issue_comments = [
+        {"id": 10, "user": {"login": "author"}, "body": "@codex review",
+         "created_at": "2026-10-17T21:05:00Z"},
+        {"id": 11, "user": actor, "body": "P1: fix the null check",
+         "created_at": finding_at},
+        {"id": 12, "user": actor,
+         "body": "Codex Review: unable to complete review. Try again later.",
+         "created_at": "2026-10-17T21:10:00Z"},
+    ]
+    if finding_at is None:
+        issue_comments[0]["created_at"] = None  # No anchor ordering is available.
+
+    def transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/comments"):
+            return issue_comments
+        if path.endswith("/issues/42/reactions"):
+            return [{
+                "content": "+1", "user": actor,
+                "created_at": "2026-10-17T21:08:00Z",
+            }]
+        return []
+
+    monkeypatch.setattr(cache, "_gh_api_paginated", transport)
+    monkeypatch.setattr(
+        reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 10, 17, 21, 4, tzinfo=_tz.utc),
+    )
+    reviews.clear_review_status_cache()
+    head = "a" * 40
+    policy = ReviewerPolicy([
+        TrustedReviewerIdentity(user_id=TRUSTED_REVIEWER_ID, login="codex")
+    ])
+    assert reviews.get_pr_review_status("owner/name", 42, "author", head, policy) == expected
+    evidence = reviews.cached_review_feedback("owner/name", 42, head, policy)
+    assert evidence is not None and evidence.findings == ("P1: fix the null check",)
+
+
+def test_review_feedback_classifies_nonfindings_and_unknown_provenance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    actor = _codex_user("chatgpt-codex-bot")
+    policy = reviews.reviewer_policy_from_config(reviews.load_config())
+    samples = {
+        "<!-- codex-review-receipt:v1 --> no findings": "receipt",
+        "create a Codex account and connect to github": "onboarding",
+        "Unable to review this PR": "provider_error",
+        "Codex Review: unable to complete review. Try again later.": "provider_error",
+        "Codex Review: Something went wrong. Try again...": "provider_error",
+        "Codex Review: Please try again": "provider_error",
+        "Review is in progress": "progress",
+        "Codex Review: Review is in progress": "progress",
+        "Something went wrong while reviewing this PR. Please try again.": "provider_error",
+        "Summary: review started": "summary",
+        "Summary: This change correctly handles empty input": "summary",
+        (
+            "<!-- codex-pull-request-review-summary -->\n"
+            '<!-- codex-review-state:v1 {"code_review":{"commit_sha":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+            '"status":"completed",'
+            '"has_any_findings":false,"has_unresolved_findings":false}} -->\n\n'
+            "## Codex Review Summary"
+        ): "summary",
+        (
+            "<!-- codex-pull-request-review-summary -->\n"
+            '<!-- codex-review-state:v1 {"code_review":{"status":"in_progress"}} -->'
+        ): "summary",
+        "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v2 {} -->": "unknown",
+        "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 broken -->": "unknown",
+        (
+            "<!-- codex-pull-request-review-summary -->\n"
+            "<!-- codex-review-state:v1 broken -->\n[P1] metadata text"
+        ): "unknown",
+        "Summary:\n[P1] Fix the empty input": "finding",
+        "": "unknown",
+        "I found one issue.": "finding",
+        "This dereferences None on empty input": "finding",
+        "P2: fix the null check": "finding",
+        "[P1] Fix the no findings empty state": "finding",
+        "[P1] Fix the review complete callback": "finding",
+        "Please fix the review complete callback": "finding",
+    }
+    for body, expected in samples.items():
+        assert reviews.classify_review_comment({"body": body}) == expected
+    for state in (
+        {"code_review": {"status": "unsupported"}},
+        {"code_review": {"status": "completed", "has_any_findings": None}},
+        {"code_review": {
+            "commit_sha": "a" * 40, "status": "completed",
+            "has_any_findings": None, "has_unresolved_findings": False,
+        }},
+        {"code_review": {
+            "commit_sha": "a" * 40, "status": "completed",
+            "has_any_findings": False, "has_unresolved_findings": True,
+        }},
+        {"code_review": {
+            "status": "completed", "has_any_findings": False,
+            "has_unresolved_findings": None,
+        }},
+        {"security_review": {}},
+    ):
+        body = (
+            "<!-- codex-pull-request-review-summary -->\n"
+            f"<!-- codex-review-state:v1 {json.dumps(state)} -->"
+        )
+        assert reviews.classify_review_comment({"body": body}) == "unknown"
+    assert reviews.classify_review_comment({"body": "rename this"}, inline=True) == "finding"
+
+    anchor = {"id": 1, "user": {"login": "author"}, "body": "@codex review",
+              "created_at": "2026-01-01T00:00:00"}
+    finding = {"id": 2, "user": actor, "body": "P1: fix the bug",
+               "created_at": "2026-01-01T00:01:00"}
+    evidence = reviews.feedback_from_comments(
+        [anchor, finding], [], "author", policy,
+        datetime(2026, 1, 1, 0, 0),
+    )
+    assert evidence.findings == ("P1: fix the bug",)
+    assert evidence.source_ids == (2,)
+    assert evidence.sources == (("issue", 2, actor["id"]),)
+    assert evidence.latest_blocking_at == datetime(2026, 1, 1, 0, 1, tzinfo=_tz.utc)
+    assert evidence.latest_finding_at == datetime(2026, 1, 1, 0, 1, tzinfo=_tz.utc)
+    assert not evidence.undated_blocking
+    later = {**finding, "id": 4, "created_at": "2026-01-01T00:03:00Z"}
+    undated = {**finding, "id": 5, "created_at": None}
+    evidence = reviews.feedback_from_comments([finding, later], [undated], "author", policy)
+    assert evidence.latest_blocking_at == datetime(2026, 1, 1, 0, 3, tzinfo=_tz.utc)
+    assert evidence.latest_finding_at == datetime(2026, 1, 1, 0, 3, tzinfo=_tz.utc)
+    assert evidence.undated_blocking
+    unsupported = {"id": 3, "user": actor, "body": "",
+                   "created_at": "2026-01-01T00:02:00Z"}
+    assert reviews.feedback_from_comments(
+        [anchor, unsupported], [], "author", policy
+    ).unknown_reason is not None
+
+    body_reactions: list[dict] = []
+
+    def unknown_transport(path: str) -> list[dict]:
+        if path.endswith("/issues/42/reactions"):
+            return body_reactions
+        if path.endswith("/issues/42/comments"):
+            return [anchor, unsupported]
+        return []
+
+    monkeypatch.setattr(cache, "_gh_api_paginated", unknown_transport)
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status(
+        "owner/name", 42, "author", "head", policy=policy
+    ) == ReviewStatus.PENDING
+    monkeypatch.setattr(
+        reviews, "_get_pr_push_time",
+        lambda *_: datetime(2026, 1, 1, tzinfo=_tz.utc),
+    )
+    body_reactions.append({
+        "content": "+1", "user": actor,
+        "created_at": "2026-01-01T00:03:00Z",
+    })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status(
+        "owner/name", 42, "author", "head", policy=policy
+    ) == ReviewStatus.APPROVED
+    body_reactions[0]["created_at"] = "2026-01-01T00:01:00Z"
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status(
+        "owner/name", 42, "author", "head", policy=policy
+    ) == ReviewStatus.PENDING
+    unsupported["body"] = "unable to complete review"
+    body_reactions[:] = [{"content": "eyes", "user": actor}]
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status(
+        "owner/name", 42, "author", "head", policy=policy
+    ) == ReviewStatus.EYES
+    body_reactions.append({
+        "content": "+1", "user": actor,
+        "created_at": "2025-12-31T23:59:00Z",
+    })
+    reviews.clear_review_status_cache()
+    assert reviews.get_pr_review_status(
+        "owner/name", 42, "author", "head", policy=policy
+    ) == ReviewStatus.EYES
+
+    def unavailable(path: str) -> list[dict]:
+        raise RuntimeError("transport unavailable")
+
+    monkeypatch.setattr(cache, "_gh_api_paginated", unavailable)
+    assert "transport unavailable" in (
+        reviews.read_review_feedback("owner/name", 42, "author", policy).unknown_reason or ""
+    )
+
+
 def test_get_latest_codex_feedback_returns_none_when_no_codex_comments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6315,7 +6860,7 @@ def test_get_latest_codex_feedback_returns_all_codex_comments_when_no_anchor(
                 {
                     "id": 1,
                     "user": _codex_user("codex-bot"),
-                    "body": "feedback before any anchor",
+                    "body": "P1: feedback before any anchor",
                     "created_at": "2026-04-27T01:00:00Z",
                 }
             ]
@@ -6326,7 +6871,7 @@ def test_get_latest_codex_feedback_returns_all_codex_comments_when_no_anchor(
     monkeypatch.setattr("src.github.cache._gh_api_paginated", fake_paginated)
 
     out = comments.get_latest_codex_feedback("owner/name", 42)
-    assert out == "feedback before any anchor"
+    assert out == "P1: feedback before any anchor"
 
 
 def test_get_latest_codex_feedback_skips_non_author_anchor(
@@ -6409,7 +6954,7 @@ def test_get_latest_codex_feedback_truncates_oversized_output(
     """
     monkeypatch.setattr("src.github.prs.get_pr_author", lambda repo, n: "author")
 
-    big_body = "x" * 6000
+    big_body = "P1: " + "x" * 6000
 
     def fake_paginated(path: str) -> list[dict]:
         if path.endswith("/issues/42/comments"):

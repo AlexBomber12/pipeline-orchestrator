@@ -25,9 +25,13 @@ from src.models import (
     PipelineState,
     PRInfo,
     QueueTask,
+    RepoState,
     ReviewStatus,
     TaskStatus,
 )
+from src.publication_migration import confirmable as migration_confirmable
+from src.publication_migration import enqueue as enqueue_migration
+from src.publication_migration import migration_binding
 from src.retry_commands import (
     RetryCommandStatus,
     RetryEffectStage,
@@ -913,6 +917,117 @@ async def test_watch_retry_keeps_fix_binding_when_pr_observation_is_unknown(
     await restarted.handle_watch()
     assert restarted.state.state == PipelineState.WATCH
     assert restarted.state.current_pr.number == pr.number
+
+
+@pytest.mark.asyncio
+async def test_retry_admits_historical_pr_with_durable_exact_proposal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, command, task, _repo = await _prepared_runner(tmp_path)
+    snapshot = RepoState(url=runner.state.url, name=runner.name,
+                         state=PipelineState.IDLE)
+    await runner.redis.set(pipeline_state(runner.name), snapshot.model_dump_json())
+    assert await runner._hydrate_current_task_from_persisted_state()
+    assert runner._publication_snapshot_pr_unbound
+    runner._publication_recovery_cutoff_at = NOW
+    runner.state.current_task = task
+    runner.state.state = PipelineState.ERROR
+    published = NOW - timedelta(days=1)
+    pr = PRInfo(
+        number=42, branch=task.branch, pr_id=task.pr_id, head_sha="a" * 40,
+        publication_observed=True, publication_at=published,
+        publication_repo=runner.owner_repo,
+        publication_head_repo=runner.owner_repo,
+        publication_ref=f"refs/heads/{task.branch}",
+        publication_head_sha="a" * 40,
+        publication_provenance="github-activity:branch_creation",
+    )
+    monkeypatch.setattr(runner, "_validate_retry_command", _async_value((object(), task)))
+    monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *_a, **_k: [pr])
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
+    monkeypatch.setattr(runner, "_clear_retry_failure_evidence", _async_value(None))
+    assert await runner._apply_retry_command(command) == RetryDispatch.WATCH
+    proposal = runner.state.publication_migration
+    assert proposal is not None
+    assert proposal.source == "pr_undiscovered_snapshot"
+    assert proposal.published_at == published
+    assert migration_confirmable(proposal)
+    assert runner.state.publication_watermark is None
+    await runner.publish_state()
+    saved = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert saved.publication_migration == proposal
+    assert runner._validate_publication_observation(
+        pr.number, pr.head_sha, pr.publication_at, None,
+        head_repo=pr.publication_head_repo, ref=pr.publication_ref,
+        observed_repo=pr.publication_repo, observed_head_sha=pr.publication_head_sha,
+        provenance=pr.publication_provenance,
+    )[0] is None
+    monkeypatch.setattr(
+        retry_module.gh_prs, "get_pr_head_publication", lambda *_a, **_k:
+        retry_module.gh_prs.HeadPublicationEvidence(
+            repo=pr.publication_repo, pr_number=pr.number,
+            head_repo=pr.publication_head_repo, ref=pr.publication_ref,
+            head_sha=pr.head_sha, published_at=published,
+            provenance=pr.publication_provenance,
+        ),
+    )
+    binding = migration_binding(proposal)
+    await enqueue_migration(runner.redis, runner.name, binding)
+    assert await runner._consume_publication_migration_command()
+    floor = runner.state.publication_watermark
+    assert floor is not None and floor.published_at == published
+    assert runner.state.publication_migration is None
+    assert await runner._reconcile_applied_retry(command) == RetryDispatch.WATCH
+    assert runner.state.publication_watermark == floor
+    assert runner.state.publication_migration is None
+    assert runner._validate_publication_observation(
+        pr.number, pr.head_sha, pr.publication_at, None,
+        head_repo=pr.publication_head_repo, ref=pr.publication_ref,
+        observed_repo=pr.publication_repo, observed_head_sha=pr.publication_head_sha,
+        provenance=pr.publication_provenance,
+    ) == (published, None)
+
+
+@pytest.mark.asyncio
+async def test_applied_retry_preserves_unknown_migration_until_matching_activity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, command, task, _repo = await _prepared_runner(tmp_path)
+    snapshot = RepoState(url=runner.state.url, name=runner.name,
+                         state=PipelineState.IDLE)
+    await runner.redis.set(pipeline_state(runner.name), snapshot.model_dump_json())
+    assert await runner._hydrate_current_task_from_persisted_state()
+    runner.state.current_task = task
+    runner.state.state = PipelineState.ERROR
+    pr = PRInfo(
+        number=42, branch=task.branch, pr_id=task.pr_id, head_sha="a" * 40,
+        publication_observed=True, publication_reason="activity unavailable",
+    )
+    monkeypatch.setattr(runner, "_validate_retry_command", _async_value((object(), task)))
+    monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *_a, **_k: [pr])
+    assert await runner._reconcile_applied_retry(command) == RetryDispatch.WATCH
+    proposal = runner.state.publication_migration
+    assert proposal is not None and proposal.published_at is None
+    assert proposal.source == "pr_undiscovered_snapshot"
+    await runner.publish_state()
+    saved = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert saved.publication_migration == proposal
+    assert saved.publication_watermark is None
+    # A later matching poll completes the same proposal without a new Retry.
+    complete = pr.model_copy(update={
+        "publication_at": NOW - timedelta(days=1),
+        "publication_repo": runner.owner_repo,
+        "publication_head_repo": runner.owner_repo,
+        "publication_ref": f"refs/heads/{task.branch}",
+        "publication_head_sha": pr.head_sha,
+        "publication_provenance": "github-activity:branch_creation",
+        "publication_reason": None,
+    })
+    runner._admit_observed_pr(complete)
+    assert migration_confirmable(runner.state.publication_migration)
+    assert runner.state.publication_watermark is None
 
 
 @pytest.mark.asyncio

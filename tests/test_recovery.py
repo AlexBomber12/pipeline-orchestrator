@@ -6,6 +6,7 @@ import asyncio
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -714,7 +715,10 @@ def test_recover_preserves_crashed_run_commits_before_canceling(
     not lost when the user re-uploads to retry."""
     task = _doing_task()
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [])
-    monkeypatch.setattr(recovery_module, "scan_pr_diff", lambda diff: [type("V", (), {"category": "large_diff_threshold"})()])
+    monkeypatch.setattr(
+        recovery_module, "scan_pr_diff",
+        lambda diff: [type("V", (), {"category": "large_diff_threshold"})()],
+    )
 
     events: list[str] = []
 
@@ -1656,16 +1660,14 @@ def test_recover_validation_error_returns_false(
     assert "duplicate pr_id" in (runner.state.error_message or "")
 
 
-def test_rehydrate_last_push_at_ignores_metadata_failure_for_new_pr(
+def test_rehydrate_last_push_at_ignores_publication_failure_for_new_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Metadata fetch failures should still bind the PR number without a timestamp."""
+    """Publication failures bind the PR number without a timestamp."""
     pr = PRInfo(number=17, branch="pr-042-inflight")
 
-    def boom(repo: str, number: int) -> dict[str, str]:
-        raise RuntimeError("gh unavailable")
-
-    monkeypatch.setattr("src.github.prs.get_pr_metadata", boom)
+    monkeypatch.setattr("src.github.prs.get_pr_head_publication",
+                        lambda *_a, **_kw: SimpleNamespace(published_at=None, unknown_reason="gh unavailable"))
 
     runner = _make_runner()
     runner._last_push_at = datetime(2026, 4, 18, 12, 0, tzinfo=timezone.utc)
@@ -1677,74 +1679,84 @@ def test_rehydrate_last_push_at_ignores_metadata_failure_for_new_pr(
     assert runner._last_push_at_pr_number == 17
 
 
-def test_rehydrate_last_push_at_adds_utc_to_naive_timestamp(
+def test_rehydrate_last_push_at_rejects_naive_activity_timestamp(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Naive commit timestamps from metadata should be normalized to UTC."""
-    pr = PRInfo(number=17, branch="pr-042-inflight")
-    parsed = datetime(2026, 4, 19, 10, 15)
-
-    monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {"head_commit_date": "2026-04-19T10:15:00"},
-    )
-    monkeypatch.setattr("src.github.gh_runner._parse_iso", lambda iso: parsed)
+    """An activity event without a timezone cannot prove publication."""
+    head = "a" * 40
+    pr = PRInfo(number=17, branch="pr-042-inflight", head_sha=head)
+    def transport(args: list[str], **_kw: object) -> object:
+        if "/pulls/" in args[1]:
+            return {"branch": pr.branch, "repo": "octo/demo", "sha": head}
+        return [{"activity_type": "branch_creation", "ref": "refs/heads/pr-042-inflight",
+                 "before": "0" * 40, "after": head, "timestamp": "2026-04-19T10:15:00"}]
+    monkeypatch.setattr("src.github.gh_runner.run_gh", transport)
 
     runner = _make_runner()
 
     runner._rehydrate_last_push_at(pr)
 
-    assert runner._last_push_at == parsed.replace(tzinfo=timezone.utc)
+    assert runner._last_push_at is None
+    assert runner._push_provenance_reason == "publication activity incomplete"
     assert runner._last_push_at_pr_number == 17
 
 
-def test_rehydrate_last_push_at_keeps_existing_timestamp_when_metadata_missing(
+def test_rehydrate_last_push_at_clears_existing_timestamp_when_evidence_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """For the same PR, a missing commit timestamp must not clear a known baseline."""
-    pr = PRInfo(number=17, branch="pr-042-inflight")
+    """A new unknown observation cannot reuse an old same-PR baseline."""
+    pr = PRInfo(number=17, branch="pr-042-inflight", head_sha="a" * 40)
     existing = datetime(2026, 4, 19, 9, 0, tzinfo=timezone.utc)
 
     monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {"head_commit_date": ""},
+        "src.github.prs.get_pr_head_publication",
+        lambda *_a, **_kw: SimpleNamespace(published_at=None, unknown_reason="activity unavailable"),
     )
 
     runner = _make_runner()
     runner._last_push_at = existing
     runner._last_push_at_pr_number = 17
+    runner._last_push_at_head_sha = pr.head_sha
 
     runner._rehydrate_last_push_at(pr)
 
-    assert runner._last_push_at == existing
+    assert runner._last_push_at is None
     assert runner._last_push_at_pr_number == 17
 
 
-def test_rehydrate_last_push_at_updates_only_when_newer(
+def test_rehydrate_last_push_at_rejects_backward_same_head_observation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """For the same PR, only newer commit timestamps should advance the baseline."""
-    pr = PRInfo(number=17, branch="pr-042-inflight")
+    """A backward event on the same HEAD is contradictory, then a new proof recovers."""
+    pr = PRInfo(number=17, branch="pr-042-inflight", head_sha="a" * 40)
     older = datetime(2026, 4, 19, 8, 0, tzinfo=timezone.utc)
     newer = datetime(2026, 4, 19, 11, 0, tzinfo=timezone.utc)
 
     runner = _make_runner()
     runner._last_push_at_pr_number = 17
     runner._last_push_at = newer
+    runner._last_push_at_head_sha = pr.head_sha
 
     monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {"head_commit_date": "2026-04-19T08:00:00+00:00"},
+        "src.github.prs.get_pr_head_publication",
+        lambda *_a, **_kw: SimpleNamespace(
+            repo="octo/demo", head_repo="octo/demo", ref="refs/heads/pr-042-inflight",
+            head_sha=pr.head_sha, published_at=older, unknown_reason=None,
+        ),
     )
-    monkeypatch.setattr("src.github.gh_runner._parse_iso", lambda iso: older)
     runner._rehydrate_last_push_at(pr)
-    assert runner._last_push_at == newer
+    assert runner._last_push_at is None
+    assert runner._push_provenance_reason == "publication time moved backward for unchanged branch"
+    runner._rehydrate_last_push_at(pr)
+    assert runner._last_push_at is None
+    assert runner._push_provenance_reason == "publication time moved backward for unchanged branch"
 
     monkeypatch.setattr(
-        "src.github.prs.get_pr_metadata",
-        lambda repo, number: {"head_commit_date": "2026-04-19T12:00:00+00:00"},
+        "src.github.prs.get_pr_head_publication",
+        lambda *_a, **_kw: SimpleNamespace(
+            repo="octo/demo", head_repo="octo/demo", ref="refs/heads/pr-042-inflight",
+            head_sha=pr.head_sha, published_at=newer, unknown_reason=None,
+        ),
     )
-    monkeypatch.setattr("src.github.gh_runner._parse_iso", lambda iso: newer)
-    runner._last_push_at = older
     runner._rehydrate_last_push_at(pr)
     assert runner._last_push_at == newer

@@ -1001,7 +1001,9 @@ def test_handle_idle_transitions_to_error_when_pinned_coder_unavailable(
 
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.skip_ai_error_diagnose is False
-    assert runner.state.error_message == ("Task PR-200 pinned to codex but coder unavailable")
+    assert runner.state.error_message == (
+        "Task PR-200 pinned to Codex CLI but coder unavailable: auth probe failed"
+    )
     assert runner.state.current_pr is None
     assert not coding_called["v"]
 

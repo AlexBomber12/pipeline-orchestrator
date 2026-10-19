@@ -120,7 +120,6 @@ from src.daemon.selector import (
 )
 from src.events import publish_repo_event
 from src.events.publisher import validate_event_tier
-from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github import rate_limit as gh_rate_limit
 from src.inhibitor import (
@@ -138,7 +137,13 @@ from src.keyspace import (
     upload_pending,
 )
 from src.metrics import MetricsStore, RunRecord
-from src.models import InvocationSnapshot, PipelineState, RepoState, TaskStatus
+from src.models import (
+    InvocationSnapshot,
+    PipelineState,
+    PublicationWatermark,
+    RepoState,
+    TaskStatus,
+)
 from src.process_supervisor import SupervisedProcess
 from src.queue_parser import (
     TYPE_SYNONYMS,
@@ -421,6 +426,15 @@ class PipelineRunner(
         self._error_skip_active = False
         self._last_push_at: datetime | None = None
         self._last_push_at_pr_number: int | None = None
+        self._last_push_at_head_sha: str | None = None
+        self._push_provenance_reason: str | None = None
+        # Safety watermark only: a prior proof can reject a backward read,
+        # but never substitutes for the current poll's publication evidence.
+        self._publication_high_water_identity: tuple[str, int, str, str, str] | None = None
+        self._publication_high_water_at: datetime | None = None
+        # Recovery with no usable snapshot cannot trust historical activity
+        # as a replacement for a safety floor that might have been lost.
+        self._publication_recovery_cutoff_at: datetime | None = None
         self._last_codex_review_pr: int | None = None
         self._last_codex_review_head_sha: str | None = None
         self._queue_progress_dirty = False
@@ -1022,18 +1036,57 @@ class PipelineRunner(
         self, *, allow_exploration: bool = True
     ) -> tuple[str, CoderPlugin]:
         """Return the selector's runnable coder without bypassing its gates."""
-        result = self._select_coder(allow_exploration=allow_exploration)
-        if result is not None:
-            self.state.coder = result[0]
-            return result
-        pin = self._active_task_coder_pin()
+        app_config = self.app_config
+        if not allow_exploration and app_config.daemon.exploration_epsilon != 0:
+            daemon_config = app_config.daemon.model_copy(
+                update={"exploration_epsilon": 0.0}
+            )
+            app_config = app_config.model_copy(update={"daemon": daemon_config})
+        ctx = self._selection_context(app_config=app_config)
+        resolution = resolve_active_coder(ctx, purpose=CoderPurpose.DISPATCH)
+        pin = ctx.task_coder_pin
+        preferred = pin if pin and pin != "any" else (
+            self.repo_config.coder or self.app_config.daemon.coder
+        )
+        preferred_plugin = self._registry.get_optional(preferred)
+        preferred_label = preferred_plugin.display_name if preferred_plugin else preferred
+        reason = ctx.exclusion_reasons.get(preferred)
+        reason_labels = {
+            "unrecognized_output": "auth response not recognized",
+            "credentials_missing": "credentials missing",
+            "cli_missing": "CLI unavailable",
+            "probe_failed": "auth probe failed",
+            "probe_timeout": "auth probe timed out",
+            "probe_unavailable": "auth probe unavailable",
+            "daemon_unavailable": "auth daemon unavailable",
+            "rate_limited": "rate limited",
+            "disabled": "disabled for this repository",
+            "plugin_unavailable": "plugin unavailable",
+        }
+        explanation = reason_labels.get(reason, "unavailable")
+        if resolution is not None and resolution.plugin is not None:
+            self.state.coder = resolution.name
+            if resolution.name != preferred and reason is not None:
+                task = self.state.current_task
+                context = f"Task {task.pr_id}: " if task is not None else ""
+                self.log_event(
+                    f"[INFRA] {self.state.state.value}: {context}"
+                    f"Configured {preferred_label} unavailable: "
+                    f"{explanation}; selected {resolution.plugin.display_name} "
+                    "because automatic fallback is enabled."
+                )
+            return resolution.name, resolution.plugin
         if pin and pin != "any":
             raise CoderSelectionUnavailable(
-                f"Task pinned to {pin} but coder unavailable"
+                f"Task pinned to {preferred_label} but coder unavailable: {explanation}"
             )
-        configured = self.repo_config.coder or self.app_config.daemon.coder
+        fallback = (
+            "automatic fallback is disabled"
+            if not self.app_config.daemon.auto_fallback
+            else "no fallback is eligible"
+        )
         raise CoderSelectionUnavailable(
-            f"Configured coder {configured} is unavailable and no fallback is eligible"
+            f"Configured coder {preferred_label} is unavailable: {explanation}; {fallback}"
         )
 
     def _get_auxiliary_coder(self) -> tuple[str, CoderPlugin] | None:
@@ -1100,7 +1153,7 @@ class PipelineRunner(
 
         async def _probe(name: str) -> dict[str, str]:
             if name in invalid_locations:
-                return {"status": "error"}
+                return {"status": "error", "failure_reason": "probe_unavailable"}
             location = credential_locations.get(name)
             reserved = False
             if location is not None and self._credential_reservations is not None:
@@ -1146,7 +1199,7 @@ class PipelineRunner(
                     )
                 return await _threaded_check_auth()
             except Exception:
-                return {"status": "error"}
+                return {"status": "error", "failure_reason": "probe_failed"}
             finally:
                 if reserved and self._credential_reservations is not None:
                     self._credential_reservations.release_coder(location)
@@ -1325,45 +1378,117 @@ class PipelineRunner(
             return ""
         return result.stdout.strip()
 
-    def _canonical_push_timestamp(self, pr_number: int) -> datetime:
-        """Return a monotonic baseline timestamp for ``_last_push_at``.
-
-        Reads the GitHub committer date of the PR head via
-        ``gh_prs.get_pr_metadata``. Centralizes writes to
-        ``_last_push_at`` so daemon wall clock drift cannot push the
-        baseline past a Codex review submitted seconds after the actual
-        git push (PR #407 incident).
-
-        To guard against rebases or cherry-picks where the committer
-        date is older than the actual push event, the result never
-        moves below the existing baseline for the same PR — preventing
-        old Codex comments from re-appearing as "new" feedback (Codex
-        P1 on PR #408).
-
-        Falls back to ``datetime.now(timezone.utc)`` only when no
-        canonical value AND no prior baseline are available, preserving
-        liveness of the WATCH cycle when GitHub is unreachable on the
-        first observation.
-        """
-        previous: datetime | None = None
+    def _validate_publication_observation(
+        self,
+        pr_number: int,
+        head_sha: str,
+        observed_at: datetime | None,
+        reason: str | None,
+        *,
+        head_repo: str = "",
+        ref: str = "",
+        observed_repo: str = "",
+        observed_head_sha: str | None = None,
+        provenance: str = "validated-github-activity",
+    ) -> tuple[datetime | None, str | None]:
+        """Reject backward reads without using a prior proof as current evidence."""
+        # The arguments identify the requested target. The observation may be
+        # incomplete or describe a different HEAD; neither changes that target.
+        reported_sha = observed_head_sha or ""
+        reported_repo = observed_repo
+        target = (self.owner_repo, pr_number)
+        prior_identity = self._publication_high_water_identity
+        if prior_identity is not None and prior_identity[:2] != target:
+            self._publication_high_water_identity = None
+            self._publication_high_water_at = None
+            self.state.publication_watermark = None
+            prior_identity = None
+        identity = (self.owner_repo, pr_number, head_repo, ref, head_sha)
         if (
-            self._last_push_at is not None
+            prior_identity is None
+            and head_repo and ref and reported_repo == self.owner_repo
+            and reported_sha == head_sha
+            and self._publication_recovery_cutoff_at is None
+            and self._last_push_at is not None
             and self._last_push_at_pr_number == pr_number
+            and self._last_push_at_head_sha == head_sha
+            and self._last_push_at.tzinfo is not None
         ):
-            previous = self._last_push_at
-        try:
-            metadata = gh_prs.get_pr_metadata(self.owner_repo, pr_number)
-            head_iso = metadata.get("head_commit_date", "")
-        except Exception:
-            head_iso = ""
-        head_time = gh_runner._parse_iso(head_iso) if head_iso else None
-        if head_time is not None and head_time.tzinfo is None:
-            head_time = head_time.replace(tzinfo=timezone.utc)
-        if head_time is None:
-            return previous if previous is not None else datetime.now(timezone.utc)
-        if previous is not None and head_time < previous:
-            return previous
-        return head_time
+            self._publication_high_water_identity = identity
+            self._publication_high_water_at = self._last_push_at
+            self.state.publication_watermark = PublicationWatermark(
+                repo=self.owner_repo, pr_number=pr_number, head_repo=head_repo,
+                ref=ref, head_sha=head_sha, published_at=self._last_push_at,
+                provenance=provenance,
+            )
+            self.state.publication_migration = None
+        if observed_at is None:
+            return None, reason
+        if observed_at.tzinfo is None:
+            return None, "publication timestamp missing timezone"
+        if reason is not None:
+            return None, reason
+        if (
+            reported_repo != self.owner_repo
+            or not head_sha or reported_sha.lower() != head_sha.lower()
+            or re.fullmatch(r"[^/]+/[^/]+", head_repo) is None
+            or not ref.startswith("refs/heads/")
+            or len(ref) <= len("refs/heads/")
+        ):
+            return None, reason or "publication identity unavailable or mismatched"
+        if (
+            self._publication_recovery_cutoff_at is not None
+            and observed_at <= self._publication_recovery_cutoff_at
+            and not (
+                prior_identity is not None
+                and prior_identity[:4] == identity[:4]
+                and self._publication_high_water_at is not None
+            )
+        ):
+            return None, "publication predates recovery without a trusted safety floor"
+        # Keep the floor across SHA changes on the same branch: a force push
+        # can return to an older SHA. Only a verified new branch context can
+        # start a new floor; an incomplete read above cannot clear it.
+        if (
+            self._publication_high_water_identity is not None
+            and self._publication_high_water_identity[:4] != identity[:4]
+        ):
+            self._publication_high_water_at = None
+        if (
+            self._publication_high_water_at is not None
+            and observed_at < self._publication_high_water_at
+        ):
+            return None, "publication time moved backward for unchanged branch"
+        self._publication_high_water_identity = identity
+        self._publication_high_water_at = observed_at
+        self.state.publication_watermark = PublicationWatermark(
+            repo=self.owner_repo, pr_number=pr_number, head_repo=head_repo,
+            ref=ref, head_sha=head_sha, published_at=observed_at,
+            provenance=provenance,
+        )
+        self.state.publication_migration = None
+        return observed_at, None
+
+    def _canonical_push_timestamp(self, pr_number: int) -> datetime | None:
+        """Return proven publication time for the currently observed PR HEAD."""
+        pr = self.state.current_pr
+        if pr is None or pr.number != pr_number or not pr.head_sha:
+            return None
+        evidence = gh_prs.get_pr_head_publication(
+            self.owner_repo, pr_number, expected_head_sha=pr.head_sha
+        )
+        published_at, reason = self._validate_publication_observation(
+            pr_number, pr.head_sha, evidence.published_at,
+            getattr(evidence, "unknown_reason", None),
+            head_repo=getattr(evidence, "head_repo", ""),
+            ref=getattr(evidence, "ref", ""),
+            observed_repo=getattr(evidence, "repo", ""),
+            observed_head_sha=getattr(evidence, "head_sha", ""),
+            provenance=getattr(evidence, "provenance", ""),
+        )
+        self._push_provenance_reason = reason
+        self._last_push_at_head_sha = pr.head_sha if published_at else None
+        return published_at
 
     @staticmethod
     def _attempt_count_key(repo_name: str, task_id: str) -> str:
@@ -2893,6 +3018,10 @@ class PipelineRunner(
 
     async def publish_state(self) -> None:
         """Serialize ``self.state`` and write it to Redis."""
+        if getattr(self, "_protect_unrecovered_snapshot", False) and not self._recovered:
+            # A failed startup probe must not replace the saved floor (or the
+            # parent snapshot shape) before recovery has read it.
+            return
         self.state.active = self.repo_config.active
         ctx = self._selection_context(task_coder_pin="")
         active_coder = self.state.coder or resolve_pause_coder(ctx).name
@@ -3411,7 +3540,11 @@ class PipelineRunner(
         before_remaining = await self._capture_budget_remaining_for_burn()
         try:
             async with self._cycle_lock:
-                await self._run_cycle_body()
+                self._protect_unrecovered_snapshot = not self._recovered
+                try:
+                    await self._run_cycle_body()
+                finally:
+                    self._protect_unrecovered_snapshot = False
         finally:
             await self._record_cycle_burn(before_remaining)
 
@@ -3475,6 +3608,8 @@ class PipelineRunner(
         # leaving the browser to infer success from an HTTP response.  Fresh
         # runners recover task/PR state first, then consume on the next cycle.
         if self._recovered:
+            if await self._consume_publication_migration_command():
+                return
             retry_dispatch = await self._consume_retry_command()
             if retry_dispatch != RetryDispatch.NONE:
                 await self.publish_state()

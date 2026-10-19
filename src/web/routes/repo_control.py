@@ -54,6 +54,8 @@ from src.keyspace import (
     pipeline_state,
 )
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
+from src.publication_migration import MigrationChanged
+from src.publication_migration import enqueue as enqueue_publication_migration
 from src.queue_parser import (
     QueueValidationError,
     parse_task_header,
@@ -82,6 +84,38 @@ from src.web.services.repo_state import (
 )
 
 router = APIRouter()
+
+
+@router.post("/repos/{name}/publication-migration/confirm", response_class=HTMLResponse)
+async def confirm_publication_migration(
+    request: Request, name: str, binding: str = Form(...)
+) -> Response:
+    """Queue an exact trust-anchor command for the daemon to revalidate."""
+    if re.fullmatch(r"[0-9a-f]{64}", binding) is None:
+        return HTMLResponse("Invalid migration binding", status_code=400)
+    cfg = load_config(_app.CONFIG_PATH)
+    if _find_repo_config_by_name(cfg, name) is None:
+        return HTMLResponse("Repository not found", status_code=404)
+    redis_client = getattr(request.app.state, "redis", None)
+    if redis_client is None:
+        return HTMLResponse("Redis unavailable", status_code=503)
+    try:
+        command = await enqueue_publication_migration(redis_client, name, binding)
+    except MigrationChanged as exc:
+        return HTMLResponse(escape(str(exc)), status_code=409)
+    except (RedisError, ValueError) as exc:
+        return HTMLResponse(escape(f"Migration command unavailable: {exc}"), status_code=503)
+    try:
+        await _app.publish_wake(redis_client, name, "publication_migration")
+    except Exception:
+        _app.logger.warning("Publication migration command is durable; wake failed for %s", name)
+    return HTMLResponse(
+        '<section class="mb-6 rounded-lg border border-warn/30 bg-warn/10 p-4" '
+        'data-publication-migration><p class="text-sm text-warn">'
+        f"{escape(command.reason)} Refresh this page for the daemon result."
+        "</p></section>",
+        status_code=202,
+    )
 
 _HISTORY_LIMIT = 100
 _TASK_PR_ID_PATTERN = re.compile(r"^PR-[A-Za-z0-9_.-]+$")

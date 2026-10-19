@@ -33,7 +33,7 @@ def test_stop_during_coding_then_resume_picks_next_task(
         # Shared testbed dispatch can exceed 30s because the daemon's IDLE
         # poll interval is 60s; keep this aligned with the other upload e2e
         # tests so this case exercises stop/resume behavior, not poll timing.
-        wait_for_state(["CODING"], timeout_sec=60)
+        wait_for_state(["CODING"], timeout_sec=150)
 
         stop_resp = requests.post(
             f"{dashboard_url}/repos/{testbed_slug}/stop", timeout=10
@@ -76,7 +76,7 @@ def test_stop_during_coding_then_resume_picks_next_task(
             f"{resume_resp.text!r}"
         )
 
-        coding_entry = wait_for_state(["CODING"], timeout_sec=60)
+        coding_entry = wait_for_state(["CODING"], timeout_sec=150)
         coding_task = coding_entry.get("current_task") or {}
         assert coding_task.get("pr_id") == second_expected_pr_id, (
             f"resumed CODING was for current_task={coding_task!r}, "
