@@ -323,7 +323,15 @@ def parse_task_header(path: str | Path) -> TaskHeader:
 def parse_existing_task_header(path: str | Path) -> TaskHeader:
     """Read repository history without rewriting files or weakening admission."""
     task_path = Path(path)
-    lines = task_path.read_text(encoding="utf-8").splitlines()
+    return parse_existing_task_header_text(
+        task_path, task_path.read_text(encoding="utf-8")
+    )
+
+
+def parse_existing_task_header_text(path: str | Path, text: str) -> TaskHeader:
+    """Parse historical task content obtained without checking out its revision."""
+    task_path = Path(path)
+    lines = text.splitlines()
     first = next((line.rstrip() for line in lines if line.strip()), None)
     if first in (None, "---"):
         return _parse_task_header_lines(task_path, lines)

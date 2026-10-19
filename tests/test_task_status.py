@@ -1505,6 +1505,9 @@ def test_restart_and_idle_agree_without_dispatch(completion_repo, monkeypatch, e
     is_receipt = evidence.startswith("receipt")
     if not is_receipt:
         path.write_text(path.read_text().replace("pr-085-planned", f"{evidence}/pr-085-planned"))
+        _completion_git(repo, "add", "tasks/PR-085.md")
+        _completion_git(repo, "commit", "-m", "Update task branch")
+        _completion_git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     before = path.read_bytes()
 
     def branches(*args):

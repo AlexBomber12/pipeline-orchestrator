@@ -56,6 +56,7 @@ from src.publication_migration import (
 from src.queue_parser import (
     QueueValidationError,
     UnstructuredLegacyTaskError,
+    parse_existing_task_header_text,
 )
 from src.queue_parser import (
     parse_existing_task_header as parse_task_header,
@@ -243,19 +244,52 @@ class RecoveryMixin:
     def _parse_tasks_from_headers(self) -> list[QueueTask] | None:
         """Parse structured task headers into a recovered queue snapshot.
 
-        Recovery reads task files directly; ``tasks/QUEUE.md`` is only a
+        A Git checkout may still belong to an interrupted coder. Read the
+        fetched base tree when available; ``tasks/QUEUE.md`` is only a
         generated dashboard/review view.
         """
         repo_root = Path(self.repo_path)
         task_dir = repo_root / "tasks"
-        if not task_dir.is_dir():
+        self._recovery_task_headers = {}
+        git_checkout = (repo_root / ".git").exists()
+        if not git_checkout and not task_dir.is_dir():
             return None
 
         headers = []
         task_files: dict[str, str] = {}
-        for task_file in sorted(task_dir.glob("PR-*.md")):
+        parsed_headers = {}
+        if git_checkout:
+            base = self.repo_config.branch
+            if not base or base.startswith("-") or git_ops._git(
+                self.repo_path, "check-ref-format", "--branch", base, check=False
+            ).returncode != 0:
+                raise ValueError("invalid configured base branch")
+            ref = f"refs/remotes/origin/{base}"
+            paths = git_ops._git(
+                self.repo_path, "ls-tree", "-r", "--name-only", "-z", ref,
+                "--", "tasks", timeout=60,
+            ).stdout.split("\0")
+            task_paths = [
+                path for path in paths
+                if re.fullmatch(r"tasks/PR-[^/]+\.md", path)
+            ]
+        else:
+            # Plain-directory fixtures retain the same parser contract.
+            task_paths = [
+                path.relative_to(repo_root).as_posix()
+                for path in task_dir.glob("PR-*.md")
+            ]
+        for relative_path in sorted(task_paths):
+            task_file = repo_root / relative_path
             try:
-                header = parse_task_header(task_file)
+                if git_checkout:
+                    content = git_ops._git(
+                        self.repo_path, "show", f"{ref}:{relative_path}",
+                        timeout=60,
+                    ).stdout
+                    header = parse_existing_task_header_text(task_file, content)
+                else:
+                    header = parse_task_header(task_file)
             except UnstructuredLegacyTaskError:
                 continue
             except QueueValidationError as exc:
@@ -270,7 +304,10 @@ class RecoveryMixin:
                     ]
                 )
             headers.append(header)
-            task_files[header.pr_id] = task_file.relative_to(repo_root).as_posix()
+            parsed_headers[header.pr_id] = header
+            task_files[header.pr_id] = relative_path
+
+        self._recovery_task_headers = parsed_headers
 
         if not headers:
             return None
@@ -723,6 +760,15 @@ class RecoveryMixin:
                     log_prefix="[INFRA]",
                 )
                 return False
+            except (OSError, ValueError, UnicodeDecodeError, subprocess.CalledProcessError,
+                    subprocess.TimeoutExpired) as exc:
+                await self._transition_to_error(
+                    f"recover_state: remote task headers unavailable: {exc}",
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[INFRA]",
+                )
+                return False
         finally:
             if prior_open_prs is None:
                 if hasattr(self, "_idle_open_prs"):
@@ -861,10 +907,14 @@ class RecoveryMixin:
                         and cause.payload.get("run_id") == saved.active_invocation.run_id
                     )
                 elif queued.status == TaskStatus.ERROR:
-                    try:
-                        header = parse_task_header(Path(self.repo_path) / queued.task_file)
-                    except (OSError, QueueValidationError):
-                        header = None
+                    header = getattr(self, "_recovery_task_headers", {}).get(queued.pr_id)
+                    if header is None:
+                        # Direct decision-tree callers supply their own task
+                        # snapshot rather than going through header parsing.
+                        try:
+                            header = parse_task_header(Path(self.repo_path) / queued.task_file)
+                        except (OSError, QueueValidationError):
+                            header = None
                     if (
                         header is not None
                         and header.pr_id == queued.pr_id

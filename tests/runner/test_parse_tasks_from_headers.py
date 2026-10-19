@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import asyncio
+import subprocess
 from pathlib import Path
 from typing import Any
 
 import pytest
 from src.daemon import recovery as recovery_module
-from src.models import PRInfo, QueueTask, TaskStatus
+from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 from src.queue_parser import QueueValidationError
 from src.task_status import MergedState
 
@@ -62,6 +64,96 @@ def _task_projection(task: QueueTask) -> dict[str, Any]:
         "branch": task.branch,
         "priority": task.priority,
     }
+
+
+def _git(repo: Path, *args: str) -> str:
+    return subprocess.run(
+        ["git", *args], cwd=repo, check=True, capture_output=True, text=True,
+    ).stdout.strip()
+
+
+def test_restart_reads_remote_error_without_touching_coder_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    remote = tmp_path / "remote.git"
+    _git(tmp_path, "init", "--bare", str(remote))
+    coder = tmp_path / "coder"
+    writer = tmp_path / "writer"
+    _git(tmp_path, "clone", str(remote), str(coder))
+    _git(coder, "config", "user.email", "test@example.com")
+    _git(coder, "config", "user.name", "Test")
+    _populate_tasks(coder, [{
+        "pr_id": "PR-042", "title": "Remote error", "branch": "pr-042-work",
+        "frontmatter_status": "TODO",
+    }])
+    (coder / "work.txt").write_text("base\n")
+    _git(coder, "add", "tasks", "work.txt")
+    _git(coder, "commit", "-m", "initial")
+    _git(coder, "branch", "-M", "main")
+    _git(coder, "push", "-u", "origin", "main")
+    _git(tmp_path, "clone", "--branch", "main", str(remote), str(writer))
+    _git(writer, "config", "user.email", "test@example.com")
+    _git(writer, "config", "user.name", "Test")
+    task_path = writer / "tasks" / "PR-042.md"
+    task_path.write_text(task_path.read_text().replace("status: TODO", "status: ERROR"))
+    _git(writer, "add", "tasks/PR-042.md")
+    _git(writer, "commit", "-m", "park task")
+    _git(writer, "push", "origin", "main")
+
+    _git(coder, "checkout", "-b", "pr-042-work")
+    local_task = coder / "tasks" / "PR-042.md"
+    local_task.write_text(local_task.read_text().replace("status: TODO", "status: DOING"))
+    _git(coder, "add", "tasks/PR-042.md")
+    _git(coder, "commit", "-m", "coder task")
+    (coder / "work.txt").write_text("staged\n")
+    _git(coder, "add", "work.txt")
+    (coder / "work.txt").write_text("unstaged\n")
+    (coder / "untracked.bin").write_bytes(b"\x00\xff")
+    _git(coder, "fetch", "origin", "main")
+    before = (
+        _git(coder, "rev-parse", "HEAD"), _git(coder, "branch", "--show-current"),
+        _git(coder, "status", "--porcelain"), _git(coder, "show", ":work.txt"),
+        local_task.read_bytes(), (coder / "work.txt").read_bytes(),
+        (coder / "untracked.bin").read_bytes(),
+    )
+
+    runner = h._make_runner()
+    runner.repo_path = str(coder)
+    monkeypatch.setattr(
+        recovery_module, "_resolve_merged_state",
+        lambda *_args, **_kwargs: MergedState(set(), set(), True),
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_open_prs",
+        lambda *_args, **_kwargs: [PRInfo(number=42, branch="pr-042-work")],
+    )
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.current_queue[0].status == TaskStatus.ERROR
+    assert runner.state.state != PipelineState.WATCH
+    assert before == (
+        _git(coder, "rev-parse", "HEAD"), _git(coder, "branch", "--show-current"),
+        _git(coder, "status", "--porcelain"), _git(coder, "show", ":work.txt"),
+        local_task.read_bytes(), (coder / "work.txt").read_bytes(),
+        (coder / "untracked.bin").read_bytes(),
+    )
+
+
+def test_restart_rejects_invalid_remote_base_without_using_local_headers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _git(tmp_path, "init", "-b", "main")
+    _populate_tasks(tmp_path, [{
+        "pr_id": "PR-042", "title": "Local only", "branch": "pr-042-work",
+    }])
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.repo_config.branch = "-invalid"
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_args, **_kwargs: [])
+
+    assert asyncio.run(runner.recover_state()) is False
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_queue is None
+    assert "remote task headers unavailable" in (runner.state.error_message or "")
 
 
 def _runner_for_fixture(
@@ -362,6 +454,7 @@ def test_legacy_history_does_not_reenter_queue(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str,
 ) -> None:
     import asyncio
+
     from src.daemon.handlers import idle as idle_module
 
     before = {
@@ -394,6 +487,7 @@ def test_api_outage_preserves_queue_without_dispatch_or_task_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str,
 ) -> None:
     import asyncio
+
     from src.daemon.handlers import idle as idle_module
 
     before = {
