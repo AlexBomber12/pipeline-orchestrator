@@ -543,6 +543,72 @@ def test_status_write_retries_concurrent_base_advance(
     assert _git(repo, "show", "FETCH_HEAD:concurrent.txt") == "another writer\n"
 
 
+@pytest.mark.parametrize("replacement", ["body", "branch"])
+def test_status_write_stops_when_reuploaded_during_push(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, replacement: str
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-719")
+    runner = _status_runner(repo)
+    from src.daemon import git_ops
+
+    real_git = git_ops._git
+    advanced = False
+
+    def racing_git(path: str, *args: str, **kwargs: Any) -> Any:
+        nonlocal advanced
+        if args[:2] == ("push", "origin") and not advanced:
+            advanced = True
+            other = tmp_path / "replacement"
+            _git(tmp_path, "clone", str(tmp_path / "remote.git"), str(other))
+            _git(other, "checkout", "main")
+            _git(other, "config", "user.email", "test@example.com")
+            _git(other, "config", "user.name", "Test User")
+            task_file = other / "tasks" / "PR-719.md"
+            source = task_file.read_text(encoding="utf-8")
+            if replacement == "branch":
+                source = source.replace("Branch: pr-test", "Branch: replacement")
+            else:
+                source += "\nReuploaded instructions\n"
+            task_file.write_text(source, encoding="utf-8")
+            _git(other, "add", "tasks/PR-719.md")
+            _git(other, "commit", "-m", "reupload task")
+            _git(other, "push", "origin", "main")
+        return real_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops, "_git", racing_git)
+    task = QueueTask(pr_id="PR-719", title="t", status=TaskStatus.DOING,
+                     branch="pr-test", task_file="tasks/PR-719.md")
+
+    assert not asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    remote = _remote_task(repo, "PR-719")
+    assert remote.startswith("---\nstatus: TODO\n")
+    assert ("Reuploaded instructions" in remote) == (replacement == "body")
+
+
+def test_status_write_fetches_bounded_base_without_cloning(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-720")
+    runner = _status_runner(repo)
+    from src.daemon import git_ops
+
+    real_git = git_ops._git
+    calls: list[tuple[str, ...]] = []
+
+    def recorded_git(path: str, *args: str, **kwargs: Any) -> Any:
+        calls.append(args)
+        return real_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops, "_git", recorded_git)
+    task = QueueTask(pr_id="PR-720", title="t", status=TaskStatus.DOING,
+                     branch="pr-test", task_file="tasks/PR-720.md")
+
+    assert asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    assert not any(args[0] == "clone" for args in calls)
+    assert any(args[:3] == ("fetch", "--depth=16", "--filter=blob:none")
+               for args in calls)
+
+
 def test_status_write_confirms_ambiguous_push(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
