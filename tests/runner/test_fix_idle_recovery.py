@@ -418,6 +418,60 @@ async def test_timeout_admission_reads_remote_base_after_isolated_status_write(
 
 
 @pytest.mark.asyncio
+async def test_remote_timeout_status_reader_rejects_changed_base_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, task, _pr, task_path = await _timeout_runner(tmp_path, monkeypatch)
+    remote = tmp_path / "remote.git"
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True,
+        ).stdout
+
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main")
+    git("config", "user.name", "Test User")
+    git("config", "user.email", "test@example.com")
+    git("remote", "add", "origin", str(remote))
+    git("add", task.task_file)
+    git("commit", "-m", "seed task")
+    git("push", "-u", "origin", "main")
+    runner.repo_config.url = str(remote)
+    runner.repo_config.branch = "main"
+    reader = type(runner)._remote_frontmatter_error_status_for_current_task.__get__(runner)
+
+    runner.state.current_task = None
+    assert reader() == (None, None)
+    runner.state.current_task = task.model_copy(update={"task_file": "tasks/PR-999.md"})
+    assert reader() == (None, None)
+    runner.state.current_task = task
+    runner.repo_config.branch = "-unsafe"
+    assert reader() == (None, None)
+    runner.repo_config.branch = "main"
+    runner.repo_config.url = str(tmp_path / "different.git")
+    assert reader() == (None, None)
+    runner.repo_config.url = str(remote)
+
+    git("rm", task.task_file)
+    git("commit", "-m", "remove task")
+    git("push", "origin", "main")
+    assert reader() == (None, None)
+
+    task_path.parent.mkdir(exist_ok=True)
+    task_path.write_text(
+        "---\nstatus: ERROR\nblocked_reason: fix_idle_timeout\n---\n\n"
+        "# PR-458: Recover FIX\n\nBranch: fix/pr-999\n"
+        "- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+        "- Priority: 1\n- Coder: codex\n"
+    )
+    git("add", task.task_file)
+    git("commit", "-m", "replace with different branch")
+    git("push", "origin", "main")
+    assert reader() == (None, None)
+
+
+@pytest.mark.asyncio
 async def test_timeout_admits_same_pr_then_watch_uses_fresh_ci(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
