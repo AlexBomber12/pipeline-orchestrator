@@ -2,6 +2,7 @@
 
 import asyncio
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 import redis.asyncio as aioredis
@@ -59,7 +60,7 @@ def test_publication_migration_confirmation_posts_displayed_binding(
     assert binding in requests[0]
 
 
-async def test_publication_migration_command_is_atomic_in_isolated_redis() -> None:
+def test_publication_migration_command_is_atomic_in_isolated_redis() -> None:
     """Use DB 15 of the e2e Redis container, never the daemon's DB 0."""
     address = subprocess.run(
         ["docker", "inspect", "--format",
@@ -106,4 +107,7 @@ async def test_publication_migration_command_is_atomic_in_isolated_redis() -> No
             await redis.flushdb()
             await redis.aclose()
 
-    await exercise()
+    # Playwright's synchronous browser fixture owns a loop in pytest's thread.
+    # Give the isolated Redis client its own loop and thread for this test.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(lambda: asyncio.run(exercise())).result(timeout=30)
