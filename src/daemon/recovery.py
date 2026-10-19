@@ -1604,6 +1604,7 @@ class RecoveryMixin:
             )
         if (
             getattr(self, "_publication_snapshot_absent", False)
+            and saved_floor is None
             and self.state.publication_migration is None
         ):
             self.state.publication_migration = PublicationMigration(
@@ -1614,6 +1615,7 @@ class RecoveryMixin:
             )
         if (
             getattr(self, "_publication_snapshot_pr_unbound", False)
+            and saved_floor is None
             and self.state.publication_migration is None
         ):
             self.state.publication_migration = PublicationMigration(

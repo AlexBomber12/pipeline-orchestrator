@@ -30,6 +30,8 @@ from src.models import (
     TaskStatus,
 )
 from src.publication_migration import confirmable as migration_confirmable
+from src.publication_migration import enqueue as enqueue_migration
+from src.publication_migration import migration_binding
 from src.retry_commands import (
     RetryCommandStatus,
     RetryEffectStage,
@@ -927,6 +929,7 @@ async def test_retry_admits_historical_pr_with_durable_exact_proposal(
     await runner.redis.set(pipeline_state(runner.name), snapshot.model_dump_json())
     assert await runner._hydrate_current_task_from_persisted_state()
     assert runner._publication_snapshot_pr_unbound
+    runner._publication_recovery_cutoff_at = NOW
     runner.state.current_task = task
     runner.state.state = PipelineState.ERROR
     published = NOW - timedelta(days=1)
@@ -954,6 +957,36 @@ async def test_retry_admits_historical_pr_with_durable_exact_proposal(
     await runner.publish_state()
     saved = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
     assert saved.publication_migration == proposal
+    assert runner._validate_publication_observation(
+        pr.number, pr.head_sha, pr.publication_at, None,
+        head_repo=pr.publication_head_repo, ref=pr.publication_ref,
+        observed_repo=pr.publication_repo, observed_head_sha=pr.publication_head_sha,
+        provenance=pr.publication_provenance,
+    )[0] is None
+    monkeypatch.setattr(
+        retry_module.gh_prs, "get_pr_head_publication", lambda *_a, **_k:
+        retry_module.gh_prs.HeadPublicationEvidence(
+            repo=pr.publication_repo, pr_number=pr.number,
+            head_repo=pr.publication_head_repo, ref=pr.publication_ref,
+            head_sha=pr.head_sha, published_at=published,
+            provenance=pr.publication_provenance,
+        ),
+    )
+    binding = migration_binding(proposal)
+    await enqueue_migration(runner.redis, runner.name, binding)
+    assert await runner._consume_publication_migration_command()
+    floor = runner.state.publication_watermark
+    assert floor is not None and floor.published_at == published
+    assert runner.state.publication_migration is None
+    assert await runner._reconcile_applied_retry(command) == RetryDispatch.WATCH
+    assert runner.state.publication_watermark == floor
+    assert runner.state.publication_migration is None
+    assert runner._validate_publication_observation(
+        pr.number, pr.head_sha, pr.publication_at, None,
+        head_repo=pr.publication_head_repo, ref=pr.publication_ref,
+        observed_repo=pr.publication_repo, observed_head_sha=pr.publication_head_sha,
+        provenance=pr.publication_provenance,
+    ) == (published, None)
 
 
 @pytest.mark.asyncio
