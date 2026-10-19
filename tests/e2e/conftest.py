@@ -57,7 +57,7 @@ def _bounded_testbed_state() -> dict:
 
 
 def _browser_evidence(item, record: dict, destination: Path) -> None:
-    page = item.funcargs.get("page")
+    page = getattr(item, "funcargs", {}).get("page")
     if page is None:
         return
     record["browser_errors"] = getattr(item, "_evidence_browser_errors", [])[-20:]
@@ -87,10 +87,17 @@ def _write_failure_evidence(item, phase: str) -> None:
             record[label] = collect()
         except Exception as exc:
             record["collection_errors"].append(f"{label}: {type(exc).__name__}")
-    try:
-        _browser_evidence(item, record, destination)
-    except Exception as exc:
-        record["collection_errors"].append(f"browser: {type(exc).__name__}")
+    if phase == "teardown" and hasattr(item, "_evidence_preteardown"):
+        candidate = item._evidence_preteardown
+        record["browser_errors"] = candidate.get("browser_errors", [])
+        if "screenshot" in candidate:
+            record["screenshot"] = candidate["screenshot"]
+        record["collection_errors"].extend(candidate.get("collection_errors", []))
+    else:
+        try:
+            _browser_evidence(item, record, destination)
+        except Exception as exc:
+            record["collection_errors"].append(f"browser: {type(exc).__name__}")
     destination.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 
 
@@ -111,6 +118,25 @@ def _watch_browser_errors(request):
     page.on("pageerror", lambda _error: remember("pageerror"))
     page.on("console", lambda message: remember("console-error") if message.type == "error" else None)
     yield
+    # The page fixture closes after this dependent fixture finalizes. Keep a
+    # masked candidate until pytest reports whether teardown actually failed.
+    key = hashlib.sha256(request.node.nodeid.encode()).hexdigest()[:16]
+    destination = EVIDENCE_DIR / f"preteardown-{key}.json"
+    candidate = {"browser_errors": errors[-20:]}
+    try:
+        EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+        _browser_evidence(request.node, candidate, destination)
+    except Exception as exc:
+        candidate["collection_errors"] = [f"browser: {type(exc).__name__}"]
+    request.node._evidence_preteardown = candidate
+
+
+def pytest_collectreport(report):
+    if report.failed:
+        try:
+            _write_failure_evidence(report, "collect")
+        except Exception as exc:
+            print(f"e2e evidence unavailable for {report.nodeid}: {type(exc).__name__}: {exc}")
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -123,6 +149,11 @@ def pytest_runtest_makereport(item, call):
         except Exception as exc:
             # Even a filesystem failure leaves the original report intact.
             print(f"e2e evidence unavailable for {item.nodeid}: {type(exc).__name__}: {exc}")
+    if report.when == "teardown" and not report.failed:
+        candidate = getattr(item, "_evidence_preteardown", {})
+        screenshot = candidate.get("screenshot", "")
+        if screenshot.endswith(".png"):
+            (EVIDENCE_DIR / screenshot).unlink(missing_ok=True)
 
 
 def _shared_config_bytes() -> bytes:

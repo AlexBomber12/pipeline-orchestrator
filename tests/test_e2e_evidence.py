@@ -14,6 +14,7 @@ def _isolated_failure(tmp_path: Path, fixture_body: str) -> tuple[subprocess.Com
     (tmp_path / "conftest.py").write_text(
         "from tests.e2e import conftest as source\n"
         "pytest_runtest_makereport = source.pytest_runtest_makereport\n"
+        "pytest_collectreport = source.pytest_collectreport\n"
         f"source.EVIDENCE_DIR = source.Path({str(tmp_path / 'evidence')!r})\n"
         "source._bounded_testbed_state = lambda: {'state': 'CODING', 'history': []}\n"
         + fixture_body
@@ -68,6 +69,76 @@ def test_collector_error_does_not_replace_test_failure(tmp_path):
     assert "original assertion must survive" in result.stdout
     assert record["phase"] == "call"
     assert record["collection_errors"] == ["testbed: OSError"]
+
+
+def test_collection_failure_records_module_and_bounded_state(tmp_path):
+    (tmp_path / "conftest.py").write_text(
+        "from tests.e2e import conftest as source\n"
+        "pytest_collectreport = source.pytest_collectreport\n"
+        f"source.EVIDENCE_DIR = source.Path({str(tmp_path / 'evidence')!r})\n"
+        "source._bounded_testbed_state = lambda: {'state': 'CODING', 'history': []}\n"
+    )
+    (tmp_path / "test_bad.py").write_text("def broken(:\n")
+    (tmp_path / "pytest.ini").write_text("[pytest]\n")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-c", str(tmp_path / "pytest.ini"), "-q", str(tmp_path / "test_bad.py")],
+        cwd=tmp_path, env={**os.environ, "PYTHONPATH": str(evidence.REPO_DIR)},
+        text=True, capture_output=True, timeout=30, check=False,
+    )
+    records = list((tmp_path / "evidence").glob("failure-*.json"))
+    assert result.returncode != 0
+    assert len(records) == 1, result.stdout + result.stderr
+    record = json.loads(records[0].read_text())
+    assert record["phase"] == "collect"
+    assert record["test_id"].endswith("test_bad.py")
+    assert record["testbed"]["state"] == "CODING"
+
+
+def test_teardown_failure_retains_screenshot_taken_before_page_close(tmp_path):
+    (tmp_path / "conftest.py").write_text(
+        "import pytest\n"
+        "from pathlib import Path\n"
+        "from tests.e2e import conftest as source\n"
+        "pytest_runtest_makereport = source.pytest_runtest_makereport\n"
+        "_watch_browser_errors = source._watch_browser_errors\n"
+        f"source.EVIDENCE_DIR = source.Path({str(tmp_path / 'evidence')!r})\n"
+        "source._bounded_testbed_state = lambda: {'state': 'CODING', 'history': []}\n"
+        "class Page:\n"
+        "    url = 'http://localhost:18800/settings'\n"
+        "    closed = False\n"
+        "    def on(self, *args): pass\n"
+        "    def is_closed(self): return self.closed\n"
+        "    def locator(self, selector): return selector\n"
+        "    def screenshot(self, **kwargs):\n"
+        "        assert not self.closed\n"
+        "        assert kwargs['mask'] == ['input, textarea, select, [contenteditable]']\n"
+        "        Path(kwargs['path']).write_bytes(b'masked screenshot')\n"
+        "@pytest.fixture\n"
+        "def page(request):\n"
+        "    instance = Page()\n"
+        "    yield instance\n"
+        "    instance.closed = True\n"
+        "    if request.node.name == 'test_passes':\n"
+        "        raise RuntimeError('original teardown failure')\n"
+    )
+    (tmp_path / "test_teardown.py").write_text(
+        "def test_passes(page):\n    assert not page.is_closed()\n"
+        "def test_clean(page):\n    assert not page.is_closed()\n"
+    )
+    (tmp_path / "pytest.ini").write_text("[pytest]\n")
+    result = subprocess.run(
+        [sys.executable, "-m", "pytest", "-c", str(tmp_path / "pytest.ini"), "-q", str(tmp_path / "test_teardown.py")],
+        cwd=tmp_path, env={**os.environ, "PYTHONPATH": str(evidence.REPO_DIR)},
+        text=True, capture_output=True, timeout=30, check=False,
+    )
+    records = list((tmp_path / "evidence").glob("failure-*.json"))
+    assert result.returncode != 0
+    assert "original teardown failure" in result.stdout
+    assert len(records) == 1, result.stdout + result.stderr
+    record = json.loads(records[0].read_text())
+    assert record["phase"] == "teardown"
+    assert (tmp_path / "evidence" / record["screenshot"]).read_bytes() == b"masked screenshot"
+    assert list((tmp_path / "evidence").glob("*.png")) == [tmp_path / "evidence" / record["screenshot"]]
 
 
 def test_browser_capture_masks_controls_and_omits_error_payloads(tmp_path):
@@ -133,7 +204,7 @@ def test_browser_listener_only_acquires_requested_page():
 
     page = Page()
     requested = []
-    node = SimpleNamespace()
+    node = SimpleNamespace(nodeid="test_browser_listener")
 
     def get_page(name):
         requested.append(name)

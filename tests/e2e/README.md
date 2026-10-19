@@ -47,7 +47,8 @@ and the last 200 test-stack log lines when available. Each failure record names
 the test, pytest phase, tested checkout SHA, current testbed state and the last
 20 history entries (state metadata only). Browser records count page errors and
 console errors without saving messages; screenshots mask editable controls and
-skip authentication pages. Setup failures still produce a record, and the
+skip authentication pages. A masked screenshot taken before browser teardown is
+retained only if teardown fails. Setup and collection failures also produce a record, and the
 workflow writes a checkout marker before test setup so an earlier setup failure
 has an artifact. Collection errors are recorded when possible and never change
 the test result. These artifacts use synthetic testbed data; do not add raw
