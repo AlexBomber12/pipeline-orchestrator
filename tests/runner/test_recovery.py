@@ -239,10 +239,11 @@ def test_missing_snapshot_requires_exact_operator_migration(
     assert restarted.state.publication_watermark == runner.state.publication_watermark
 
 
-def test_coding_snapshot_without_pr_offers_explicit_publication_migration(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+@pytest.mark.parametrize("snapshot_kind", ["coding", "idle", "parent_idle"])
+def test_snapshot_without_pr_offers_explicit_publication_migration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, snapshot_kind: str,
 ) -> None:
-    """A PR found after the CODING checkpoint has no saved publication proof."""
+    """A PR found after a saved checkpoint has no saved publication proof."""
     repo = "octo/demo"
     branch = "pr-001"
     head = "a" * 40
@@ -264,9 +265,16 @@ def test_coding_snapshot_without_pr_offers_explicit_publication_migration(
     task = QueueTask(pr_id="PR-001", title="test", status=TaskStatus.DOING,
                      branch=branch, task_file="tasks/PR-001.md")
     runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
-    saved = RepoState(url=runner.state.url, name=runner.state.name,
-                      state=PipelineState.CODING, current_task=task)
-    asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
+    saved = RepoState(
+        url=runner.state.url, name=runner.state.name,
+        state=PipelineState.CODING if snapshot_kind == "coding" else PipelineState.IDLE,
+        current_task=task if snapshot_kind == "coding" else None,
+    )
+    raw = saved.model_dump(mode="json")
+    if snapshot_kind == "parent_idle":
+        for key in ("publication_schema_version", "publication_watermark", "publication_migration"):
+            raw.pop(key)
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), json.dumps(raw)))
     assert asyncio.run(runner.recover_state()) is True
     assert runner.state.state == PipelineState.WATCH
     proposal = runner.state.publication_migration

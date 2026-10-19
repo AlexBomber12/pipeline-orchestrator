@@ -458,9 +458,7 @@ class RecoveryMixin:
             self._publication_snapshot_damaged = True
             return True
         self._publication_snapshot_pr_unbound = (
-            persisted.state == PipelineState.CODING
-            and persisted.current_task is not None
-            and persisted.current_pr is None
+            persisted.current_pr is None
             and persisted.publication_watermark is None
             and persisted.name == self.name
             and persisted.url == self.repo_config.url
@@ -1519,7 +1517,7 @@ class RecoveryMixin:
                 repo=self.owner_repo, pr_number=pr.number, head_repo="",
                 ref=f"refs/heads/{pr.branch}", head_sha=pr.head_sha,
                 source="pr_undiscovered_snapshot",
-                reason="Saved coding state predates PR discovery; an operator must confirm publication.",
+                reason="Saved state predates PR discovery; an operator must confirm publication.",
             )
         if getattr(self, "_publication_snapshot_damaged", False):
             self.state.publication_migration = PublicationMigration(
@@ -1582,7 +1580,7 @@ class RecoveryMixin:
             proposal.reason = "Saved state is absent; confirm this historical publication as the initial safety floor."
         elif proposal.source == "pr_undiscovered_snapshot":
             proposal.reason = (
-                "Saved coding state predates PR discovery; confirm this publication "
+                "Saved state predates PR discovery; confirm this publication "
                 "as the initial safety floor."
             )
         else:
