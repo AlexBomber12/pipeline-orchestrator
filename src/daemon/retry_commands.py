@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+import tempfile
 from datetime import datetime, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -15,6 +16,7 @@ from src.cancellation import (
     get_current_run_started_at,
     task_spec_content_hash,
 )
+from src.config import normalize_repo_url
 from src.daemon import git_ops
 from src.daemon.selector import CoderPurpose, resolve_active_coder
 from src.github import prs as gh_prs
@@ -62,6 +64,48 @@ _SPEC_CHANGE_REQUIRED = {
 class RetryCommandMixin:
     """Consume Retry commands without relying on their pub/sub wake message."""
 
+    def _remote_frontmatter_error_status_for_current_task(
+        self,
+    ) -> tuple[str | None, SuppressionReason | None]:
+        """Read the configured base without consulting the coder's stale checkout."""
+        task = self.state.current_task
+        if task is None:
+            return None, None
+        task_file = getattr(task, "task_file", None)
+        pr_id = task.pr_id if task.pr_id.startswith("PR-") else f"PR-{task.pr_id}"
+        path = Path(task_file) if task_file else None
+        if path is None or path.parts != ("tasks", f"{pr_id}.md"):
+            return None, None
+        base = self.repo_config.branch
+        try:
+            if not base or base.startswith("-") or git_ops._git(
+                self.repo_path, "check-ref-format", "--branch", base, check=False
+            ).returncode != 0:
+                return None, None
+            origin = git_ops._git(self.repo_path, "remote", "get-url", "origin")
+            if normalize_repo_url(origin.stdout) != normalize_repo_url(self.repo_config.url):
+                raise ValueError("checkout origin differs from configured repository")
+            with tempfile.TemporaryDirectory(prefix="fix-timeout-status-") as temporary:
+                isolated = str(Path(temporary) / "repo")
+                git_ops._git(
+                    temporary, "clone", "--no-checkout", "--origin", "origin",
+                    "--", self.repo_config.url, isolated, timeout=60,
+                )
+                git_ops._git(isolated, "fetch", "origin", base, timeout=60)
+                git_ops._git(isolated, "checkout", "--detach", "-f", "FETCH_HEAD")
+                tracked = Path(isolated) / path
+                if tracked.is_symlink() or not tracked.is_file():
+                    raise ValueError("task path is missing or a symlink in remote base")
+                git_ops._git(isolated, "ls-files", "--error-unmatch", "--", task_file)
+                header = parse_task_header(tracked)
+                if header.pr_id != task.pr_id or header.branch != task.branch:
+                    raise ValueError("remote task identity differs from bound task")
+                reason = header.blocked_reason
+                return header.frontmatter_status, SuppressionReason(reason) if reason else None
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] FIX timeout remote status unavailable: {exc}; staying ERROR.")
+            return None, None
+
     async def _admit_fix_idle_timeout(self) -> None:
         """Resume only the interrupted, bound FIX run after durable admission."""
         task, bound = self.state.current_task, self.state.current_pr
@@ -76,7 +120,7 @@ class RetryCommandMixin:
                 return
             self._status_write_failed_task_pr_ids.discard(task.pr_id)
             await self._persist_status_write_failed_task_pr_ids()
-        status, reason = self._frontmatter_error_status_for_current_task()
+        status, reason = self._remote_frontmatter_error_status_for_current_task()
         try:
             cause = await get_cancellation_cause(
                 self.redis, self.name, task.pr_id, refresh_ttl=False
@@ -139,11 +183,9 @@ class RetryCommandMixin:
             )
             dirty, detail = self._retry_worktree_dirty()
             task_path = self._retry_task_path(task)
-            header = parse_task_header(task_path) if task_path is not None else None
             if (
                 any(item.inhibitor_type != InhibitorType.GITHUB_BUDGET_SLOWDOWN for item in inhibitors)
-                or dirty is not False or header is None
-                or header.pr_id != task.pr_id or header.branch != task.branch
+                or dirty is not False or task_path is None
                 or bound.branch != task.branch or bound.pr_id not in (None, task.pr_id)
             ):
                 self.log_event(f"[RECOVERY] FIX timeout admission deferred ({detail}); staying ERROR.")
