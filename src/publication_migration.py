@@ -68,7 +68,9 @@ async def enqueue(redis: Any, repo: str, binding: str) -> MigrationCommand:
     async def transaction(pipe: Any) -> MigrationCommand:
         existing = await pipe.get(key)
         if existing:
-            return MigrationCommand.model_validate_json(existing)
+            receipt = MigrationCommand.model_validate_json(existing)
+            if receipt.status != "failed":
+                return receipt
         raw = await pipe.get(state_key)
         if not raw:
             raise MigrationChanged("Daemon state is unavailable; refresh the page.")

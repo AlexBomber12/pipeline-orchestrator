@@ -98,6 +98,37 @@ def test_confirmation_queues_one_exact_command(client) -> None:
     assert len([key for key in redis.store if ":publication_migration:command:" in key]) == 1
 
 
+def test_failed_receipt_can_be_retried_for_same_valid_observation(client) -> None:
+    http, redis = client
+    observation = _proposal()
+    state = RepoState(
+        url="https://github.com/example/alpha.git", name="example__alpha",
+        state=PipelineState.WATCH, publication_migration=observation,
+        current_pr=PRInfo(number=620, branch="pr-459", head_sha="a" * 40),
+    )
+    redis.store[pipeline_state(state.name)] = state.model_dump_json()
+    binding = migration_binding(observation)
+    path = f"/repos/{state.name}/publication-migration/confirm"
+    assert http.post(path, data={"binding": binding}).status_code == 202
+    key = command_key(state.name, binding)
+    failed = MigrationCommand.model_validate_json(redis.store[key])
+    failed.status = "failed"
+    failed.reason = "PR was temporarily missing from the GitHub response."
+    redis.store[key] = failed.model_dump_json()
+    redis.store.pop(pending_key(state.name))
+    html = web_app.templates.get_template(
+        "components/_publication_migration_panel.html"
+    ).render(
+        repo=state, publication_migration_binding=binding,
+        publication_migration_confirmable=True, publication_migration_command=failed,
+    )
+    assert 'data-migration-command-status="failed"' in html
+    assert "Confirm initial publication floor" in html
+    assert http.post(path, data={"binding": binding}).status_code == 202
+    assert MigrationCommand.model_validate_json(redis.store[key]).status == "pending"
+    assert redis.store[pending_key(state.name)] == binding
+
+
 def test_confirmation_refuses_unknown_or_changed_observation(client) -> None:
     http, redis = client
     observation = _proposal(published=False)

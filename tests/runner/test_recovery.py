@@ -759,6 +759,30 @@ def test_migration_command_revalidates_untrusted_inputs(
         assert runner.state.publication_watermark is None
 
 
+def test_failed_migration_receipt_retries_only_current_bound_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, binding = _migration_command_runner()
+    key = migration_command_key(runner.name, binding)
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [])
+    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    assert MigrationCommand.model_validate_json(runner.redis.store[key]).status == "failed"
+    assert runner.state.publication_watermark is None
+
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_args, **_kwargs: [runner.state.current_pr])
+    monkeypatch.setattr(gh_prs, "get_pr_head_publication", lambda *_args, **_kwargs:
+                        gh_prs.HeadPublicationEvidence(
+                            "octo/demo", 42, "octo/demo", "refs/heads/feature",
+                            "a" * 40, runner.state.publication_migration.published_at,
+                            "github-activity:push",
+                        ))
+    retried = asyncio.run(enqueue_migration(runner.redis, runner.name, binding))
+    assert retried.status == "pending"
+    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    assert MigrationCommand.model_validate_json(runner.redis.store[key]).status == "applied"
+    assert runner.state.publication_watermark.pr_number == 42
+
+
 @pytest.mark.parametrize("change", ["pointer_bytes", "command_done", "observation", "target"])
 def test_migration_transaction_checks_snapshot_again(
     monkeypatch: pytest.MonkeyPatch, change: str,
