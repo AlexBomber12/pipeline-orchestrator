@@ -3764,6 +3764,17 @@ class PipelineRunner(
             await self.publish_state()
             return
 
+        # An attempted merge is retained until exact remote evidence resolves it.
+        # It must not enter IDLE discovery or touch a possibly deleted branch.
+        if (
+            self.state.state == PipelineState.MERGE
+            and self.state.current_pr is not None
+            and self.state.merge_phase in {"merging", "post_merge_cleanup"}
+        ):
+            await self.handle_merge()
+            await self.publish_state()
+            return
+
         pre_state = self.state.state
         if self.state.state in _TRANSIENT_STATES:
             self.log_event(

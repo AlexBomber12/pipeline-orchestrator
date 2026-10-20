@@ -11,9 +11,12 @@ from src.cancellation import retry_count_key, task_spec_hash_key
 from src.daemon import git_ops as git_ops_module
 from src.daemon import runner as runner_module
 from src.daemon.handlers import merge as merge_module
+from src.daemon.retry_commands import RetryDispatch
 from src.models import PipelineState, PRInfo, QueueTask, ReviewStatus, TaskStatus
 
 from tests.runner import _helpers as h
+
+_CONFIRM_REMOTE_MERGE = merge_module.MergeMixin._confirm_remote_merge
 
 
 def test_merge_cleans_up_hash_and_retry_counter(
@@ -324,3 +327,132 @@ def test_pre_merge_sync_logs_unknown_head_when_rev_parse_fails(
         in entry.get("event", "")
         for entry in runner.state.history
     )
+
+
+@pytest.fixture(autouse=True)
+def confirmed_remote_merge(monkeypatch):
+    async def confirmed(self):
+        return True
+
+    monkeypatch.setattr("src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", confirmed)
+
+
+@pytest.mark.parametrize("case", [
+    "success", "lost", "open", "closed", "head", "base", "repo",
+    "unknown", "status_false", "status_error", "metrics_error",
+])
+def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
+    """Exercise production merge action, exact reader and handler with a gh transport."""
+    import json
+
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(merge_module.MergeMixin, "_confirm_remote_merge", _CONFIRM_REMOTE_MERGE)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.MERGE
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001", head_sha="a" * 40,
+                                     review_status=ReviewStatus.APPROVED)
+    task = QueueTask(pr_id="PR-001", title="Sample", status=TaskStatus.DOING,
+                     task_file="tasks/PR-001.md")
+    runner.state.current_task = task
+    runner.state.current_queue = [task]
+    runner._start_current_run_record("claude", "opus")
+    calls = []
+    writes = []
+    outcomes = []
+    payload = {
+        "number": 5, "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
+        "head": {"sha": "a" * 40}, "state": "closed", "merged": True,
+        "merge_commit_sha": "b" * 40,
+    }
+    if case == "open":
+        payload.update(state="open", merged=False)
+    if case == "closed":
+        payload["merged"] = False
+    if case == "head":
+        payload["head"]["sha"] = "c" * 40
+    if case == "base":
+        payload["base"]["ref"] = "release"
+    if case == "repo":
+        payload["base"]["repo"]["full_name"] = "other/repo"
+    reads_fail = case == "unknown"
+
+    def transport(args, **kwargs):
+        calls.append((args, kwargs))
+        if args[:2] == ["pr", "merge"] and case in {"lost", "unknown"}:
+            raise RuntimeError("response lost")
+        if args[:1] == ["api"]:
+            assert args[1] == "repos/octo/demo/pulls/5"
+            if reads_fail:
+                raise RuntimeError("read unavailable")
+            return "HTTP/2.0 200 OK\r\nETag: v1\r\n\r\n" + json.dumps(payload)
+        return ""
+
+    async def status(*args, **kwargs):
+        writes.append(args)
+        if case == "status_error":
+            raise RuntimeError("status push failed")
+        return case != "status_false"
+
+    async def save(reason, **kwargs):
+        if case == "metrics_error" and not outcomes:
+            outcomes.append("failed save")
+            raise RuntimeError("metrics unavailable")
+        outcomes.append(reason)
+
+    monkeypatch.setattr(merge_module.gh_runner, "run_gh", transport)
+    monkeypatch.setattr(runner, "_commit_task_status_change", status)
+    monkeypatch.setattr(runner, "_save_current_run_record", save)
+    monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
+    asyncio.run(runner.handle_merge())
+    merge_calls = [args for args, _ in calls if args[:2] == ["pr", "merge"]]
+    assert merge_calls == [["pr", "merge", "5", "--squash", "--delete-branch",
+                            "--match-head-commit", "a" * 40]]
+    assert calls[1][1]["repo"] == "octo/demo"
+    if case in {"unknown", "base", "repo", "metrics_error"}:
+        assert runner.state.state == PipelineState.MERGE
+        assert runner.state.current_task is task
+        if case != "metrics_error":
+            assert not writes and not outcomes
+            assert task.status == TaskStatus.DOING
+        # Reconciliation cannot issue another merge or touch the deleted branch.
+        monkeypatch.setattr(git_ops_module, "_git", lambda *a, **kw: pytest.fail("git during reconciliation"))
+        monkeypatch.setattr(runner, "_compute_diff_stats", lambda base: {})
+        if case == "unknown":
+            from unittest.mock import AsyncMock
+
+            runner._recovered = True
+            for method in ("ensure_repo_cloned", "_refresh_user_paused_from_redis"):
+                monkeypatch.setattr(runner, method, AsyncMock())
+            for method in ("_hold_for_coder_cleanup", "_consume_approval_command",
+                           "_consume_publication_migration_command"):
+                monkeypatch.setattr(runner, method, AsyncMock(return_value=False))
+            monkeypatch.setattr(runner, "_consume_retry_command", AsyncMock(return_value=RetryDispatch.NONE))
+            monkeypatch.setattr(runner, "_check_github_api_budget", AsyncMock(return_value=True))
+            monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+            monkeypatch.setattr(runner, "handle_idle", AsyncMock(side_effect=AssertionError("duplicate discovery")))
+            asyncio.run(runner._run_cycle_body())
+            assert runner.state.state == PipelineState.MERGE
+            assert runner.state.current_task is task
+            assert not writes and not outcomes
+        reads_fail = False
+        payload["base"] = {"ref": "main", "repo": {"full_name": "octo/demo"}}
+        if case == "unknown":
+            asyncio.run(runner._run_cycle_body())
+        else:
+            asyncio.run(runner.handle_merge())
+        assert len([a for a, _ in calls if a[:2] == ["pr", "merge"]]) == 1
+        assert runner.state.state == PipelineState.IDLE
+    elif case in {"open", "head"}:
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+        assert runner.state.current_task is task
+        assert not writes and not outcomes
+    elif case == "closed":
+        assert runner.state.state == PipelineState.IDLE
+        assert outcomes == ["closed_unmerged"] and not writes
+        assert task.status == TaskStatus.DOING
+    else:
+        assert runner.state.state == PipelineState.IDLE
+        assert writes[0][1] == "DONE"
+        assert outcomes == ["success_merged"]
+        assert runner.state.current_queue[0].status == TaskStatus.DONE

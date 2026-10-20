@@ -1495,7 +1495,7 @@ def test_escalate_queue_sync_transitions_to_error_when_expired(
     assert events == [f"[MERGE] {runner.state.error_message}."]
 
 
-def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_handle_merge_lost_response_uses_confirmed_remote_success(monkeypatch: pytest.MonkeyPatch) -> None:
     h._patch_subprocess(monkeypatch)
 
     def boom(repo: str, num: int, expected_head_sha: str) -> None:
@@ -1508,8 +1508,8 @@ def test_handle_merge_failure_sets_error(monkeypatch: pytest.MonkeyPatch) -> Non
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     asyncio.run(runner.handle_merge())
 
-    assert runner.state.state == PipelineState.ERROR
-    assert "merge conflict" in (runner.state.error_message or "")
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
 
 
 def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2670,3 +2670,11 @@ def test_handle_coding_honors_stop_requested_after_pr_poll_exhaustion(
     assert runner.state.current_pr is None
     assert attempts["count"] == 3
     assert any(entry["event"] == "[CODING] CODING aborted: user stop requested." for entry in runner.state.history)
+
+
+@pytest.fixture(autouse=True)
+def confirmed_remote_merge(monkeypatch):
+    async def confirmed(self):
+        return True
+
+    monkeypatch.setattr("src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", confirmed)

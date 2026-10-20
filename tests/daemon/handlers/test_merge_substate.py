@@ -228,17 +228,10 @@ def test_dashboard_omits_phase_for_non_merge_state() -> None:
     assert "data-merge-phase" not in html
 
 
-def test_merge_phase_cleared_on_error_path(
+def test_merge_phase_cleared_after_lost_response_with_remote_proof(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Simulate an exception inside ``gh_prs.merge_pr`` mid-``merging``.
-
-    ``_transition_to_error`` sets ``state.state = ERROR`` which triggers
-    the ``__setattr__`` hook to clear ``merge_phase``. The forensic value
-    survives in Redis until the next ``publish_state`` (see spec
-    threat-model note), but the in-memory state must read None as soon as
-    the MERGE→ERROR transition lands so the dashboard subtitle disappears.
-    """
+    """A lost command response still clears the phase after remote proof."""
 
     def fake_git(repo_path: str, *args: str, **kwargs: object):
         if args[:1] == ("merge",) and len(args) > 1 and str(args[1]).startswith(
@@ -279,7 +272,7 @@ def test_merge_phase_cleared_on_error_path(
 
     asyncio.run(runner.handle_merge())
 
-    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.state == PipelineState.IDLE
     assert runner.state.merge_phase is None
     # ``merging`` was visible on the publish that ran immediately before
     # ``merge_pr`` raised, proving the forensic value reached Redis.
@@ -354,10 +347,10 @@ def test_handle_merge_entered_from_watch_publishes_state_merge(
     assert runner.state.merge_phase is None
 
 
-def test_handle_merge_from_watch_clears_phase_on_error(
+def test_handle_merge_from_watch_clears_phase_after_confirmed_merge(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Entry from WATCH must still let the MERGE→ERROR hook clear phase."""
+    """Entry from WATCH clears the phase after proved remote success."""
 
     def fake_git(repo_path: str, *args: str, **kwargs: object):
         if args[:1] == ("merge",) and len(args) > 1 and str(args[1]).startswith(
@@ -397,5 +390,13 @@ def test_handle_merge_from_watch_clears_phase_on_error(
 
     asyncio.run(runner.handle_merge())
 
-    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.state == PipelineState.IDLE
     assert runner.state.merge_phase is None
+
+
+@pytest.fixture(autouse=True)
+def confirmed_remote_merge(monkeypatch):
+    async def confirmed(self):
+        return True
+
+    monkeypatch.setattr("src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", confirmed)

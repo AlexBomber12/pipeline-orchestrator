@@ -32,7 +32,7 @@ def test_exact_pr_outcome_by_identity(
 ) -> None:
     payload = {
         "number": 42,
-        "base": {"ref": "main"},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
         "head": {"sha": "a" * 40},
         "state": state,
         "merged": merged,
@@ -58,7 +58,7 @@ def test_exact_pr_outcome_permission_error_and_stale_cache(monkeypatch: pytest.M
         "_etag_get",
         lambda path: {
             "number": 42,
-            "base": {"ref": "main"},
+            "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
             "head": {"sha": "a" * 40},
             "state": "closed",
             "merged": False,
@@ -93,7 +93,7 @@ def test_merged_discovery_accepts_complete_identity_and_rejects_stale_cache(
 ) -> None:
     payload = [{
         "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
-        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
         "merge_commit_sha": "b" * 40,
     }]
     monkeypatch.setattr(cache, "_etag_get", lambda path: payload)
@@ -123,7 +123,7 @@ def test_merged_discovery_rejects_identity_mismatch(
 ) -> None:
     payload = {
         "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
-        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
         "merge_commit_sha": "b" * 40,
     }
     if change == "base":
@@ -146,7 +146,7 @@ def test_merged_discovery_rejects_nonpositive_pr_number(
 ) -> None:
     valid = {
         "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
-        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
         "merge_commit_sha": "b" * 40,
     }
     payload = ([valid] if valid_first else []) + [{**valid, "number": number}]
@@ -163,7 +163,7 @@ def test_merged_discovery_rejects_malformed_merge_timestamp(
 ) -> None:
     valid = {
         "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
-        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
         "merge_commit_sha": "b" * 40,
     }
     monkeypatch.setattr(cache, "_etag_get", lambda path: [valid, {**valid, "merged_at": merged_at}])
@@ -192,7 +192,7 @@ def test_pr_readers_accept_successful_revalidation_after_ttl(
     monkeypatch.setattr(cache, "_etag_cache", OrderedDict())
     payload = {
         "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
-        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
         "merge_commit_sha": "b" * 40, "state": "closed", "merged": True,
     }
     calls: list[list[str]] = []

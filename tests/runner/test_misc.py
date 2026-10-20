@@ -1885,3 +1885,11 @@ def test_auxiliary_awaiter_cancellation_cleans_before_propagating() -> None:
     assert managed.cleanup_calls == 1
     assert runner._current_coder_process is None
     assert runner._current_coder_supervised_process is None
+
+
+@pytest.fixture(autouse=True)
+def confirmed_remote_merge(monkeypatch):
+    async def confirmed(self):
+        return True
+
+    monkeypatch.setattr("src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", confirmed)

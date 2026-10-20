@@ -178,10 +178,13 @@ def get_exact_pr_outcome(repo: str, base_branch: str, number: int, head_sha: str
         raw.get("number") != number
         or not isinstance(base, dict)
         or base.get("ref") != base_branch
+        or not isinstance(base.get("repo"), dict)
+        or str(base["repo"].get("full_name", "")).casefold() != repo.casefold()
         or not isinstance(head, dict)
-        or head.get("sha") != head_sha
     ):
         return unknown("identity mismatch")
+    if head.get("sha") != head_sha:
+        return unknown("head mismatch")
     state = raw.get("state")
     merged = raw.get("merged")
     merge_sha = raw.get("merge_commit_sha")

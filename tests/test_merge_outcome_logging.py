@@ -388,3 +388,11 @@ def test_build_outcome_record_falls_back_to_config_when_run_record_missing(
 
     assert record["coder"] == "codex"
     assert record["coder_model_string"] == "gpt-5-codex"
+
+
+@pytest.fixture(autouse=True)
+def confirmed_remote_merge(monkeypatch):
+    async def confirmed(self):
+        return True
+
+    monkeypatch.setattr("src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", confirmed)
