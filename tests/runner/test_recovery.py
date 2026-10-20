@@ -2328,6 +2328,20 @@ def _setup_headers_recovery_fixture(
 
     monkeypatch.setattr(recovery_module, "_resolve_merged_state", fake_resolve)
 
+    # Golden scenarios model historical completions, whose accounting has
+    # already been written. Seed durable evidence rather than relying on Redis.
+    import os
+
+    from src.analytics.outcome_logger import compute_task_id_hash
+
+    analytics_dir = Path(os.environ["PO_ANALYTICS_DIR"])
+    analytics_dir.mkdir(parents=True, exist_ok=True)
+    with (analytics_dir / "2026-04.jsonl").open("a") as outcomes:
+        for task in before.get("tasks", []):
+            outcomes.write(json.dumps({
+                "task_id_hash": compute_task_id_hash(task["pr_id"], "octo__demo"),
+            }) + "\n")
+
     runner = h._make_runner()
     runner.repo_path = str(repo)
     runner._crashed_task_pr_ids = set(before.get("crashed_task_pr_ids", []))
@@ -2427,7 +2441,7 @@ def test_megaraid_scenario_resolved_in_headers_mode(
 @pytest.mark.parametrize("phase", ["merging", "post_merge_cleanup"])
 @pytest.mark.parametrize("status,missing_record", [
     (TaskStatus.DOING, False), (TaskStatus.DONE, False),
-    (TaskStatus.TODO, True), (TaskStatus.DOING, True),
+    (TaskStatus.TODO, True), (TaskStatus.DOING, True), (TaskStatus.DONE, True),
 ])
 def test_restart_retains_merge_until_remote_bookkeeping_finishes(
     monkeypatch, phase, status, snapshot, missing_record, pr_id,
@@ -2575,7 +2589,9 @@ def test_recovery_rejects_unbound_merge_snapshot(monkeypatch, mismatch):
     "incomplete", "metrics_error", "unmatched", "ambiguous", "open", "not_done", "no_branch",
     "unprefixed", "wrong_pr_id", "unprefixed_ambiguous", "unprefixed_wrong_branch",
 ])
-def test_header_merge_recovery_uses_complete_bound_github_evidence(monkeypatch, case):
+def test_header_merge_recovery_uses_complete_bound_github_evidence(
+    monkeypatch, isolate_analytics_dir, case,
+):
     from dataclasses import replace
     from unittest.mock import AsyncMock
 
@@ -2593,6 +2609,13 @@ def test_header_merge_recovery_uses_complete_bound_github_evidence(monkeypatch, 
     records = [record]
     if case in {"pending_header", "historical"}:
         records = []
+    if case == "historical":
+        from src.analytics.outcome_logger import compute_task_id_hash
+
+        isolate_analytics_dir.mkdir(parents=True, exist_ok=True)
+        (isolate_analytics_dir / "2026-04.jsonl").write_text(json.dumps({
+            "task_id_hash": compute_task_id_hash(task.pr_id, runner.name),
+        }) + "\n")
     if case == "finished":
         record.exit_reason = "success_merged"
     if case == "wrong_record":
@@ -2642,13 +2665,13 @@ def test_header_merge_recovery_uses_complete_bound_github_evidence(monkeypatch, 
         result = asyncio.run(runner._recover_header_merge_attempt([task], open_prs))
     assert result is (case not in {"incomplete", "metrics_error", "ambiguous", "unprefixed_ambiguous"})
     saved = getattr(runner, "_persisted_merge_recovery", None)
-    if case in {"pending_header", "pending_record", "unprefixed"}:
+    if case in {"pending_header", "pending_record", "unprefixed", "wrong_record"}:
         assert saved.current_task is task
         assert saved.current_pr.number == 629
         assert saved.current_pr.head_sha == "a" * 40
         assert saved.merge_phase == "post_merge_cleanup"
-        assert runner._current_run_record is (None if case == "pending_header" else record)
+        assert runner._current_run_record is (None if case in {"pending_header", "wrong_record"} else record)
     else:
         assert saved is None
-    if case in {"historical", "finished", "wrong_record", "open", "not_done", "no_branch"}:
+    if case in {"historical", "finished", "open", "not_done", "no_branch"}:
         assert not calls

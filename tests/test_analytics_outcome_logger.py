@@ -315,6 +315,37 @@ def test_replayed_outcome_is_idempotent_across_months_and_repository_scoped(
     assert {row["repo_slug"] for row in rows} == {"owner__repo", "other__repo"}
 
 
+@pytest.mark.parametrize("tail", [b"\n", b'{"truncated":', b"\xff", b"{}"])
+def test_damaged_rows_do_not_block_new_outcomes_or_deduplication(
+    tmp_path, monkeypatch, tail,
+):
+    from src.analytics.outcome_logger import has_merged_outcome
+
+    monkeypatch.setenv("PO_ANALYTICS_DIR", str(tmp_path))
+    # Malformed rows in any historical partition must not poison the scan.
+    damage = b'\n{broken}\nnull\n[]\n42\n{}\n{"older": true}\n'
+    (tmp_path / "2026-03.jsonl").write_bytes(damage)
+    target = tmp_path / "2026-04.jsonl"
+    target.write_bytes(damage + tail)
+    assert not has_merged_outcome("PR-204", "owner__repo")
+    log_merged_pr(_full_record())
+    assert has_merged_outcome("PR-204", "owner__repo")
+    assert not has_merged_outcome("PR-204", "other__repo")
+    first = target.read_bytes()
+    log_merged_pr(_full_record())
+    assert target.read_bytes() == first
+    assert json.loads(first.splitlines()[-1])["pr_id"] == "PR-204"
+
+
+def test_outcome_lookup_propagates_storage_failure(tmp_path, monkeypatch):
+    from src.analytics.outcome_logger import has_merged_outcome
+
+    monkeypatch.setenv("PO_ANALYTICS_DIR", str(tmp_path))
+    (tmp_path / "2026-04.jsonl").mkdir()
+    with pytest.raises(OSError):
+        has_merged_outcome("PR-204", "owner__repo")
+
+
 @pytest.fixture(autouse=True)
 def _no_binary_on_path(monkeypatch: pytest.MonkeyPatch) -> None:
     """Default ``shutil.which`` to "binary missing" for npm-fallback tests.

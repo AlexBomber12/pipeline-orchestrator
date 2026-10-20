@@ -484,7 +484,7 @@ def test_legacy_history_does_not_reenter_queue(
 
 @pytest.mark.parametrize("entry", ["idle", "recovery"])
 def test_api_outage_preserves_queue_without_dispatch_or_task_failure(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entry: str, isolate_analytics_dir,
 ) -> None:
     import asyncio
 
@@ -498,6 +498,15 @@ def test_api_outage_preserves_queue_without_dispatch_or_task_failure(
         pr_id="PR-002", title="Merged", status=TaskStatus.DONE,
         task_file="tasks/PR-002.md", branch="pr-002-merged",
     )
+    # This is a historical merge with already-completed outcome accounting.
+    import json
+
+    from src.analytics.outcome_logger import compute_task_id_hash
+
+    isolate_analytics_dir.mkdir(parents=True, exist_ok=True)
+    (isolate_analytics_dir / "2026-04.jsonl").write_text(json.dumps({
+        "task_id_hash": compute_task_id_hash(previous.pr_id, runner.name),
+    }) + "\n")
     runner.state.current_queue = [previous]
     runner.state.queue_done = 1
     runner.state.queue_total = 1

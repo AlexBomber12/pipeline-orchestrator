@@ -64,6 +64,31 @@ def _resolve_partition_when(record: dict) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _contains_task_outcome(analytics_dir: Path, task_id_hash: str) -> bool:
+    """Read durable completion keys, tolerating damaged or older log rows."""
+    for partition in analytics_dir.glob("*.jsonl"):
+        with open(partition, "rb") as existing:
+            for line in existing:
+                try:
+                    row = json.loads(line)
+                except (ValueError, UnicodeDecodeError):
+                    continue
+                if isinstance(row, dict) and row.get("task_id_hash") == task_id_hash:
+                    return True
+    return False
+
+
+def has_merged_outcome(pr_id: str, repo_slug: str) -> bool:
+    """Return whether durable analytics already accounts for this task.
+
+    An absent row permits recovery to replay; the append lock deduplicates
+    against concurrent completions. Storage errors propagate to defer recovery.
+    """
+    return _contains_task_outcome(
+        _resolve_analytics_dir(), compute_task_id_hash(pr_id, repo_slug),
+    )
+
+
 def log_merged_pr(pr_data: dict) -> None:
     """Validate and append one outcome per repository/task identity.
 
@@ -100,13 +125,16 @@ def log_merged_pr(pr_data: dict) -> None:
     with open(analytics_dir / ".outcomes.lock", "a", encoding="utf-8") as lock:
         try:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            for partition in analytics_dir.glob("*.jsonl"):
-                with open(partition, encoding="utf-8") as existing:
-                    for line in existing:
-                        if json.loads(line)["task_id_hash"] == record["task_id_hash"]:
-                            return
-            with open(target, "a", encoding="utf-8") as handle:
-                handle.write(serialized + "\n")
+            if _contains_task_outcome(analytics_dir, record["task_id_hash"]):
+                return
+            with open(target, "a+b") as handle:
+                # A crashed writer may have left a truncated final row. Keep
+                # the new outcome on its own line so later scans can find it.
+                if handle.tell():
+                    handle.seek(-1, os.SEEK_END)
+                    if handle.read(1) != b"\n":
+                        handle.write(b"\n")
+                handle.write((serialized + "\n").encode("utf-8"))
                 handle.flush()
                 os.fsync(handle.fileno())
         finally:

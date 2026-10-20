@@ -1555,7 +1555,9 @@ def test_resolver_uses_receipt_with_or_without_github(completion_repo, monkeypat
 
 
 @pytest.mark.parametrize("evidence", ["fix", "feat", "docs", "receipt_online", "receipt_offline"])
-def test_restart_and_idle_agree_without_dispatch(completion_repo, monkeypatch, evidence) -> None:
+def test_restart_and_idle_agree_without_dispatch(
+    completion_repo, monkeypatch, evidence, isolate_analytics_dir,
+) -> None:
     repo, _ = completion_repo
     path = repo / "tasks/PR-085.md"
     is_receipt = evidence.startswith("receipt")
@@ -1565,6 +1567,14 @@ def test_restart_and_idle_agree_without_dispatch(completion_repo, monkeypatch, e
         _completion_git(repo, "commit", "-m", "Update task branch")
         _completion_git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     before = path.read_bytes()
+
+    # The historical completion is already accounted for outside Redis.
+    from src.analytics.outcome_logger import compute_task_id_hash
+
+    isolate_analytics_dir.mkdir(parents=True, exist_ok=True)
+    (isolate_analytics_dir / "2026-04.jsonl").write_text(json.dumps({
+        "task_id_hash": compute_task_id_hash("PR-085", "octo__demo"),
+    }) + "\n")
 
     def branches(*args):
         if evidence == "receipt_offline":

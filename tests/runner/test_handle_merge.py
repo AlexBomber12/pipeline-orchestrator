@@ -749,8 +749,11 @@ def test_restart_after_outcome_append_logs_once(monkeypatch, isolate_analytics_d
     assert rows[0]["pr_id"] == "PR-401"
 
 
-def test_done_header_retains_recoverable_run_without_pipeline_snapshot(monkeypatch):
-    """A crash after DONE must leave indexed accounting for header recovery."""
+@pytest.mark.parametrize("redis_reset", [False, True])
+def test_done_header_retains_recoverable_run_without_pipeline_snapshot(
+    monkeypatch, isolate_analytics_dir, redis_reset,
+):
+    """DONE plus GitHub must recover even after all Redis state is lost."""
     from unittest.mock import AsyncMock
 
     from src.metrics import MetricsStore
@@ -788,7 +791,8 @@ def test_done_header_retains_recoverable_run_without_pipeline_snapshot(monkeypat
     # Discard the entire pipeline snapshot and in-memory record. Only the
     # terminal header, indexed checkpoint and remote merged identity survive.
     runner = h._make_runner()
-    runner.redis = original.redis
+    if not redis_reset:
+        runner.redis = original.redis
     runner._metrics_store = MetricsStore(runner.redis)
     runner.state = RepoState(url=original.state.url, name=original.state.name)
     runner._recovery_task_headers = {task.pr_id: SimpleNamespace(frontmatter_status="done")}
@@ -801,9 +805,22 @@ def test_done_header_retains_recoverable_run_without_pipeline_snapshot(monkeypat
     runner.state = recovered
     monkeypatch.setattr(runner, "_compute_diff_stats", lambda *a: {"files_touched_count": 1})
     monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
-    monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
+    from src.analytics import log_merged_pr
+
+    monkeypatch.setattr(merge_module, "log_merged_pr", log_merged_pr)
     asyncio.run(runner.handle_merge())
     assert runner.state.state == PipelineState.IDLE
+    if redis_reset:
+        records = asyncio.run(runner._metrics_store.list_task_runs(runner.name, task.pr_id))
+        assert len(records) == 1
+        assert records[0].run_id != run_id
+        run_id = records[0].run_id
     saved = asyncio.run(runner._metrics_store.get(run_id))
     assert saved.exit_reason == "success_merged"
     assert saved.files_touched_count == 1
+    assert len(list(isolate_analytics_dir.glob("*.jsonl"))) == 1
+    # A second Redis loss must recognize the durable completion as historical.
+    runner._persisted_merge_recovery = None
+    runner._metrics_store = MetricsStore(h._make_runner().redis)
+    assert asyncio.run(runner._recover_header_merge_attempt([task], []))
+    assert runner._persisted_merge_recovery is None

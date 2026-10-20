@@ -414,9 +414,9 @@ class MergeMixin:
                 self.log_event(f"[MERGE] Run record unavailable for PR #{number}; retaining ownership.")
                 return
 
-        # DONE headers without retained metrics are historical completions on
-        # snapshot-free recovery. Persist the validated run (including its task
-        # index) first so a crash before success accounting remains replayable.
+        # Persist the validated run and task index before the terminal header.
+        # If Redis is lost too, header recovery uses the durable outcome log
+        # to distinguish completed accounting from a merge that needs replay.
         try:
             await self._checkpoint_current_run_record()
         except Exception as exc:

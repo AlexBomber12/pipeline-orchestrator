@@ -15,6 +15,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.analytics.outcome_logger import has_merged_outcome
 from src.branch_context import BranchContext
 from src.cancellation import (
     SUBSOURCE_VOCABULARY,
@@ -813,8 +814,8 @@ class RecoveryMixin:
     ) -> bool:
         """Recover unfinished merge bookkeeping without a pipeline snapshot.
 
-        Historical DONE tasks with no retained metrics need no replay. A run
-        still awaiting success, or an explicitly unfinished header, does.
+        DONE tasks without retained metrics need replay unless the durable
+        outcome log already accounts for them. Redis is only a cache.
         Discovery only selects an identity; MERGE still requires exact proof.
         """
         if getattr(self, "_persisted_merge_recovery", None) is not None:
@@ -830,7 +831,8 @@ class RecoveryMixin:
                 records = [r for r in records if r.task_id == task.pr_id and r.repo_name == self.name]
                 record = max(records, key=lambda r: (r.started_at, r.run_id), default=None)
                 if (record is not None and record.exit_reason != "success_merged"
-                        or header.frontmatter_status in {"todo", "doing"}):
+                        or header.frontmatter_status in {"todo", "doing"}
+                        or record is None and not has_merged_outcome(task.pr_id, self.name)):
                     candidates.append((task, record))
             if not candidates:
                 return True
