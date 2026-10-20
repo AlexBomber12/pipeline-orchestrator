@@ -402,6 +402,27 @@ class MergeMixin:
         self.state.merge_phase = "post_merge_cleanup"
         await self.publish_state()
         current_task = self.state.current_task
+        if current_task is not None:
+            if self._current_run_record is None:
+                await self._restore_current_run_record()
+            record = self._current_run_record
+            invocation = self.state.active_invocation
+            if (record is None or record.task_id != current_task.pr_id
+                    or record.repo_name != self.name
+                    or invocation is not None and invocation.run_id is not None
+                    and record.run_id != invocation.run_id):
+                self.log_event(f"[MERGE] Run record unavailable for PR #{number}; retaining ownership.")
+                return
+
+        # DONE headers without retained metrics are historical completions on
+        # snapshot-free recovery. Persist the validated run (including its task
+        # index) first so a crash before success accounting remains replayable.
+        try:
+            await self._checkpoint_current_run_record()
+        except Exception as exc:
+            self.log_event(f"[MERGE] Run checkpoint deferred for PR #{number}: {exc}.")
+            return
+
         if current_task is not None and current_task.task_file:
             try:
                 written = await self._commit_task_status_change(
@@ -419,18 +440,6 @@ class MergeMixin:
                     f"[ERROR] Failed to write status:DONE to "
                     f"{current_task.task_file}: {exc}"
                 )
-                return
-
-        if current_task is not None:
-            if self._current_run_record is None:
-                await self._restore_current_run_record()
-            record = self._current_run_record
-            invocation = self.state.active_invocation
-            if (record is None or record.task_id != current_task.pr_id
-                    or record.repo_name != self.name
-                    or invocation is not None and invocation.run_id is not None
-                    and record.run_id != invocation.run_id):
-                self.log_event(f"[MERGE] Run record unavailable for PR #{number}; retaining ownership.")
                 return
 
         self._mark_task_done_in_snapshot()

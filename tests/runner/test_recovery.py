@@ -2509,7 +2509,7 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(monkeypatch, ph
     assert write.await_args.args[1] == "DONE"
     assert record.exit_reason == "success_merged"
     assert reads == [["api", "repos/octo/demo/pulls/629", "--include"]]
-    runner._metrics_store.save.assert_awaited_once()
+    assert runner._metrics_store.save.await_count == 2
 
 
 @pytest.mark.parametrize("mismatch", [

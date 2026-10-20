@@ -469,13 +469,13 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
         assert runner.state.current_queue[0].status == TaskStatus.DONE
 
 
-@pytest.mark.parametrize("failure", ["read", "missing", "wrong_task", "wrong_repo", "wrong_run"])
+@pytest.mark.parametrize("failure", ["read", "missing", "wrong_task", "wrong_repo", "wrong_run", "checkpoint"])
 def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeypatch, failure):
     from unittest.mock import AsyncMock
 
     runner = h._make_runner()
     task = QueueTask(pr_id="PR-401", title="Merge", branch="pr-401",
-                     task_file="tasks/PR-401.md", status=TaskStatus.DONE)
+                     task_file="tasks/PR-401.md", status=TaskStatus.DOING)
     runner.state.current_task = task
     runner.state.current_pr = PRInfo(number=629, branch=task.branch, head_sha="a" * 40)
     runner.state.state = PipelineState.MERGE
@@ -491,28 +491,37 @@ def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeyp
         bad = replace(record, **{{"wrong_task": "task_id", "wrong_repo": "repo_name",
                                   "wrong_run": "run_id"}[failure]: "other"})
     lookup = (AsyncMock(side_effect=RuntimeError("metrics unavailable"))
-              if failure == "read" else AsyncMock(return_value=bad))
+              if failure == "read" else AsyncMock(return_value=record if failure == "checkpoint" else bad))
     monkeypatch.setattr(runner._metrics_store, "get", lookup)
     monkeypatch.setattr(runner._metrics_store, "recent", AsyncMock(side_effect=AssertionError("wrong run fallback")))
-    save = AsyncMock()
+    save = AsyncMock(side_effect=RuntimeError("checkpoint unavailable") if failure == "checkpoint" else None)
     monkeypatch.setattr(runner._metrics_store, "save", save)
-    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
+    status = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_commit_task_status_change", status)
     monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {"files_touched_count": 0})
     monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
     asyncio.run(runner.handle_merge())
     assert runner.state.state == PipelineState.MERGE
     assert runner.state.current_task is task
-    save.assert_not_awaited()
+    status.assert_not_awaited()
+    assert task.status == TaskStatus.DOING
+    if failure == "checkpoint":
+        save.assert_awaited_once_with(record)
+    else:
+        save.assert_not_awaited()
     lookup.assert_awaited_once_with(record.run_id)
 
     # Recovery retries the exact key even if the recency index was never saved.
     lookup.side_effect = None
     lookup.return_value = record
+    save.side_effect = None
+    save.reset_mock()
     asyncio.run(runner.handle_merge())
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert record.exit_reason == "success_merged"
-    save.assert_awaited_once_with(record)
+    assert save.await_count == 2  # Durable checkpoint, then final success.
+    status.assert_awaited_once()
 
 
 @pytest.mark.parametrize("phase", ["merging", "post_merge_cleanup"])
@@ -614,3 +623,63 @@ def test_recovered_merge_stats_use_retained_head_from_base_checkout(
     assert record.diff_lines_added == 2
     assert record.diff_lines_deleted == 0
     assert record.languages_touched == ["python"]
+
+
+def test_done_header_retains_recoverable_run_without_pipeline_snapshot(monkeypatch):
+    """A crash after DONE must leave indexed accounting for header recovery."""
+    from unittest.mock import AsyncMock
+
+    from src.metrics import MetricsStore
+    from src.models import RepoState
+
+    original = h._make_runner()
+    task = QueueTask(pr_id="PR-401", title="Merge", branch="pr-401",
+                     task_file="tasks/PR-401.md", status=TaskStatus.DOING)
+    original.state.current_task = task
+    original.state.current_pr = PRInfo(number=629, pr_id=task.pr_id,
+                                       branch=task.branch, head_sha="a" * 40)
+    original.state.state = PipelineState.MERGE
+    original._start_current_run_record("claude", "opus")
+    run_id = original._current_run_record.run_id
+    durable_save = original._metrics_store.save
+
+    async def fail_success(record):
+        if record.exit_reason == "success_merged":
+            raise RuntimeError("success save unavailable")
+        await durable_save(record)
+
+    async def write_done(*args):
+        records = await original._metrics_store.list_task_runs(original.name, task.pr_id)
+        assert len(records) == 1 and records[0].run_id == run_id
+        assert records[0].exit_reason != "success_merged"
+        task.status = TaskStatus.DONE
+        return True
+
+    monkeypatch.setattr(original._metrics_store, "save", fail_success)
+    monkeypatch.setattr(original, "_commit_task_status_change", write_done)
+    asyncio.run(original._finish_confirmed_merge({"files_touched_count": 1}))
+    assert task.status == TaskStatus.DONE
+    assert original.state.current_task is task
+
+    # Discard the entire pipeline snapshot and in-memory record. Only the
+    # terminal header, indexed checkpoint and remote merged identity survive.
+    runner = h._make_runner()
+    runner.redis = original.redis
+    runner._metrics_store = MetricsStore(runner.redis)
+    runner.state = RepoState(url=original.state.url, name=original.state.name)
+    runner._recovery_task_headers = {task.pr_id: SimpleNamespace(frontmatter_status="done")}
+    monkeypatch.setattr(merge_module.gh_prs, "get_merged_prs_discovery", lambda *a:
+                        merge_module.gh_prs.PRDiscovery(
+                            runner.owner_repo, "main", [original.state.current_pr], True))
+    assert asyncio.run(runner._recover_header_merge_attempt([task], []))
+    recovered = runner._persisted_merge_recovery
+    assert recovered is not None
+    runner.state = recovered
+    monkeypatch.setattr(runner, "_compute_diff_stats", lambda *a: {"files_touched_count": 1})
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
+    monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
+    asyncio.run(runner.handle_merge())
+    assert runner.state.state == PipelineState.IDLE
+    saved = asyncio.run(runner._metrics_store.get(run_id))
+    assert saved.exit_reason == "success_merged"
+    assert saved.files_touched_count == 1

@@ -129,6 +129,7 @@ def test_merge_writes_status_done_to_file(
         task_file="tasks/PR-701.md",
     )
 
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     task_text = _remote_task(repo, "PR-701")
@@ -166,6 +167,7 @@ def test_merge_logs_status_commit_exception(
 
     runner._commit_task_status_change = fail_commit  # type: ignore[method-assign]
 
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     assert any(
@@ -198,6 +200,7 @@ def test_merge_status_commit_ignores_divergent_pr_branch_task_file(
         task_file="tasks/PR-701.md",
     )
 
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     task_text = _remote_task(repo, "PR-701")
