@@ -18,35 +18,6 @@
     'CHANGES_REQUESTED': '✏️',
 } %}
 
-{% if resources %}
-{% set chip_specs = [
-    ('github_rest', 'GH REST', 'GitHub REST API'),
-    ('github_graphql', 'GraphQL', 'GitHub GraphQL API'),
-    ('claude_5h', 'Claude 5h', 'Claude 5-hour window'),
-    ('claude_weekly', 'Claude weekly', 'Claude weekly window'),
-    ('codex_5h', 'Codex 5h', 'Codex 5-hour window'),
-    ('codex_weekly', 'Codex weekly', 'Codex weekly window'),
-] %}
-<div class="mb-3 resource-chip-row" data-resource-chips>
-    {% for key, label, full_name in chip_specs %}
-    {% set chip = resources[key] %}
-    {% set pct = chip.percent_used %}
-    {% if chip.reset_unix %}
-    {%- set tooltip -%}{{ full_name }}
-{{ chip.remaining }} / {{ chip.limit }} remaining
-{{ chip.reset_unix | format_reset }}{%- endset -%}
-    {% else %}
-    {%- set tooltip -%}{{ full_name }}
-{% if chip.remaining is not none %}{{ chip.remaining }} / {{ chip.limit }} remaining{% else %}No data{% endif %}{%- endset -%}
-    {% endif %}
-    <span class="resource-chip" data-zone="{{ chip.zone }}" data-resource="{{ key }}" title="{{ tooltip }}">
-        <span class="resource-chip-label">{{ label }}</span>
-        <span class="resource-chip-value">{% if pct is none %}—{% else %}{{ pct | round(0, 'floor') | int }}%{% endif %}</span>
-    </span>
-    {% endfor %}
-</div>
-{% endif %}
-
 {% set _card_only = card_only | default(false) %}
 {% if not repos %}
 <div class="rounded-lg border border-white/5 bg-surface-2 p-8 text-center">
@@ -197,10 +168,8 @@
         <div class="text-xs text-accent/70 italic mt-1">{{ _coder_name }} is {{ 'coding' if repo.state.value == 'CODING' else 'fixing' }}...</div>
         {% endif %}
         {% endif %}
-        {% if repo.usage_api_degraded %}
-        <div class="text-xs text-warn italic mt-1" title="Usage API has failed 10+ consecutive times">Usage API degraded</div>
-        {% endif %}
         {% set _active_inhibitors = repo.active_inhibitors | default([]) %}
+        {% include "components/usage_inhibitors.html" %}
         {% if repo.state.value == 'PAUSED' and _active_inhibitors %}
         {% set _inhibitor_labels = inhibitor_labels | default({}) %}
         <div class="inhibitor-stack mt-2 flex flex-wrap gap-1" data-inhibitor-stack>

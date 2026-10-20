@@ -8,6 +8,7 @@
          class="min-w-0 overflow-x-auto rounded-lg border border-white/10 bg-surface-2 p-2 lg:sticky lg:top-6 lg:self-start lg:overflow-visible">
         <div class="flex w-max gap-1 lg:w-auto lg:flex-col">
             <a href="#settings-coders-section" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Coders</a>
+            <a href="#settings-github" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">GitHub</a>
             <a href="#settings-repositories" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Repositories</a>
             <a href="#settings-automation" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Automation</a>
             <a href="#settings-usage" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Usage limits</a>
@@ -18,8 +19,29 @@
     </nav>
 
     <div class="min-w-0 space-y-10">
+    <div hx-get="/partials/settings/usage" hx-trigger="every 30s" hx-swap="none" aria-hidden="true"></div>
     <section id="settings-coders-section" class="scroll-mt-6">
         {% include "components/settings_coders_wrapper.html" %}
+    </section>
+
+    <section id="settings-github" aria-label="GitHub" class="scroll-mt-6">
+        <h2 class="text-xl font-semibold tracking-tight mb-4">GitHub</h2>
+    <div class="mt-4 rounded-lg border border-white/10 bg-surface-3 p-4">
+        {% set gh_ok = auth.gh.status == "ok" %}
+        <div class="flex items-center gap-3 mb-2">
+            <span class="w-2.5 h-2.5 rounded-full {% if gh_ok %}bg-ok{% else %}bg-fail{% endif %}"
+                  aria-hidden="true"></span>
+            <span class="text-sm font-medium text-gray-200">GitHub CLI</span>
+            <span class="ml-auto text-xs uppercase tracking-wide {% if gh_ok %}text-ok{% else %}text-fail{% endif %}">
+                {% if gh_ok %}Authorized{% else %}Error{% endif %}
+            </span>
+        </div>
+        <div class="font-mono text-xs text-gray-400 break-all">{{ auth.gh.detail }}</div>
+        <p class="mt-3 text-xs text-gray-500">
+            Infrastructure only. Run <span class="font-mono text-gray-400">docker compose run --rm daemon bash</span> to re-authenticate.
+        </p>
+    </div>
+        {% include "components/settings_github_usage.html" %}
     </section>
 
     <section id="settings-repositories" class="scroll-mt-6">

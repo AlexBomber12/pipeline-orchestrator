@@ -1,0 +1,19 @@
+<section id="coder-{{ coder.name }}-usage" data-coder-usage="{{ coder.name }}" {% if usage_oob | default(false) %}hx-swap-oob="outerHTML"{% endif %}>
+    {% set usage = (coder_usage | default({})).get(coder.name, {}) %}
+    {% if usage.supported %}
+    <div class="mt-4 border-t border-white/10 pt-4" aria-label="{{ coder.display_name }} usage">
+        <h4 class="font-medium text-gray-200">Usage</h4>
+        <p class="mt-1 text-xs {{ 'text-gray-400' if usage.status == 'available' else 'text-warn' }}" data-usage-status="{{ usage.status }}">
+            {% if usage.status == 'available' %}Current provider data{% elif usage.status == 'stale' %}Data is out of date{% else %}Usage data unavailable{% endif %}
+        </p>
+        {% for window in usage.windows %}
+        <div class="mt-2 flex flex-wrap justify-between gap-2 text-sm">
+            <span class="text-gray-400">{{ window.label }}</span>
+            <span class="font-mono">{% if window.percent is not none %}{{ window.percent }}% used{% else %}Awaiting current window{% endif %}</span>
+            {% if window.reset_at %}<span class="w-full text-xs text-gray-500">{{ window.reset_at | format_reset }}</span>{% endif %}
+        </div>
+        {% endfor %}
+        {% if usage.updated_at %}<p class="mt-2 text-xs text-gray-500">Last successful update: {{ usage.updated_at }}</p>{% endif %}
+    </div>
+    {% endif %}
+</section>

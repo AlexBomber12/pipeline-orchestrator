@@ -8,11 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 
 import pytest
 from src.models import InvocationSnapshot, PipelineState, PRInfo, RepoState
+from src.usage import UsageSnapshot
 
 from tests.runner._helpers import (
     _allow_all_coder_auth,
@@ -59,8 +61,9 @@ def test_publish_state_writes_to_redis() -> None:
     asyncio.run(runner.publish_state())
 
     assert isinstance(runner.redis, _FakeRedis)
-    assert len(runner.redis.writes) == 1
-    key, payload = runner.redis.writes[0]
+    writes = [(key, value) for key, value in runner.redis.writes if key.startswith("pipeline:")]
+    assert len(writes) == 1
+    key, payload = writes[0]
     assert key == f"pipeline:{runner.name}"
     assert runner.name in payload
 
@@ -340,16 +343,8 @@ def test_publish_state_emits_state_change_on_usage_field_change(
     transition fires."""
     from tests.runner._helpers import _FakeUsageProvider
 
-    class _UsageSnap:
-        def __init__(
-            self,
-            session_percent: int | None,
-            weekly_percent: int | None,
-        ) -> None:
-            self.session_percent = session_percent
-            self.session_resets_at = None
-            self.weekly_percent = weekly_percent
-            self.weekly_resets_at = None
+    def _UsageSnap(session_percent: int | None, weekly_percent: int | None) -> UsageSnapshot:
+        return UsageSnapshot(session_percent, None, weekly_percent, None, time.time())
 
     published: list[tuple[str, str, dict[str, object], object | None]] = []
 
@@ -938,3 +933,71 @@ def test_repo_state_resets_codex_retrigger_on_pr_transition() -> None:
     state.current_pr = PRInfo(number=2, branch="pr-002")
 
     assert state.last_codex_retrigger_at is None
+
+
+def test_shared_usage_publication_keeps_last_success_and_isolates_failure(monkeypatch):
+    from src.keyspace import coder_usage
+    from src.usage import UsageObservation
+
+    from tests.runner._helpers import _FakeUsageProvider
+
+    runner = _make_runner()
+    snap = UsageSnapshot(20, 1900000000, None, None, time.time())
+    runner._claude_usage_provider = _FakeUsageProvider(snapshot=snap)
+    runner._codex_usage_provider = None
+    asyncio.run(runner.publish_state())
+    stored = UsageObservation.model_validate_json(runner.redis.store[coder_usage("claude")])
+    assert stored.status == "available"
+    assert stored.snapshot == snap
+    assert UsageObservation.model_validate_json(runner.redis.store[coder_usage("codex")]).status == "unsupported"
+
+    async def fail(name):
+        raise RuntimeError("unavailable")
+
+    monkeypatch.setattr(runner, "_fetch_usage_snapshot", fail)
+    asyncio.run(runner.publish_state())
+    stored = UsageObservation.model_validate_json(runner.redis.store[coder_usage("claude")])
+    assert stored.status == "unavailable"
+    assert stored.last_successful_at == snap.fetched_at
+    assert stored.snapshot is None
+    assert runner.state.state != PipelineState.ERROR
+
+
+def test_usage_publication_can_read_during_coder_reservation():
+    from src.coder_login import CoderCredentialReservations
+    from src.keyspace import coder_usage
+    from src.usage import UsageObservation
+
+    from tests.runner._helpers import _FakeUsageProvider
+
+    runner = _make_runner()
+    snapshot = UsageSnapshot(20, 1900000000, None, None, time.time())
+    runner._claude_usage_provider = _FakeUsageProvider(snapshot=snapshot)
+    reservations = CoderCredentialReservations()
+    runner._credential_reservations = reservations
+    location = runner._coder_credential_location("claude")
+    assert location is not None
+    assert reservations.reserve_coder(location)
+    try:
+        asyncio.run(runner.publish_state())
+        stored = UsageObservation.model_validate_json(runner.redis.store[coder_usage("claude")])
+        assert stored.status == "available"
+        assert stored.snapshot == snapshot
+    finally:
+        reservations.release_coder(location)
+
+
+def test_usage_observation_store_failure_does_not_change_gate(monkeypatch):
+    from tests.runner._helpers import _FakeUsageProvider
+
+    runner = _make_runner()
+    runner._claude_usage_provider = _FakeUsageProvider(
+        snapshot=UsageSnapshot(20, 1900000000, None, None, time.time()),
+    )
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("offline")
+
+    monkeypatch.setattr(runner.redis, "set", fail)
+    result = asyncio.run(runner._publish_usage_observations())
+    assert result["claude"].session_percent == 20

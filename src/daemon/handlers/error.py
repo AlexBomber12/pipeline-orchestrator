@@ -271,12 +271,7 @@ class ErrorMixin:
             snapshot = await self._fetch_usage_snapshot(coder_name)
         except Exception:
             snapshot = None
-        if snapshot and (
-            snapshot.session_percent
-            >= self.app_config.daemon.rate_limit_session_pause_percent
-            or snapshot.weekly_percent
-            >= self.app_config.daemon.rate_limit_weekly_pause_percent
-        ):
+        if snapshot and self._rate_limit_threshold_breach(snapshot) is not None:
             if context != self._error_skip_context:
                 if retry_task_id is not None:
                     await self._reset_suppression_detail_count(  # pragma: no cover

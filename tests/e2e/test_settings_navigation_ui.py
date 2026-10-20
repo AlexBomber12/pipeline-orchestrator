@@ -4,6 +4,7 @@ import pytest
 
 SECTIONS = (
     ("settings-coders-section", "Coders"),
+    ("settings-github", "GitHub"),
     ("settings-repositories", "Repositories"),
     ("settings-automation", "Automation"),
     ("settings-usage", "Usage limits"),
@@ -152,6 +153,9 @@ def test_settings_navigation_and_coder_cards(
 
     links = page.locator('nav[aria-label="Settings sections"] a[href^="#"]')
     assert links.count() == len(SECTIONS)
+    assert links.evaluate_all(
+        "elements => elements.map(link => link.getAttribute('href'))"
+    ) == [f"#{section_id}" for section_id, _ in SECTIONS]
     for section_id, heading in SECTIONS:
         link = page.locator(f'nav[aria-label="Settings sections"] a[href="#{section_id}"]')
         assert link.count() == 1
