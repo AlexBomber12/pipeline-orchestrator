@@ -87,6 +87,26 @@ def test_plugin_without_quota_has_no_usage_controls():
     assert "Usage data unavailable" not in html
 
 
+def test_refresh_renders_generic_plugin_and_keeps_unsupported_plugin_empty():
+    redis = _FakeRedis(store={
+        coder_usage("third"): observation(weekly=47),
+        coder_usage("local"): observation(status="unsupported"),
+    })
+    data = context(redis, ["third", "local"])
+    html = web_app.templates.get_template("components/settings_usage_refresh.html").render(
+        coders=[
+            SimpleNamespace(name="third", display_name="Third Coder"),
+            SimpleNamespace(name="local", display_name="Local"),
+        ],
+        **data,
+    )
+    assert 'id="coder-third-usage"' in html
+    assert 'id="coder-local-usage"' in html
+    assert 'aria-label="Third Coder usage"' in html
+    assert "47% used" in html
+    assert 'aria-label="Local usage"' not in html
+
+
 def test_unavailable_provider_preserves_last_update_without_values():
     redis = _FakeRedis(store={coder_usage("codex"): observation(status="unavailable")})
     data = context(redis)

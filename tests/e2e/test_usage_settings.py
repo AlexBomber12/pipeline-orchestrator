@@ -36,9 +36,9 @@ def _refresh_html(percent: int, status: str = "available") -> str:
 def test_usage_refresh_preserves_settings_controls(page: Page, dashboard_url: str) -> None:
     fresh = _refresh_html(47)
     unavailable = _refresh_html(47, "unavailable")
-    response = page.goto(dashboard_url + "/settings", wait_until="domcontentloaded")
+    response = page.goto(dashboard_url + "/settings", wait_until="load")
     assert response is not None and response.status == 200
-    page.wait_for_function("Boolean(window.htmx)")
+    page.wait_for_function("Boolean(window.htmx && window.settingsSaveFeedbackInstalled)")
     expect(page.locator("#settings-github")).to_be_visible()
     model = page.locator("#codex-model")
     selected = model.input_value()
@@ -46,14 +46,18 @@ def test_usage_refresh_preserves_settings_controls(page: Page, dashboard_url: st
     page.route("**/partials/settings/usage", lambda route: route.fulfill(
         status=200, content_type="text/html", body=fresh,
     ))
-    page.evaluate("htmx.ajax('GET', '/partials/settings/usage', {swap: 'none'})")
+    with page.expect_response("**/partials/settings/usage") as refreshed:
+        page.evaluate("() => { htmx.ajax('GET', '/partials/settings/usage', {swap: 'none'}); }")
+    assert refreshed.value.status == 200
     expect(quota).to_contain_text("47% used")
     expect(model).to_have_value(selected)
     page.unroute("**/partials/settings/usage")
     page.route("**/partials/settings/usage", lambda route: route.fulfill(
         status=200, content_type="text/html", body=unavailable,
     ))
-    page.evaluate("htmx.ajax('GET', '/partials/settings/usage', {swap: 'none'})")
+    with page.expect_response("**/partials/settings/usage") as refreshed:
+        page.evaluate("() => { htmx.ajax('GET', '/partials/settings/usage', {swap: 'none'}); }")
+    assert refreshed.value.status == 200
     expect(quota).to_contain_text("Usage data unavailable")
     expect(quota).not_to_contain_text("47% used")
     expect(model).to_have_value(selected)
