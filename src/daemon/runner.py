@@ -2459,7 +2459,7 @@ class PipelineRunner(
             if record is not None and record.task_id == bound_pr_id
             else None
         )
-        if admitted_hash is None:
+        if not admitted_hash:
             try:
                 admitted_hash = task_spec_content_hash(
                     (repo_root / task_path).read_text(encoding="utf-8")
