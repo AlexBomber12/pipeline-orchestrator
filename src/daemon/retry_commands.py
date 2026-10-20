@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import subprocess
 import tempfile
 from datetime import datetime, timezone
@@ -66,22 +67,22 @@ class RetryCommandMixin:
 
     def _remote_frontmatter_error_status_for_current_task(
         self,
-    ) -> tuple[str | None, SuppressionReason | None]:
+    ) -> tuple[str | None, SuppressionReason | None, str | None]:
         """Read the configured base without consulting the coder's stale checkout."""
         task = self.state.current_task
         if task is None:
-            return None, None
+            return None, None, None
         task_file = getattr(task, "task_file", None)
         pr_id = task.pr_id if task.pr_id.startswith("PR-") else f"PR-{task.pr_id}"
         path = Path(task_file) if task_file else None
         if path is None or path.parts != ("tasks", f"{pr_id}.md"):
-            return None, None
+            return None, None, None
         base = self.repo_config.branch
         try:
             if not base or base.startswith("-") or git_ops._git(
                 self.repo_path, "check-ref-format", "--branch", base, check=False
             ).returncode != 0:
-                return None, None
+                return None, None, None
             origin = git_ops._git(self.repo_path, "remote", "get-url", "origin")
             if normalize_repo_url(origin.stdout) != normalize_repo_url(self.repo_config.url):
                 raise ValueError("checkout origin differs from configured repository")
@@ -102,10 +103,11 @@ class RetryCommandMixin:
                 if header.pr_id != task.pr_id or header.branch != task.branch:
                     raise ValueError("remote task identity differs from bound task")
                 reason = header.blocked_reason
-                return header.frontmatter_status, SuppressionReason(reason) if reason else None
+                revision = hashlib.sha256(tracked.read_bytes()).hexdigest()
+                return header.frontmatter_status, SuppressionReason(reason) if reason else None, revision
         except Exception as exc:
             self.log_event(f"[RECOVERY] FIX timeout remote status unavailable: {exc}; staying ERROR.")
-            return None, None
+            return None, None, None
 
     async def _admit_fix_idle_timeout(self) -> None:
         """Resume only the interrupted, bound FIX run after durable admission."""
@@ -121,7 +123,7 @@ class RetryCommandMixin:
                 return
             self._status_write_failed_task_pr_ids.discard(task.pr_id)
             await self._persist_status_write_failed_task_pr_ids()
-        status, reason = self._remote_frontmatter_error_status_for_current_task()
+        status, reason, revision = self._remote_frontmatter_error_status_for_current_task()
         try:
             cause = await get_cancellation_cause(
                 self.redis, self.name, task.pr_id, refresh_ttl=False
@@ -132,7 +134,7 @@ class RetryCommandMixin:
         if (status == "error" and reason != SuppressionReason.FIX_IDLE_TIMEOUT) or (
             cause is not None
             and cause.payload.get("subsource") != "fix_idle_timeout"
-        ) or status not in {"error", "todo"}:
+        ) or status not in {"error", "todo"} or revision is None:
             self.log_event("[RECOVERY] FIX timeout admission changed; operator Retry required.")
             return
         if status == "error" and cause is None:
@@ -208,8 +210,9 @@ class RetryCommandMixin:
             if found != find_matching_open_pr(task.pr_id, task.branch, [found]):
                 self.log_event("[RECOVERY] Bound PR identity changed; staying ERROR.")
                 return
-            if status == "error" and not await self._commit_task_status_change(
-                task, "TODO", f"confirmed FIX timeout recovery {count}/{cap}"
+            if not await self._commit_task_status_change(
+                task, "TODO", f"confirmed FIX timeout recovery {count}/{cap}",
+                expected_task_sha256=revision,
             ):
                 self.log_event("[RECOVERY] FIX timeout status:TODO write failed; staying ERROR.")
                 return

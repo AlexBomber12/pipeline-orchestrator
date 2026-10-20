@@ -21,6 +21,7 @@ Mixin resolution order (left-to-right, less-dependent first):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -2394,6 +2395,8 @@ class PipelineRunner(
         status: str,
         reason: str,
         blocked_reason: SuppressionReason | str | None = None,
+        *,
+        expected_task_sha256: str | None = None,
     ) -> bool:
         """Best-effort commit of daemon-written task frontmatter status."""
         task_file = getattr(current_task, "task_file", None)
@@ -2467,7 +2470,12 @@ class PipelineRunner(
                     if not isolated_task.is_relative_to(Path(isolated).resolve()) or not isolated_task.is_file():
                         raise ValueError("task path is missing or escapes isolated checkout")
                     git_ops._git(isolated, "ls-files", "--error-unmatch", "--", task_file)
-                    task_text = isolated_task.read_text(encoding="utf-8")
+                    task_bytes = isolated_task.read_bytes()
+                    task_text = task_bytes.decode("utf-8")
+                    if (expected_task_sha256 is not None
+                            and hashlib.sha256(task_bytes).hexdigest()
+                            != expected_task_sha256):
+                        raise ValueError("remote task changed since status admission")
                     branch = re.search(r"(?m)^Branch:\s*(\S+)\s*$", task_text)
                     if not branch or branch.group(1) != current_task.branch:
                         raise ValueError("remote task branch differs from bound task")

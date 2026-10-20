@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import subprocess
 import types
 from pathlib import Path
@@ -728,6 +729,32 @@ def test_status_write_no_change_keeps_remote_head(tmp_path: Path) -> None:
     head = _git(tmp_path / "remote.git", "rev-parse", "refs/heads/main")
     assert asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
     assert _git(tmp_path / "remote.git", "rev-parse", "refs/heads/main") == head
+
+
+@pytest.mark.parametrize("replacement", ["body", "todo"])
+def test_status_write_rejects_reupload_since_admission(
+    tmp_path: Path, replacement: str,
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-716")
+    runner = _status_runner(repo)
+    task = QueueTask(pr_id="PR-716", title="t", status=TaskStatus.ERROR,
+                     branch="pr-test", task_file="tasks/PR-716.md")
+    original = _remote_task(repo, "PR-716")
+    admitted_revision = hashlib.sha256(original.encode()).hexdigest()
+    task_file = repo / task.task_file
+    if replacement == "body":
+        task_file.write_text(original + "\nReuploaded instructions\n")
+    else:
+        task_file.write_text(original.replace("status: TODO", "status: ERROR"))
+    _git(repo, "add", task.task_file)
+    _git(repo, "commit", "-m", "reupload")
+    _git(repo, "push", "origin", "main")
+    changed = _remote_task(repo, "PR-716")
+
+    assert not asyncio.run(runner._commit_task_status_change(
+        task, "TODO", "timeout recovery", expected_task_sha256=admitted_revision,
+    ))
+    assert _remote_task(repo, "PR-716") == changed
 
 
 @pytest.mark.parametrize("failure", ["diff", "confirm", "push"])
