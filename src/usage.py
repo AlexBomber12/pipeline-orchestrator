@@ -14,20 +14,50 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class UsageSnapshot:
-    session_percent: int
-    session_resets_at: int
-    weekly_percent: int
-    weekly_resets_at: int
+    session_percent: int | None
+    session_resets_at: int | None
+    weekly_percent: int | None
+    weekly_resets_at: int | None
     fetched_at: float
+
+
+class UsageObservation(BaseModel):
+    """Daemon-owned account observation, independent of repository progress."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+    status: Literal["available", "unavailable", "unsupported"]
+    checked_at: float = Field(ge=0, le=253402300799)
+    last_successful_at: float | None = Field(default=None, ge=0, le=253402300799)
+    snapshot: UsageSnapshot | None = None
+
+
+def _read_window(raw: object, percent_key: str, reset_key: str) -> tuple[int | None, int | None]:
+    if raw is None:
+        return None, None
+    if not isinstance(raw, dict):
+        raise ValueError("Invalid usage window")
+    percent, reset = raw.get(percent_key), raw.get(reset_key)
+    if percent is None or reset is None:
+        return None, None
+    if isinstance(percent, bool) or isinstance(reset, bool):
+        raise ValueError("Invalid usage values")
+    percent = float(percent)
+    if not 0 <= percent <= 100:
+        raise ValueError("Usage percent outside 0..100")
+    timestamp = datetime.fromisoformat(reset).timestamp() if reset_key == "resets_at" else int(reset)
+    if timestamp <= 0:
+        raise ValueError("Invalid usage reset")
+    return int(percent), int(timestamp)
 
 
 class UsageProvider(Protocol):
@@ -134,18 +164,12 @@ class OAuthUsageProvider:
                 return None
             try:
                 data = response.json()
-                snap = UsageSnapshot(
-                    session_percent=int(data["five_hour"]["utilization"]),
-                    session_resets_at=int(
-                        datetime.fromisoformat(data["five_hour"]["resets_at"]).timestamp()
-                    ),
-                    weekly_percent=int(data["seven_day"]["utilization"]),
-                    weekly_resets_at=int(
-                        datetime.fromisoformat(data["seven_day"]["resets_at"]).timestamp()
-                    ),
-                    fetched_at=time.time(),
-                )
-            except (KeyError, TypeError, ValueError) as exc:
+                session = _read_window(data.get("five_hour"), "utilization", "resets_at")
+                weekly = _read_window(data.get("seven_day"), "utilization", "resets_at")
+                if session[0] is None and weekly[0] is None:
+                    raise ValueError("No usage windows available")
+                snap = UsageSnapshot(*session, *weekly, fetched_at=time.time())
+            except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as exc:
                 logger.warning("usage endpoint returned unexpected shape: %s", exc)
                 self._record_failure()
                 return None
@@ -267,30 +291,12 @@ class OpenAIUsageProvider:
             try:
                 data = response.json()
                 rl = data.get("rate_limit") or {}
-                primary = rl.get("primary_window") or {}
-                secondary = rl.get("secondary_window") or {}
-                if "used_percent" not in primary or "used_percent" not in secondary:
-                    logger.warning(
-                        "OpenAI usage response missing used_percent fields"
-                    )
-                    logger.debug("OpenAI usage response body: %s", response.text[:500])
-                    self._record_failure()
-                    return None
-                if "reset_at" not in primary or "reset_at" not in secondary:
-                    logger.warning(
-                        "OpenAI usage response missing reset_at fields"
-                    )
-                    logger.debug("OpenAI usage response body: %s", response.text[:500])
-                    self._record_failure()
-                    return None
-                snap = UsageSnapshot(
-                    session_percent=int(primary["used_percent"]),
-                    session_resets_at=int(primary["reset_at"]),
-                    weekly_percent=int(secondary["used_percent"]),
-                    weekly_resets_at=int(secondary["reset_at"]),
-                    fetched_at=time.time(),
-                )
-            except (KeyError, TypeError, ValueError, AttributeError) as exc:
+                primary = _read_window(rl.get("primary_window"), "used_percent", "reset_at")
+                secondary = _read_window(rl.get("secondary_window"), "used_percent", "reset_at")
+                if primary[0] is None and secondary[0] is None:
+                    raise ValueError("No usage windows available")
+                snap = UsageSnapshot(*primary, *secondary, fetched_at=time.time())
+            except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as exc:
                 logger.warning("OpenAI usage endpoint returned unexpected shape: %s", exc)
                 logger.debug("OpenAI usage response body: %s", response.text[:500])
                 self._record_failure()

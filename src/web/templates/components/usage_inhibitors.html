@@ -1,0 +1,11 @@
+{% for inhibitor in repo.active_inhibitors | default([]) %}
+{% set kind = inhibitor.inhibitor_type.value %}
+{% if kind in ('github_budget_pause', 'github_budget_slowdown') or ((usage_notice_detail | default(false)) and kind in ('rate_limit', 'spend_ceiling')) %}
+{% if (usage_notice_detail | default(false)) or repo.state.value != 'PAUSED' %}
+<p class="mt-2 text-xs text-warn" data-usage-inhibitor="{{ kind }}">
+    {{ inhibitor.reason_text }}
+    <a class="underline" href="/settings#{{ 'settings-github' if kind.startswith('github_') else 'settings-coders-section' }}">Usage settings</a>
+</p>
+{% endif %}
+{% endif %}
+{% endfor %}

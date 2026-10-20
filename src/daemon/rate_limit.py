@@ -20,8 +20,9 @@ from typing import Any
 from src.config import DEFAULT_CODER_PLUGINS
 from src.daemon.notifications import send_spend_ceiling_warning
 from src.daemon.selector import resolve_pause_coder
+from src.keyspace import coder_usage
 from src.models import PipelineState
-from src.usage import UsageSnapshot
+from src.usage import UsageObservation, UsageSnapshot
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,36 @@ RATE_LIMIT_BRANCH_MAP = (
 
 class RateLimitMixin:
     """Rate-limit detection and proactive usage checks."""
+
+    async def _publish_usage_observations(self) -> dict[str, UsageSnapshot | None]:
+        """Refresh registered account readers using their shared cache/backoff."""
+        snapshots = {}
+        for name in self._registry.coder_names():
+            provider = self._usage_provider_for(name)
+            try:
+                snapshot = await self._fetch_usage_snapshot(name) if provider is not None else None
+                observation = UsageObservation(
+                    status=(
+                        "unsupported" if provider is None else "available" if snapshot is not None else "unavailable"
+                    ),
+                    checked_at=time.time(),
+                    last_successful_at=getattr(snapshot, "fetched_at", None),
+                    snapshot=snapshot,
+                )
+            except Exception:
+                snapshot = None
+                observation = UsageObservation(status="unavailable", checked_at=time.time())
+            snapshots[name] = snapshot
+            try:
+                if snapshot is None and provider is not None:
+                    previous = await self.redis.get(coder_usage(name))
+                    if previous:
+                        prior = UsageObservation.model_validate_json(previous)
+                        observation.last_successful_at = prior.last_successful_at
+                await self.redis.set(coder_usage(name), observation.model_dump_json())
+            except Exception:
+                pass
+        return snapshots
 
     @staticmethod
     async def _run_reserved_sync_reader(reader: Callable[[], Any]) -> Any:
@@ -185,7 +216,8 @@ class RateLimitMixin:
         config = self.app_config.daemon
         session_threshold = config.usage_gate_rate_limit_session_pause_percent
         weekly_threshold = config.usage_gate_rate_limit_weekly_pause_percent
-        if snapshot.session_percent >= session_threshold:
+        if (snapshot.session_percent is not None and snapshot.session_resets_at is not None
+                and snapshot.session_percent >= session_threshold):
             return UsageThresholdBreach(
                 source="rate-limit",
                 limit_kind="session",
@@ -193,7 +225,8 @@ class RateLimitMixin:
                 cap_percent=session_threshold,
                 resets_at=snapshot.session_resets_at,
             )
-        if snapshot.weekly_percent >= weekly_threshold:
+        if (snapshot.weekly_percent is not None and snapshot.weekly_resets_at is not None
+                and snapshot.weekly_percent >= weekly_threshold):
             return UsageThresholdBreach(
                 source="rate-limit",
                 limit_kind="weekly",
@@ -210,7 +243,8 @@ class RateLimitMixin:
         config = self.app_config.daemon
         session_cap = config.usage_gate_spend_ceiling_session_percent
         weekly_cap = config.usage_gate_spend_ceiling_weekly_percent
-        if session_cap is not None and snapshot.session_percent >= session_cap:
+        if (session_cap is not None and snapshot.session_percent is not None and snapshot.session_resets_at is not None
+                and snapshot.session_percent >= session_cap):
             return UsageThresholdBreach(
                 source="spend-ceiling",
                 limit_kind="session",
@@ -218,7 +252,8 @@ class RateLimitMixin:
                 cap_percent=session_cap,
                 resets_at=snapshot.session_resets_at,
             )
-        if weekly_cap is not None and snapshot.weekly_percent >= weekly_cap:
+        if (weekly_cap is not None and snapshot.weekly_percent is not None and snapshot.weekly_resets_at is not None
+                and snapshot.weekly_percent >= weekly_cap):
             return UsageThresholdBreach(
                 source="spend-ceiling",
                 limit_kind="weekly",
@@ -282,7 +317,7 @@ class RateLimitMixin:
                 snapshot.weekly_resets_at,
             ),
         ):
-            if cap is None:
+            if cap is None or current is None or resets_at is None:
                 continue
             if current * 100 < cap * warning_pct:
                 continue

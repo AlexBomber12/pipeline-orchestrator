@@ -15,11 +15,6 @@ async def test_repo_template_context_invokes_load_config_via_to_thread(monkeypat
     registry.list_coders.return_value = []
 
     monkeypatch.setattr(dashboard_routes.asyncio, "to_thread", to_thread)
-    monkeypatch.setattr(
-        dashboard_routes,
-        "_build_recent_graphql_burns_view",
-        AsyncMock(return_value=None),
-    )
     monkeypatch.delattr(
         dashboard_routes._app.app.state,
         "coder_registry",
@@ -58,11 +53,6 @@ async def test_repo_template_context_uses_configured_runtime_coders(monkeypatch)
         dashboard_routes.asyncio,
         "to_thread",
         AsyncMock(return_value=config),
-    )
-    monkeypatch.setattr(
-        dashboard_routes,
-        "_build_recent_graphql_burns_view",
-        AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
         dashboard_routes._app.app.state,

@@ -220,6 +220,7 @@ def test_settings_navigation_resolves_unique_sections_in_order(empty_config: Pat
     targets = re.findall(r'<a href="#([^"]+)"', navigation)
     assert targets == [
         "settings-coders-section",
+        "settings-github",
         "settings-repositories",
         "settings-automation",
         "settings-usage",
@@ -784,7 +785,7 @@ def test_coder_cards_keep_controls_and_login_preservation(
     assert 'id="coder-codex-device-login"' in body
     assert 'data-device-login-shell' in body
     assert 'hx-preserve="true"' in body
-    assert "GitHub CLI" in body
+    assert "GitHub CLI" not in body
 
 
 def test_put_daemon_updates_numeric_fields(empty_config: Path) -> None:
