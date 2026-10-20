@@ -2480,7 +2480,8 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(
     assert runner._current_run_record is record
 
     # The first cycle after recovery uses the retained identity, even though
-    # GitHub's open-PR list is empty and headers may already say DONE.
+    # GitHub's open-PR list is empty and headers may already say DONE. A dirty
+    # checkout must not let preflight erase MERGE before bookkeeping replays.
     runner._recovered = True
     for method in ("ensure_repo_cloned", "_refresh_user_paused_from_redis"):
         monkeypatch.setattr(runner, method, AsyncMock())
@@ -2489,10 +2490,15 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(
         monkeypatch.setattr(runner, method, AsyncMock(return_value=False))
     monkeypatch.setattr(runner, "_consume_retry_command", AsyncMock(return_value=RetryDispatch.NONE))
     monkeypatch.setattr(runner, "_check_github_api_budget", AsyncMock(return_value=True))
-    monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+    preflight = AsyncMock(wraps=runner.preflight)
+    monkeypatch.setattr(runner, "preflight", preflight)
     monkeypatch.setattr(runner, "handle_idle", AsyncMock(side_effect=AssertionError("duplicate discovery")))
-    monkeypatch.setattr(recovery_module.git_ops, "_git",
-                        lambda *a, **kw: pytest.fail("branch access during reconciliation"))
+    def dirty_git(repo_path, *args, **kwargs):
+        if args == ("status", "--porcelain"):
+            return subprocess.CompletedProcess(args, 0, stdout="?? crash-leftover.txt\n")
+        pytest.fail("branch access during reconciliation")
+
+    monkeypatch.setattr(recovery_module.git_ops, "_git", dirty_git)
     monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {"files_touched_count": 0})
     monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
     write = AsyncMock(return_value=True)
@@ -2511,6 +2517,7 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(
 
     monkeypatch.setattr(merge_module.gh_runner, "run_gh", transport)
     asyncio.run(runner._run_cycle_body())
+    preflight.assert_not_awaited()
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert runner.state.current_queue[0].status == TaskStatus.DONE

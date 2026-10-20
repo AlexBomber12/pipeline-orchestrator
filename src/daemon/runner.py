@@ -3803,11 +3803,9 @@ class PipelineRunner(
             await self.publish_state()
             return
 
-        if not await self.preflight():
-            await self.publish_state()
-            return
-
         # An attempted merge is retained until exact remote evidence resolves it.
+        # Reconcile before preflight: a dirty checkout must not clear the retained
+        # identity via ERROR before DONE and success accounting can be replayed.
         # It must not enter IDLE discovery or touch a possibly deleted branch.
         if (
             self.state.state == PipelineState.MERGE
@@ -3815,6 +3813,10 @@ class PipelineRunner(
             and self.state.merge_phase in {"merging", "post_merge_cleanup"}
         ):
             await self.handle_merge()
+            await self.publish_state()
+            return
+
+        if not await self.preflight():
             await self.publish_state()
             return
 
