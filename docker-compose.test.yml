@@ -11,6 +11,7 @@ services:
 
   web-test:
     build: .
+    init: true
     container_name: pipeline-orchestrator-web-test
     command: bash scripts/entrypoint.sh python -m uvicorn src.web.app:app --host 0.0.0.0 --port 8000
     depends_on:
@@ -35,6 +36,7 @@ services:
 
   daemon-test:
     build: .
+    init: true
     container_name: pipeline-orchestrator-daemon-test
     command:
       - bash
