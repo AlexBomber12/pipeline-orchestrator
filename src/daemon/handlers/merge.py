@@ -404,7 +404,7 @@ class MergeMixin:
         current_task = self.state.current_task
         if current_task is not None:
             if self._current_run_record is None:
-                await self._restore_current_run_record()
+                await self._restore_current_run_record(recover_missing_merge=True)
             record = self._current_run_record
             invocation = self.state.active_invocation
             if (record is None or record.task_id != current_task.pr_id

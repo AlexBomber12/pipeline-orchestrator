@@ -469,7 +469,7 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
         assert runner.state.current_queue[0].status == TaskStatus.DONE
 
 
-@pytest.mark.parametrize("failure", ["read", "missing", "wrong_task", "wrong_repo", "wrong_run", "checkpoint"])
+@pytest.mark.parametrize("failure", ["read", "wrong_task", "wrong_repo", "wrong_run", "checkpoint"])
 def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeypatch, failure):
     from unittest.mock import AsyncMock
 
@@ -522,6 +522,58 @@ def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeyp
     assert record.exit_reason == "success_merged"
     assert save.await_count == 2  # Durable checkpoint, then final success.
     status.assert_awaited_once()
+
+
+@pytest.mark.parametrize("bound", [False, True])
+def test_confirmed_merge_reconstructs_missing_accounting_before_done(monkeypatch, bound):
+    from unittest.mock import AsyncMock
+
+    runner = h._make_runner()
+    task = QueueTask(pr_id="PR-401", title="Merge", branch="pr-401",
+                     task_file="tasks/PR-401.md", status=TaskStatus.DOING)
+    runner.state.current_task = task
+    runner.state.current_pr = PRInfo(number=629, branch=task.branch, head_sha="a" * 40)
+    runner.state.state = PipelineState.MERGE
+    runner.state.merge_phase = "post_merge_cleanup"
+    if bound:
+        runner._start_current_run_record("claude", "opus")
+        runner._capture_invocation_snapshot("claude", {"model": "opus"}, phase="coding")
+    invocation = runner.state.active_invocation
+    runner._current_run_record = None
+    monkeypatch.setattr(runner._metrics_store, "get", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner._metrics_store, "recent", AsyncMock(return_value=[]))
+    monkeypatch.setattr(runner._metrics_store, "list_task_runs", AsyncMock(return_value=[]))
+    save = AsyncMock(side_effect=RuntimeError("checkpoint unavailable"))
+    monkeypatch.setattr(runner._metrics_store, "save", save)
+    status = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_commit_task_status_change", status)
+    monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {"files_touched_count": 0})
+    monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
+
+    asyncio.run(runner.handle_merge())
+    record = runner._current_run_record
+    assert record.repo_name == runner.name and record.task_id == task.pr_id
+    assert record.profile_id == "recovery:unknown:container"
+    assert record.tokens_in == record.tokens_out == 0
+    if bound:
+        assert record.run_id == invocation.run_id
+        assert record.invocations == [invocation]
+    else:
+        assert record.run_id and not record.invocations
+    assert runner.state.state == PipelineState.MERGE
+    assert runner.state.current_task is task
+    assert task.status == TaskStatus.DOING
+    status.assert_not_awaited()
+    save.assert_awaited_once_with(record)
+
+    save.side_effect = None
+    save.reset_mock()
+    asyncio.run(runner.handle_merge())
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert record.exit_reason == "success_merged"
+    status.assert_awaited_once()
+    assert save.await_count == 2
 
 
 @pytest.mark.parametrize("phase", ["merging", "post_merge_cleanup"])

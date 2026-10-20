@@ -1796,7 +1796,7 @@ class PipelineRunner(
             return "recovery"
         return "coding"
 
-    async def _restore_current_run_record(self) -> None:
+    async def _restore_current_run_record(self, *, recover_missing_merge: bool = False) -> None:
         """Restore the bound invocation, or latest task run when no binding survived."""
         task = self.state.current_task
         if task is None:
@@ -1830,6 +1830,29 @@ class PipelineRunner(
                 f"{task.pr_id}: {exc}."
             )
             return
+        if recover_missing_merge and not recent:
+            # Exact remote merge proof allows completion after Redis loss. Do
+            # not invent lost coder usage or fall back past a mismatched record.
+            # The caller checkpoints this accounting before writing DONE.
+            self._current_run_record = RunRecord(
+                run_id=run_id if run_id is not None else str(uuid.uuid4()),
+                task_id=task.pr_id,
+                repo_name=self.name,
+                profile_id="recovery:unknown:container",
+                task_type="",
+                complexity="",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                ended_at=None,
+                duration_ms=None,
+                fix_iterations=0,
+                tokens_in=0,
+                tokens_out=0,
+                exit_reason="",
+                operator_intervention=False,
+                run_phase="merge",
+                invocations=[invocation] if invocation is not None else [],
+            )
+            self.log_event(f"[MERGE] Reconstructed missing accounting for {task.pr_id}.")
         if (
             self.state.active_invocation is None
             and self._current_run_record is not None

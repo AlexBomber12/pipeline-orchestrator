@@ -2424,8 +2424,13 @@ def test_megaraid_scenario_resolved_in_headers_mode(
 
 @pytest.mark.parametrize("snapshot", ["valid", "absent", "damaged"])
 @pytest.mark.parametrize("phase", ["merging", "post_merge_cleanup"])
-@pytest.mark.parametrize("status", [TaskStatus.DOING, TaskStatus.DONE])
-def test_restart_retains_merge_until_remote_bookkeeping_finishes(monkeypatch, phase, status, snapshot):
+@pytest.mark.parametrize("status,missing_record", [
+    (TaskStatus.DOING, False), (TaskStatus.DONE, False),
+    (TaskStatus.TODO, True), (TaskStatus.DOING, True),
+])
+def test_restart_retains_merge_until_remote_bookkeeping_finishes(
+    monkeypatch, phase, status, snapshot, missing_record,
+):
     from unittest.mock import AsyncMock
 
     from src.daemon.retry_commands import RetryDispatch
@@ -2440,7 +2445,7 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(monkeypatch, ph
     original.state.state = PipelineState.MERGE
     original.state.merge_phase = phase
     original._start_current_run_record("claude", "opus")
-    record = original._current_run_record
+    record = None if missing_record else original._current_run_record
     runner = h._make_runner()
     if snapshot != "absent":
         runner.redis.store[pipeline_state(runner.name)] = (
@@ -2455,12 +2460,14 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(monkeypatch, ph
         return [queued.model_copy(update={"status": TaskStatus.DONE})]
 
     monkeypatch.setattr(runner, "_parse_tasks_from_headers", parse)
-    monkeypatch.setattr(runner._metrics_store, "list_task_runs", AsyncMock(return_value=[record]))
+    monkeypatch.setattr(
+        runner._metrics_store, "list_task_runs", AsyncMock(return_value=[] if missing_record else [record]),
+    )
     monkeypatch.setattr(gh_prs, "get_merged_prs_discovery", lambda *a: gh_prs.PRDiscovery(
         runner.owner_repo, "main", [original.state.current_pr], True,
     ))
     monkeypatch.setattr(runner, "_cleanup_expected_branch", lambda: None)
-    monkeypatch.setattr(runner._metrics_store, "recent", AsyncMock(return_value=[record]))
+    monkeypatch.setattr(runner._metrics_store, "recent", AsyncMock(return_value=[] if missing_record else [record]))
     monkeypatch.setattr(runner._metrics_store, "save", AsyncMock())
     h._patch_subprocess(monkeypatch)
     assert asyncio.run(runner.recover_state())
@@ -2507,6 +2514,10 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(monkeypatch, ph
     assert runner.state.current_queue[0].status == TaskStatus.DONE
     assert write.await_args.args[0].pr_id == queued.pr_id
     assert write.await_args.args[1] == "DONE"
+    if missing_record:
+        record = runner._metrics_store.save.await_args.args[0]
+        assert record.task_id == task.pr_id and record.repo_name == runner.name
+        assert record.profile_id == "recovery:unknown:container"
     assert record.exit_reason == "success_merged"
     assert reads == [["api", "repos/octo/demo/pulls/629", "--include"]]
     assert runner._metrics_store.save.await_count == 2
