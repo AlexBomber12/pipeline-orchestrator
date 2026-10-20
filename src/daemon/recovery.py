@@ -641,7 +641,7 @@ class RecoveryMixin:
             and re.fullmatch(r"[0-9a-fA-F]{40}", persisted.current_pr.head_sha) is not None
             and bool(persisted.current_task.branch)
             and persisted.current_task.branch == persisted.current_pr.branch
-            and persisted.current_pr.pr_id == persisted.current_task.pr_id
+            and persisted.current_pr.pr_id in {None, persisted.current_task.pr_id}
         ):
             self._persisted_merge_recovery = persisted
         if persisted.state != PipelineState.CODING:
@@ -842,7 +842,7 @@ class RecoveryMixin:
             return False
         for task, record in candidates:
             matches = [pr for pr in discovery.prs
-                       if pr.pr_id == task.pr_id and pr.branch == task.branch]
+                       if pr.pr_id in {None, task.pr_id} and pr.branch == task.branch]
             if not matches:
                 continue
             if len(matches) != 1:

@@ -2422,6 +2422,7 @@ def test_megaraid_scenario_resolved_in_headers_mode(
     assert [t.status for t in runner.state.current_queue] == [TaskStatus.DONE]
 
 
+@pytest.mark.parametrize("pr_id", ["PR-401", None])
 @pytest.mark.parametrize("snapshot", ["valid", "absent", "damaged"])
 @pytest.mark.parametrize("phase", ["merging", "post_merge_cleanup"])
 @pytest.mark.parametrize("status,missing_record", [
@@ -2429,7 +2430,7 @@ def test_megaraid_scenario_resolved_in_headers_mode(
     (TaskStatus.TODO, True), (TaskStatus.DOING, True),
 ])
 def test_restart_retains_merge_until_remote_bookkeeping_finishes(
-    monkeypatch, phase, status, snapshot, missing_record,
+    monkeypatch, phase, status, snapshot, missing_record, pr_id,
 ):
     from unittest.mock import AsyncMock
 
@@ -2440,7 +2441,7 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(
     task = QueueTask(pr_id="PR-401", title="Merge", branch="pr-401",
                      task_file="tasks/PR-401.md", status=TaskStatus.DOING)
     original.state.current_task = task
-    original.state.current_pr = PRInfo(number=629, pr_id=task.pr_id,
+    original.state.current_pr = PRInfo(number=629, pr_id=pr_id, title="Confirm remote merge",
                                        branch=task.branch, head_sha="a" * 40)
     original.state.state = PipelineState.MERGE
     original.state.merge_phase = phase
@@ -2475,6 +2476,7 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(
     assert runner.state.merge_phase == (phase if snapshot == "valid" else "post_merge_cleanup")
     assert runner.state.current_task.pr_id == queued.pr_id
     assert runner.state.current_pr.head_sha == "a" * 40
+    assert runner.state.current_pr.pr_id == pr_id
     assert runner._current_run_record is record
 
     # The first cycle after recovery uses the retained identity, even though
@@ -2564,6 +2566,7 @@ def test_recovery_rejects_unbound_merge_snapshot(monkeypatch, mismatch):
 @pytest.mark.parametrize("case", [
     "pending_header", "pending_record", "historical", "finished", "wrong_record",
     "incomplete", "metrics_error", "unmatched", "ambiguous", "open", "not_done", "no_branch",
+    "unprefixed", "wrong_pr_id", "unprefixed_ambiguous", "unprefixed_wrong_branch",
 ])
 def test_header_merge_recovery_uses_complete_bound_github_evidence(monkeypatch, case):
     from dataclasses import replace
@@ -2610,9 +2613,14 @@ def test_header_merge_recovery_uses_complete_bound_github_evidence(monkeypatch, 
             "base": {"ref": "main"}, "head": {"ref": "pr-401", "sha": "a" * 40},
             "merge_commit_sha": "b" * 40,
         }
-        if case == "unmatched":
+        if case.startswith("unprefixed"):
+            entry["title"] = "Confirm remote merge"
+        if case == "wrong_pr_id":
+            entry["title"] = "PR-999: Different task"
+        if case in {"unmatched", "unprefixed_wrong_branch"}:
             entry["head"]["ref"] = "other"
-        entries = [entry, dict(entry, number=630)] if case == "ambiguous" else [entry]
+        entries = ([entry, dict(entry, number=630)]
+                   if case in {"ambiguous", "unprefixed_ambiguous"} else [entry])
         return "HTTP/2.0 200 OK\r\n\r\n" + json.dumps(entries)
 
     monkeypatch.setattr(gh_prs.gh_runner, "run_gh", transport)
@@ -2625,9 +2633,9 @@ def test_header_merge_recovery_uses_complete_bound_github_evidence(monkeypatch, 
         assert runner.state.current_task is None
     else:
         result = asyncio.run(runner._recover_header_merge_attempt([task], open_prs))
-    assert result is (case not in {"incomplete", "metrics_error", "ambiguous"})
+    assert result is (case not in {"incomplete", "metrics_error", "ambiguous", "unprefixed_ambiguous"})
     saved = getattr(runner, "_persisted_merge_recovery", None)
-    if case in {"pending_header", "pending_record"}:
+    if case in {"pending_header", "pending_record", "unprefixed"}:
         assert saved.current_task is task
         assert saved.current_pr.number == 629
         assert saved.current_pr.head_sha == "a" * 40
