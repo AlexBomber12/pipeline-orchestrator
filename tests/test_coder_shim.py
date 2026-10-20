@@ -166,3 +166,42 @@ def test_shim_ignores_status_doing_outside_task_metadata(tmp_path: Path) -> None
 
     assert result.returncode == 0
     assert result.stdout == "PR-002\tpr-002\n"
+
+
+def test_success_shim_separates_branch_creation_from_head_publication(tmp_path: Path) -> None:
+    remote = tmp_path / "remote.git"
+    repo = tmp_path / "repo"
+
+    def git(*args: str, cwd: Path = tmp_path) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    git("init", "--bare", "--initial-branch=main", str(remote))
+    git("config", "core.logAllRefUpdates", "true", cwd=remote)
+    git("clone", str(remote), str(repo))
+    git("config", "user.name", "Fixture", cwd=repo)
+    git("config", "user.email", "fixture@test.invalid", cwd=repo)
+    git("commit", "--allow-empty", "-m", "base", cwd=repo)
+    base = git("rev-parse", "HEAD", cwd=repo)
+    git("push", "origin", "main", cwd=repo)
+
+    result = subprocess.run(
+        ["bash", "-c", '''
+source "$1"
+ensure_pr_url() { printf 'https://example.invalid/pull/42'; }
+gh() { return 0; }
+run_success PR-42 pr-42-success
+''', "bash", str(SHIM.resolve())],
+        cwd=repo, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    head = git("rev-parse", "refs/heads/pr-42-success", cwd=remote)
+    assert head != base
+    assert "PR-42" in git("show", f"{head}:tests/e2e-shim-marker.txt", cwd=remote)
+    events = (remote / "logs/refs/heads/pr-42-success").read_text().splitlines()
+    assert len(events) == 2
+    created, pushed = (event.split() for event in events)
+    assert created[1] == base and pushed[0] == base and pushed[1] == head
+    created_at, pushed_at = (int(event.split("\t", 1)[0].rsplit(" ", 2)[1]) for event in events)
+    assert pushed_at > created_at

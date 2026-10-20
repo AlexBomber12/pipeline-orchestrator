@@ -2629,7 +2629,11 @@ def test_model_refresh_rejects_unknown_and_static_and_refreshes_claude(
 
 
 @pytest.mark.asyncio
-async def test_codex_catalog_cache_coalesces_concurrent_refreshes() -> None:
+async def test_codex_catalog_cache_coalesces_concurrent_refreshes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Exercise configured auth contexts independently of the daemon's login.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     started = asyncio.Event()
     release = asyncio.Event()
     calls = 0
@@ -2775,6 +2779,7 @@ async def test_configured_static_catalog_uses_daemon_loader() -> None:
 async def test_codex_catalog_cache_expires_retains_last_known_and_handles_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     clock = [0.0]
     monkeypatch.setattr(_model_catalog.time, "monotonic", lambda: clock[0])
     model = CodexModel("known", "Known", False, None, ())

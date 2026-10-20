@@ -17,6 +17,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 from urllib.parse import quote
 
 from src.config import load_config
@@ -74,7 +75,6 @@ class BranchPublication:
             and _FULL_SHA_RE.fullmatch(self.head_sha) is not None
         )
 
-
     def to_pr_info(self) -> PRInfo:
         """Convert verified publication evidence to WATCH's PR model."""
         return PRInfo(
@@ -102,6 +102,103 @@ class HeadPublicationEvidence:
     published_at: datetime | None
     provenance: str
     unknown_reason: str | None = None
+
+
+class ExactPRState(str, Enum):
+    OPEN = "OPEN"
+    MERGED = "MERGED"
+    CLOSED = "CLOSED"
+    UNKNOWN = "UNKNOWN"
+
+
+@dataclass(frozen=True)
+class ExactPROutcome:
+    """A single PR observation bound to its configured identity and head."""
+
+    repo: str
+    base_branch: str
+    number: int
+    head_sha: str
+    state: ExactPRState
+    discovery_complete: bool
+    merge_commit_sha: str | None = None
+    reason: str | None = None
+
+
+@dataclass(frozen=True)
+class PRDiscovery:
+    """Merged PR list and whether every page was freshly accounted for."""
+
+    repo: str
+    base_branch: str
+    prs: list[PRInfo]
+    complete: bool
+    reason: str | None = None
+
+
+def get_exact_pr_outcome(repo: str, base_branch: str, number: int, head_sha: str) -> ExactPROutcome:
+    """Read one PR by identity, including terminal outcomes absent from open lists.
+
+    Evidence must have been fetched or successfully revalidated within the
+    merged-list TTL to authorize a terminal decision. Callers can retry UNKNOWN later.
+    """
+
+    def unknown(reason: str) -> ExactPROutcome:
+        return ExactPROutcome(
+            repo,
+            base_branch,
+            number,
+            head_sha,
+            ExactPRState.UNKNOWN,
+            False,
+            reason=reason,
+        )
+
+    if (
+        not repo
+        or not base_branch
+        or isinstance(number, bool)
+        or number <= 0
+        or _FULL_SHA_RE.fullmatch(head_sha) is None
+    ):
+        return unknown("invalid identity")
+    path = f"repos/{repo}/pulls/{number}"
+    try:
+        raw = cache._etag_get(path)
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+        return unknown(str(exc))
+    observed = cache._etag_payload_observed_at(path, raw)
+    if observed is not None and (datetime.now(timezone.utc) - observed).total_seconds() > _MERGED_PRS_CACHE_TTL_SECONDS:
+        return unknown("stale cache")
+    if not isinstance(raw, dict):
+        return unknown("malformed response")
+    base = raw.get("base")
+    head = raw.get("head")
+    if (
+        raw.get("number") != number
+        or not isinstance(base, dict)
+        or base.get("ref") != base_branch
+        or not isinstance(head, dict)
+        or head.get("sha") != head_sha
+    ):
+        return unknown("identity mismatch")
+    state = raw.get("state")
+    merged = raw.get("merged")
+    merge_sha = raw.get("merge_commit_sha")
+    if merged is True and state == "closed" and _FULL_SHA_RE.fullmatch(merge_sha if isinstance(merge_sha, str) else ""):
+        return ExactPROutcome(
+            repo,
+            base_branch,
+            number,
+            head_sha,
+            ExactPRState.MERGED,
+            True,
+            merge_sha,
+        )
+    if merged is False and state in {"open", "closed"}:
+        result = ExactPRState.OPEN if state == "open" else ExactPRState.CLOSED
+        return ExactPROutcome(repo, base_branch, number, head_sha, result, True)
+    return unknown("inconsistent state or missing merge commit")
 
 
 class GitHubPollError(Exception):
@@ -160,10 +257,7 @@ def get_branch_publications(
             "--limit",
             "20",
             "--json",
-            (
-                "number,title,baseRefName,headRefName,headRefOid,state,"
-                "isDraft,isCrossRepository,createdAt,url"
-            ),
+            ("number,title,baseRefName,headRefName,headRefOid,state,isDraft,isCrossRepository,createdAt,url"),
         ],
         repo=repo,
         timeout=10,
@@ -175,10 +269,7 @@ def get_branch_publications(
     for entry in raw:
         if not isinstance(entry, dict):
             continue
-        if (
-            entry.get("baseRefName") != base_branch
-            or entry.get("headRefName") != head_branch
-        ):
+        if entry.get("baseRefName") != base_branch or entry.get("headRefName") != head_branch:
             continue
         number = entry.get("number")
         if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
@@ -219,9 +310,7 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
     merged_branches: set[str] = set()
     for offset in range(0, len(branch_names), _GH_HEAD_QUERY_CHUNK):
         chunk = branch_names[offset : offset + _GH_HEAD_QUERY_CHUNK]
-        branch_variables = ", ".join(
-            f"$branch{index}: String!" for index in range(len(chunk))
-        )
+        branch_variables = ", ".join(f"$branch{index}: String!" for index in range(len(chunk)))
         branch_queries = " ".join(
             (
                 f"b{index}: pullRequests("
@@ -249,16 +338,11 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
         try:
             raw = gh_runner.run_gh(args)
         except RuntimeError as exc:
-            raise GhPrMergedBranchesUnavailable(
-                f"gh pr merged branch lookup failed: {exc}"
-            ) from exc
+            raise GhPrMergedBranchesUnavailable(f"gh pr merged branch lookup failed: {exc}") from exc
         repository = raw.get("data", {}).get("repository", {})
         for index, branch in enumerate(chunk):
             nodes = repository.get(f"b{index}", {}).get("nodes") or []
-            if any(
-                entry.get("headRefName") == branch and entry.get("mergedAt")
-                for entry in nodes
-            ):
+            if any(entry.get("headRefName") == branch and entry.get("mergedAt") for entry in nodes):
                 merged_branches.add(branch)
     return merged_branches
 
@@ -271,9 +355,7 @@ def _is_valid_branch_name(branch: str) -> bool:
     if ".." in branch or "//" in branch or "@{" in branch:
         return False
     return all(
-        part not in {"", ".", ".."}
-        and not part.startswith(".")
-        and not part.endswith(".lock")
+        part not in {"", ".", ".."} and not part.startswith(".") and not part.endswith(".lock")
         for part in branch.split("/")
     )
 
@@ -288,9 +370,7 @@ def get_open_prs(
 
     _begin_review_cache_cycle(repo)
     reviewer_policy = reviewer_policy or reviewer_policy_from_config(load_config())
-    required_checks = (
-        tuple(required_checks) if required_checks is not None else None
-    )
+    required_checks = tuple(required_checks) if required_checks is not None else None
     try:
         raw = gh_runner.run_gh(
             [
@@ -306,9 +386,7 @@ def get_open_prs(
     except RuntimeError as exc:
         if "GraphQL: API rate limit" not in str(exc):
             raise
-        logger.warning(
-            "gh pr list GraphQL rate-limited for %s; falling back to REST", repo
-        )
+        logger.warning("gh pr list GraphQL rate-limited for %s; falling back to REST", repo)
         return _get_open_prs_rest(
             repo,
             allow_merge_without_checks=allow_merge_without_checks,
@@ -332,8 +410,7 @@ def get_open_prs(
         quarantine_labels = {
             label.get("name", "")
             for label in labels
-            if isinstance(label, dict)
-            and (label.get("name") or "").startswith("quarantine:")
+            if isinstance(label, dict) and (label.get("name") or "").startswith("quarantine:")
         }
         prs.append(
             PRInfo(
@@ -369,9 +446,7 @@ def get_open_prs(
                 url=entry.get("url", ""),
                 last_activity=_parse_iso(entry.get("updatedAt")),
                 is_escalated=any(
-                    isinstance(label, dict)
-                    and (label.get("name") or "").lower() == "escalated"
-                    for label in labels
+                    isinstance(label, dict) and (label.get("name") or "").lower() == "escalated" for label in labels
                 ),
                 is_cross_repository=bool(entry.get("isCrossRepository", False)),
                 quarantine_labels=quarantine_labels,
@@ -389,9 +464,7 @@ def _get_open_prs_rest(
 ) -> list[PRInfo]:
     """Return open PRs via REST when GraphQL status rollup is unavailable."""
 
-    required_checks = (
-        tuple(required_checks) if required_checks is not None else None
-    )
+    required_checks = tuple(required_checks) if required_checks is not None else None
     raw = cache._gh_api_paginated(f"repos/{repo}/pulls?state=open&per_page=100")
     if raw is None:
         return []
@@ -411,8 +484,7 @@ def _get_open_prs_rest(
         quarantine_labels = {
             label.get("name", "")
             for label in labels
-            if isinstance(label, dict)
-            and (label.get("name") or "").startswith("quarantine:")
+            if isinstance(label, dict) and (label.get("name") or "").startswith("quarantine:")
         }
         prs.append(
             PRInfo(
@@ -448,9 +520,7 @@ def _get_open_prs_rest(
                 url=entry.get("html_url", ""),
                 last_activity=_parse_iso(entry.get("updated_at")),
                 is_escalated=any(
-                    isinstance(label, dict)
-                    and (label.get("name") or "").lower() == "escalated"
-                    for label in labels
+                    isinstance(label, dict) and (label.get("name") or "").lower() == "escalated" for label in labels
                 ),
                 is_cross_repository=bool(head.get("repo", {}).get("fork", False)),
                 quarantine_labels=quarantine_labels,
@@ -477,30 +547,64 @@ def get_merged_prs(
     cache_key = (repo, base_branch or "")
     cached = _merged_prs_cache.get(cache_key)
     now = time.monotonic()
-    if (
-        not refresh
-        and cached is not None
-        and (now - cached[0]) < _MERGED_PRS_CACHE_TTL_SECONDS
-    ):
+    if not refresh and cached is not None and (now - cached[0]) < _MERGED_PRS_CACHE_TTL_SECONDS:
         return list(cached[1])
 
     path = f"repos/{repo}/pulls?state=closed&per_page=100"
     if base_branch:
-        path = (
-            f"repos/{repo}/pulls?state=closed"
-            f"&base={quote(base_branch, safe='')}&per_page=100"
-        )
+        path = f"repos/{repo}/pulls?state=closed&base={quote(base_branch, safe='')}&per_page=100"
 
     raw = cache._gh_api_paginated(path)
     if raw is None:
-        raise RuntimeError(
-            f"gh api repos/{repo}/pulls returned unexpected payload"
-        )
+        raise RuntimeError(f"gh api repos/{repo}/pulls returned unexpected payload")
 
+    prs = _merged_pr_infos(raw, base_branch)
+    _merged_prs_cache[cache_key] = (now, prs)
+    return list(prs)
+
+
+def get_merged_prs_discovery(repo: str, base_branch: str) -> PRDiscovery:
+    """Return merged candidates only with a complete, fresh page walk.
+
+    An empty incomplete result cannot prove absence. The compatibility list
+    reader remains available while lifecycle callers migrate to this result.
+    """
+    path = f"repos/{repo}/pulls?state=closed&base={quote(base_branch, safe='')}&per_page=100"
+    evidence = cache._etag_get_paginated_evidence(path)
+    if not evidence.complete:
+        return PRDiscovery(repo, base_branch, [], False, evidence.error or "incomplete pages")
+    if (
+        evidence.observed_at is not None
+        and (datetime.now(timezone.utc) - evidence.observed_at).total_seconds() > _MERGED_PRS_CACHE_TTL_SECONDS
+    ):
+        return PRDiscovery(repo, base_branch, [], False, "stale cache")
+    try:
+        prs = _merged_pr_infos(evidence.items, base_branch, strict=True)
+    except (TypeError, ValueError, AttributeError):
+        return PRDiscovery(repo, base_branch, [], False, "malformed entry")
+    return PRDiscovery(repo, base_branch, prs, True)
+
+
+def _merged_pr_infos(raw: list[dict], base_branch: str | None, *, strict: bool = False) -> list[PRInfo]:
     prs: list[PRInfo] = []
     for entry in raw:
+        if strict and (
+            not isinstance(entry, dict)
+            or not isinstance(entry.get("number"), int)
+            or isinstance(entry.get("number"), bool)
+            or entry["number"] <= 0
+            or not isinstance(entry.get("title"), str)
+            or not isinstance(entry.get("base"), dict)
+            or not isinstance(entry.get("head"), dict)
+        ):
+            raise ValueError("malformed PR")
+        if strict and entry["base"].get("ref") != base_branch:
+            raise ValueError("base mismatch")
         if entry.get("merged_at") in (None, ""):
             continue
+        merged_at = _parse_iso(entry.get("merged_at"))
+        if strict and merged_at is None:
+            raise ValueError("malformed merge timestamp")
         base = entry.get("base") or {}
         if base_branch and base.get("ref") != base_branch:
             continue
@@ -509,6 +613,11 @@ def get_merged_prs(
             continue
         title = entry.get("title", "")
         head = entry.get("head") or {}
+        if strict and (
+            _FULL_SHA_RE.fullmatch(head.get("sha", "")) is None
+            or _FULL_SHA_RE.fullmatch(entry.get("merge_commit_sha", "")) is None
+        ):
+            raise ValueError("missing merged identity")
         head_repo = head.get("repo")
         if not isinstance(head_repo, dict):
             head_repo = {}
@@ -520,11 +629,14 @@ def get_merged_prs(
                 pr_id=extract_queue_pr_id(title),
                 url="",
                 is_cross_repository=bool(head_repo.get("fork", False)),
-                last_activity=_parse_iso(entry.get("merged_at")),
+                last_activity=merged_at,
+                head_sha=head.get("sha", "") if isinstance(head.get("sha"), str) else "",
+                merge_commit_sha=entry.get("merge_commit_sha")
+                if isinstance(entry.get("merge_commit_sha"), str)
+                else None,
             )
         )
-    _merged_prs_cache[cache_key] = (now, prs)
-    return list(prs)
+    return prs
 
 
 def pr_state(repo: str, pr_number: int) -> dict[str, str | None] | None:
@@ -810,19 +922,26 @@ def get_branch_last_push_time(repo: str, pr_number: int) -> float | None:
 
 
 def _publication_from_activity(
-    repo: str, pr_number: int, head_repo: str, ref: str,
-    head_sha: str, raw: object,
+    repo: str,
+    pr_number: int,
+    head_repo: str,
+    ref: str,
+    head_sha: str,
+    raw: object,
 ) -> HeadPublicationEvidence:
     """Parse the newest relevant activity without falling back past contradictions."""
+
     def unknown(reason: str) -> HeadPublicationEvidence:
-        return HeadPublicationEvidence(
-            repo, pr_number, head_repo, ref, head_sha, None, "github-activity", reason
-        )
+        return HeadPublicationEvidence(repo, pr_number, head_repo, ref, head_sha, None, "github-activity", reason)
 
     if not isinstance(raw, list):
         return unknown("activity payload malformed")
     publication_types = {
-        "branch_creation", "push", "force_push", "pr_merge", "merge_queue_merge",
+        "branch_creation",
+        "push",
+        "force_push",
+        "pr_merge",
+        "merge_queue_merge",
     }
     relevant = []
     for event in raw:
@@ -834,7 +953,8 @@ def _publication_from_activity(
             timestamp = gh_runner._parse_iso(event.get("timestamp"))
             after = event.get("after")
             if (
-                timestamp is None or timestamp.tzinfo is None
+                timestamp is None
+                or timestamp.tzinfo is None
                 or not isinstance(after, str)
                 or _FULL_SHA_RE.fullmatch(after) is None
             ):
@@ -852,23 +972,37 @@ def _publication_from_activity(
     if event["after"].lower() != head_sha.lower():
         return unknown("latest publication HEAD differs from observed PR HEAD")
     return HeadPublicationEvidence(
-        repo, pr_number, head_repo, ref, head_sha, latest_time,
+        repo,
+        pr_number,
+        head_repo,
+        ref,
+        head_sha,
+        latest_time,
         f"github-activity:{event['activity_type']}",
     )
 
 
 def get_pr_head_publication(
-    repo: str, pr_number: int, *, expected_head_sha: str = "",
+    repo: str,
+    pr_number: int,
+    *,
+    expected_head_sha: str = "",
 ) -> HeadPublicationEvidence:
     """Read bounded GitHub activity proving publication of the observed PR HEAD."""
+
     def unknown(reason: str, head_repo: str = "", ref: str = "", sha: str = "") -> HeadPublicationEvidence:
         return HeadPublicationEvidence(repo, pr_number, head_repo, ref, sha, None, "github-activity", reason)
 
     try:
-        head_raw = gh_runner.run_gh([
-            "api", f"repos/{repo}/pulls/{pr_number}", "--jq",
-            '{branch: .head.ref, repo: .head.repo.full_name, sha: .head.sha}',
-        ], timeout=10)
+        head_raw = gh_runner.run_gh(
+            [
+                "api",
+                f"repos/{repo}/pulls/{pr_number}",
+                "--jq",
+                "{branch: .head.ref, repo: .head.repo.full_name, sha: .head.sha}",
+            ],
+            timeout=10,
+        )
         if not isinstance(head_raw, dict):
             return unknown("PR head context unavailable")
         branch = head_raw.get("branch")
@@ -883,10 +1017,13 @@ def get_pr_head_publication(
             return unknown("PR HEAD unavailable", head_repo, ref)
         if expected_head_sha and sha.lower() != expected_head_sha.lower():
             return unknown("observed PR HEAD changed", head_repo, ref, sha)
-        raw = gh_runner.run_gh([
-            "api",
-            f"repos/{head_repo}/activity?ref={quote(ref, safe='')}&per_page=100&direction=desc",
-        ], timeout=10)
+        raw = gh_runner.run_gh(
+            [
+                "api",
+                f"repos/{head_repo}/activity?ref={quote(ref, safe='')}&per_page=100&direction=desc",
+            ],
+            timeout=10,
+        )
         return _publication_from_activity(repo, pr_number, head_repo, ref, sha, raw)
     except Exception as exc:
         return unknown(f"publication read unavailable: {type(exc).__name__}")

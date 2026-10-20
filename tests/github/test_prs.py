@@ -1,14 +1,228 @@
 from __future__ import annotations
 
+import json
 import subprocess
-from datetime import datetime, timezone
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 from src.config import AppConfig, DaemonConfig, TrustedReviewerIdentity
+from src.github import cache
 from src.github import prs as gh_prs
 from src.github.reviewer_policy import ReviewerPolicy
 from src.models import ReviewStatus
+
+
+@pytest.mark.parametrize(
+    ("state", "merged", "merge_sha", "expected"),
+    [
+        ("open", False, None, gh_prs.ExactPRState.OPEN),
+        ("closed", False, None, gh_prs.ExactPRState.CLOSED),
+        ("closed", True, "b" * 40, gh_prs.ExactPRState.MERGED),
+        ("closed", True, None, gh_prs.ExactPRState.UNKNOWN),
+    ],
+)
+def test_exact_pr_outcome_by_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    merged: bool,
+    merge_sha: str | None,
+    expected: gh_prs.ExactPRState,
+) -> None:
+    payload = {
+        "number": 42,
+        "base": {"ref": "main"},
+        "head": {"sha": "a" * 40},
+        "state": state,
+        "merged": merged,
+        "merge_commit_sha": merge_sha,
+    }
+    monkeypatch.setattr(cache, "_etag_get", lambda path: payload)
+    result = gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40)
+    assert result.state == expected
+    assert result.discovery_complete is (expected != gh_prs.ExactPRState.UNKNOWN)
+    assert result.merge_commit_sha == (merge_sha if expected == gh_prs.ExactPRState.MERGED else None)
+    payload["base"] = {"ref": "release"}
+    assert gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40).state == gh_prs.ExactPRState.UNKNOWN
+
+
+def test_exact_pr_outcome_permission_error_and_stale_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    def denied(path: str) -> object:
+        raise RuntimeError("HTTP 403")
+
+    monkeypatch.setattr(cache, "_etag_get", denied)
+    assert gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40).state == gh_prs.ExactPRState.UNKNOWN
+    monkeypatch.setattr(
+        cache,
+        "_etag_get",
+        lambda path: {
+            "number": 42,
+            "base": {"ref": "main"},
+            "head": {"sha": "a" * 40},
+            "state": "closed",
+            "merged": False,
+        },
+    )
+    monkeypatch.setattr(
+        cache, "_etag_payload_observed_at", lambda path, payload: datetime(2020, 1, 1, tzinfo=timezone.utc)
+    )
+    assert gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40).state == gh_prs.ExactPRState.UNKNOWN
+
+
+def test_merged_discovery_rejects_truncated_and_malformed_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+    path = "repos/octo/demo/pulls?state=closed&base=main&per_page=100"
+    calls: list[str] = []
+
+    def page(url: str) -> object:
+        calls.append(url)
+        if url.endswith("page=1"):
+            return [{"number": n} for n in range(100)]
+        raise RuntimeError("HTTP 403")
+
+    monkeypatch.setattr(cache, "_etag_get", page)
+    result = gh_prs.get_merged_prs_discovery("octo/demo", "main")
+    assert result.complete is False and result.prs == []
+    assert calls == [f"{path}&page=1", f"{path}&page=2"]
+    monkeypatch.setattr(cache, "_etag_get", lambda url: [{"number": 1, "merged_at": "2026-01-01"}])
+    assert gh_prs.get_merged_prs_discovery("octo/demo", "main").complete is False
+
+
+def test_merged_discovery_accepts_complete_identity_and_rejects_stale_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = [{
+        "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
+        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "merge_commit_sha": "b" * 40,
+    }]
+    monkeypatch.setattr(cache, "_etag_get", lambda path: payload)
+    result = gh_prs.get_merged_prs_discovery("octo/demo", "main")
+    assert result.complete is True
+    assert (result.repo, result.base_branch) == ("octo/demo", "main")
+    assert [(pr.number, pr.head_sha, pr.merge_commit_sha) for pr in result.prs] == [
+        (42, "a" * 40, "b" * 40)
+    ]
+    monkeypatch.setattr(
+        cache, "_etag_payload_observed_at",
+        lambda path, payload: datetime(2020, 1, 1, tzinfo=timezone.utc),
+    )
+    stale = gh_prs.get_merged_prs_discovery("octo/demo", "main")
+    assert stale.complete is False and stale.reason == "stale cache"
+
+
+def test_unknown_exact_payload_and_invalid_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cache, "_etag_get", lambda path: "bad")
+    assert gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40).state == gh_prs.ExactPRState.UNKNOWN
+    assert gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "short").reason == "invalid identity"
+
+
+@pytest.mark.parametrize("change", ["base", "head"])
+def test_merged_discovery_rejects_identity_mismatch(
+    monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    payload = {
+        "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
+        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "merge_commit_sha": "b" * 40,
+    }
+    if change == "base":
+        payload["base"] = {"ref": "release"}
+    else:
+        payload["head"] = {"ref": "pr-42-done", "sha": "short"}
+    monkeypatch.setattr(cache, "_etag_get", lambda path: [payload])
+    assert gh_prs.get_merged_prs_discovery("octo/demo", "main").complete is False
+
+
+def test_merged_discovery_rejects_non_mapping_page_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cache, "_etag_get", lambda path: ["bad"])
+    assert gh_prs.get_merged_prs_discovery("octo/demo", "main").complete is False
+
+
+@pytest.mark.parametrize("number", [0, -1])
+@pytest.mark.parametrize("valid_first", [False, True])
+def test_merged_discovery_rejects_nonpositive_pr_number(
+    monkeypatch: pytest.MonkeyPatch, number: int, valid_first: bool,
+) -> None:
+    valid = {
+        "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
+        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "merge_commit_sha": "b" * 40,
+    }
+    payload = ([valid] if valid_first else []) + [{**valid, "number": number}]
+    monkeypatch.setattr(cache, "_etag_get", lambda path: payload)
+    result = gh_prs.get_merged_prs_discovery("octo/demo", "main")
+    assert result.complete is False
+    assert result.prs == []
+    assert result.reason == "malformed entry"
+
+
+@pytest.mark.parametrize("merged_at", ["invalid", 123, True, [], {}])
+def test_merged_discovery_rejects_malformed_merge_timestamp(
+    monkeypatch: pytest.MonkeyPatch, merged_at: object,
+) -> None:
+    valid = {
+        "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
+        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "merge_commit_sha": "b" * 40,
+    }
+    monkeypatch.setattr(cache, "_etag_get", lambda path: [valid, {**valid, "merged_at": merged_at}])
+    result = gh_prs.get_merged_prs_discovery("octo/demo", "main")
+    assert result.complete is False
+    assert result.prs == []
+    assert result.reason == "malformed entry"
+    # Compatibility callers retain their permissive timestamp behavior.
+    assert gh_prs._merged_pr_infos([{**valid, "merged_at": merged_at}], "main")[0].last_activity is None
+
+
+@pytest.mark.parametrize("stderr_304", [False, True])
+@pytest.mark.parametrize("reader", ["exact", "discovery"])
+def test_pr_readers_accept_successful_revalidation_after_ttl(
+    monkeypatch: pytest.MonkeyPatch, reader: str, stderr_304: bool,
+) -> None:
+    clock = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return clock
+
+    monkeypatch.setattr(cache, "datetime", Clock)
+    monkeypatch.setattr(gh_prs, "datetime", Clock)
+    monkeypatch.setattr(cache, "_etag_cache", OrderedDict())
+    payload = {
+        "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
+        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "merge_commit_sha": "b" * 40, "state": "closed", "merged": True,
+    }
+    calls: list[list[str]] = []
+
+    def transport(args: list[str]) -> str:
+        calls.append(args)
+        if any("If-None-Match" in arg for arg in args):
+            if stderr_304:
+                raise RuntimeError("gh: HTTP 304")
+            return "HTTP/2.0 304 Not Modified\r\n\r\n"
+        # Discovery walks a full first page and a short second page.
+        body = payload if reader == "exact" else ([payload] * 100 if args[1].endswith("page=1") else [])
+        return 'HTTP/2.0 200 OK\r\nETag: "v1"\r\n\r\n' + json.dumps(body)
+
+    monkeypatch.setattr(cache.gh_runner, "run_gh", transport)
+    for _ in range(3):
+        if reader == "exact":
+            result = gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40)
+            assert result.state == gh_prs.ExactPRState.MERGED
+            assert result.merge_commit_sha == "b" * 40
+        else:
+            discovery = gh_prs.get_merged_prs_discovery("octo/demo", "main")
+            assert discovery.complete is True
+            assert len(discovery.prs) == 100
+            assert all(pr.number == 42 and pr.merge_commit_sha == "b" * 40 for pr in discovery.prs)
+        assert all(entry.observed_at == clock for entry in cache._etag_cache.values())
+        clock += timedelta(seconds=61)
+    page_count = 1 if reader == "exact" else 2
+    assert len(calls) == 3 * page_count
+    assert all('If-None-Match: "v1"' in args for args in calls[page_count:])
 
 
 class _FakeCompletedProcess:
@@ -23,9 +237,7 @@ def test_get_branch_publications_uses_targeted_bounded_query(
     calls: list[tuple[list[str], str | None, int]] = []
     sha = "a" * 40
 
-    def fake_run_gh(
-        args: list[str], repo: str | None = None, timeout: int = 30
-    ) -> list[object]:
+    def fake_run_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> list[object]:
         calls.append((args, repo, timeout))
         return [
             {
@@ -55,14 +267,10 @@ def test_get_branch_publications_uses_targeted_bounded_query(
 
     monkeypatch.setattr(gh_prs.gh_runner, "run_gh", fake_run_gh)
 
-    [publication] = gh_prs.get_branch_publications(
-        "octo/demo", "main", "feat/publication"
-    )
+    [publication] = gh_prs.get_branch_publications("octo/demo", "main", "feat/publication")
 
     assert publication.is_verified_ready is True
-    assert publication.created_at == datetime(
-        2026, 10, 4, 12, tzinfo=timezone.utc
-    )
+    assert publication.created_at == datetime(2026, 10, 4, 12, tzinfo=timezone.utc)
     assert publication.to_pr_info().head_sha == sha
     args, repo, timeout = calls[0]
     assert repo == "octo/demo"
@@ -100,9 +308,7 @@ def test_get_branch_publications_rejects_non_list_payload(
         ({}, True),
     ],
 )
-def test_branch_publication_requires_verifiable_ready_evidence(
-    overrides: dict[str, object], verified: bool
-) -> None:
+def test_branch_publication_requires_verifiable_ready_evidence(overrides: dict[str, object], verified: bool) -> None:
     values: dict[str, object] = {
         "number": 7,
         "title": "PR-007: ready",
@@ -225,11 +431,7 @@ def test_get_open_prs_snapshots_reviewer_policy_once_per_poll(
         nonlocal config_loads
         config_loads += 1
         return AppConfig(
-            daemon=DaemonConfig(
-                trusted_reviewer_identities=[
-                    TrustedReviewerIdentity(user_id=123, login="codex[bot]")
-                ]
-            )
+            daemon=DaemonConfig(trusted_reviewer_identities=[TrustedReviewerIdentity(user_id=123, login="codex[bot]")])
         )
 
     monkeypatch.setattr(gh_prs, "load_config", fake_load_config)

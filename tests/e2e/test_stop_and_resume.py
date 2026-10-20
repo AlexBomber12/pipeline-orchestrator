@@ -1,3 +1,5 @@
+import json
+import subprocess
 import time
 
 import requests
@@ -83,7 +85,21 @@ def test_stop_during_coding_then_resume_picks_next_task(
             f"expected pr_id={second_expected_pr_id!r}"
         )
 
+        watch_entry = wait_for_state(["WATCH"], timeout_sec=90)
+        watch_pr = watch_entry.get("current_pr") or {}
+        assert watch_pr.get("branch") == coding_task["branch"]
         wait_for_state(["IDLE"], timeout_sec=180)
+        result = subprocess.run(
+            [
+                "gh", "pr", "view", str(watch_pr["number"]),
+                "--repo", testbed_slug.replace("__", "/", 1),
+                "--json", "state,headRefName,mergedAt",
+            ],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        merged = json.loads(result.stdout)
+        assert merged["headRefName"] == coding_task["branch"]
+        assert merged["state"] == "MERGED" and merged["mergedAt"], merged
 
     state = get_state()
     assert state is not None, "no state entry returned for testbed at end"

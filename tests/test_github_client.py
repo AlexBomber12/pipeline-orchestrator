@@ -5281,6 +5281,15 @@ def test_retrieve_ci_status_evidence_distinguishes_source_outcomes(
 def test_retrieve_ci_status_evidence_reuses_contract_across_cache_and_304(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    clock = datetime(2026, 10, 1, tzinfo=_tz.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return clock
+
+    monkeypatch.setattr(cache, "datetime", Clock)
+    monkeypatch.setattr(checks, "datetime", Clock)
     sha = "a" * 40
     status_calls: list[list[str]] = []
 
@@ -5331,6 +5340,7 @@ def test_retrieve_ci_status_evidence_reuses_contract_across_cache_and_304(
     assert first.evidence.observed_at == cached.evidence.observed_at
     assert len(status_calls) == 1
 
+    clock += timedelta(seconds=61)
     clear_ci_status_cache()
     revalidated = _retrieve_ci_status_evidence("owner/name", sha)
 
@@ -5339,7 +5349,8 @@ def test_retrieve_ci_status_evidence_reuses_contract_across_cache_and_304(
     assert revalidated.evidence.sha == first.evidence.sha
     assert revalidated.evidence.sources_complete is True
     assert revalidated.evidence.policy_result == CIStatus.SUCCESS
-    assert revalidated.evidence.observed_at == first.evidence.observed_at
+    assert revalidated.evidence.observed_at == clock
+    assert revalidated.evidence.observed_at > first.evidence.observed_at
     assert any("If-None-Match" in arg for arg in status_calls[-1])
 
 
@@ -7678,3 +7689,34 @@ def test_get_pr_metadata_extracts_nested_user_and_head(
         "head_sha": "abc123",
         "head_commit_date": "2026-04-15T12:00:00Z",
     }
+
+
+@pytest.mark.parametrize("malformed_page", [1, 2])
+def test_etag_pagination_compatibility_keeps_valid_entries_on_mixed_pages(
+    monkeypatch: pytest.MonkeyPatch, malformed_page: int,
+) -> None:
+    path = "repos/owner/name/pulls?state=closed&per_page=2"
+    pages = [[{"number": 1}, {"number": 2}], [{"number": 3}, {"number": 4}], [{"number": 5}]]
+    pages[malformed_page - 1][1] = "malformed"
+    calls: list[str] = []
+
+    def page(url: str) -> object:
+        calls.append(url)
+        return pages[int(url.rsplit("=", 1)[1]) - 1]
+
+    monkeypatch.setattr(cache, "_etag_get", page)
+    expected = [item for items in pages for item in items if isinstance(item, dict)]
+    assert cache._etag_get_paginated(path) == expected
+    assert calls == [f"{path}&page={n}" for n in (1, 2, 3)]
+    calls.clear()
+    evidence = cache._etag_get_paginated_evidence(path)
+    assert evidence.complete is False
+    assert evidence.error == "malformed entry"
+    assert calls == [f"{path}&page={n}" for n in range(1, malformed_page + 1)]
+
+
+def test_etag_pagination_compatibility_filters_entirely_malformed_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(cache, "_etag_get", lambda url: ["malformed"])
+    assert cache._etag_get_paginated("repos/owner/name/pulls") == []
