@@ -134,6 +134,7 @@ def test_initial_settings_and_read_only_refresh_render_same_observations(tmp_pat
 def test_actual_github_slowdown_remains_visible_without_dashboard_counters():
     from src.inhibitor import InhibitorType, WorkInhibitor
     from src.models import PipelineState
+
     from tests.web.routes.test_inhibitor_ui import _render_card, _state
 
     repo = _state(state=PipelineState.WATCH, active_inhibitors=[WorkInhibitor(
