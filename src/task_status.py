@@ -73,6 +73,7 @@ def _resolve_merged_state(
     headers: Iterable[TaskHeader],
     *,
     log_event: Callable[[str], None],
+    remote_ref: str | None = None,
 ) -> MergedState:
     candidate_pr_ids = set(candidate_pr_ids)
     candidate_branches = {header.branch for header in headers if header.branch}
@@ -93,6 +94,7 @@ def _resolve_merged_state(
     try:
         recorded = get_recorded_completions(
             repo_path, base_branch, owner_repo, candidate_pr_ids,
+            **({"remote_ref": remote_ref} if remote_ref is not None else {}),
         )
     except CompletionEvidenceUnavailable as exc:
         raise MergeStatusUnavailable(str(exc)) from exc

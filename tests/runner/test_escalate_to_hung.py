@@ -822,6 +822,27 @@ def test_status_write_rejects_reupload_since_admission(
     assert _remote_task(repo, "PR-716") == changed
 
 
+def test_status_write_binds_first_fetch_to_recorded_generation(tmp_path: Path) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-716")
+    runner = _status_runner(repo)
+    task = QueueTask(pr_id="PR-716", title="t", status=TaskStatus.DOING,
+                     branch="pr-test", task_file="tasks/PR-716.md")
+    from src.cancellation import task_spec_content_hash
+
+    original = _remote_task(repo, "PR-716")
+    runner._current_run_record = types.SimpleNamespace(
+        task_id="PR-716", task_spec_hash=task_spec_content_hash(original),
+    )
+    task_file = repo / task.task_file
+    task_file.write_text(original + "\nReplacement generation\n")
+    _git(repo, "add", task.task_file)
+    _git(repo, "commit", "-m", "replace task")
+    _git(repo, "push", "origin", "main")
+
+    assert not asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    assert _remote_task(repo, "PR-716") == task_file.read_text()
+
+
 @pytest.mark.parametrize("failure", ["diff", "confirm", "push"])
 def test_status_write_does_not_claim_unconfirmed_commit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str

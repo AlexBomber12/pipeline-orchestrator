@@ -51,6 +51,8 @@ def get_recorded_completions(
     base_branch: str,
     owner_repo: str,
     candidate_pr_ids: set[str],
+    *,
+    remote_ref: str | None = None,
 ) -> set[str]:
     """Verify matching task bytes and commit ancestry, without network or writes.
 
@@ -58,9 +60,21 @@ def get_recorded_completions(
     verifies that the exact task is still present and the recorded commit
     belongs to the configured base. A changed task does not inherit a receipt.
     """
-    manifest_path = Path(repo_path) / "tasks" / "completions.json"
     try:
-        raw = manifest_path.read_text(encoding="utf-8")
+        if remote_ref is None:
+            raw = (Path(repo_path) / "tasks" / "completions.json").read_text(encoding="utf-8")
+        else:
+            result = _git(repo_path, "show", f"{remote_ref}:tasks/completions.json")
+            if result.returncode != 0:
+                # Absence is normal; other git errors must fail closed.
+                present = _git(repo_path, "cat-file", "-e", f"{remote_ref}^{{commit}}")
+                if present.returncode != 0:
+                    raise CompletionEvidenceUnavailable("Cannot resolve remote completion snapshot")
+                listed = _git(repo_path, "ls-tree", "--name-only", remote_ref, "tasks/completions.json")
+                if listed.returncode != 0 or listed.stdout.strip():
+                    raise CompletionEvidenceUnavailable("Cannot read remote completion manifest")
+                return set()
+            raw = result.stdout
     except FileNotFoundError:
         return set()
     except (OSError, UnicodeError) as exc:
@@ -87,9 +101,17 @@ def get_recorded_completions(
     for pr_id, record in manifest.completions.items():
         if pr_id not in candidate_pr_ids:
             continue
-        task_path = Path(repo_path) / "tasks" / f"{pr_id}.md"
         try:
-            task_bytes = task_path.read_bytes()
+            if remote_ref is None:
+                task_bytes = (Path(repo_path) / "tasks" / f"{pr_id}.md").read_bytes()
+            else:
+                result = subprocess.run(
+                    ["git", "-C", repo_path, "show", f"{remote_ref}:tasks/{pr_id}.md"],
+                    capture_output=True, timeout=10, check=False,
+                )
+                if result.returncode != 0:
+                    raise OSError(result.stderr.decode("utf-8", errors="replace"))
+                task_bytes = result.stdout
         except OSError as exc:
             raise CompletionEvidenceUnavailable(
                 f"Cannot read task for completion record {pr_id}"

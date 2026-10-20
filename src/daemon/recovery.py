@@ -323,6 +323,7 @@ class RecoveryMixin:
             },
             headers,
             log_event=self.log_event,
+            **({"remote_ref": ref} if git_checkout else {}),
         )
         open_prs = list(getattr(self, "_idle_open_prs", ()))
         merged_prs = list(getattr(self, "_idle_merged_prs", ()))

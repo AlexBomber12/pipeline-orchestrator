@@ -47,6 +47,7 @@ from src.cancellation import (
     get_cancellation_cause,
     safe_delete_cancellation_cause,
     safe_record_cancellation_cause,
+    task_spec_content_hash,
     truncate_for_payload,
 )
 from src.cancellation.availability import (
@@ -2329,6 +2330,9 @@ class PipelineRunner(
         frontmatter_status, _blocked, _revision = (
             self._remote_frontmatter_error_status_for_current_task()
         )
+        if frontmatter_status is None:
+            self.log_event("[RECOVERY] Remote ERROR task status unavailable; staying ERROR.")
+            return
         if frontmatter_status == "error" and (reason is None or from_frontmatter):
             reason, from_frontmatter = _blocked, True
         if frontmatter_status == "todo":
@@ -2446,6 +2450,24 @@ class PipelineRunner(
             blocked_reason,
         )
 
+        # Bind the first remote fetch to the generation admitted for this run.
+        # Status fields are daemon-managed and intentionally excluded from this
+        # fingerprint, so ordinary ERROR/DONE transitions remain possible.
+        record = self._current_run_record
+        admitted_hash = (
+            record.task_spec_hash
+            if record is not None and record.task_id == bound_pr_id
+            else None
+        )
+        if admitted_hash is None:
+            try:
+                admitted_hash = task_spec_content_hash(
+                    (repo_root / task_path).read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError):
+                self.log_event("[INFRA] Warning: admitted task spec unavailable.")
+                return False
+
         try:
             # get-url expands url.*.insteadOf (including CI's credentialed
             # rewrite), which is not the stored repository identity.
@@ -2480,6 +2502,8 @@ class PipelineRunner(
                     git_ops._git(isolated, "ls-files", "--error-unmatch", "--", task_file)
                     task_bytes = isolated_task.read_bytes()
                     task_text = task_bytes.decode("utf-8")
+                    if task_spec_content_hash(task_text) != admitted_hash:
+                        raise ValueError("remote task differs from admitted generation")
                     if (expected_task_sha256 is not None
                             and hashlib.sha256(task_bytes).hexdigest()
                             != expected_task_sha256):

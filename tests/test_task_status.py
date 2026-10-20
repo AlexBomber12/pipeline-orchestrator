@@ -1380,6 +1380,16 @@ def test_recorded_completion_checks_real_git_ancestry(completion_repo) -> None:
     assert get_recorded_completions(str(repo), "main", "octo/demo", {"PR-085"}) == {"PR-085"}
 
 
+def test_recorded_completion_uses_remote_snapshot_on_stale_worktree(completion_repo) -> None:
+    repo, _ = completion_repo
+    _completion_git(repo, "checkout", "-b", "coder-stale", "HEAD~1")
+    assert not (repo / "tasks/completions.json").exists()
+    assert get_recorded_completions(
+        str(repo), "main", "octo/demo", {"PR-085"},
+        remote_ref="refs/remotes/origin/main",
+    ) == {"PR-085"}
+
+
 def test_completion_receipt_is_not_inherited_by_changed_task(completion_repo) -> None:
     repo, _ = completion_repo
     path = repo / "tasks/PR-085.md"

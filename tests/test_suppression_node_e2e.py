@@ -58,6 +58,17 @@ def _runner(tmp_path: Path, task: QueueTask | None = None) -> Any:
     runner.state.current_task = current
     runner.state.current_queue = [current]
 
+    def fixture_remote_status() -> tuple[str | None, SuppressionReason | None, str | None]:
+        path = tmp_path / str(current.task_file)
+        if not path.is_file():
+            return None, None, None
+        header = parse_task_header(path)
+        reason = header.blocked_reason
+        return (header.frontmatter_status,
+                SuppressionReason(reason) if reason else None, "fixture-revision")
+
+    runner._remote_frontmatter_error_status_for_current_task = fixture_remote_status
+
     async def _noop(*_args: Any, **_kwargs: Any) -> None:
         return None
 
@@ -267,6 +278,20 @@ def test_self_healing_auto_exits(tmp_path: Path) -> None:
     assert runner.state.state == PipelineState.IDLE
     assert asyncio.run(runner._suppression_record_for_task(task.pr_id)) is None
     assert any("AI diagnosis disabled for self-healing ERROR" in e["event"] for e in runner.state.history)
+
+
+def test_unavailable_remote_status_preserves_error_evidence(tmp_path: Path) -> None:
+    task = _task()
+    _write_task(tmp_path, task)
+    runner = _runner(tmp_path, task)
+    _install_coarse_writer(runner)
+    asyncio.run(_transition(runner, SuppressionReason.GUARDRAIL))
+    runner._remote_frontmatter_error_status_for_current_task = lambda: (None, None, None)
+
+    asyncio.run(runner._handle_single_error_exit())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert asyncio.run(runner._suppression_record_for_task(task.pr_id)) is not None
 
 
 def test_operator_clearable_stays_until_cleared(tmp_path: Path) -> None:
