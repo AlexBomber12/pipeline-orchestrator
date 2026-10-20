@@ -391,9 +391,9 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
 
     async def status(*args, **kwargs):
         writes.append(args)
-        if case == "status_error":
+        if case == "status_error" and len(writes) == 1:
             raise RuntimeError("status push failed")
-        return case != "status_false"
+        return case != "status_false" or len(writes) > 1
 
     async def save(reason, **kwargs):
         if case == "metrics_error" and not outcomes:
@@ -410,15 +410,20 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
     assert merge_calls == [["pr", "merge", "5", "--squash", "--delete-branch",
                             "--match-head-commit", "a" * 40]]
     assert calls[1][1]["repo"] == "octo/demo"
-    if case in {"unknown", "base", "repo", "metrics_error"}:
+    if case in {"unknown", "base", "repo", "metrics_error", "status_error", "status_false"}:
         assert runner.state.state == PipelineState.MERGE
         assert runner.state.current_task is task
-        if case != "metrics_error":
+        if case in {"status_error", "status_false"}:
+            assert len(writes) == 1 and not outcomes
+            assert runner.state.merge_phase == "post_merge_cleanup"
+            assert task.status == TaskStatus.DOING
+            assert runner._current_run_record is not None
+        elif case != "metrics_error":
             assert not writes and not outcomes
             assert task.status == TaskStatus.DOING
         # Reconciliation cannot issue another merge or touch the deleted branch.
         monkeypatch.setattr(git_ops_module, "_git", lambda *a, **kw: pytest.fail("git during reconciliation"))
-        monkeypatch.setattr(runner, "_compute_diff_stats", lambda base: {})
+        monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {})
         if case == "unknown":
             from unittest.mock import AsyncMock
 
@@ -444,6 +449,10 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
             asyncio.run(runner.handle_merge())
         assert len([a for a, _ in calls if a[:2] == ["pr", "merge"]]) == 1
         assert runner.state.state == PipelineState.IDLE
+        assert outcomes[-1] == "success_merged"
+        assert runner.state.current_queue[0].status == TaskStatus.DONE
+        if case in {"status_error", "status_false"}:
+            assert len(writes) == 2
     elif case in {"open", "head"}:
         assert runner.state.state == PipelineState.WATCH
         assert runner.state.current_pr.review_status == ReviewStatus.PENDING
@@ -488,7 +497,7 @@ def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeyp
     save = AsyncMock()
     monkeypatch.setattr(runner._metrics_store, "save", save)
     monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
-    monkeypatch.setattr(runner, "_compute_diff_stats", lambda base: {})
+    monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {})
     monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
     asyncio.run(runner.handle_merge())
     assert runner.state.state == PipelineState.MERGE
@@ -504,3 +513,60 @@ def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeyp
     assert runner.state.current_task is None
     assert record.exit_reason == "success_merged"
     save.assert_awaited_once_with(record)
+
+
+@pytest.mark.parametrize("phase", ["merging", "post_merge_cleanup"])
+def test_recovered_merge_stats_use_retained_head_from_base_checkout(
+    monkeypatch, tmp_path, phase,
+):
+    import subprocess
+    from unittest.mock import AsyncMock
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    (tmp_path / "base.txt").write_text("base\n")
+    git("add", ".")
+    git("commit", "-m", "base")
+    git("checkout", "-b", "pr-401")
+    (tmp_path / "feature.py").write_text("first\nsecond\n")
+    git("add", ".")
+    git("commit", "-m", "feature")
+    head = git("rev-parse", "HEAD")
+    # Match gh's squash-and-delete behavior: the checkout returns to base,
+    # whose history contains the change but does not contain the PR head.
+    git("checkout", "main")
+    git("merge", "--squash", "pr-401")
+    git("commit", "-m", "squashed feature")
+    git("branch", "-D", "pr-401")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    task = QueueTask(pr_id="PR-401", title="Merge", status=TaskStatus.DOING,
+                     task_file="tasks/PR-401.md")
+    runner.state.current_task = task
+    runner.state.current_pr = PRInfo(number=629, branch="pr-401", head_sha=head)
+    runner.state.state = PipelineState.MERGE
+    runner.state.merge_phase = phase
+    runner._start_current_run_record("claude", "opus")
+    record = runner._current_run_record
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
+    monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
+    monkeypatch.setattr(git_ops_module, "_git", lambda *a, **kw: pytest.fail("branch sync during recovery"))
+    monkeypatch.setattr(merge_module.gh_prs, "merge_pr", lambda *a: pytest.fail("duplicate merge"))
+
+    assert runner._compute_diff_stats("main")["files_touched_count"] == 0
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert record.exit_reason == "success_merged"
+    assert record.files_touched_count == 1
+    assert record.diff_lines_added == 2
+    assert record.diff_lines_deleted == 0
+    assert record.languages_touched == ["python"]

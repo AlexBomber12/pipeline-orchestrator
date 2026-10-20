@@ -155,7 +155,10 @@ def test_handle_merge_appends_outcome_row(
         lambda coder: "0.0.0-test",
     )
 
+    from unittest.mock import AsyncMock
+
     runner = _make_runner()
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     runner.state.state = PipelineState.MERGE
     runner.state.current_pr = PRInfo(
         number=42,
@@ -226,7 +229,10 @@ def test_handle_merge_outcome_log_failure_does_not_block_merge(
 
     monkeypatch.setattr("src.daemon.handlers.merge.log_merged_pr", boom)
 
+    from unittest.mock import AsyncMock
+
     runner = _make_runner()
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     runner.state.state = PipelineState.MERGE
     runner.state.current_pr = PRInfo(number=99, branch="pr-204-y", pr_id="PR-204")
     runner.state.current_task = QueueTask(

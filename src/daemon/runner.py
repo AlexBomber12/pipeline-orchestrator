@@ -1699,11 +1699,13 @@ class PipelineRunner(
                 )
                 return
 
-    def _compute_diff_stats(self, base_branch: str) -> dict[str, object]:
-        """Compute file/language/line stats for the current branch vs base."""
+    def _compute_diff_stats(
+        self, base_branch: str, head_ref: str = "HEAD",
+    ) -> dict[str, object]:
+        """Compute file/language/line stats for the selected head vs base."""
         try:
             numstat = subprocess.run(
-                ["git", "diff", "--numstat", f"origin/{base_branch}...HEAD"],
+                ["git", "diff", "--numstat", f"origin/{base_branch}...{head_ref}"],
                 cwd=self.repo_path,
                 capture_output=True,
                 text=True,

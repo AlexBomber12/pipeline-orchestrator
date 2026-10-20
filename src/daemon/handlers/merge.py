@@ -83,7 +83,9 @@ class MergeMixin:
         # Reconcile the same identity before touching the possibly deleted branch.
         if self.state.merge_phase in {"merging", "post_merge_cleanup"}:
             if await self._confirm_remote_merge():
-                await self._finish_confirmed_merge(self._compute_diff_stats(base))
+                await self._finish_confirmed_merge(
+                    self._compute_diff_stats(base, self.state.current_pr.head_sha)
+                )
             return
         if not self.state.current_pr.is_cross_repository:
             # PR-352: dashboard sub-phase visibility during the long MERGE
@@ -396,11 +398,13 @@ class MergeMixin:
                     self.log_event(
                         f"[MERGE] Remote merge confirmed but status:DONE was not written to {current_task.task_file}."
                     )
+                    return
             except Exception as exc:
                 self.log_event(
                     f"[ERROR] Failed to write status:DONE to "
                     f"{current_task.task_file}: {exc}"
                 )
+                return
 
         if current_task is not None:
             if self._current_run_record is None:

@@ -3967,6 +3967,7 @@ def test_fix_iterations_survive_recovery_until_merge(
     assert recovered._current_run_record is not None
     assert recovered._current_run_record.fix_iterations == 1
 
+    monkeypatch.setattr(recovered, "_commit_task_status_change", AsyncMock(return_value=True))
     asyncio.run(recovered.handle_merge())
 
     recent = asyncio.run(

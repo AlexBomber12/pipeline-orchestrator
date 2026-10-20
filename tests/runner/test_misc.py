@@ -1306,11 +1306,14 @@ def test_save_current_run_record_sets_duration_none_for_invalid_started_at() -> 
 
 
 def test_merge_finalizes_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import AsyncMock
+
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(
@@ -1340,6 +1343,8 @@ def test_merge_finalizes_record(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_merge_calculates_duration(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import AsyncMock
+
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
@@ -1356,6 +1361,7 @@ def test_merge_calculates_duration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner_module, "datetime", _FixedDateTime)
 
     runner = h._make_runner()
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(
