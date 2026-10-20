@@ -109,6 +109,34 @@ def test_merged_discovery_accepts_complete_identity_and_rejects_stale_cache(
     assert stale.complete is False and stale.reason == "stale cache"
 
 
+def test_unknown_exact_payload_and_invalid_identity(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cache, "_etag_get", lambda path: "bad")
+    assert gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40).state == gh_prs.ExactPRState.UNKNOWN
+    assert gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "short").reason == "invalid identity"
+
+
+@pytest.mark.parametrize("change", ["base", "head"])
+def test_merged_discovery_rejects_identity_mismatch(
+    monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    payload = {
+        "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
+        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "merge_commit_sha": "b" * 40,
+    }
+    if change == "base":
+        payload["base"] = {"ref": "release"}
+    else:
+        payload["head"] = {"ref": "pr-42-done", "sha": "short"}
+    monkeypatch.setattr(cache, "_etag_get", lambda path: [payload])
+    assert gh_prs.get_merged_prs_discovery("octo/demo", "main").complete is False
+
+
+def test_merged_discovery_rejects_non_mapping_page_entry(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(cache, "_etag_get", lambda path: ["bad"])
+    assert gh_prs.get_merged_prs_discovery("octo/demo", "main").complete is False
+
+
 class _FakeCompletedProcess:
     def __init__(self, stdout: str = "", returncode: int = 0) -> None:
         self.stdout = stdout
