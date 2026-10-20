@@ -83,9 +83,24 @@ class MergeMixin:
         # Reconcile the same identity before touching the possibly deleted branch.
         if self.state.merge_phase in {"merging", "post_merge_cleanup"}:
             if await self._confirm_remote_merge():
-                await self._finish_confirmed_merge(
-                    self._compute_diff_stats(base, self.state.current_pr.head_sha)
-                )
+                stats = self._compute_diff_stats(base, self.state.current_pr.head_sha)
+                if not stats:
+                    # Fresh clones only fetch base. GitHub retains the PR head
+                    # ref even after squash merging and deleting its branch.
+                    try:
+                        git_ops._git(
+                            self.repo_path, "fetch", "origin",
+                            f"refs/pull/{number}/head", timeout=60,
+                        )
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+                        self.log_event(f"[MERGE] PR #{number} head fetch deferred: {exc}.")
+                        return
+                    # Use the proved SHA, never FETCH_HEAD (the ref may change).
+                    stats = self._compute_diff_stats(base, self.state.current_pr.head_sha)
+                    if not stats:
+                        self.log_event(f"[MERGE] PR #{number} diff statistics unavailable; retaining ownership.")
+                        return
+                await self._finish_confirmed_merge(stats)
             return
         if not self.state.current_pr.is_cross_repository:
             # PR-352: dashboard sub-phase visibility during the long MERGE

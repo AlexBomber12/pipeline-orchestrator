@@ -2484,7 +2484,7 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(monkeypatch, ph
     monkeypatch.setattr(runner, "handle_idle", AsyncMock(side_effect=AssertionError("duplicate discovery")))
     monkeypatch.setattr(recovery_module.git_ops, "_git",
                         lambda *a, **kw: pytest.fail("branch access during reconciliation"))
-    monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {})
+    monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {"files_touched_count": 0})
     monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
     write = AsyncMock(return_value=True)
     monkeypatch.setattr(runner, "_commit_task_status_change", write)

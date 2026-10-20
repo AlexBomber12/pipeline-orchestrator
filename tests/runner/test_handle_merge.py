@@ -423,7 +423,7 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
             assert task.status == TaskStatus.DOING
         # Reconciliation cannot issue another merge or touch the deleted branch.
         monkeypatch.setattr(git_ops_module, "_git", lambda *a, **kw: pytest.fail("git during reconciliation"))
-        monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {})
+        monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {"files_touched_count": 0})
         if case == "unknown":
             from unittest.mock import AsyncMock
 
@@ -497,7 +497,7 @@ def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeyp
     save = AsyncMock()
     monkeypatch.setattr(runner._metrics_store, "save", save)
     monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
-    monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {})
+    monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {"files_touched_count": 0})
     monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
     asyncio.run(runner.handle_merge())
     assert runner.state.state == PipelineState.MERGE
@@ -516,15 +516,18 @@ def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeyp
 
 
 @pytest.mark.parametrize("phase", ["merging", "post_merge_cleanup"])
+@pytest.mark.parametrize("checkout", ["retained", "fresh", "fetch_failure", "wrong_head"])
 def test_recovered_merge_stats_use_retained_head_from_base_checkout(
-    monkeypatch, tmp_path, phase,
+    monkeypatch, tmp_path, phase, checkout,
 ):
     import subprocess
     from unittest.mock import AsyncMock
 
+    repo_path = tmp_path
+
     def git(*args):
         return subprocess.run(
-            ["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True,
+            ["git", *args], cwd=repo_path, check=True, capture_output=True, text=True,
         ).stdout.strip()
 
     git("init", "-b", "main")
@@ -545,9 +548,26 @@ def test_recovered_merge_stats_use_retained_head_from_base_checkout(
     git("commit", "-m", "squashed feature")
     git("branch", "-D", "pr-401")
     git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("update-ref", "refs/pull/629/head", head)
+    if checkout != "retained":
+        source = repo_path
+        git("clone", "--single-branch", "--no-local", str(source), str(tmp_path / "fresh"))
+        repo_path = tmp_path / "fresh"
+        missing = subprocess.run(
+            ["git", "cat-file", "-e", head], cwd=repo_path, capture_output=True,
+        )
+        assert missing.returncode != 0
+        if checkout == "fetch_failure":
+            git("remote", "set-url", "origin", str(tmp_path / "missing"))
+        elif checkout == "wrong_head":
+            # Even a successful fetch must not substitute a different head.
+            subprocess.run(
+                ["git", "update-ref", "refs/pull/629/head", "main"],
+                cwd=source, check=True, capture_output=True,
+            )
 
     runner = h._make_runner()
-    runner.repo_path = str(tmp_path)
+    runner.repo_path = str(repo_path)
     task = QueueTask(pr_id="PR-401", title="Merge", status=TaskStatus.DOING,
                      task_file="tasks/PR-401.md")
     runner.state.current_task = task
@@ -556,15 +576,39 @@ def test_recovered_merge_stats_use_retained_head_from_base_checkout(
     runner.state.merge_phase = phase
     runner._start_current_run_record("claude", "opus")
     record = runner._current_run_record
-    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
+    write = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_commit_task_status_change", write)
     monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
-    monkeypatch.setattr(git_ops_module, "_git", lambda *a, **kw: pytest.fail("branch sync during recovery"))
+    real_git = git_ops_module._git
+    fetches = []
+
+    def fetch_only(path, *args, **kwargs):
+        assert args == ("fetch", "origin", "refs/pull/629/head")
+        fetches.append(args)
+        return real_git(path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops_module, "_git", fetch_only)
     monkeypatch.setattr(merge_module.gh_prs, "merge_pr", lambda *a: pytest.fail("duplicate merge"))
 
     assert runner._compute_diff_stats("main")["files_touched_count"] == 0
     asyncio.run(runner.handle_merge())
 
+    if checkout in {"fetch_failure", "wrong_head"}:
+        assert runner.state.state == PipelineState.MERGE
+        assert runner.state.current_task is task
+        assert runner._current_run_record is record
+        assert task.status == TaskStatus.DOING
+        write.assert_not_awaited()
+        assert record.exit_reason != "success_merged"
+        git("remote", "set-url", "origin", str(source))
+        subprocess.run(
+            ["git", "update-ref", "refs/pull/629/head", head],
+            cwd=source, check=True, capture_output=True,
+        )
+        asyncio.run(runner.handle_merge())
+
     assert runner.state.state == PipelineState.IDLE
+    assert len(fetches) == {"retained": 0, "fresh": 1, "fetch_failure": 2, "wrong_head": 2}[checkout]
     assert record.exit_reason == "success_merged"
     assert record.files_touched_count == 1
     assert record.diff_lines_added == 2
