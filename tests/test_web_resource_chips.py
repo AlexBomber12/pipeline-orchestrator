@@ -50,6 +50,9 @@ def test_freshness_covers_idle_cadence_and_configured_slowdown():
     assert usage_publication_interval(AppConfig()) == 300
     idle_snapshot = _FakeRedis(store={coder_usage("codex"): observation(age=240)})
     assert context(idle_snapshot)["coder_usage"]["codex"]["status"] == "available"
+    slow_watch = AppConfig()
+    slow_watch.daemon.watch_fast_poll_interval_sec = 900
+    assert usage_publication_interval(slow_watch) == 900
     config = AppConfig(repositories=[RepoConfig(
         url="https://github.com/example/active", poll_interval_sec=90,
     )])

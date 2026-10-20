@@ -20,6 +20,7 @@ def usage_publication_interval(config: AppConfig) -> int:
         daemon.poll_interval_sec,
         daemon.idle_extended_poll_interval_sec,
         daemon.watch_slow_poll_interval_sec,
+        daemon.watch_fast_poll_interval_sec,
         *(repo.poll_interval_sec * daemon.github_api_slowdown_multiplier
           for repo in config.repositories if repo.active),
     )

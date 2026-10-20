@@ -963,6 +963,30 @@ def test_shared_usage_publication_keeps_last_success_and_isolates_failure(monkey
     assert runner.state.state != PipelineState.ERROR
 
 
+def test_usage_publication_can_read_during_coder_reservation():
+    from src.coder_login import CoderCredentialReservations
+    from src.keyspace import coder_usage
+    from src.usage import UsageObservation
+
+    from tests.runner._helpers import _FakeUsageProvider
+
+    runner = _make_runner()
+    snapshot = UsageSnapshot(20, 1900000000, None, None, time.time())
+    runner._claude_usage_provider = _FakeUsageProvider(snapshot=snapshot)
+    reservations = CoderCredentialReservations()
+    runner._credential_reservations = reservations
+    location = runner._coder_credential_location("claude")
+    assert location is not None
+    assert reservations.reserve_coder(location)
+    try:
+        asyncio.run(runner.publish_state())
+        stored = UsageObservation.model_validate_json(runner.redis.store[coder_usage("claude")])
+        assert stored.status == "available"
+        assert stored.snapshot == snapshot
+    finally:
+        reservations.release_coder(location)
+
+
 def test_usage_observation_store_failure_does_not_change_gate(monkeypatch):
     from tests.runner._helpers import _FakeUsageProvider
 
