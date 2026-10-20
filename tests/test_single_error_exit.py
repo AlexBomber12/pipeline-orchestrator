@@ -59,6 +59,10 @@ def _runner(tmp_path: Path) -> PipelineRunner:
     runner.state.current_task = _task()
     runner.state.error_message = "ERROR: synthetic failure"
     _write_task(tmp_path, runner.state.current_task, SuppressionReason.GUARDRAIL)
+    # These dispatcher tests use a local task fixture as their base snapshot.
+    runner._remote_frontmatter_error_status_for_current_task = (  # type: ignore[method-assign]
+        lambda: (*runner._frontmatter_error_status_for_current_task(), "fixture")
+    )
     return runner
 
 
@@ -226,6 +230,21 @@ def test_self_healing_unchanged(
     asyncio.run(limited._run_cycle_body())
 
     assert limited.state.state == PipelineState.PAUSED
+
+
+def test_taskless_error_can_self_heal_without_remote_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(tmp_path)
+    _stub_cycle(monkeypatch, runner)
+    runner.state.current_task = None
+    runner.state.error_message = "git fetch origin failed"
+    runner.app_config.daemon.error_handler_use_ai = False
+
+    asyncio.run(runner._run_cycle_body())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert any("self-healing ERROR" in event for event in _events(runner))
 
 
 def test_reupload_releases_park_from_error(

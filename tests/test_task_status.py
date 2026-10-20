@@ -1380,6 +1380,62 @@ def test_recorded_completion_checks_real_git_ancestry(completion_repo) -> None:
     assert get_recorded_completions(str(repo), "main", "octo/demo", {"PR-085"}) == {"PR-085"}
 
 
+def test_recorded_completion_uses_remote_snapshot_on_stale_worktree(completion_repo) -> None:
+    repo, _ = completion_repo
+    _completion_git(repo, "checkout", "-b", "coder-stale", "HEAD~1")
+    assert not (repo / "tasks/completions.json").exists()
+    assert get_recorded_completions(
+        str(repo), "main", "octo/demo", {"PR-085"},
+        remote_ref="refs/remotes/origin/main",
+    ) == {"PR-085"}
+
+
+def test_remote_completion_snapshot_handles_missing_manifest_and_ref(completion_repo) -> None:
+    repo, _ = completion_repo
+    _completion_git(repo, "update-ref", "refs/remotes/origin/main", "HEAD~1")
+    assert get_recorded_completions(
+        str(repo), "main", "octo/demo", {"PR-085"},
+        remote_ref="refs/remotes/origin/main",
+    ) == set()
+    with pytest.raises(CompletionEvidenceUnavailable, match="resolve remote"):
+        get_recorded_completions(
+            str(repo), "main", "octo/demo", {"PR-085"},
+            remote_ref="refs/remotes/origin/missing",
+        )
+
+
+def test_remote_completion_snapshot_rejects_missing_task(completion_repo) -> None:
+    repo, _ = completion_repo
+    _completion_git(repo, "rm", "tasks/PR-085.md")
+    _completion_git(repo, "commit", "-m", "remove recorded task")
+    _completion_git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    with pytest.raises(CompletionEvidenceUnavailable, match="Cannot read task"):
+        get_recorded_completions(
+            str(repo), "main", "octo/demo", {"PR-085"},
+            remote_ref="refs/remotes/origin/main",
+        )
+
+
+def test_remote_completion_snapshot_rejects_unreadable_manifest(
+    completion_repo, monkeypatch,
+) -> None:
+    repo, _ = completion_repo
+    from src import completion_evidence
+    real_git = completion_evidence._git
+
+    def failing_show(path, *args):
+        if args[:1] == ("show",):
+            return subprocess.CompletedProcess(args, 1, "", "read failed")
+        return real_git(path, *args)
+
+    monkeypatch.setattr(completion_evidence, "_git", failing_show)
+    with pytest.raises(CompletionEvidenceUnavailable, match="Cannot read remote"):
+        get_recorded_completions(
+            str(repo), "main", "octo/demo", {"PR-085"},
+            remote_ref="refs/remotes/origin/main",
+        )
+
+
 def test_completion_receipt_is_not_inherited_by_changed_task(completion_repo) -> None:
     repo, _ = completion_repo
     path = repo / "tasks/PR-085.md"
@@ -1505,6 +1561,9 @@ def test_restart_and_idle_agree_without_dispatch(completion_repo, monkeypatch, e
     is_receipt = evidence.startswith("receipt")
     if not is_receipt:
         path.write_text(path.read_text().replace("pr-085-planned", f"{evidence}/pr-085-planned"))
+        _completion_git(repo, "add", "tasks/PR-085.md")
+        _completion_git(repo, "commit", "-m", "Update task branch")
+        _completion_git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
     before = path.read_bytes()
 
     def branches(*args):

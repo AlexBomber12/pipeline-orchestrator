@@ -3,17 +3,19 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import subprocess
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
+from src import codex_cli
 from src.cancellation import (
     CancellationCause,
     cause_key,
     record_cancellation_cause,
 )
 from src.coders.claude import claude_cli
-from src import codex_cli
 from src.daemon import retry_commands as retry_module
 from src.daemon.retry_commands import RetryDispatch
 from src.github import prs as gh_prs
@@ -24,6 +26,13 @@ from src.queue_parser import write_frontmatter_status
 from src.subsource_registry import SuppressionReason
 
 from tests.runner import _helpers as h
+
+
+def _local_status_snapshot(runner):
+    status, reason = runner._frontmatter_error_status_for_current_task()
+    task = runner.state.current_task
+    revision = hashlib.sha256((Path(runner.repo_path) / task.task_file).read_bytes()).hexdigest() if status else None
+    return status, reason, revision
 
 
 async def _published_coding_runner(
@@ -40,6 +49,19 @@ async def _published_coding_runner(
         "Branch: fix/pr-458\n- Type: bugfix\n- Complexity: low\n"
         "- Depends on: none\n- Priority: 1\n- Coder: claude\n",
         encoding="utf-8",
+    )
+    # These recovery tests use an unversioned temporary task file. Model the
+    # confirmed status write without invoking the isolated Git transport.
+    async def commit_status(
+        _self, _task, status, _reason, blocked_reason=None, **_kwargs,
+    ) -> bool:
+        write_frontmatter_status(task_path, status, blocked_reason)
+        return True
+
+    monkeypatch.setattr(type(runner), "_commit_task_status_change", commit_status)
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task",
+        lambda: _local_status_snapshot(runner),
     )
     task = QueueTask(
         pr_id="PR-458", title="Recover FIX", status=TaskStatus.DOING,
@@ -171,6 +193,10 @@ async def test_published_coding_timeout_recovers_then_dispatches_fix(
         [task.model_copy(update={"status": TaskStatus.ERROR})], [pr]
     )
     monkeypatch.setattr(restarted, "_retry_worktree_dirty", lambda: (False, ""))
+    monkeypatch.setattr(
+        restarted, "_remote_frontmatter_error_status_for_current_task",
+        lambda: _local_status_snapshot(restarted),
+    )
     monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_a, **_k: [pr])
     await restarted.handle_error()
     assert restarted.state.state == PipelineState.WATCH
@@ -330,12 +356,164 @@ async def _timeout_runner(
     monkeypatch.setattr(retry_module, "derive_active_inhibitors", no_inhibitors)
     monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_a, **_k: [pr])
 
-    async def commit(_task, status, _reason):
+    async def commit(_task, status, _reason, **_kwargs):
         write_frontmatter_status(task_path, status)
         return True
 
     monkeypatch.setattr(runner, "_commit_task_status_change", commit)
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task",
+        lambda: _local_status_snapshot(runner),
+    )
     return runner, task, pr, task_path
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", [None, "body", "todo"])
+async def test_timeout_admission_reads_remote_base_after_isolated_status_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, replacement: str | None,
+) -> None:
+    runner, task, _pr, task_path = await _timeout_runner(tmp_path, monkeypatch)
+    remote = tmp_path / "remote.git"
+
+    def git(*args: str, cwd: Path = tmp_path) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+        ).stdout
+
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main")
+    git("config", "user.name", "Test User")
+    git("config", "user.email", "test@example.com")
+    git("remote", "add", "origin", str(remote))
+    task_path.write_text(
+        task_path.read_text().replace(
+            "status: ERROR\nblocked_reason: fix_idle_timeout", "status: TODO"
+        )
+    )
+    git("add", task.task_file)
+    git("commit", "-m", "seed task")
+    git("push", "-u", "origin", "main")
+    runner.repo_config.url = str(remote)
+    runner.repo_config.branch = "main"
+    original_head = git("rev-parse", "HEAD").strip()
+    original_writer = type(runner)._commit_task_status_change.__get__(runner)
+    assert await original_writer(
+        task, "ERROR", "FIX idle timeout",
+        blocked_reason=SuppressionReason.FIX_IDLE_TIMEOUT,
+    )
+    assert "status: TODO" in task_path.read_text()
+    assert "status: ERROR" in git(
+        "--git-dir", str(remote), "show", f"main:{task.task_file}"
+    )
+    monkeypatch.setattr(runner, "_commit_task_status_change", original_writer)
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task",
+        type(runner)._remote_frontmatter_error_status_for_current_task.__get__(runner),
+    )
+    git_calls: list[tuple[str, ...]] = []
+    original_git = retry_module.git_ops._git
+
+    def record_git(repo_path: str, *args: str, **kwargs):
+        git_calls.append(args)
+        return original_git(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(retry_module.git_ops, "_git", record_git)
+    assert runner._remote_frontmatter_error_status_for_current_task() == (
+        "error", SuppressionReason.FIX_IDLE_TIMEOUT,
+        hashlib.sha256(git("--git-dir", str(remote), "show", f"main:{task.task_file}").encode()).hexdigest(),
+    ), runner.state.history
+    assert not any("clone" in args for args in git_calls)
+    assert sum(args[:3] == ("fetch", "--depth=1", "--filter=blob:none") for args in git_calls) == 1
+
+    if replacement is not None:
+        def reupload(*_args, **_kwargs):
+            other = tmp_path / "replacement"
+            git("clone", str(remote), str(other))
+            git("checkout", "main", cwd=other)
+            git("config", "user.name", "Test User", cwd=other)
+            git("config", "user.email", "test@example.com", cwd=other)
+            replaced = other / task.task_file
+            content = replaced.read_text()
+            if replacement == "todo":
+                content = content.replace(
+                    "status: ERROR\nblocked_reason: fix_idle_timeout", "status: TODO"
+                )
+            else:
+                content += "\nReuploaded task instructions\n"
+            replaced.write_text(content)
+            git("add", task.task_file, cwd=other)
+            git("commit", "-m", "reupload task", cwd=other)
+            git("push", "origin", "main", cwd=other)
+            return [_pr]
+
+        monkeypatch.setattr(gh_prs, "get_open_prs", reupload)
+
+    await runner.handle_error()
+
+    assert runner.state.state == (PipelineState.ERROR if replacement else PipelineState.WATCH), runner.state.history
+    remote_task = git(
+        "--git-dir", str(remote), "show", f"main:{task.task_file}"
+    )
+    assert ("status: TODO" in remote_task) == (replacement in (None, "todo"))
+    assert ("Reuploaded task instructions" in remote_task) == (replacement == "body")
+    assert "status: TODO" in task_path.read_text()
+    assert git("rev-parse", "HEAD").strip() == original_head
+    assert (await runner.redis.get(cause_key(runner.name, task.pr_id)) is None) == (replacement is None)
+
+
+@pytest.mark.asyncio
+async def test_remote_timeout_status_reader_rejects_changed_base_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, task, _pr, task_path = await _timeout_runner(tmp_path, monkeypatch)
+    remote = tmp_path / "remote.git"
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, check=True, capture_output=True, text=True,
+        ).stdout
+
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main")
+    git("config", "user.name", "Test User")
+    git("config", "user.email", "test@example.com")
+    git("remote", "add", "origin", str(remote))
+    git("add", task.task_file)
+    git("commit", "-m", "seed task")
+    git("push", "-u", "origin", "main")
+    runner.repo_config.url = str(remote)
+    runner.repo_config.branch = "main"
+    reader = type(runner)._remote_frontmatter_error_status_for_current_task.__get__(runner)
+
+    runner.state.current_task = None
+    assert reader() == (None, None, None)
+    runner.state.current_task = task.model_copy(update={"task_file": "tasks/PR-999.md"})
+    assert reader() == (None, None, None)
+    runner.state.current_task = task
+    runner.repo_config.branch = "-unsafe"
+    assert reader() == (None, None, None)
+    runner.repo_config.branch = "main"
+    runner.repo_config.url = str(tmp_path / "different.git")
+    assert reader() == (None, None, None)
+    runner.repo_config.url = str(remote)
+
+    git("rm", task.task_file)
+    git("commit", "-m", "remove task")
+    git("push", "origin", "main")
+    assert reader() == (None, None, None)
+
+    task_path.parent.mkdir(exist_ok=True)
+    task_path.write_text(
+        "---\nstatus: ERROR\nblocked_reason: fix_idle_timeout\n---\n\n"
+        "# PR-458: Recover FIX\n\nBranch: fix/pr-999\n"
+        "- Type: bugfix\n- Complexity: low\n- Depends on: none\n"
+        "- Priority: 1\n- Coder: codex\n"
+    )
+    git("add", task.task_file)
+    git("commit", "-m", "replace with different branch")
+    git("push", "origin", "main")
+    assert reader() == (None, None, None)
 
 
 @pytest.mark.asyncio
@@ -449,7 +627,10 @@ async def test_unsafe_recovery_keeps_evidence(
     elif blocker == "dirty":
         monkeypatch.setattr(runner, "_retry_worktree_dirty", lambda: (True, " M work.py"))
     elif blocker == "header":
-        task_path.write_text(task_path.read_text().replace("fix/pr-458", "fix/pr-999"))
+        monkeypatch.setattr(
+            runner, "_remote_frontmatter_error_status_for_current_task",
+            lambda: (None, None, None),
+        )
     elif blocker == "record":
         runner._current_run_record = None
 
@@ -565,6 +746,10 @@ async def test_restart_restores_timeout_binding_and_count(
     assert restarted.state.current_pr.number == 458
     assert restarted._current_run_record.fix_iterations == 1
     monkeypatch.setattr(restarted, "_retry_worktree_dirty", lambda: (False, ""))
+    monkeypatch.setattr(
+        restarted, "_remote_frontmatter_error_status_for_current_task",
+        lambda: _local_status_snapshot(restarted),
+    )
     monkeypatch.setattr(restarted, "_commit_task_status_change", runner._commit_task_status_change)
     await restarted.handle_error()
     assert restarted.state.state == PipelineState.WATCH
@@ -862,6 +1047,16 @@ async def test_restart_finishes_committed_admission_without_new_attempt(
     )
     assert restarted.state.state == PipelineState.ERROR
     monkeypatch.setattr(restarted, "_retry_worktree_dirty", lambda: (False, ""))
+    monkeypatch.setattr(
+        restarted, "_remote_frontmatter_error_status_for_current_task",
+        lambda: _local_status_snapshot(restarted),
+    )
+    async def confirm_status(_task, status, _reason, *, expected_task_sha256):
+        assert status == "TODO"
+        assert expected_task_sha256 == hashlib.sha256(task_path.read_bytes()).hexdigest()
+        return True
+
+    monkeypatch.setattr(restarted, "_commit_task_status_change", confirm_status)
     monkeypatch.setattr(retry_module, "delete_cancellation_cause", original_delete)
     await restarted.handle_error()
     assert restarted.state.state == PipelineState.WATCH

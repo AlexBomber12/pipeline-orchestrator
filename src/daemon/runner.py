@@ -21,12 +21,14 @@ Mixin resolution order (left-to-right, less-dependent first):
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import random
 import re
 import subprocess
+import tempfile
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -45,6 +47,7 @@ from src.cancellation import (
     get_cancellation_cause,
     safe_delete_cancellation_cause,
     safe_record_cancellation_cause,
+    task_spec_content_hash,
     truncate_for_payload,
 )
 from src.cancellation.availability import (
@@ -67,6 +70,7 @@ from src.config import (
     AppConfig,
     RepoConfig,
     load_config,
+    normalize_repo_url,
 )
 from src.daemon import (
     error_rate_tracker,
@@ -2321,7 +2325,16 @@ class PipelineRunner(
         task = self.state.current_task
         task_id = task.pr_id if task is not None else None
 
-        frontmatter_status, _blocked = self._frontmatter_error_status_for_current_task()
+        # The coder checkout can retain TODO after the status writer commits
+        # ERROR to the base branch. Only the confirmed base can clear a park.
+        frontmatter_status, _blocked, _revision = (
+            self._remote_frontmatter_error_status_for_current_task()
+        )
+        if task is not None and frontmatter_status is None:
+            self.log_event("[RECOVERY] Remote ERROR task status unavailable; staying ERROR.")
+            return
+        if frontmatter_status == "error" and (reason is None or from_frontmatter):
+            reason, from_frontmatter = _blocked, True
         if frontmatter_status == "todo":
             self.state.skip_ai_error_diagnose = False
             self.state.error_message = None
@@ -2392,6 +2405,8 @@ class PipelineRunner(
         status: str,
         reason: str,
         blocked_reason: SuppressionReason | str | None = None,
+        *,
+        expected_task_sha256: str | None = None,
     ) -> bool:
         """Best-effort commit of daemon-written task frontmatter status."""
         task_file = getattr(current_task, "task_file", None)
@@ -2400,7 +2415,12 @@ class PipelineRunner(
             return False
 
         task_path = Path(task_file)
-        if task_path.is_absolute() or ".." in task_path.parts:
+        bound_pr_id = pr_id if str(pr_id).startswith("PR-") else f"PR-{pr_id}"
+        if (
+            task_path.is_absolute()
+            or ".." in task_path.parts
+            or task_path.parts != ("tasks", f"{bound_pr_id}.md")
+        ):
             self.log_event(
                 f"[INFRA] Warning: refusing to commit unsafe task path "
                 f"{task_file!r}."
@@ -2430,45 +2450,105 @@ class PipelineRunner(
             blocked_reason,
         )
 
-        try:
-            git_ops._git(self.repo_path, "fetch", "origin", base, timeout=60)
-            git_ops._git(self.repo_path, "checkout", "-f", base, timeout=60)
-            git_ops._git(
-                self.repo_path,
-                "reset",
-                "--hard",
-                f"origin/{base}",
-                timeout=60,
-            )
-            write_frontmatter_status(
-                Path(self.repo_path) / task_file,
-                status,
-                blocked_reason,
-            )
-            git_ops._git(self.repo_path, "add", "--", task_file, timeout=30)
-            diff = git_ops._git(
-                self.repo_path,
-                "diff",
-                "--cached",
-                "--quiet",
-                "--",
-                task_file,
-                check=False,
-            )
-            if diff.returncode == 0:
-                self.log_event(
-                    f"[MERGE] No task status change to commit for {task_file}."
+        # Bind the first remote fetch to the generation admitted for this run.
+        # Status fields are daemon-managed and intentionally excluded from this
+        # fingerprint, so ordinary ERROR/DONE transitions remain possible.
+        record = self._current_run_record
+        admitted_hash = (
+            record.task_spec_hash
+            if record is not None and record.task_id == bound_pr_id
+            else None
+        )
+        if not admitted_hash:
+            try:
+                admitted_hash = task_spec_content_hash(
+                    (repo_root / task_path).read_text(encoding="utf-8")
                 )
-                return True
-            git_ops._git(
-                self.repo_path,
-                "commit",
-                "-m",
-                message,
-                timeout=60,
-            )
-            git_ops._git(self.repo_path, "push", "origin", base, timeout=60)
-            return True
+            except (OSError, UnicodeError):
+                self.log_event("[INFRA] Warning: admitted task spec unavailable.")
+                return False
+
+        try:
+            # get-url expands url.*.insteadOf (including CI's credentialed
+            # rewrite), which is not the stored repository identity.
+            origin = git_ops._git(self.repo_path, "config", "--get", "remote.origin.url")
+            if normalize_repo_url(origin.stdout) != normalize_repo_url(self.repo_config.url):
+                raise ValueError("checkout origin differs from configured repository")
+            if not base or base.startswith("-") or git_ops._git(
+                self.repo_path, "check-ref-format", "--branch", base, check=False
+            ).returncode != 0:
+                raise ValueError("invalid configured base branch")
+
+            # This repository owns its own worktree, index and refs. Fetch only
+            # a bounded slice of the configured base instead of cloning its
+            # entire history for each status write.
+            with tempfile.TemporaryDirectory(prefix="task-status-") as temporary:
+                isolated = str(Path(temporary) / "repo")
+                git_ops._git(temporary, "init", "--quiet", isolated)
+                git_ops._git(isolated, "remote", "add", "origin", self.repo_config.url)
+                for _attempt in range(3):
+                    git_ops._git(
+                        isolated, "fetch", "--depth=16", "--filter=blob:none",
+                        "origin", base, timeout=120,
+                    )
+                    git_ops._git(isolated, "checkout", "--detach", "-f", "FETCH_HEAD")
+                    tracked_task = Path(isolated) / task_path
+                    if tracked_task.is_symlink():
+                        raise ValueError("task path is a symlink in isolated checkout")
+                    isolated_task = tracked_task.resolve()
+                    if not isolated_task.is_relative_to(Path(isolated).resolve()) or not isolated_task.is_file():
+                        raise ValueError("task path is missing or escapes isolated checkout")
+                    git_ops._git(isolated, "ls-files", "--error-unmatch", "--", task_file)
+                    task_bytes = isolated_task.read_bytes()
+                    task_text = task_bytes.decode("utf-8")
+                    if task_spec_content_hash(task_text) != admitted_hash:
+                        raise ValueError("remote task differs from admitted generation")
+                    if (expected_task_sha256 is not None
+                            and hashlib.sha256(task_bytes).hexdigest()
+                            != expected_task_sha256):
+                        raise ValueError("remote task changed since status admission")
+                    header = parse_task_header(isolated_task)
+                    if (header.pr_id != bound_pr_id
+                            or header.branch != current_task.branch):
+                        raise ValueError("remote task identity differs from bound task")
+                    write_frontmatter_status(isolated_task, status, blocked_reason)
+                    git_ops._git(isolated, "add", "--", task_file)
+                    diff = git_ops._git(
+                        isolated, "diff", "--cached", "--quiet", "--", task_file,
+                        check=False,
+                    )
+                    if diff.returncode == 0:
+                        self.log_event(
+                            f"[MERGE] No task status change to commit for {task_file}."
+                        )
+                        return True
+                    if diff.returncode != 1:
+                        raise RuntimeError("task status diff failed")
+                    git_ops._git(
+                        isolated, "-c", "user.name=pipeline-orchestrator",
+                        "-c", "user.email=pipeline-orchestrator@localhost",
+                        "commit", "-m", message, timeout=60,
+                    )
+                    commit = git_ops._git(isolated, "rev-parse", "HEAD").stdout.strip()
+                    push = git_ops._git(
+                        isolated, "push", "origin", f"HEAD:refs/heads/{base}",
+                        timeout=60, check=False,
+                    )
+                    # A lost push response and a concurrent base advance are
+                    # both resolved by reading the remote ref again.
+                    git_ops._git(isolated, "fetch", "origin", base, timeout=60)
+                    confirmed = git_ops._git(
+                        isolated, "merge-base", "--is-ancestor", commit,
+                        "FETCH_HEAD", check=False,
+                    )
+                    if confirmed.returncode == 0:
+                        return True
+                    if confirmed.returncode != 1:
+                        raise RuntimeError("could not confirm remote status commit")
+                    if _attempt == 2:
+                        raise RuntimeError(
+                            f"status push not confirmed: {push.stderr.strip()}"
+                        )
         except Exception as exc:
             self.log_event(
                 f"[INFRA] Warning: failed to commit {status} status for "

@@ -666,9 +666,23 @@ async def test_async_adapter_timeout_cleans_descendants(
         lambda cmd, _cwd, **_kwargs: cmd,
     )
 
-    result = await _run_fake_adapter(provider, tmp_path, timeout=0.05)
+    def wait_for_ready(_process: asyncio.subprocess.Process) -> None:
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            try:
+                if len(pid_file.read_text(encoding="utf-8").split()) == 2:
+                    return
+            except FileNotFoundError:
+                pass
+            time.sleep(0.01)
+        pytest.fail("fake coder did not report leader and child readiness")
+
+    result = await _run_fake_adapter(
+        provider, tmp_path, timeout=0.05, on_process_start=wait_for_ready,
+    )
     pids = await _read_fake_pids(pid_file)
 
+    assert len(pids) == 2
     assert result == (-1, "", "Timeout after 0.05s")
     await _wait_not_live(*pids)
 
