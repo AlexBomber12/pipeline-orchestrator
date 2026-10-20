@@ -785,6 +785,60 @@ def test_status_write_rejects_invalid_base_and_missing_remote_task(tmp_path: Pat
     assert _remote_task(repo, "PR-714").startswith("---\nstatus: TODO\n")
 
 
+@pytest.mark.parametrize("mismatch", ["branch", "missing_remote_task"])
+def test_status_write_rejects_remote_task_mismatch_without_touching_coder_work(
+    tmp_path: Path, mismatch: str,
+) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-724")
+    runner = _status_runner(repo)
+    task_id = "PR-724"
+    branch = "different-bound-branch" if mismatch == "branch" else "pr-test"
+    if mismatch == "missing_remote_task":
+        task_id = "PR-725"
+        source = (repo / "tasks/PR-724.md").read_text(encoding="utf-8")
+        (repo / "tasks/PR-725.md").write_text(
+            source.replace("PR-724", task_id), encoding="utf-8",
+        )
+
+    _git(repo, "checkout", "pr-test")
+    coder_file = repo / "coder.txt"
+    coder_file.write_text("committed\n", encoding="utf-8")
+    _git(repo, "add", "coder.txt")
+    _git(repo, "commit", "-m", "coder work")
+    coder_file.write_text("staged\n", encoding="utf-8")
+    _git(repo, "add", "coder.txt")
+    coder_file.write_text("unstaged\n", encoding="utf-8")
+    (repo / "draft.bin").write_bytes(b"\x00\xff\x01")
+    before = (
+        _git(repo, "rev-parse", "HEAD"),
+        _git(repo, "symbolic-ref", "HEAD"),
+        _git(repo, "status", "--porcelain"),
+        (repo / ".git/index").read_bytes(),
+    )
+    remote_head = _git(tmp_path / "remote.git", "rev-parse", "refs/heads/main")
+    task = QueueTask(
+        pr_id=task_id, title="t", status=TaskStatus.DOING,
+        branch=branch, task_file=f"tasks/{task_id}.md",
+    )
+
+    assert not asyncio.run(runner._commit_task_status_change(task, "ERROR", "crash"))
+
+    assert (
+        _git(repo, "rev-parse", "HEAD"),
+        _git(repo, "symbolic-ref", "HEAD"),
+        _git(repo, "status", "--porcelain"),
+        (repo / ".git/index").read_bytes(),
+    ) == before
+    assert coder_file.read_text(encoding="utf-8") == "unstaged\n"
+    assert (repo / "draft.bin").read_bytes() == b"\x00\xff\x01"
+    assert _git(tmp_path / "remote.git", "rev-parse", "refs/heads/main") == remote_head
+    expected_error = (
+        "remote task identity differs from bound task" if mismatch == "branch"
+        else "task path is missing or escapes isolated checkout"
+    )
+    assert any(expected_error in event["event"] for event in runner.state.history)
+
+
 def test_status_write_no_change_keeps_remote_head(tmp_path: Path) -> None:
     repo = _make_repo_with_task(tmp_path, "PR-716")
     runner = _status_runner(repo)

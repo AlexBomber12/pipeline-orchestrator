@@ -2486,7 +2486,6 @@ class PipelineRunner(
                 isolated = str(Path(temporary) / "repo")
                 git_ops._git(temporary, "init", "--quiet", isolated)
                 git_ops._git(isolated, "remote", "add", "origin", self.repo_config.url)
-                original_task = None
                 for _attempt in range(3):
                     git_ops._git(
                         isolated, "fetch", "--depth=16", "--filter=blob:none",
@@ -2512,26 +2511,6 @@ class PipelineRunner(
                     if (header.pr_id != bound_pr_id
                             or header.branch != current_task.branch):
                         raise ValueError("remote task identity differs from bound task")
-                    # Only status and its durable reason may change between
-                    # attempts. A reupload can reuse the same path and branch.
-                    lines = task_text.splitlines(keepends=True)
-                    closing = next(
-                        (i for i, line in enumerate(lines[1:], 1)
-                         if line.strip() == "---"), None,
-                    ) if lines and lines[0].strip() == "---" else None
-                    if closing is None:
-                        task_identity = task_text
-                    else:
-                        task_identity = "".join(
-                            line for i, line in enumerate(lines)
-                            if i == 0 or i >= closing or not re.match(
-                                r"^(?:status|blocked_reason):", line
-                            )
-                        )
-                    if original_task is None:
-                        original_task = task_identity
-                    elif task_identity != original_task:
-                        raise ValueError("remote task changed during status retry")
                     write_frontmatter_status(isolated_task, status, blocked_reason)
                     git_ops._git(isolated, "add", "--", task_file)
                     diff = git_ops._git(
