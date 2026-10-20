@@ -1,6 +1,7 @@
 services:
   web:
     build: .
+    init: true
     entrypoint: ["bash", "scripts/entrypoint.sh"]
     command: uvicorn src.web.app:app --app-dir /app --host 0.0.0.0 --port 8000
     user: "1000:1000"
@@ -22,6 +23,7 @@ services:
 
   daemon:
     build: .
+    init: true
     command: python -m src.daemon.main
     user: "1000:1000"
     mem_limit: 8g
@@ -40,6 +42,7 @@ services:
 
   mcp:
     build: .
+    init: true
     entrypoint: ["bash", "scripts/mcp-entrypoint.sh"]
     user: "1000:1000"
     mem_limit: 1g
