@@ -454,8 +454,8 @@ class RecoveryMixin:
 
         ``publish_state`` writes the live ``RepoState`` to
         ``pipeline_state(self.name)`` at the end of every cycle, so the
-        last persisted snapshot is the authoritative record of which
-        task was active when the daemon went down. The runner re-builds
+        last persisted snapshot preserves dispatch details when available.
+        Task headers and GitHub remain the startup recovery sources. The runner re-builds
         a fresh ``RepoState`` on startup with ``current_task=None``;
         without this rehydrate the headers helper's
         ``current_task_pr_id`` input is always ``None``, and a pre-push
@@ -799,11 +799,62 @@ class RecoveryMixin:
                 "IDLE regeneration."
             )
             tasks = []
+        if not await self._recover_header_merge_attempt(tasks, prs):
+            return False
         await self._apply_recovery_decisions(tasks, prs)
         # PR-263: hydrate the in-memory queue snapshot so the dashboard's
         # /api/repo/{name}/queue endpoint reflects post-restart state
         # immediately, without waiting for the next IDLE cycle.
         self.state.current_queue = list(tasks)
+        return True
+
+    async def _recover_header_merge_attempt(
+        self, tasks: list[QueueTask], open_prs: list[PRInfo]
+    ) -> bool:
+        """Recover unfinished merge bookkeeping without a pipeline snapshot.
+
+        Historical DONE tasks with no retained metrics need no replay. A run
+        still awaiting success, or an explicitly unfinished header, does.
+        Discovery only selects an identity; MERGE still requires exact proof.
+        """
+        if getattr(self, "_persisted_merge_recovery", None) is not None:
+            return True
+        candidates = []
+        try:
+            for task in tasks:
+                header = getattr(self, "_recovery_task_headers", {}).get(task.pr_id)
+                if (header is None or task.status != TaskStatus.DONE or not task.branch
+                        or find_matching_open_pr(task.pr_id, task.branch, open_prs) is not None):
+                    continue
+                records = await self._metrics_store.list_task_runs(self.name, task.pr_id)
+                records = [r for r in records if r.task_id == task.pr_id and r.repo_name == self.name]
+                record = max(records, key=lambda r: (r.started_at, r.run_id), default=None)
+                if (record is not None and record.exit_reason != "success_merged"
+                        or header.frontmatter_status in {"todo", "doing"}):
+                    candidates.append((task, record))
+            if not candidates:
+                return True
+            discovery = gh_prs.get_merged_prs_discovery(self.owner_repo, self.repo_config.branch)
+            if not discovery.complete:
+                raise RuntimeError(discovery.reason or "incomplete merged discovery")
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Merge bookkeeping discovery deferred: {exc}.")
+            return False
+        for task, record in candidates:
+            matches = [pr for pr in discovery.prs
+                       if pr.pr_id == task.pr_id and pr.branch == task.branch]
+            if not matches:
+                continue
+            if len(matches) != 1:
+                self.log_event(f"[RECOVERY] Ambiguous merged identity for {task.pr_id}; retrying.")
+                return False
+            self._persisted_merge_recovery = self.state.model_copy(update={
+                "current_task": task, "current_pr": matches[0],
+                "active_invocation": record.invocations[-1] if record and record.invocations else None,
+                "state": PipelineState.MERGE, "merge_phase": "post_merge_cleanup",
+            })
+            self._current_run_record = record
+            break
         return True
 
     async def _rehydrate_quarantines_from_labels(  # pragma: no cover
@@ -905,7 +956,8 @@ class RecoveryMixin:
                 self.state.active_invocation = saved_merge.active_invocation
                 self.state.state = PipelineState.MERGE
                 self.state.merge_phase = saved_merge.merge_phase
-                await self._restore_current_run_record()
+                if self._current_run_record is None:
+                    await self._restore_current_run_record()
                 self.log_event(
                     f"[RECOVERY] Restored MERGE attempt for {queued.pr_id} "
                     f"PR #{self.state.current_pr.number} ({self.state.merge_phase})."

@@ -79,6 +79,8 @@ from src.task_status import MergedState
 
 from tests.runner import _helpers as h
 
+_CONFIRM_REMOTE_MERGE = merge_module.MergeMixin._confirm_remote_merge
+
 
 def test_recovery_retry_keeps_initial_publication_cutoff(
     monkeypatch: pytest.MonkeyPatch,
@@ -2420,13 +2422,15 @@ def test_megaraid_scenario_resolved_in_headers_mode(
     assert [t.status for t in runner.state.current_queue] == [TaskStatus.DONE]
 
 
+@pytest.mark.parametrize("snapshot", ["valid", "absent", "damaged"])
 @pytest.mark.parametrize("phase", ["merging", "post_merge_cleanup"])
 @pytest.mark.parametrize("status", [TaskStatus.DOING, TaskStatus.DONE])
-def test_restart_retains_merge_until_remote_bookkeeping_finishes(monkeypatch, phase, status):
+def test_restart_retains_merge_until_remote_bookkeeping_finishes(monkeypatch, phase, status, snapshot):
     from unittest.mock import AsyncMock
 
     from src.daemon.retry_commands import RetryDispatch
 
+    monkeypatch.setattr(merge_module.MergeMixin, "_confirm_remote_merge", _CONFIRM_REMOTE_MERGE)
     original = h._make_runner()
     task = QueueTask(pr_id="PR-401", title="Merge", branch="pr-401",
                      task_file="tasks/PR-401.md", status=TaskStatus.DOING)
@@ -2438,18 +2442,31 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(monkeypatch, ph
     original._start_current_run_record("claude", "opus")
     record = original._current_run_record
     runner = h._make_runner()
-    runner.redis.store[pipeline_state(runner.name)] = original.state.model_dump_json()
+    if snapshot != "absent":
+        runner.redis.store[pipeline_state(runner.name)] = (
+            original.state.model_dump_json() if snapshot == "valid" else "damaged"
+        )
     queued = task.model_copy(update={"status": status})
     monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: [])
-    monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [queued])
+    def parse():
+        runner._recovery_task_headers = {task.pr_id: types.SimpleNamespace(
+            frontmatter_status=status.value.lower(),
+        )}
+        return [queued.model_copy(update={"status": TaskStatus.DONE})]
+
+    monkeypatch.setattr(runner, "_parse_tasks_from_headers", parse)
+    monkeypatch.setattr(runner._metrics_store, "list_task_runs", AsyncMock(return_value=[record]))
+    monkeypatch.setattr(gh_prs, "get_merged_prs_discovery", lambda *a: gh_prs.PRDiscovery(
+        runner.owner_repo, "main", [original.state.current_pr], True,
+    ))
     monkeypatch.setattr(runner, "_cleanup_expected_branch", lambda: None)
     monkeypatch.setattr(runner._metrics_store, "recent", AsyncMock(return_value=[record]))
     monkeypatch.setattr(runner._metrics_store, "save", AsyncMock())
     h._patch_subprocess(monkeypatch)
     assert asyncio.run(runner.recover_state())
     assert runner.state.state == PipelineState.MERGE
-    assert runner.state.merge_phase == phase
-    assert runner.state.current_task == queued
+    assert runner.state.merge_phase == (phase if snapshot == "valid" else "post_merge_cleanup")
+    assert runner.state.current_task.pr_id == queued.pr_id
     assert runner.state.current_pr.head_sha == "a" * 40
     assert runner._current_run_record is record
 
@@ -2472,7 +2489,10 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(monkeypatch, ph
     write = AsyncMock(return_value=True)
     monkeypatch.setattr(runner, "_commit_task_status_change", write)
 
+    reads = []
+
     def transport(args, **kwargs):
+        reads.append(args)
         assert args == ["api", "repos/octo/demo/pulls/629", "--include"]
         return "HTTP/2.0 200 OK\r\n\r\n" + json.dumps({
             "number": 629, "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
@@ -2485,8 +2505,10 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(monkeypatch, ph
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert runner.state.current_queue[0].status == TaskStatus.DONE
-    assert write.await_args.args[:2] == (queued, "DONE")
+    assert write.await_args.args[0].pr_id == queued.pr_id
+    assert write.await_args.args[1] == "DONE"
     assert record.exit_reason == "success_merged"
+    assert reads == [["api", "repos/octo/demo/pulls/629", "--include"]]
     runner._metrics_store.save.assert_awaited_once()
 
 
@@ -2526,3 +2548,81 @@ def test_recovery_rejects_unbound_merge_snapshot(monkeypatch, mismatch):
     assert asyncio.run(runner.recover_state())
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
+
+
+@pytest.mark.parametrize("case", [
+    "pending_header", "pending_record", "historical", "finished", "wrong_record",
+    "incomplete", "metrics_error", "unmatched", "ambiguous", "open", "not_done", "no_branch",
+])
+def test_header_merge_recovery_uses_complete_bound_github_evidence(monkeypatch, case):
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    runner = h._make_runner()
+    task = QueueTask(pr_id="PR-401", title="Merge", branch="pr-401",
+                     task_file="tasks/PR-401.md", status=TaskStatus.DONE)
+    runner.state.current_task = task
+    runner._start_current_run_record("claude", "opus")
+    record = runner._current_run_record
+    runner.state.current_task = None
+    runner._current_run_record = None
+    runner._recovery_task_headers = {task.pr_id: types.SimpleNamespace(
+        frontmatter_status="todo" if case == "pending_header" else "done",
+    )}
+    records = [record]
+    if case in {"pending_header", "historical"}:
+        records = []
+    if case == "finished":
+        record.exit_reason = "success_merged"
+    if case == "wrong_record":
+        records = [replace(record, task_id="PR-999"), replace(record, repo_name="other")]
+    if case == "not_done":
+        task.status = TaskStatus.TODO
+    if case == "no_branch":
+        task.branch = ""
+    lookup = AsyncMock(return_value=records)
+    if case == "metrics_error":
+        lookup.side_effect = RuntimeError("metrics unavailable")
+    monkeypatch.setattr(runner._metrics_store, "list_task_runs", lookup)
+    from src.github import cache
+
+    cache.clear_etag_cache()
+    calls = []
+
+    def transport(args, **kwargs):
+        calls.append(args)
+        assert args[1].startswith("repos/octo/demo/pulls?state=closed&base=main&per_page=100")
+        if case == "incomplete":
+            return "HTTP/2.0 200 OK\r\n\r\nbroken"
+        entry = {
+            "number": 629, "title": "PR-401: Merge", "merged_at": "2026-10-20T00:00:00Z",
+            "base": {"ref": "main"}, "head": {"ref": "pr-401", "sha": "a" * 40},
+            "merge_commit_sha": "b" * 40,
+        }
+        if case == "unmatched":
+            entry["head"]["ref"] = "other"
+        entries = [entry, dict(entry, number=630)] if case == "ambiguous" else [entry]
+        return "HTTP/2.0 200 OK\r\n\r\n" + json.dumps(entries)
+
+    monkeypatch.setattr(gh_prs.gh_runner, "run_gh", transport)
+    open_prs = [PRInfo(number=629, pr_id=task.pr_id, branch=task.branch)] if case == "open" else []
+    if case in {"incomplete", "metrics_error"}:
+        monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: open_prs)
+        monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [task])
+        monkeypatch.setattr(runner, "_cleanup_expected_branch", lambda: None)
+        result = asyncio.run(runner.recover_state())
+        assert runner.state.current_task is None
+    else:
+        result = asyncio.run(runner._recover_header_merge_attempt([task], open_prs))
+    assert result is (case not in {"incomplete", "metrics_error", "ambiguous"})
+    saved = getattr(runner, "_persisted_merge_recovery", None)
+    if case in {"pending_header", "pending_record"}:
+        assert saved.current_task is task
+        assert saved.current_pr.number == 629
+        assert saved.current_pr.head_sha == "a" * 40
+        assert saved.merge_phase == "post_merge_cleanup"
+        assert runner._current_run_record is (None if case == "pending_header" else record)
+    else:
+        assert saved is None
+    if case in {"historical", "finished", "wrong_record", "open", "not_done", "no_branch"}:
+        assert not calls

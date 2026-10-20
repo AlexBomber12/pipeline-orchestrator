@@ -1893,3 +1893,17 @@ def confirmed_remote_merge(monkeypatch):
         return True
 
     monkeypatch.setattr("src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", confirmed)
+
+
+def test_restore_run_record_without_invocation_uses_task_index_after_partial_save():
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(pr_id="PR-401", title="Merge", status=TaskStatus.DONE)
+    runner._start_current_run_record("claude", "opus")
+    record = runner._current_run_record
+    asyncio.run(runner._metrics_store.save(record))
+    # Simulate failure after the record and task set were written but before
+    # the recency list was updated. A snapshot without an invocation is valid.
+    runner.redis.lists.clear()
+    runner._current_run_record = None
+    asyncio.run(runner._restore_current_run_record())
+    assert runner._current_run_record.run_id == record.run_id

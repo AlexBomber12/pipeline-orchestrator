@@ -1458,6 +1458,7 @@ def test_handle_merge_success_sets_idle(monkeypatch: pytest.MonkeyPatch) -> None
         title="t",
         status=TaskStatus.DOING,
     )
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.IDLE
@@ -1538,6 +1539,7 @@ def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.IDLE
@@ -1574,6 +1576,7 @@ def test_handle_merge_marks_pr_ready_before_merge(
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
 
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.IDLE
@@ -1605,6 +1608,7 @@ def test_handle_merge_ignores_pr_ready_failure(
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
 
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.IDLE
@@ -2096,6 +2100,7 @@ def test_handle_merge_skips_sync_for_cross_repo_pr(
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001", is_cross_repository=True)
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.IDLE

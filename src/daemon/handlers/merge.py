@@ -402,6 +402,18 @@ class MergeMixin:
                     f"{current_task.task_file}: {exc}"
                 )
 
+        if current_task is not None:
+            if self._current_run_record is None:
+                await self._restore_current_run_record()
+            record = self._current_run_record
+            invocation = self.state.active_invocation
+            if (record is None or record.task_id != current_task.pr_id
+                    or record.repo_name != self.name
+                    or invocation is not None and invocation.run_id is not None
+                    and record.run_id != invocation.run_id):
+                self.log_event(f"[MERGE] Run record unavailable for PR #{number}; retaining ownership.")
+                return
+
         self._mark_task_done_in_snapshot()
 
         try:

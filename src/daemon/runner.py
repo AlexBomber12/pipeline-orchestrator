@@ -1795,16 +1795,31 @@ class PipelineRunner(
         return "coding"
 
     async def _restore_current_run_record(self) -> None:
-        """Reload the latest persisted record for the active task."""
+        """Restore the bound invocation, or latest task run when no binding survived."""
         task = self.state.current_task
         if task is None:
             self._current_run_record = None
             return
         try:
-            recent = await self._metrics_store.recent(
-                task_id=task.pr_id,
-                limit=20,
-                repo_name=self.name,
+            invocation = self.state.active_invocation
+            run_id = invocation.run_id if invocation is not None else None
+            if run_id is not None:
+                record = await self._metrics_store.get(run_id)
+                recent = [record] if record is not None else []
+            else:
+                recent = await self._metrics_store.recent(
+                    task_id=task.pr_id, limit=20, repo_name=self.name,
+                )
+                if not recent:
+                    recent = sorted(
+                        await self._metrics_store.list_task_runs(self.name, task.pr_id),
+                        key=lambda record: (record.started_at, record.run_id), reverse=True,
+                    )
+            self._current_run_record = next(
+                (record for record in recent
+                 if record.task_id == task.pr_id and record.repo_name == self.name
+                 and (run_id is None or record.run_id == run_id)),
+                None,
             )
         except Exception as exc:
             self._current_run_record = None
@@ -1813,10 +1828,6 @@ class PipelineRunner(
                 f"{task.pr_id}: {exc}."
             )
             return
-        self._current_run_record = next(
-            (record for record in recent if record.task_id == task.pr_id),
-            None,
-        )
         if (
             self.state.active_invocation is None
             and self._current_run_record is not None

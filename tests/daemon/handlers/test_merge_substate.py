@@ -40,6 +40,7 @@ def _seed_runner_in_merge() -> PipelineRunner:
     runner.state.current_task = QueueTask(
         pr_id="PR-007", title="t", status=TaskStatus.DOING
     )
+    runner._start_current_run_record("claude", "opus")
     return runner
 
 

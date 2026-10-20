@@ -43,6 +43,7 @@ def test_merge_cleans_up_hash_and_retry_counter(
         status=TaskStatus.DOING,
     )
 
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     assert task_spec_hash_key("octo__demo", "PR-001") not in runner.redis.store
@@ -82,6 +83,7 @@ def test_merge_logs_cleanup_failure(
 
     runner.redis.delete = fail_delete
 
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     assert any("Failed to clear retry metadata for PR-001" in event for event in events)
@@ -456,3 +458,49 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
         assert writes[0][1] == "DONE"
         assert outcomes == ["success_merged"]
         assert runner.state.current_queue[0].status == TaskStatus.DONE
+
+
+@pytest.mark.parametrize("failure", ["read", "missing", "wrong_task", "wrong_repo", "wrong_run"])
+def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeypatch, failure):
+    from unittest.mock import AsyncMock
+
+    runner = h._make_runner()
+    task = QueueTask(pr_id="PR-401", title="Merge", branch="pr-401",
+                     task_file="tasks/PR-401.md", status=TaskStatus.DONE)
+    runner.state.current_task = task
+    runner.state.current_pr = PRInfo(number=629, branch=task.branch, head_sha="a" * 40)
+    runner.state.state = PipelineState.MERGE
+    runner.state.merge_phase = "post_merge_cleanup"
+    runner._start_current_run_record("claude", "opus")
+    runner._capture_invocation_snapshot("claude", {"model": "opus"}, phase="coding")
+    record = runner._current_run_record
+    runner._current_run_record = None
+    bad = None
+    if failure.startswith("wrong_"):
+        from dataclasses import replace
+
+        bad = replace(record, **{{"wrong_task": "task_id", "wrong_repo": "repo_name",
+                                  "wrong_run": "run_id"}[failure]: "other"})
+    lookup = (AsyncMock(side_effect=RuntimeError("metrics unavailable"))
+              if failure == "read" else AsyncMock(return_value=bad))
+    monkeypatch.setattr(runner._metrics_store, "get", lookup)
+    monkeypatch.setattr(runner._metrics_store, "recent", AsyncMock(side_effect=AssertionError("wrong run fallback")))
+    save = AsyncMock()
+    monkeypatch.setattr(runner._metrics_store, "save", save)
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner, "_compute_diff_stats", lambda base: {})
+    monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
+    asyncio.run(runner.handle_merge())
+    assert runner.state.state == PipelineState.MERGE
+    assert runner.state.current_task is task
+    save.assert_not_awaited()
+    lookup.assert_awaited_once_with(record.run_id)
+
+    # Recovery retries the exact key even if the recency index was never saved.
+    lookup.side_effect = None
+    lookup.return_value = record
+    asyncio.run(runner.handle_merge())
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert record.exit_reason == "success_merged"
+    save.assert_awaited_once_with(record)
