@@ -59,6 +59,10 @@ def _runner(tmp_path: Path) -> PipelineRunner:
     runner.state.current_task = _task()
     runner.state.error_message = "ERROR: synthetic failure"
     _write_task(tmp_path, runner.state.current_task, SuppressionReason.GUARDRAIL)
+    # These dispatcher tests use a local task fixture as their base snapshot.
+    runner._remote_frontmatter_error_status_for_current_task = (  # type: ignore[method-assign]
+        lambda: (*runner._frontmatter_error_status_for_current_task(), "fixture")
+    )
     return runner
 
 

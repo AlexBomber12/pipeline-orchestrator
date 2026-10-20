@@ -83,7 +83,7 @@ class RetryCommandMixin:
                 self.repo_path, "check-ref-format", "--branch", base, check=False
             ).returncode != 0:
                 return None, None, None
-            origin = git_ops._git(self.repo_path, "remote", "get-url", "origin")
+            origin = git_ops._git(self.repo_path, "config", "--get", "remote.origin.url")
             if normalize_repo_url(origin.stdout) != normalize_repo_url(self.repo_config.url):
                 raise ValueError("checkout origin differs from configured repository")
             with tempfile.TemporaryDirectory(prefix="fix-timeout-status-") as temporary:

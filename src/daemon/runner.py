@@ -2324,7 +2324,13 @@ class PipelineRunner(
         task = self.state.current_task
         task_id = task.pr_id if task is not None else None
 
-        frontmatter_status, _blocked = self._frontmatter_error_status_for_current_task()
+        # The coder checkout can retain TODO after the status writer commits
+        # ERROR to the base branch. Only the confirmed base can clear a park.
+        frontmatter_status, _blocked, _revision = (
+            self._remote_frontmatter_error_status_for_current_task()
+        )
+        if frontmatter_status == "error" and (reason is None or from_frontmatter):
+            reason, from_frontmatter = _blocked, True
         if frontmatter_status == "todo":
             self.state.skip_ai_error_diagnose = False
             self.state.error_message = None
@@ -2441,7 +2447,9 @@ class PipelineRunner(
         )
 
         try:
-            origin = git_ops._git(self.repo_path, "remote", "get-url", "origin")
+            # get-url expands url.*.insteadOf (including CI's credentialed
+            # rewrite), which is not the stored repository identity.
+            origin = git_ops._git(self.repo_path, "config", "--get", "remote.origin.url")
             if normalize_repo_url(origin.stdout) != normalize_repo_url(self.repo_config.url):
                 raise ValueError("checkout origin differs from configured repository")
             if not base or base.startswith("-") or git_ops._git(
@@ -2476,9 +2484,10 @@ class PipelineRunner(
                             and hashlib.sha256(task_bytes).hexdigest()
                             != expected_task_sha256):
                         raise ValueError("remote task changed since status admission")
-                    branch = re.search(r"(?m)^Branch:\s*(\S+)\s*$", task_text)
-                    if not branch or branch.group(1) != current_task.branch:
-                        raise ValueError("remote task branch differs from bound task")
+                    header = parse_task_header(isolated_task)
+                    if (header.pr_id != bound_pr_id
+                            or header.branch != current_task.branch):
+                        raise ValueError("remote task identity differs from bound task")
                     # Only status and its durable reason may change between
                     # attempts. A reupload can reuse the same path and branch.
                     lines = task_text.splitlines(keepends=True)

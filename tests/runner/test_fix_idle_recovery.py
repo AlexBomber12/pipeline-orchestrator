@@ -388,7 +388,7 @@ async def test_timeout_admission_reads_remote_base_after_isolated_status_write(
     git("remote", "add", "origin", str(remote))
     task_path.write_text(
         task_path.read_text().replace(
-            "status: ERROR\nblocked_reason: fix_idle_timeout", "status: DOING"
+            "status: ERROR\nblocked_reason: fix_idle_timeout", "status: TODO"
         )
     )
     git("add", task.task_file)
@@ -402,7 +402,7 @@ async def test_timeout_admission_reads_remote_base_after_isolated_status_write(
         task, "ERROR", "FIX idle timeout",
         blocked_reason=SuppressionReason.FIX_IDLE_TIMEOUT,
     )
-    assert "status: DOING" in task_path.read_text()
+    assert "status: TODO" in task_path.read_text()
     assert "status: ERROR" in git(
         "--git-dir", str(remote), "show", f"main:{task.task_file}"
     )
@@ -457,7 +457,7 @@ async def test_timeout_admission_reads_remote_base_after_isolated_status_write(
     )
     assert ("status: TODO" in remote_task) == (replacement in (None, "todo"))
     assert ("Reuploaded task instructions" in remote_task) == (replacement == "body")
-    assert "status: DOING" in task_path.read_text()
+    assert "status: TODO" in task_path.read_text()
     assert git("rev-parse", "HEAD").strip() == original_head
     assert (await runner.redis.get(cause_key(runner.name, task.pr_id)) is None) == (replacement is None)
 

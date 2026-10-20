@@ -526,6 +526,71 @@ def test_status_write_preserves_coder_checkout_and_index(
     assert _remote_task(repo, "PR-709").startswith("---\nstatus: ERROR\n")
 
 
+def test_error_dispatch_reads_base_after_status_write(tmp_path: Path) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-721")
+    runner = _status_runner(repo)
+    runner.repo_config.feature_flags.use_single_error_exit = True
+    runner.state.state = PipelineState.ERROR
+    runner.state.current_task = QueueTask(
+        pr_id="PR-721", title="t", status=TaskStatus.ERROR,
+        branch="pr-test", task_file="tasks/PR-721.md",
+    )
+    runner.state.error_message = "GUARDRAIL: blocked"
+
+    assert asyncio.run(runner._commit_task_status_change(
+        runner.state.current_task, "ERROR", "guardrail",
+        blocked_reason=SuppressionReason.GUARDRAIL,
+    ))
+    assert (repo / "tasks/PR-721.md").read_text().startswith("---\nstatus: TODO")
+
+    asyncio.run(runner._handle_single_error_exit())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert _remote_task(repo, "PR-721").startswith(
+        "---\nstatus: ERROR\nblocked_reason: guardrail\n"
+    )
+
+
+def test_status_write_accepts_branch_header_spacing(tmp_path: Path) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-722")
+    task_path = repo / "tasks/PR-722.md"
+    task_path.write_text(task_path.read_text().replace(
+        "Branch: pr-test", "Branch : pr-test"
+    ))
+    _git(repo, "add", "tasks/PR-722.md")
+    _git(repo, "commit", "-m", "use valid branch spacing")
+    _git(repo, "push", "origin", "main")
+    runner = _status_runner(repo)
+    task = QueueTask(
+        pr_id="PR-722", title="t", status=TaskStatus.DOING,
+        branch="pr-test", task_file="tasks/PR-722.md",
+    )
+
+    assert asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    assert _remote_task(repo, "PR-722").startswith("---\nstatus: DONE\n")
+
+
+def test_status_read_and_write_ignore_git_url_rewrite(tmp_path: Path) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-723")
+    stored_url = _git(repo, "config", "--get", "remote.origin.url").strip()
+    _git(repo, "config", f"url.file://{stored_url}.insteadOf", stored_url)
+    assert _git(repo, "remote", "get-url", "origin").strip() != stored_url
+    runner = _status_runner(repo)
+    runner.repo_config.url = stored_url
+    task = QueueTask(
+        pr_id="PR-723", title="t", status=TaskStatus.ERROR,
+        branch="pr-test", task_file="tasks/PR-723.md",
+    )
+    runner.state.current_task = task
+
+    assert asyncio.run(runner._commit_task_status_change(
+        task, "ERROR", "guardrail", blocked_reason=SuppressionReason.GUARDRAIL,
+    ))
+    assert runner._remote_frontmatter_error_status_for_current_task()[:2] == (
+        "error", SuppressionReason.GUARDRAIL,
+    )
+
+
 def test_status_write_retries_concurrent_base_advance(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
