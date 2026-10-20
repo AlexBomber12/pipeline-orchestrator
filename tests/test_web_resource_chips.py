@@ -8,11 +8,12 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from src.config import AppConfig, RepoConfig
 from src.daemon.github_rate_limit import BUDGET_GRAPHQL_REDIS_KEY, BUDGET_REST_REDIS_KEY
 from src.keyspace import coder_usage
 from src.usage import UsageObservation, UsageSnapshot
 from src.web import app as web_app
-from src.web.services.usage import usage_settings_context
+from src.web.services.usage import usage_publication_interval, usage_settings_context
 
 from tests.test_web_app import _FakeRedis, _make_bucket_redis
 
@@ -27,7 +28,7 @@ def observation(*, status="available", age=0, session=0, weekly=47, reset=None):
 
 
 def context(redis, names=None):
-    return asyncio.run(usage_settings_context(redis, names or ["codex"], 60))
+    return asyncio.run(usage_settings_context(redis, names or ["codex"], 60, 300))
 
 
 def test_account_observation_uses_fetch_time_and_preserves_zero():
@@ -39,10 +40,27 @@ def test_account_observation_uses_fetch_time_and_preserves_zero():
     assert view["updated_at"].endswith("UTC")
 
 
-@pytest.mark.parametrize("age", [181, -61])
+@pytest.mark.parametrize("age", [361, -61])
 def test_old_or_future_observation_is_never_current(age):
     redis = _FakeRedis(store={coder_usage("codex"): observation(age=age)})
     assert context(redis)["coder_usage"]["codex"]["status"] == "stale"
+
+
+def test_freshness_covers_idle_cadence_and_configured_slowdown():
+    assert usage_publication_interval(AppConfig()) == 300
+    idle_snapshot = _FakeRedis(store={coder_usage("codex"): observation(age=240)})
+    assert context(idle_snapshot)["coder_usage"]["codex"]["status"] == "available"
+    config = AppConfig(repositories=[RepoConfig(
+        url="https://github.com/example/active", poll_interval_sec=90,
+    )])
+    interval = usage_publication_interval(config)
+    assert interval == 450
+    redis = _FakeRedis(store={coder_usage("codex"): observation(age=400)})
+    view = asyncio.run(usage_settings_context(redis, ["codex"], 60, interval))
+    assert view["coder_usage"]["codex"]["status"] == "available"
+    redis.store[coder_usage("codex")] = observation(age=511)
+    view = asyncio.run(usage_settings_context(redis, ["codex"], 60, interval))
+    assert view["coder_usage"]["codex"]["status"] == "stale"
 
 
 def test_expired_window_has_no_current_counter():

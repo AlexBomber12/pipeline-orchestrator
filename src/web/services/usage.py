@@ -7,12 +7,27 @@ import time
 from datetime import datetime, timezone
 from typing import Any
 
+from src.config import AppConfig
 from src.daemon.github_rate_limit import read_graphql_budget, read_rest_budget
 from src.keyspace import coder_usage
 from src.usage import UsageObservation
 
 
-async def usage_settings_context(redis_client: Any, coder_names: list[str], cache_ttl: int) -> dict[str, Any]:
+def usage_publication_interval(config: AppConfig) -> int:
+    """Longest configured gap between daemon-owned usage publications."""
+    daemon = config.daemon
+    return max(
+        daemon.poll_interval_sec,
+        daemon.idle_extended_poll_interval_sec,
+        daemon.watch_slow_poll_interval_sec,
+        *(repo.poll_interval_sec * daemon.github_api_slowdown_multiplier
+          for repo in config.repositories if repo.active),
+    )
+
+
+async def usage_settings_context(
+    redis_client: Any, coder_names: list[str], cache_ttl: int, publish_interval: int,
+) -> dict[str, Any]:
     now = time.time()
 
     async def read_coder(name: str) -> tuple[str, dict[str, Any]]:
@@ -34,7 +49,8 @@ async def usage_settings_context(redis_client: Any, coder_names: list[str], cach
             ).strftime("%Y-%m-%d %H:%M:%S UTC")
         snapshot = observation.snapshot
         if snapshot is not None:
-            if now - snapshot.fetched_at > max(120, cache_ttl * 3) or snapshot.fetched_at > now + 60:
+            if (now - snapshot.fetched_at > max(120, cache_ttl * 3, publish_interval + cache_ttl)
+                    or snapshot.fetched_at > now + 60):
                 view["status"] = "stale"
             for label, percent, reset in (
                 ("Session", snapshot.session_percent, snapshot.session_resets_at),

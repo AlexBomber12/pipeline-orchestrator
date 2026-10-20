@@ -26,7 +26,7 @@ def _refresh_html(percent: int, status: str = "available") -> str:
 
     with ThreadPoolExecutor(max_workers=1) as pool:
         context = pool.submit(
-            lambda: asyncio.run(usage_settings_context(Observations(), ["codex"], 60)),
+            lambda: asyncio.run(usage_settings_context(Observations(), ["codex"], 60, 300)),
         ).result(timeout=10)
     return web_app.templates.get_template("components/settings_usage_refresh.html").render(
         coders=[SimpleNamespace(name="codex", display_name="Codex")], **context,
