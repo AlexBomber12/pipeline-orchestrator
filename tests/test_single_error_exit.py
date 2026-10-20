@@ -232,6 +232,21 @@ def test_self_healing_unchanged(
     assert limited.state.state == PipelineState.PAUSED
 
 
+def test_taskless_error_can_self_heal_without_remote_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(tmp_path)
+    _stub_cycle(monkeypatch, runner)
+    runner.state.current_task = None
+    runner.state.error_message = "git fetch origin failed"
+    runner.app_config.daemon.error_handler_use_ai = False
+
+    asyncio.run(runner._run_cycle_body())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert any("self-healing ERROR" in event for event in _events(runner))
+
+
 def test_reupload_releases_park_from_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

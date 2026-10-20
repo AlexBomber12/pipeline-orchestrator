@@ -2330,7 +2330,7 @@ class PipelineRunner(
         frontmatter_status, _blocked, _revision = (
             self._remote_frontmatter_error_status_for_current_task()
         )
-        if frontmatter_status is None:
+        if task is not None and frontmatter_status is None:
             self.log_event("[RECOVERY] Remote ERROR task status unavailable; staying ERROR.")
             return
         if frontmatter_status == "error" and (reason is None or from_frontmatter):
