@@ -592,6 +592,7 @@ def _merged_pr_infos(raw: list[dict], base_branch: str | None, *, strict: bool =
             not isinstance(entry, dict)
             or not isinstance(entry.get("number"), int)
             or isinstance(entry.get("number"), bool)
+            or entry["number"] <= 0
             or not isinstance(entry.get("title"), str)
             or not isinstance(entry.get("base"), dict)
             or not isinstance(entry.get("head"), dict)

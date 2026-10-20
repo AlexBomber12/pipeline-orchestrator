@@ -139,6 +139,24 @@ def test_merged_discovery_rejects_non_mapping_page_entry(monkeypatch: pytest.Mon
     assert gh_prs.get_merged_prs_discovery("octo/demo", "main").complete is False
 
 
+@pytest.mark.parametrize("number", [0, -1])
+@pytest.mark.parametrize("valid_first", [False, True])
+def test_merged_discovery_rejects_nonpositive_pr_number(
+    monkeypatch: pytest.MonkeyPatch, number: int, valid_first: bool,
+) -> None:
+    valid = {
+        "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
+        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "merge_commit_sha": "b" * 40,
+    }
+    payload = ([valid] if valid_first else []) + [{**valid, "number": number}]
+    monkeypatch.setattr(cache, "_etag_get", lambda path: payload)
+    result = gh_prs.get_merged_prs_discovery("octo/demo", "main")
+    assert result.complete is False
+    assert result.prs == []
+    assert result.reason == "malformed entry"
+
+
 @pytest.mark.parametrize("merged_at", ["invalid", 123, True, [], {}])
 def test_merged_discovery_rejects_malformed_merge_timestamp(
     monkeypatch: pytest.MonkeyPatch, merged_at: object,
