@@ -15,6 +15,11 @@ before, byte-identical to the previous f-strings.
 from __future__ import annotations
 
 
+def coder_usage(coder_name: str) -> str:
+    """Latest daemon-owned quota observation for a registered coder."""
+    return f"usage:coder:{coder_name}"
+
+
 def pipeline_state(repo_name: str) -> str:
     """Key for the published RepoState snapshot consumed by the dashboard."""
     return f"pipeline:{repo_name}"

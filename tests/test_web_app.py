@@ -24,19 +24,13 @@ from src.models import (
 )
 from src.web import app as web_app
 from src.web.app import (
-    _active_rate_limit_coder,
     _active_repo_coder,
-    _build_recent_graphql_burns_view,
-    _build_resources_view,
-    _claude_usage_chip,
-    _codex_usage_chip,
     _find_repo_config_by_name,
     _format_duration_ms,
     _format_reset_unix,
     _get_repo_state_safe,
     _parse_iso8601,
     _recent_repo_metrics_payload,
-    _resource_zone,
     app,
     get_all_repo_states,
     get_repo_state,
@@ -512,7 +506,6 @@ def test_api_repo_queue_returns_snapshot(
     assert payload["queue"][0]["priority"] == 1
 
 
-
 def test_api_repo_queue_snapshot_without_snapshot_timestamp(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -626,7 +619,6 @@ def test_api_repo_queue_503_when_state_has_no_queue(
     assert response.json()["error"] == "Queue not yet computed"
 
 
-
 def test_api_repo_queue_unknown_repo_returns_404(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -650,10 +642,6 @@ def _seed_disk_queue(repos_dir: Path) -> None:
         "- Tasks file: tasks/PR-010.md\n",
         encoding="utf-8",
     )
-
-
-
-
 
 
 def test_list_repo_tasks_uses_snapshot_when_available(
@@ -693,7 +681,6 @@ def test_list_repo_tasks_uses_snapshot_when_available(
     assert response.status_code == 200
     assert "Snapshot task" in response.text
     assert "Disk task that should not render" not in response.text
-
 
 
 def test_partial_repo_list_returns_html_fragment(
@@ -1248,7 +1235,6 @@ def test_stop_endpoint_reports_atomic_stop_key_write_failure(
     state = RepoState.model_validate_json(fake.store["pipeline:example__alpha"])
     assert state.user_paused is False
     assert "control:example__alpha:stop" not in fake.store
-
 
 
 @pytest.mark.parametrize(
@@ -2197,20 +2183,6 @@ def test_parse_iso8601_and_format_duration_cover_edge_cases() -> None:
     assert _format_duration_ms(3_660_000) == "1h 1m"
 
 
-def test_active_rate_limit_coder_hides_any_without_active_pick() -> None:
-    state = RepoState(
-        url="https://github.com/example/alpha.git",
-        name="example__alpha",
-        current_task=QueueTask(
-            pr_id="PR-141",
-            title="Rate limit badge",
-            status=TaskStatus.DOING,
-        ),
-    )
-
-    assert _active_rate_limit_coder(state, "any") is None
-
-
 def test_active_repo_coder_requires_active_task_and_run_state() -> None:
     state = RepoState(
         url="https://github.com/example/alpha.git",
@@ -2436,7 +2408,7 @@ def test_partial_repo_detail_renders_redis_payload(
         ),
     ],
 )
-def test_partial_repo_detail_rate_limit_badge_follows_active_coder(
+def test_partial_repo_detail_omits_quota_counters_for_active_and_idle_coders(
     two_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
     state: RepoState,
@@ -2459,10 +2431,9 @@ def test_partial_repo_detail_rate_limit_badge_follows_active_coder(
 
     assert response.status_code == 200
     body = response.text
-    for needle in present:
-        assert needle in body
-    for needle in absent:
+    for needle in (*present, *absent):
         assert needle not in body
+    assert "data-resource-chips" not in body
 
 
 def test_cli_log_route_returns_log(
@@ -3769,15 +3740,6 @@ def _claude_state(
     )
 
 
-def test_resource_zone_boundaries() -> None:
-    assert _resource_zone(69.9) == "green"
-    assert _resource_zone(70.0) == "yellow"
-    assert _resource_zone(89.9) == "yellow"
-    assert _resource_zone(90.0) == "red"
-    assert _resource_zone(100.0) == "red"
-    assert _resource_zone(None) == "none"
-
-
 def test_format_reset_unix_smart_switches_relative_and_absolute() -> None:
     assert _format_reset_unix(0) == "unknown"
     assert _format_reset_unix(None) == "unknown"
@@ -3812,110 +3774,7 @@ def test_format_reset_unix_smart_switches_relative_and_absolute() -> None:
     )
 
 
-def test_build_resources_view_missing_data_renders_neutral() -> None:
-    """No GitHub or coder data anywhere → all six chips render as none."""
-    view = asyncio.run(_build_resources_view(_FakeRedis(), []))
-
-    assert set(view) == {
-        "github_rest",
-        "github_graphql",
-        "claude_5h",
-        "claude_weekly",
-        "codex_5h",
-        "codex_weekly",
-    }
-    for chip in view.values():
-        assert chip["remaining"] is None
-        assert chip["percent_used"] is None
-        assert chip["zone"] == "none"
-
-
-def test_build_resources_view_populates_github_buckets_independently() -> None:
-    """REST and GraphQL chips must come from their own keys, not the constrained min."""
-    redis = _make_bucket_redis(rest_remaining=4500, graphql_remaining=1000)
-
-    view = asyncio.run(_build_resources_view(redis, []))
-
-    assert view["github_rest"]["remaining"] == 4500
-    assert view["github_rest"]["percent_used"] == 10.0
-    assert view["github_rest"]["zone"] == "green"
-    assert view["github_graphql"]["remaining"] == 1000
-    assert view["github_graphql"]["percent_used"] == 80.0
-    assert view["github_graphql"]["zone"] == "yellow"
-    # Coder chips are still neutral when no matching state is provided.
-    assert view["claude_5h"]["zone"] == "none"
-    assert view["claude_weekly"]["zone"] == "none"
-    assert view["codex_5h"]["zone"] == "none"
-    assert view["codex_weekly"]["zone"] == "none"
-
-
-def test_build_resources_view_red_zone_when_buckets_near_exhaustion() -> None:
-    redis = _make_bucket_redis(rest_remaining=10, graphql_remaining=900)
-
-    view = asyncio.run(_build_resources_view(redis, []))
-
-    # 99.8% used → red.
-    assert view["github_rest"]["zone"] == "red"
-    # 82% used → yellow.
-    assert view["github_graphql"]["zone"] == "yellow"
-
-
-def test_build_resources_view_neutralizes_expired_bucket_snapshot() -> None:
-    """Snapshots whose ``reset_at`` has passed must render neutral, not red.
-
-    GitHub rolls the bucket over at ``reset_at``; a stale low-remaining
-    snapshot from before the rollover would otherwise hold a critical
-    chip indefinitely even though the daemon already stopped throttling.
-    """
-    expired_reset = datetime.now(timezone.utc) - timedelta(seconds=60)
-    redis = _make_bucket_redis(
-        rest_remaining=10, graphql_remaining=10, reset_at=expired_reset
-    )
-
-    view = asyncio.run(_build_resources_view(redis, []))
-
-    for key in ("github_rest", "github_graphql"):
-        assert view[key]["zone"] == "none"
-        assert view[key]["percent_used"] is None
-        assert view[key]["remaining"] is None
-        assert view[key]["reset_unix"] is None
-
-
-def test_build_resources_view_picks_most_recent_claude_state() -> None:
-    """Aggregation walks repos and uses the freshest Claude snapshot."""
-    older = _claude_state(
-        name="octo__a",
-        session_percent=10,
-        weekly_percent=5,
-        last_updated=datetime(2026, 1, 1, tzinfo=timezone.utc),
-    )
-    newer = _claude_state(
-        name="octo__b",
-        session_percent=70,
-        session_resets_at=1700000000,
-        weekly_percent=80,
-        weekly_resets_at=1700100000,
-        last_updated=datetime(2026, 5, 1, tzinfo=timezone.utc),
-    )
-    # A non-Claude state must be ignored even if it carries usage fields.
-    other = _claude_state(
-        name="octo__c",
-        coder="codex",
-        session_percent=99,
-        weekly_percent=99,
-        last_updated=datetime(2026, 6, 1, tzinfo=timezone.utc),
-    )
-
-    view = asyncio.run(_build_resources_view(_FakeRedis(), [older, newer, other]))
-
-    assert view["claude_5h"]["percent_used"] == 70.0
-    assert view["claude_5h"]["zone"] == "yellow"
-    assert view["claude_5h"]["reset_unix"] == 1700000000
-    assert view["claude_weekly"]["percent_used"] == 80.0
-    assert view["claude_weekly"]["zone"] == "yellow"
-
-
-def test_repo_detail_shows_chip_row_filtered_by_active_claude_coder(
+def test_repo_detail_omits_claude_quota_counters(
     two_repo_config: Path,
 ) -> None:
     stored = RepoState(
@@ -3933,17 +3792,12 @@ def test_repo_detail_shows_chip_row_filtered_by_active_claude_coder(
         "components/repo_summary.html"
     ).render(context)
 
-    assert 'data-resource="github_rest"' in rendered
-    assert 'data-resource="github_graphql"' in rendered
-    assert 'data-resource="claude_5h"' in rendered
-    assert 'data-resource="claude_weekly"' in rendered
-    assert 'data-resource="codex_5h"' not in rendered
-    assert 'data-resource="codex_weekly"' not in rendered
-    assert "Claude Session 27%" not in rendered
-    assert "|</span>" not in rendered
+    assert 'data-resource-chips' not in rendered
+    assert '27%' not in rendered
+    assert '42%' not in rendered
 
 
-def test_repo_detail_shows_codex_repo_chips(two_repo_config: Path) -> None:
+def test_repo_detail_omits_codex_quota_counters(two_repo_config: Path) -> None:
     stored = RepoState(
         url="https://github.com/example/alpha.git",
         name="example__alpha",
@@ -3959,127 +3813,15 @@ def test_repo_detail_shows_codex_repo_chips(two_repo_config: Path) -> None:
         "components/repo_summary.html"
     ).render(context)
 
-    assert 'data-resource="github_rest"' in rendered
-    assert 'data-resource="github_graphql"' in rendered
-    assert 'data-resource="codex_5h"' in rendered
-    assert 'data-resource="codex_weekly"' in rendered
-    assert 'data-resource="claude_5h"' not in rendered
-    assert 'data-resource="claude_weekly"' not in rendered
-    assert 'data-zone="red" data-resource="codex_5h"' in rendered
-    assert "92%" in rendered.split('data-resource="codex_5h"', 1)[1].split(
-        'data-resource="codex_weekly"', 1
-    )[0]
+    assert 'data-resource-chips' not in rendered
+    assert '92%' not in rendered
+    assert '35%' not in rendered
 
 
-def test_claude_usage_chip_returns_neutral_when_no_claude_state() -> None:
-    only_codex = _claude_state(coder="codex", session_percent=10, weekly_percent=10)
-    chip = _claude_usage_chip([only_codex], window="session")
-    assert chip["zone"] == "none"
-    assert chip["percent_used"] is None
-
-
-def test_codex_usage_chip_uses_codex_state() -> None:
-    codex = _claude_state(
-        coder="codex",
-        session_percent=92,
-        session_resets_at=1700000000,
-    )
-
-    chip = _codex_usage_chip([codex], window="session")
-
-    assert chip["percent_used"] == 92.0
-    assert chip["remaining"] == 8
-    assert chip["zone"] == "red"
-
-
-def test_claude_usage_chip_skips_states_without_window_data() -> None:
-    no_session = _claude_state(weekly_percent=20)
-    no_weekly = _claude_state(session_percent=20)
-    assert _claude_usage_chip([no_session], window="session")["zone"] == "none"
-    assert _claude_usage_chip([no_weekly], window="weekly")["zone"] == "none"
-
-
-def test_claude_usage_chip_excludes_inactive_repos() -> None:
-    """Disabled Claude repos must not win the freshness race.
-
-    Inactive runners stop refreshing usage fields but still bump
-    ``last_updated`` each publish, so without this gate a disabled repo's
-    stale snapshot would supplant the active account's current observation.
-    """
-    active = _claude_state(
-        name="octo__active",
-        session_percent=10,
-        session_resets_at=1700000000,
-        weekly_percent=15,
-        weekly_resets_at=1700100000,
-        last_updated=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        active=True,
-    )
-    inactive_newer = _claude_state(
-        name="octo__inactive",
-        session_percent=90,
-        session_resets_at=1700200000,
-        weekly_percent=95,
-        weekly_resets_at=1700300000,
-        last_updated=datetime(2026, 5, 1, tzinfo=timezone.utc),
-        active=False,
-    )
-
-    session = _claude_usage_chip(
-        [active, inactive_newer], window="session"
-    )
-    weekly = _claude_usage_chip(
-        [active, inactive_newer], window="weekly"
-    )
-
-    # Active repo's snapshot wins despite being older.
-    assert session["percent_used"] == 10.0
-    assert session["reset_unix"] == 1700000000
-    assert weekly["percent_used"] == 15.0
-    assert weekly["reset_unix"] == 1700100000
-
-
-def test_claude_usage_chip_neutral_when_only_candidate_inactive() -> None:
-    """Only inactive Claude repos available → render neutral, not stale data."""
-    only_inactive = _claude_state(
-        session_percent=20,
-        weekly_percent=30,
-        active=False,
-    )
-    assert (
-        _claude_usage_chip([only_inactive], window="session")["zone"] == "none"
-    )
-    assert (
-        _claude_usage_chip([only_inactive], window="weekly")["zone"] == "none"
-    )
-
-
-def test_build_recent_graphql_burns_view_returns_none_without_data() -> None:
-    assert (
-        asyncio.run(_build_recent_graphql_burns_view(_FakeRedis(), "octo__demo"))
-        is None
-    )
-
-
-def test_build_recent_graphql_burns_view_computes_avg_and_max() -> None:
-    from src.daemon.github_rate_limit import BURNS_REDIS_KEY_PREFIX
-
-    redis = _FakeRedis(
-        lists={f"{BURNS_REDIS_KEY_PREFIX}octo__demo": ["10", "20", "0"]}
-    )
-
-    view = asyncio.run(_build_recent_graphql_burns_view(redis, "octo__demo"))
-
-    assert view is not None
-    assert view["burns"] == [10, 20, 0]
-    assert view["max"] == 20
-    assert view["avg"] == 10.0
-
-
-def test_repo_template_context_exposes_recent_graphql_burns(
+def test_repo_template_context_omits_graphql_burns(
     two_repo_config: Path,
 ) -> None:
-    """The per-repo render context surfaces the burn summary when present."""
+    """Per-repo rendering no longer reads the removed quota diagnostics."""
     from src.daemon.github_rate_limit import BURNS_REDIS_KEY_PREFIX
 
     stored = RepoState(
@@ -4094,17 +3836,13 @@ def test_repo_template_context_exposes_recent_graphql_burns(
 
     context = asyncio.run(web_app._repo_template_context("example__alpha", fake))
 
-    assert context["recent_graphql_burns"] == {
-        "burns": [7, 13],
-        "avg": 10.0,
-        "max": 13,
-    }
+    assert "recent_graphql_burns" not in context
 
 
-def test_repo_summary_renders_recent_graphql_burns(
+def test_repo_summary_omits_recent_graphql_burns(
     two_repo_config: Path,
 ) -> None:
-    """The detail page surfaces avg/max without breaking the existing layout."""
+    """Removing quota diagnostics preserves the task and PR layout."""
     from src.daemon.github_rate_limit import BURNS_REDIS_KEY_PREFIX
 
     stored = RepoState(
@@ -4122,8 +3860,8 @@ def test_repo_summary_renders_recent_graphql_burns(
         "components/repo_summary.html"
     ).render(context)
 
-    assert "data-recent-graphql-burns" in rendered
-    assert "GraphQL/cycle: avg 15.0 (max 20)" in rendered
+    assert "data-recent-graphql-burns" not in rendered
+    assert "GraphQL/cycle" not in rendered
     # Existing Current Task / Current PR layout still intact.
     assert "Current Task" in rendered
     assert "Current PR" in rendered

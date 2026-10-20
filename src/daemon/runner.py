@@ -3108,7 +3108,8 @@ class PipelineRunner(
         self.state.coder = active_coder
         if self.repo_config.active:
             provider = self._usage_provider_for(active_coder)
-            snap = await self._fetch_usage_snapshot(active_coder)
+            snapshots = await self._publish_usage_observations()
+            snap = snapshots.get(active_coder)
             if snap is not None:
                 self.state.usage_session_percent = snap.session_percent
                 self.state.usage_session_resets_at = snap.session_resets_at

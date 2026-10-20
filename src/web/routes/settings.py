@@ -58,6 +58,7 @@ from src.web.services.config_writer import (
 )
 from src.web.services.model_catalog import ModelCatalogSnapshot
 from src.web.services.repo_state import _find_repo_config_by_name
+from src.web.services.usage import usage_publication_interval, usage_settings_context
 
 router = APIRouter()
 
@@ -737,6 +738,10 @@ async def _settings_daemon_template_context(
     return {
         "daemon": cfg.daemon,
         "repos": cfg.repositories,
+        **await usage_settings_context(
+            getattr(request.app.state, "redis", None), registry.coder_names(),
+            cfg.daemon.usage_api_cache_ttl_sec, usage_publication_interval(cfg),
+        ),
         "coders": _build_coder_rows(
             cfg,
             auth,
@@ -824,6 +829,10 @@ async def settings_page(request: Request) -> HTMLResponse:
             "repos": cfg.repositories,
             "daemon": cfg.daemon,
             "coders": coder_rows,
+            **await usage_settings_context(
+                getattr(request.app.state, "redis", None), registry.coder_names(),
+                cfg.daemon.usage_api_cache_ttl_sec, usage_publication_interval(cfg),
+            ),
             "auth": auth,
             "selectable_coders": selectable_coders,
             "selectable_coder_ids": {
@@ -839,6 +848,20 @@ async def settings_page(request: Request) -> HTMLResponse:
             ),
             "sandbox_actual_state": _sandbox_actual_state(cfg.daemon),
         },
+    )
+
+
+@router.get("/partials/settings/usage", response_class=HTMLResponse)
+async def partial_settings_usage(request: Request) -> HTMLResponse:
+    cfg = load_config(_app.CONFIG_PATH)
+    registry = request.app.state.coder_registry
+    context = await usage_settings_context(
+        getattr(request.app.state, "redis", None), registry.coder_names(),
+        cfg.daemon.usage_api_cache_ttl_sec, usage_publication_interval(cfg),
+    )
+    return _app.templates.TemplateResponse(
+        request, "components/settings_usage_refresh.html",
+        {**context, "coders": registry.list_coders()},
     )
 
 

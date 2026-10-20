@@ -16,7 +16,7 @@ import re
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator
 
 import redis.asyncio as aioredis
 from fastapi import APIRouter, Request
@@ -42,12 +42,6 @@ from src.cancellation.storage import (
 )
 from src.coders import build_coder_registry
 from src.config import AppConfig, RepoConfig, load_config
-from src.daemon.github_rate_limit import (
-    RateLimitBudget,
-    read_graphql_budget,
-    read_rest_budget,
-    recent_cycle_burns,
-)
 from src.events.sse import format_sse_comment, format_sse_event
 from src.github import gh_runner
 from src.github import prs as gh_prs
@@ -220,19 +214,6 @@ def _repo_coder_label(coder: str | None, registry: Any) -> str:
     return ""
 
 
-def _active_rate_limit_coder(
-    state: RepoState, effective_coder: str
-) -> str | None:
-    """Return the active coder whose rate-limit data should be shown."""
-    if state.current_task is None:
-        return None
-    if state.coder:
-        return state.coder
-    if effective_coder == "any":
-        return None
-    return effective_coder
-
-
 def _active_repo_coder(state: RepoState) -> str | None:
     """Return the runtime coder only while a repo is actively executing work."""
     if state.current_task is None or state.state not in _ACTIVE_RUN_STATES:
@@ -252,11 +233,6 @@ def _invocation_snapshot_view(
         ),
         "phase_label": snapshot.phase.upper(),
     }
-
-
-def _coder_rate_limit_supported(coder: str | None) -> bool:
-    """Return whether ``coder`` has meaningful rate-limit usage data."""
-    return coder in {"claude", "codex"}
 
 
 _GUARDRAIL_EXCERPT_MAX_CHARS = 200
@@ -490,176 +466,6 @@ async def _build_guardrail_pending_view(
     return views
 
 
-
-async def _build_recent_graphql_burns_view(
-    redis_client: aioredis.Redis | None,
-    repo_name: str,
-) -> dict[str, Any] | None:
-    """Return the recent GraphQL cycle-burn summary for ``repo_name``.
-
-    Returns ``None`` when no cycle burns have been recorded yet so the
-    template can hide the inline metric. ``avg`` and ``max`` are computed
-    here for dashboard convenience and rounded so the display is stable
-    across renders.
-    """
-    burns = await recent_cycle_burns(redis_client, repo_name)
-    if not burns:
-        return None
-    avg = sum(burns) / len(burns)
-    return {
-        "burns": burns,
-        "avg": round(avg, 1),
-        "max": max(burns),
-    }
-
-
-def _resource_zone(percent_used: float | None) -> str:
-    """Map ``percent_used`` to one of ``green|yellow|red|none``.
-
-    Boundaries: ``<70`` green, ``70<=pct<90`` yellow, ``>=90`` red. ``None``
-    (resource value unknown) collapses to ``none`` so the chip can render
-    a neutral placeholder rather than mis-coloring a missing reading.
-    """
-    if percent_used is None:
-        return "none"
-    if percent_used < 70:
-        return "green"
-    if percent_used < 90:
-        return "yellow"
-    return "red"
-
-
-def _budget_chip(
-    budget: RateLimitBudget | None,
-    *,
-    now: datetime | None = None,
-) -> dict[str, Any]:
-    if budget is None:
-        return {
-            "remaining": None,
-            "limit": None,
-            "percent_used": None,
-            "reset_unix": None,
-            "zone": "none",
-        }
-    # Snapshots whose ``reset_at`` has already passed describe a window
-    # GitHub has since rolled over. The remaining/limit pair is no longer
-    # informative — the daemon stops throttling once ``now >= reset_at`` —
-    # so render the chip as neutral until the next successful probe rather
-    # than letting a stale low-remaining reading hold a critical zone.
-    current = now if now is not None else datetime.now(timezone.utc)
-    if budget.reset_at <= current:
-        return {
-            "remaining": None,
-            "limit": None,
-            "percent_used": None,
-            "reset_unix": None,
-            "zone": "none",
-        }
-    pct_used = max(0.0, min(100.0, 100.0 - float(budget.remaining_percent)))
-    return {
-        "remaining": budget.remaining,
-        "limit": budget.limit,
-        "percent_used": round(pct_used, 1),
-        "reset_unix": int(budget.reset_at.timestamp()),
-        "zone": _resource_zone(pct_used),
-    }
-
-
-def _coder_usage_chip(
-    states: list[RepoState],
-    *,
-    coder: Literal["claude", "codex"],
-    window: Literal["session", "weekly"],
-) -> dict[str, Any]:
-    """Aggregate coder usage across active repos for the chip row.
-
-    Coder repos share one account so any active coder state's
-    snapshot is representative of the whole account. The most recently
-    updated one wins so the chip reflects the freshest observation.
-
-    Inactive repos are excluded: their usage fields are not refreshed by the
-    runner once ``repo_config.active`` flips false, but ``last_updated`` is
-    still bumped each publish cycle. Without this gate, a disabled repo's
-    stale snapshot can win the timestamp race and the chip would render an
-    outdated percentage/reset for the live account.
-    """
-    candidate: RepoState | None = None
-    for state in states:
-        if (state.coder or "") != coder:
-            continue
-        if not state.active:
-            continue
-        if window == "session" and state.usage_session_percent is None:
-            continue
-        if window == "weekly" and state.usage_weekly_percent is None:
-            continue
-        if candidate is None or state.last_updated > candidate.last_updated:
-            candidate = state
-    if candidate is None:
-        return {
-            "remaining": None,
-            "limit": None,
-            "percent_used": None,
-            "reset_unix": None,
-            "zone": "none",
-        }
-    if window == "session":
-        used = candidate.usage_session_percent or 0
-        reset_unix = candidate.usage_session_resets_at
-    else:
-        used = candidate.usage_weekly_percent or 0
-        reset_unix = candidate.usage_weekly_resets_at
-    pct_used = max(0.0, min(100.0, float(used)))
-    return {
-        "remaining": int(round(100.0 - pct_used)),
-        "limit": 100,
-        "percent_used": round(pct_used, 1),
-        "reset_unix": reset_unix,
-        "zone": _resource_zone(pct_used),
-    }
-
-
-def _claude_usage_chip(
-    states: list[RepoState],
-    *,
-    window: Literal["session", "weekly"],
-) -> dict[str, Any]:
-    return _coder_usage_chip(states, coder="claude", window=window)
-
-
-def _codex_usage_chip(
-    states: list[RepoState],
-    *,
-    window: Literal["session", "weekly"],
-) -> dict[str, Any]:
-    return _coder_usage_chip(states, coder="codex", window=window)
-
-
-async def _build_resources_view(
-    redis_client: aioredis.Redis | None,
-    states: list[RepoState],
-) -> dict[str, dict[str, Any]]:
-    """Return the resource payload for the dashboard chip row.
-
-    Each entry exposes ``remaining``, ``limit``, ``percent_used``,
-    ``reset_unix`` and a precomputed ``zone`` (``green|yellow|red|none``).
-    Missing data renders as ``percent_used: None`` plus ``zone: none``
-    rather than crashing the dashboard or hiding the chip.
-    """
-    rest = await read_rest_budget(redis_client)
-    graphql = await read_graphql_budget(redis_client)
-    now = datetime.now(timezone.utc)
-    return {
-        "github_rest": _budget_chip(rest, now=now),
-        "github_graphql": _budget_chip(graphql, now=now),
-        "claude_5h": _claude_usage_chip(states, window="session"),
-        "claude_weekly": _claude_usage_chip(states, window="weekly"),
-        "codex_5h": _codex_usage_chip(states, window="session"),
-        "codex_weekly": _codex_usage_chip(states, window="weekly"),
-    }
-
-
 async def _repo_template_context(
     name: str,
     redis_client: aioredis.Redis | None,
@@ -678,16 +484,6 @@ async def _repo_template_context(
     )
     repo_config = _find_repo_config_by_name(config, name)
     effective_coder = _effective_coder_name(repo_config, config)
-    active_rate_limit_coder = _active_rate_limit_coder(state, effective_coder)
-    show_rate_limit_badge = _coder_rate_limit_supported(active_rate_limit_coder) and (
-        state.usage_session_percent is not None
-        or state.usage_weekly_percent is not None
-        or state.usage_api_degraded
-    )
-    recent_graphql_burns = await _build_recent_graphql_burns_view(
-        redis_client, name
-    )
-    resources = await _build_resources_view(redis_client, [state])
     guardrail_pending = await _build_guardrail_pending_view(
         redis_client, name, state
     )
@@ -714,8 +510,6 @@ async def _repo_template_context(
         registry = build_coder_registry()
     return {
         "repo": state,
-        "recent_graphql_burns": recent_graphql_burns,
-        "resources": resources,
         "guardrail_pending": guardrail_pending,
         "publication_migration_binding": migration_token,
         "publication_migration_confirmable": (
@@ -727,11 +521,6 @@ async def _repo_template_context(
         "daemon": config.daemon,
         "coders": _selectable_coder_plugins(registry),
         "effective_coder": effective_coder,
-        "active_rate_limit_coder": active_rate_limit_coder,
-        "active_rate_limit_coder_label": (
-            "Claude" if active_rate_limit_coder == "claude" else "Codex"
-        ),
-        "show_rate_limit_badge": show_rate_limit_badge,
         "selected_repo_coder": selected_repo_coder,
         "selected_repo_coder_label": _repo_coder_label(
             selected_repo_coder, registry
@@ -1612,7 +1401,6 @@ async def index(request: Request) -> HTMLResponse:
     stats = _compute_stats(states)
     alerts = _build_alerts(states)
     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
-    resources = await _build_resources_view(redis_client, states)
     panic_state = await _read_panic_state_for_banner(redis_client)
     cancellation_subsources = await _build_cancellation_subsources(
         redis_client, states
@@ -1630,8 +1418,7 @@ async def index(request: Request) -> HTMLResponse:
             "stats": stats,
             "latest_alert": latest_alert,
             "redis_warning": redis_warning,
-            "resources": resources,
-            "page_rendered_at": page_rendered_at,
+                "page_rendered_at": page_rendered_at,
             "panic_state": panic_state,
             "cancellation_subsources": cancellation_subsources,
             "subsource_lookup": _subsource_lookup,
@@ -2052,7 +1839,6 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
     )
     states = await _attach_upload_pending_counts(states, redis_client)
     config = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
-    resources = await _build_resources_view(redis_client, states)
     cancellation_subsources = await _build_cancellation_subsources(
         redis_client, states
     )
@@ -2065,8 +1851,7 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
         {
             "repos": states,
             "redis_warning": redis_warning,
-            "resources": resources,
-            "cancellation_subsources": cancellation_subsources,
+                "cancellation_subsources": cancellation_subsources,
             "subsource_lookup": _subsource_lookup,
             "drain_progress": drain_progress,
             "inhibitor_labels": INHIBITOR_LABELS,

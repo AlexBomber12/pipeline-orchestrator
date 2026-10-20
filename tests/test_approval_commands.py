@@ -1225,9 +1225,10 @@ async def test_successive_approvals_retain_only_independently_approved_findings(
 @pytest.mark.parametrize("unified", [False, True])
 @pytest.mark.parametrize("limit", ["rate", "spend"])
 async def test_coder_limits_do_not_block_approved_watch(approval, monkeypatch, single, unified, limit):
-    from types import SimpleNamespace
+    import time
 
     from src.inhibitor import derive_active_inhibitors
+    from src.usage import UsageSnapshot
 
     runner, command, _, _ = approval
     runner.repo_config.feature_flags.use_single_error_exit = single
@@ -1237,8 +1238,10 @@ async def test_coder_limits_do_not_block_approved_watch(approval, monkeypatch, s
     else:
         runner.app_config.daemon.spend_ceiling_session_percent = 80
         runner.state.usage_session_percent = 90
-        snapshot = SimpleNamespace(
-            session_percent=90, session_resets_at=None, weekly_percent=0, weekly_resets_at=None,
+        now = time.time()
+        snapshot = UsageSnapshot(
+            session_percent=90, session_resets_at=int(now + 600),
+            weekly_percent=0, weekly_resets_at=int(now + 900), fetched_at=now,
         )
         for provider in (runner._claude_usage_provider, runner._codex_usage_provider):
             monkeypatch.setattr(provider, "fetch", lambda: snapshot)

@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+import pytest
 from src.usage import OAuthUsageProvider, OpenAIUsageProvider
 
 
@@ -717,3 +718,39 @@ class TestOpenAIProviderConcurrency:
                 assert elapsed < 0.5, f"state reads blocked on HTTP: {elapsed}s"
                 release.set()
                 fetch_future.result(timeout=5.0)
+
+
+@pytest.mark.parametrize("missing", ["primary_window", "secondary_window"])
+@pytest.mark.parametrize("value", [None, {}, {"used_percent": 20}])
+def test_openai_preserves_other_window_when_one_is_absent(tmp_path, missing, value):
+    provider = _make_openai_provider(tmp_path, creds={"tokens": {"access_token": "tok"}})
+    data = {"rate_limit": {
+        "primary_window": {"used_percent": 0, "reset_at": 1900000000},
+        "secondary_window": {"used_percent": 73, "reset_at": 1900000600},
+    }}
+    data["rate_limit"][missing] = value
+    with patch.object(httpx, "get", return_value=_mock_openai_response(json_data=data)):
+        result = provider.fetch()
+    assert result is not None
+    assert provider.consecutive_failures == 0
+    assert result.session_percent == (None if missing == "primary_window" else 0)
+    assert result.weekly_percent == (None if missing == "secondary_window" else 73)
+
+
+def test_claude_preserves_session_when_weekly_is_absent(tmp_path):
+    provider = _make_provider(tmp_path, creds={"accessToken": "tok"})
+    data = {"five_hour": {"utilization": 25, "resets_at": "2030-01-01T00:00:00Z"}, "seven_day": None}
+    with patch.object(httpx, "get", return_value=_mock_response(json_data=data)):
+        result = provider.fetch()
+    assert result.session_percent == 25
+    assert result.weekly_percent is None
+
+
+@pytest.mark.parametrize("window", [[], {"used_percent": True, "reset_at": 123},
+    {"used_percent": 20, "reset_at": False}, {"used_percent": -1, "reset_at": 123},
+    {"used_percent": 101, "reset_at": 123}, {"used_percent": 10, "reset_at": 0}])
+def test_invalid_openai_window_never_fabricates_quota(tmp_path, window):
+    provider = _make_openai_provider(tmp_path, creds={"tokens": {"access_token": "tok"}})
+    response = _mock_openai_response(json_data={"rate_limit": {"primary_window": window}})
+    with patch.object(httpx, "get", return_value=response):
+        assert provider.fetch() is None

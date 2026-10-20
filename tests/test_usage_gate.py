@@ -204,3 +204,23 @@ def test_no_config_field_deleted() -> None:
     assert cfg.usage_gate_spend_ceiling_session_percent == 72
     assert cfg.usage_gate_spend_ceiling_weekly_percent == 87
     assert cfg.spend_ceiling_warning_percent == 67
+
+
+@pytest.mark.parametrize("session,weekly", [(None, 95), (95, None), (None, None)])
+def test_partial_snapshots_keep_available_window_enforcement(session, weekly):
+    runner = h._make_runner()
+    snapshot = UsageSnapshot(session, 1900000000 if session is not None else None,
+        weekly, 1900000600 if weekly is not None else None, 1700000000)
+    runner._claude_usage_provider = h._FakeUsageProvider(snapshot=snapshot)
+    runner.app_config.daemon.rate_limit_session_pause_percent = 80
+    runner.app_config.daemon.rate_limit_weekly_pause_percent = 80
+    expected = session is None and weekly is None
+    assert asyncio.run(runner.usage_gate(proactive_coder="claude")) is expected
+    assert (runner.state.state != PipelineState.PAUSED) is expected
+    runner.app_config.daemon.spend_ceiling_session_percent = 80
+    runner.app_config.daemon.spend_ceiling_weekly_percent = 80
+    assert (runner._spend_ceiling_threshold_breach(snapshot) is None) is expected
+    runner.app_config.daemon.guardrail_notification_webhook_url = "https://example.test/hook"
+    runner.app_config.daemon.spend_ceiling_session_percent = None
+    runner.app_config.daemon.spend_ceiling_weekly_percent = None
+    asyncio.run(runner._maybe_send_ceiling_warning("claude", snapshot))
