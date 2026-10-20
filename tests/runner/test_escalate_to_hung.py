@@ -468,6 +468,23 @@ def test_commit_task_status_change_truncates_long_reason(
     )
 
 
+def test_status_write_adds_frontmatter_to_legacy_task(tmp_path: Path) -> None:
+    repo = _make_repo_with_task(tmp_path, "PR-706")
+    task_path = repo / "tasks" / "PR-706.md"
+    task_path.write_text(task_path.read_text().split("---\n\n", 1)[1])
+    _git(repo, "add", "tasks/PR-706.md")
+    _git(repo, "commit", "-m", "legacy task without frontmatter")
+    _git(repo, "push", "origin", "main")
+    runner = _status_runner(repo)
+    task = QueueTask(
+        pr_id="PR-706", title="t", status=TaskStatus.DOING,
+        branch="pr-test", task_file="tasks/PR-706.md",
+    )
+
+    assert asyncio.run(runner._commit_task_status_change(task, "DONE", "merged"))
+    assert _remote_task(repo, "PR-706").startswith("---\nstatus: DONE\n---\n\n# PR-706")
+
+
 @pytest.mark.parametrize("detached", [False, True])
 def test_status_write_preserves_coder_checkout_and_index(
     tmp_path: Path, detached: bool

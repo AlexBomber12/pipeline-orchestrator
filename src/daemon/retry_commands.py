@@ -87,11 +87,12 @@ class RetryCommandMixin:
                 raise ValueError("checkout origin differs from configured repository")
             with tempfile.TemporaryDirectory(prefix="fix-timeout-status-") as temporary:
                 isolated = str(Path(temporary) / "repo")
+                git_ops._git(temporary, "init", "--quiet", isolated)
+                git_ops._git(isolated, "remote", "add", "origin", self.repo_config.url)
                 git_ops._git(
-                    temporary, "clone", "--no-checkout", "--origin", "origin",
-                    "--", self.repo_config.url, isolated, timeout=60,
+                    isolated, "fetch", "--depth=1", "--filter=blob:none",
+                    "origin", base, timeout=120,
                 )
-                git_ops._git(isolated, "fetch", "origin", base, timeout=60)
                 git_ops._git(isolated, "checkout", "--detach", "-f", "FETCH_HEAD")
                 tracked = Path(isolated) / path
                 if tracked.is_symlink() or not tracked.is_file():

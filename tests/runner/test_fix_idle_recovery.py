@@ -402,9 +402,19 @@ async def test_timeout_admission_reads_remote_base_after_isolated_status_write(
         runner, "_remote_frontmatter_error_status_for_current_task",
         type(runner)._remote_frontmatter_error_status_for_current_task.__get__(runner),
     )
+    git_calls: list[tuple[str, ...]] = []
+    original_git = retry_module.git_ops._git
+
+    def record_git(repo_path: str, *args: str, **kwargs):
+        git_calls.append(args)
+        return original_git(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(retry_module.git_ops, "_git", record_git)
     assert runner._remote_frontmatter_error_status_for_current_task() == (
         "error", SuppressionReason.FIX_IDLE_TIMEOUT
     ), runner.state.history
+    assert not any("clone" in args for args in git_calls)
+    assert sum(args[:3] == ("fetch", "--depth=1", "--filter=blob:none") for args in git_calls) == 1
 
     await runner.handle_error()
 
