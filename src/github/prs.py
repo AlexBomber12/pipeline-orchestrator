@@ -139,8 +139,8 @@ class PRDiscovery:
 def get_exact_pr_outcome(repo: str, base_branch: str, number: int, head_sha: str) -> ExactPROutcome:
     """Read one PR by identity, including terminal outcomes absent from open lists.
 
-    A cached ETag response older than the merged-list TTL is not fresh enough
-    to authorize a terminal decision. Callers can retry UNKNOWN later.
+    Evidence must have been fetched or successfully revalidated within the
+    merged-list TTL to authorize a terminal decision. Callers can retry UNKNOWN later.
     """
 
     def unknown(reason: str) -> ExactPROutcome:

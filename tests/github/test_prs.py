@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import subprocess
-from datetime import datetime, timezone
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -135,6 +137,56 @@ def test_merged_discovery_rejects_identity_mismatch(
 def test_merged_discovery_rejects_non_mapping_page_entry(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cache, "_etag_get", lambda path: ["bad"])
     assert gh_prs.get_merged_prs_discovery("octo/demo", "main").complete is False
+
+
+@pytest.mark.parametrize("stderr_304", [False, True])
+@pytest.mark.parametrize("reader", ["exact", "discovery"])
+def test_pr_readers_accept_successful_revalidation_after_ttl(
+    monkeypatch: pytest.MonkeyPatch, reader: str, stderr_304: bool,
+) -> None:
+    clock = datetime(2026, 10, 1, tzinfo=timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: object = None) -> datetime:
+            return clock
+
+    monkeypatch.setattr(cache, "datetime", Clock)
+    monkeypatch.setattr(gh_prs, "datetime", Clock)
+    monkeypatch.setattr(cache, "_etag_cache", OrderedDict())
+    payload = {
+        "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
+        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "merge_commit_sha": "b" * 40, "state": "closed", "merged": True,
+    }
+    calls: list[list[str]] = []
+
+    def transport(args: list[str]) -> str:
+        calls.append(args)
+        if any("If-None-Match" in arg for arg in args):
+            if stderr_304:
+                raise RuntimeError("gh: HTTP 304")
+            return "HTTP/2.0 304 Not Modified\r\n\r\n"
+        # Discovery walks a full first page and a short second page.
+        body = payload if reader == "exact" else ([payload] * 100 if args[1].endswith("page=1") else [])
+        return 'HTTP/2.0 200 OK\r\nETag: "v1"\r\n\r\n' + json.dumps(body)
+
+    monkeypatch.setattr(cache.gh_runner, "run_gh", transport)
+    for _ in range(3):
+        if reader == "exact":
+            result = gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40)
+            assert result.state == gh_prs.ExactPRState.MERGED
+            assert result.merge_commit_sha == "b" * 40
+        else:
+            discovery = gh_prs.get_merged_prs_discovery("octo/demo", "main")
+            assert discovery.complete is True
+            assert len(discovery.prs) == 100
+            assert all(pr.number == 42 and pr.merge_commit_sha == "b" * 40 for pr in discovery.prs)
+        assert all(entry.observed_at == clock for entry in cache._etag_cache.values())
+        clock += timedelta(seconds=61)
+    page_count = 1 if reader == "exact" else 2
+    assert len(calls) == 3 * page_count
+    assert all('If-None-Match: "v1"' in args for args in calls[page_count:])
 
 
 class _FakeCompletedProcess:
