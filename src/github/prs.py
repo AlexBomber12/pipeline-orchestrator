@@ -601,6 +601,9 @@ def _merged_pr_infos(raw: list[dict], base_branch: str | None, *, strict: bool =
             raise ValueError("base mismatch")
         if entry.get("merged_at") in (None, ""):
             continue
+        merged_at = _parse_iso(entry.get("merged_at"))
+        if strict and merged_at is None:
+            raise ValueError("malformed merge timestamp")
         base = entry.get("base") or {}
         if base_branch and base.get("ref") != base_branch:
             continue
@@ -625,7 +628,7 @@ def _merged_pr_infos(raw: list[dict], base_branch: str | None, *, strict: bool =
                 pr_id=extract_queue_pr_id(title),
                 url="",
                 is_cross_repository=bool(head_repo.get("fork", False)),
-                last_activity=_parse_iso(entry.get("merged_at")),
+                last_activity=merged_at,
                 head_sha=head.get("sha", "") if isinstance(head.get("sha"), str) else "",
                 merge_commit_sha=entry.get("merge_commit_sha")
                 if isinstance(entry.get("merge_commit_sha"), str)

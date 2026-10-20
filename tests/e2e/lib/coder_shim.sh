@@ -168,6 +168,11 @@ safe_push_branch() {
 run_success() {
     local pr="$1" branch="$2"
     git_setup_branch "${branch}"
+    # Publish the base first so branch creation and the implementation push
+    # cannot share GitHub's second-resolution activity timestamp. An ambiguous
+    # publication correctly blocks WATCH even with allow_merge_without_review.
+    safe_push_branch "${branch}"
+    sleep 2
     write_marker_and_commit "${pr}"
     safe_push_branch "${branch}"
     local pr_url

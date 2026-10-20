@@ -139,6 +139,24 @@ def test_merged_discovery_rejects_non_mapping_page_entry(monkeypatch: pytest.Mon
     assert gh_prs.get_merged_prs_discovery("octo/demo", "main").complete is False
 
 
+@pytest.mark.parametrize("merged_at", ["invalid", 123, True, [], {}])
+def test_merged_discovery_rejects_malformed_merge_timestamp(
+    monkeypatch: pytest.MonkeyPatch, merged_at: object,
+) -> None:
+    valid = {
+        "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
+        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "merge_commit_sha": "b" * 40,
+    }
+    monkeypatch.setattr(cache, "_etag_get", lambda path: [valid, {**valid, "merged_at": merged_at}])
+    result = gh_prs.get_merged_prs_discovery("octo/demo", "main")
+    assert result.complete is False
+    assert result.prs == []
+    assert result.reason == "malformed entry"
+    # Compatibility callers retain their permissive timestamp behavior.
+    assert gh_prs._merged_pr_infos([{**valid, "merged_at": merged_at}], "main")[0].last_activity is None
+
+
 @pytest.mark.parametrize("stderr_304", [False, True])
 @pytest.mark.parametrize("reader", ["exact", "discovery"])
 def test_pr_readers_accept_successful_revalidation_after_ttl(
