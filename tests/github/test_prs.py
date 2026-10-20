@@ -6,9 +6,107 @@ from typing import Any
 
 import pytest
 from src.config import AppConfig, DaemonConfig, TrustedReviewerIdentity
+from src.github import cache
 from src.github import prs as gh_prs
 from src.github.reviewer_policy import ReviewerPolicy
 from src.models import ReviewStatus
+
+
+@pytest.mark.parametrize(
+    ("state", "merged", "merge_sha", "expected"),
+    [
+        ("open", False, None, gh_prs.ExactPRState.OPEN),
+        ("closed", False, None, gh_prs.ExactPRState.CLOSED),
+        ("closed", True, "b" * 40, gh_prs.ExactPRState.MERGED),
+        ("closed", True, None, gh_prs.ExactPRState.UNKNOWN),
+    ],
+)
+def test_exact_pr_outcome_by_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+    merged: bool,
+    merge_sha: str | None,
+    expected: gh_prs.ExactPRState,
+) -> None:
+    payload = {
+        "number": 42,
+        "base": {"ref": "main"},
+        "head": {"sha": "a" * 40},
+        "state": state,
+        "merged": merged,
+        "merge_commit_sha": merge_sha,
+    }
+    monkeypatch.setattr(cache, "_etag_get", lambda path: payload)
+    result = gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40)
+    assert result.state == expected
+    assert result.discovery_complete is (expected != gh_prs.ExactPRState.UNKNOWN)
+    assert result.merge_commit_sha == (merge_sha if expected == gh_prs.ExactPRState.MERGED else None)
+    payload["base"] = {"ref": "release"}
+    assert gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40).state == gh_prs.ExactPRState.UNKNOWN
+
+
+def test_exact_pr_outcome_permission_error_and_stale_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    def denied(path: str) -> object:
+        raise RuntimeError("HTTP 403")
+
+    monkeypatch.setattr(cache, "_etag_get", denied)
+    assert gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40).state == gh_prs.ExactPRState.UNKNOWN
+    monkeypatch.setattr(
+        cache,
+        "_etag_get",
+        lambda path: {
+            "number": 42,
+            "base": {"ref": "main"},
+            "head": {"sha": "a" * 40},
+            "state": "closed",
+            "merged": False,
+        },
+    )
+    monkeypatch.setattr(
+        cache, "_etag_payload_observed_at", lambda path, payload: datetime(2020, 1, 1, tzinfo=timezone.utc)
+    )
+    assert gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40).state == gh_prs.ExactPRState.UNKNOWN
+
+
+def test_merged_discovery_rejects_truncated_and_malformed_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+    path = "repos/octo/demo/pulls?state=closed&base=main&per_page=100"
+    calls: list[str] = []
+
+    def page(url: str) -> object:
+        calls.append(url)
+        if url.endswith("page=1"):
+            return [{"number": n} for n in range(100)]
+        raise RuntimeError("HTTP 403")
+
+    monkeypatch.setattr(cache, "_etag_get", page)
+    result = gh_prs.get_merged_prs_discovery("octo/demo", "main")
+    assert result.complete is False and result.prs == []
+    assert calls == [f"{path}&page=1", f"{path}&page=2"]
+    monkeypatch.setattr(cache, "_etag_get", lambda url: [{"number": 1, "merged_at": "2026-01-01"}])
+    assert gh_prs.get_merged_prs_discovery("octo/demo", "main").complete is False
+
+
+def test_merged_discovery_accepts_complete_identity_and_rejects_stale_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = [{
+        "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
+        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "merge_commit_sha": "b" * 40,
+    }]
+    monkeypatch.setattr(cache, "_etag_get", lambda path: payload)
+    result = gh_prs.get_merged_prs_discovery("octo/demo", "main")
+    assert result.complete is True
+    assert (result.repo, result.base_branch) == ("octo/demo", "main")
+    assert [(pr.number, pr.head_sha, pr.merge_commit_sha) for pr in result.prs] == [
+        (42, "a" * 40, "b" * 40)
+    ]
+    monkeypatch.setattr(
+        cache, "_etag_payload_observed_at",
+        lambda path, payload: datetime(2020, 1, 1, tzinfo=timezone.utc),
+    )
+    stale = gh_prs.get_merged_prs_discovery("octo/demo", "main")
+    assert stale.complete is False and stale.reason == "stale cache"
 
 
 class _FakeCompletedProcess:
@@ -23,9 +121,7 @@ def test_get_branch_publications_uses_targeted_bounded_query(
     calls: list[tuple[list[str], str | None, int]] = []
     sha = "a" * 40
 
-    def fake_run_gh(
-        args: list[str], repo: str | None = None, timeout: int = 30
-    ) -> list[object]:
+    def fake_run_gh(args: list[str], repo: str | None = None, timeout: int = 30) -> list[object]:
         calls.append((args, repo, timeout))
         return [
             {
@@ -55,14 +151,10 @@ def test_get_branch_publications_uses_targeted_bounded_query(
 
     monkeypatch.setattr(gh_prs.gh_runner, "run_gh", fake_run_gh)
 
-    [publication] = gh_prs.get_branch_publications(
-        "octo/demo", "main", "feat/publication"
-    )
+    [publication] = gh_prs.get_branch_publications("octo/demo", "main", "feat/publication")
 
     assert publication.is_verified_ready is True
-    assert publication.created_at == datetime(
-        2026, 10, 4, 12, tzinfo=timezone.utc
-    )
+    assert publication.created_at == datetime(2026, 10, 4, 12, tzinfo=timezone.utc)
     assert publication.to_pr_info().head_sha == sha
     args, repo, timeout = calls[0]
     assert repo == "octo/demo"
@@ -100,9 +192,7 @@ def test_get_branch_publications_rejects_non_list_payload(
         ({}, True),
     ],
 )
-def test_branch_publication_requires_verifiable_ready_evidence(
-    overrides: dict[str, object], verified: bool
-) -> None:
+def test_branch_publication_requires_verifiable_ready_evidence(overrides: dict[str, object], verified: bool) -> None:
     values: dict[str, object] = {
         "number": 7,
         "title": "PR-007: ready",
@@ -225,11 +315,7 @@ def test_get_open_prs_snapshots_reviewer_policy_once_per_poll(
         nonlocal config_loads
         config_loads += 1
         return AppConfig(
-            daemon=DaemonConfig(
-                trusted_reviewer_identities=[
-                    TrustedReviewerIdentity(user_id=123, login="codex[bot]")
-                ]
-            )
+            daemon=DaemonConfig(trusted_reviewer_identities=[TrustedReviewerIdentity(user_id=123, login="codex[bot]")])
         )
 
     monkeypatch.setattr(gh_prs, "load_config", fake_load_config)

@@ -87,6 +87,9 @@ class PRInfo(BaseModel):
     # without re-fetching PR metadata. Empty string when the upstream
     # ``gh`` payload omitted the SHA.
     head_sha: str = ""
+    # A positive merge commit is evidence of the terminal outcome, not an
+    # inference from the PR disappearing from the open list.
+    merge_commit_sha: str | None = None
     # Transient publication observation from the current GitHub status poll.
     publication_observed: bool = False
     publication_at: datetime | None = None

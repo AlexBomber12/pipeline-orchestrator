@@ -284,9 +284,7 @@ def _gh_api_paginated_evidence(path: str) -> PaginatedEvidence:
         if not isinstance(runs, list):
             return PaginatedEvidence(items, False, len(items) == 0, "malformed")
         fetched += len(runs)
-        expected_total, complete = _pagination_complete(
-            raw.get("total_count"), expected_total, len(runs), fetched
-        )
+        expected_total, complete = _pagination_complete(raw.get("total_count"), expected_total, len(runs), fetched)
         if complete is not None:
             return PaginatedEvidence(
                 items,
@@ -330,9 +328,7 @@ def _etag_get_object_pages_evidence(path: str, list_field: str) -> PaginatedEvid
         try:
             raw = retry_transient(lambda u=url: _etag_get(u), operation_name=f"gh api {url}")
         except RuntimeError as exc:
-            return PaginatedEvidence(
-                items, False, fetched == 0, str(exc), min(observed_at) if observed_at else None
-            )
+            return PaginatedEvidence(items, False, fetched == 0, str(exc), min(observed_at) if observed_at else None)
         source_payload = raw
         if isinstance(raw, str):
             try:
@@ -340,14 +336,10 @@ def _etag_get_object_pages_evidence(path: str, list_field: str) -> PaginatedEvid
             except json.JSONDecodeError:
                 raw = None
         if not isinstance(raw, dict):
-            return PaginatedEvidence(
-                items, False, fetched == 0, "malformed", min(observed_at) if observed_at else None
-            )
+            return PaginatedEvidence(items, False, fetched == 0, "malformed", min(observed_at) if observed_at else None)
         page_items = raw.get(list_field)
         if not isinstance(page_items, list):
-            return PaginatedEvidence(
-                items, False, fetched == 0, "malformed", min(observed_at) if observed_at else None
-            )
+            return PaginatedEvidence(items, False, fetched == 0, "malformed", min(observed_at) if observed_at else None)
 
         page_observed_at = _etag_payload_observed_at(url, source_payload) or requested_at
         observed_at.append(page_observed_at)
@@ -393,30 +385,42 @@ def _etag_get_paginated(path: str) -> list[dict] | None:
     Wraps each per-page ``_etag_get`` in ``retry_transient`` to match the
     transient-retry semantics callers had under the legacy slurp path.
     """
+    result = _etag_get_paginated_evidence(path)
+    if result.error is not None and not result.items:
+        if result.error not in {"missing page", "malformed page", "malformed entry"}:
+            raise RuntimeError(result.error)
+        return None
+    return result.items
+
+
+def _etag_get_paginated_evidence(path: str) -> PaginatedEvidence:
+    """Walk the existing ETag pages and retain completeness and observation age."""
     sep = "&" if "?" in path else "?"
     per_page_match = re.search(r"(?:^|[?&])per_page=(\d+)", path)
     per_page = int(per_page_match.group(1)) if per_page_match else _ETAG_PAGINATED_DEFAULT_PER_PAGE
     items: list[dict] = []
+    observed_at: list[datetime] = []
     for page_num in itertools.count(1):
         url = f"{path}{sep}page={page_num}"
+        requested_at = datetime.now(timezone.utc)
         try:
             payload = retry_transient(
                 lambda u=url: _etag_get(u),
                 operation_name=f"gh api {url}",
             )
-        except RuntimeError:
-            if page_num == 1:
-                raise
-            break
+        except (RuntimeError, OSError) as exc:
+            return PaginatedEvidence(items, False, not items, str(exc), min(observed_at) if observed_at else None)
         if payload is None:
-            if page_num == 1:
-                return None
-            break
+            return PaginatedEvidence(items, False, not items, "missing page", min(observed_at) if observed_at else None)
         if not isinstance(payload, list):
-            if page_num == 1:
-                return None
-            break
-        items.extend(item for item in payload if isinstance(item, dict))
+            return PaginatedEvidence(
+                items, False, not items, "malformed page", min(observed_at) if observed_at else None
+            )
+        if any(not isinstance(item, dict) for item in payload):
+            return PaginatedEvidence(
+                items, False, not items, "malformed entry", min(observed_at) if observed_at else None
+            )
+        observed_at.append(_etag_payload_observed_at(url, payload) or requested_at)
+        items.extend(payload)
         if len(payload) < per_page:
-            break
-    return items
+            return PaginatedEvidence(items, True, not items, observed_at=min(observed_at))
