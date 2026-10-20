@@ -1910,7 +1910,13 @@ class PipelineRunner(
         else:
             record.cause_subsource = None
         record.run_phase = run_phase or self._run_phase_for_metrics(exit_reason)
-        record.head_sha = self._git_rev_parse("HEAD")
+        pr = self.state.current_pr
+        # Merge cleanup and fresh-clone recovery can run on the base branch.
+        # The retained PR identity supplies the head proved merged by GitHub.
+        record.head_sha = (
+            pr.head_sha if exit_reason == "success_merged" and pr is not None
+            and pr.head_sha else self._git_rev_parse("HEAD")
+        )
         if exit_reason in ("success_merged", "coding_complete", "closed_unmerged"):
             resolved_base_branch = base_branch or self.repo_config.branch or "main"
             stats = diff_stats

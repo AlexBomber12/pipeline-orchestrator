@@ -4,7 +4,7 @@ The log lives at ``<analytics_dir>/<year>-<month>.jsonl`` where
 ``analytics_dir`` defaults to ``/data/analytics`` and may be overridden
 via the ``PO_ANALYTICS_DIR`` environment variable for tests and
 multi-tenant deployments. Writes are guarded by an exclusive
-``fcntl.flock`` on the partition file to make concurrent appends from
+``fcntl.flock`` on a shared lock file to make concurrent appends from
 multiple daemon processes safe (low contention in practice — at most one
 merge per repo per cycle — but the lock keeps the contract honest if the
 daemon ever forks per repo).
@@ -65,7 +65,7 @@ def _resolve_partition_when(record: dict) -> datetime:
 
 
 def log_merged_pr(pr_data: dict) -> None:
-    """Validate ``pr_data`` against the outcome schema and append to JSONL.
+    """Validate and append one outcome per repository/task identity.
 
     The caller assembles every field defined in ``OUTCOME_FIELDS``; this
     function does not invent values. Fields with no available data must
@@ -93,13 +93,21 @@ def log_merged_pr(pr_data: dict) -> None:
         ensure_ascii=False,
     )
 
-    # Open in append mode so a concurrent writer cannot truncate. Acquire
-    # an exclusive lock for the duration of the single write+newline so
-    # two appends never interleave bytes within one line.
-    with open(target, "a", encoding="utf-8") as handle:
+    # Recovery may replay after the append but before clearing task ownership.
+    # Lock across partitions: a replay can occur in a later month, and must
+    # detect the original row before appending. Existing logs supply the
+    # durable completion key without a second, crash-sensitive marker write.
+    with open(analytics_dir / ".outcomes.lock", "a", encoding="utf-8") as lock:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
-            handle.write(serialized + "\n")
-            handle.flush()
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            for partition in analytics_dir.glob("*.jsonl"):
+                with open(partition, encoding="utf-8") as existing:
+                    for line in existing:
+                        if json.loads(line)["task_id_hash"] == record["task_id_hash"]:
+                            return
+            with open(target, "a", encoding="utf-8") as handle:
+                handle.write(serialized + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
         finally:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)

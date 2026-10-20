@@ -685,10 +685,68 @@ def test_recovered_merge_stats_use_retained_head_from_base_checkout(
     assert runner.state.state == PipelineState.IDLE
     assert len(fetches) == {"retained": 0, "fresh": 1, "fetch_failure": 2, "wrong_head": 2}[checkout]
     assert record.exit_reason == "success_merged"
+    assert record.head_sha == head
+    saved = asyncio.run(runner._metrics_store.get(record.run_id))
+    assert saved.head_sha == head
     assert record.files_touched_count == 1
     assert record.diff_lines_added == 2
     assert record.diff_lines_deleted == 0
     assert record.languages_touched == ["python"]
+
+
+def test_restart_after_outcome_append_logs_once(monkeypatch, isolate_analytics_dir):
+    """A process exit after the append leaves a replayable cleanup snapshot."""
+    import json
+    from unittest.mock import AsyncMock
+
+    from src.analytics import log_merged_pr
+    from src.keyspace import pipeline_state
+    from src.metrics import MetricsStore
+    from src.models import RepoState
+
+    h._patch_subprocess(monkeypatch)
+    original = h._make_runner()
+    original.state.current_task = QueueTask(
+        pr_id="PR-401", title="Merge", branch="pr-401", status=TaskStatus.DOING,
+    )
+    original.state.current_pr = PRInfo(
+        number=629, pr_id="PR-401", branch="pr-401", head_sha="a" * 40,
+    )
+    original.state.state = PipelineState.MERGE
+    original._start_current_run_record("claude", "opus")
+    run_id = original._current_run_record.run_id
+
+    def append_then_exit(record):
+        log_merged_pr(record)
+        raise SystemExit("crash before clearing task")
+
+    monkeypatch.setattr(merge_module, "log_merged_pr", append_then_exit)
+    with pytest.raises(SystemExit, match="crash before clearing task"):
+        asyncio.run(original._finish_confirmed_merge({"files_touched_count": 1}))
+
+    runner = h._make_runner()
+    runner.redis = original.redis
+    runner._metrics_store = MetricsStore(runner.redis)
+    runner.state = RepoState.model_validate_json(
+        runner.redis.store[pipeline_state(runner.name)],
+    )
+    assert runner.state.merge_phase == "post_merge_cleanup"
+    assert runner.state.current_task.pr_id == "PR-401"
+    assert runner._current_run_record is None
+    monkeypatch.setattr(merge_module, "log_merged_pr", log_merged_pr)
+    monkeypatch.setattr(runner, "_confirm_remote_merge", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner, "_compute_diff_stats", lambda *a: {"files_touched_count": 1})
+    asyncio.run(runner.handle_merge())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    saved = asyncio.run(runner._metrics_store.get(run_id))
+    assert saved.exit_reason == "success_merged"
+    assert saved.head_sha == "a" * 40
+    rows = [json.loads(line) for path in isolate_analytics_dir.glob("*.jsonl")
+            for line in path.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["pr_id"] == "PR-401"
 
 
 def test_done_header_retains_recoverable_run_without_pipeline_snapshot(monkeypatch):
