@@ -1809,12 +1809,18 @@ class PipelineRunner(
                 record = await self._metrics_store.get(run_id)
                 recent = [record] if record is not None else []
             else:
-                recent = await self._metrics_store.recent(
-                    task_id=task.pr_id, limit=20, repo_name=self.name,
-                )
+                # The recency index is shared by all PR tasks in this repo.
+                # Unrelated runs must not suppress task-index recovery.
+                recent = [
+                    record for record in await self._metrics_store.recent(
+                        task_id=task.pr_id, limit=20, repo_name=self.name,
+                    )
+                    if record.task_id == task.pr_id and record.repo_name == self.name
+                ]
                 if not recent:
                     recent = sorted(
-                        await self._metrics_store.list_task_runs(self.name, task.pr_id),
+                        (record for record in await self._metrics_store.list_task_runs(self.name, task.pr_id)
+                         if record.task_id == task.pr_id and record.repo_name == self.name),
                         key=lambda record: (record.started_at, record.run_id), reverse=True,
                     )
             self._current_run_record = next(

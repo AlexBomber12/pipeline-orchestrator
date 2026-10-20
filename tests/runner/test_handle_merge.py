@@ -525,7 +525,8 @@ def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeyp
 
 
 @pytest.mark.parametrize("bound", [False, True])
-def test_confirmed_merge_reconstructs_missing_accounting_before_done(monkeypatch, bound):
+@pytest.mark.parametrize("unrelated_recent", [False, True])
+def test_confirmed_merge_reconstructs_missing_accounting_before_done(monkeypatch, bound, unrelated_recent):
     from unittest.mock import AsyncMock
 
     runner = h._make_runner()
@@ -541,8 +542,16 @@ def test_confirmed_merge_reconstructs_missing_accounting_before_done(monkeypatch
     invocation = runner.state.active_invocation
     runner._current_run_record = None
     monkeypatch.setattr(runner._metrics_store, "get", AsyncMock(return_value=None))
-    monkeypatch.setattr(runner._metrics_store, "recent", AsyncMock(return_value=[]))
-    monkeypatch.setattr(runner._metrics_store, "list_task_runs", AsyncMock(return_value=[]))
+    if unrelated_recent:
+        from dataclasses import replace
+
+        runner._start_current_run_record("claude", "opus")
+        unrelated = replace(runner._current_run_record, task_id="PR-999")
+        runner._current_run_record = None
+    recent = AsyncMock(return_value=[unrelated] if unrelated_recent else [])
+    task_runs = AsyncMock(return_value=[])
+    monkeypatch.setattr(runner._metrics_store, "recent", recent)
+    monkeypatch.setattr(runner._metrics_store, "list_task_runs", task_runs)
     save = AsyncMock(side_effect=RuntimeError("checkpoint unavailable"))
     monkeypatch.setattr(runner._metrics_store, "save", save)
     status = AsyncMock(return_value=True)
@@ -565,6 +574,11 @@ def test_confirmed_merge_reconstructs_missing_accounting_before_done(monkeypatch
     assert task.status == TaskStatus.DOING
     status.assert_not_awaited()
     save.assert_awaited_once_with(record)
+    if bound:
+        recent.assert_not_awaited()
+        task_runs.assert_not_awaited()
+    else:
+        task_runs.assert_awaited_once_with(runner.name, task.pr_id)
 
     save.side_effect = None
     save.reset_mock()
