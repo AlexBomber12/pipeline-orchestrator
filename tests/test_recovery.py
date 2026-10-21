@@ -627,6 +627,7 @@ def test_recover_legacy_size_error_from_git_and_pr(
     )
     runner = _make_runner()
     runner.repo_path = str(repo)
+    monkeypatch.setattr(recovery_module, "checkout_process_blocker", lambda _: None)
     if saved_watch:
         runner.redis.store[pipeline_state(runner.name)] = RepoState(
             name=runner.name, url=runner.repo_config.url, state=PipelineState.WATCH,
@@ -741,6 +742,7 @@ def test_legacy_size_recovery_fetches_external_pr_head(
     )
     runner = _make_runner()
     runner.repo_path = str(repo)
+    monkeypatch.setattr(recovery_module, "checkout_process_blocker", lambda _: None)
     assert asyncio.run(runner.recover_state()) is True
     assert runner.state.state == PipelineState.WATCH
     assert git(repo, "show-ref") == before_refs
@@ -796,6 +798,8 @@ def test_legacy_size_recovery_waits_for_checkout_safety(
     )
     runner = _make_runner()
     runner.repo_path = str(repo)
+    if blocker != "process":
+        monkeypatch.setattr(recovery_module, "checkout_process_blocker", lambda _: None)
     assert asyncio.run(runner.recover_state()) is False
     assert runner._crashed_task_pr_ids == set()
     assert git(repo, "rev-parse", "HEAD") == before_head
