@@ -10,6 +10,7 @@ import pytest
 from src.coders import claude as claude_plugin_module
 from src.daemon import git_ops
 from src.daemon.handlers import coding as coding_module
+from src.daemon.quarantine import continued_size_label
 from src.github import gh_runner
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
@@ -93,6 +94,18 @@ def test_happy_path_pr_exists_transitions_to_watch(
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 42
+
+
+def test_coding_defers_when_size_marker_cannot_be_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(monkeypatch)
+    marker = continued_size_label("a" * 40)
+    runner.state.current_pr = PRInfo(number=42, branch="pr-001", quarantine_labels={marker})
+    monkeypatch.setattr(gh_runner, "run_gh", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
+    asyncio.run(runner.handle_coding())
+    assert runner.state.current_pr.quarantine_labels == {marker}
+    assert any("marker removal deferred" in item["event"] for item in runner.state.history)
 
 
 def test_case_a_no_branch_no_remote_parks_in_error(

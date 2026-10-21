@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from src.audit.operator_actions import write_operator_action_audit
@@ -26,13 +27,23 @@ _CATEGORY_LABEL_ALIASES = {
 }
 
 OBSOLETE_SIZE_LABEL = "quarantine:large_diff"
-CONTINUED_SIZE_LABEL = "quarantine:large_diff_continued"
-SIZE_RECOVERY_LABELS = {OBSOLETE_SIZE_LABEL, CONTINUED_SIZE_LABEL}
+CONTINUED_SIZE_PREFIX = "size-ok:"
+
+
+def continued_size_label(head_sha: str) -> str:
+    """Identify the exact PR revision whose size decision was continued."""
+    if re.fullmatch(r"[0-9a-fA-F]{40}", head_sha) is None:
+        raise ValueError("A published PR HEAD is required for size continuation")
+    return f"{CONTINUED_SIZE_PREFIX}{head_sha.lower()}"
+
+
+def is_continued_size_label(label: str) -> bool:
+    return label.startswith(CONTINUED_SIZE_PREFIX)
 
 
 def blocking_quarantine_labels(labels: set[str]) -> set[str]:
     """Ignore only the former size decision; retain every other quarantine."""
-    return labels - SIZE_RECOVERY_LABELS
+    return {label for label in labels if label != OBSOLETE_SIZE_LABEL and not is_continued_size_label(label)}
 
 
 def quarantine_label_for_category(category: str) -> str:

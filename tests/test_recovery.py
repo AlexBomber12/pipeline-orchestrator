@@ -13,7 +13,7 @@ import pytest
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
-from src.daemon.quarantine import CONTINUED_SIZE_LABEL, OBSOLETE_SIZE_LABEL, SIZE_RECOVERY_LABELS
+from src.daemon.quarantine import OBSOLETE_SIZE_LABEL, continued_size_label
 from src.daemon.runner import PipelineRunner
 from src.keyspace import pipeline_state
 from src.models import (
@@ -576,17 +576,14 @@ def test_recovery_marks_error_tasks_in_crashed_set(
     assert runner.state.current_queue[0].status == TaskStatus.ERROR
 
 
-@pytest.mark.parametrize("labels", [
-    {OBSOLETE_SIZE_LABEL},
-    {CONTINUED_SIZE_LABEL},
-    SIZE_RECOVERY_LABELS,
-    {OBSOLETE_SIZE_LABEL, "quarantine:workflow"},
+@pytest.mark.parametrize("label_kind", [
+    "obsolete", "continued", "both", "workflow",
 ])
 @pytest.mark.parametrize("published_spec_changed", [False, True])
 @pytest.mark.parametrize("head_missing", [False, True])
 @pytest.mark.parametrize("saved_watch", [False, True])
 def test_recover_legacy_size_error_from_git_and_pr(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, labels: set[str],
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label_kind: str,
     published_spec_changed: bool, head_missing: bool, saved_watch: bool,
 ) -> None:
     repo = tmp_path / "repo"
@@ -615,9 +612,17 @@ def test_recover_legacy_size_error_from_git_and_pr(
     git(repo, "add", ".")
     git(repo, "commit", "-m", "published work")
     git(repo, "push", "-u", "origin", "pr-100-size")
+    head_sha = "a" * 40 if head_missing else git(repo, "rev-parse", "HEAD")
+    labels = {OBSOLETE_SIZE_LABEL}
+    if label_kind in ("continued", "both"):
+        labels.add(continued_size_label(head_sha))
+    if label_kind == "continued":
+        labels.remove(OBSOLETE_SIZE_LABEL)
+    if label_kind == "workflow":
+        labels.add("quarantine:workflow")
     pr = PRInfo(
         number=100, branch="pr-100-size", pr_id="PR-100",
-        head_sha="a" * 40 if head_missing else git(repo, "rev-parse", "HEAD"),
+        head_sha=head_sha,
         quarantine_labels=labels,
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [pr])
@@ -639,10 +644,10 @@ def test_recover_legacy_size_error_from_git_and_pr(
         ).model_dump_json()
     completed = asyncio.run(runner.recover_state())
 
-    if head_missing and labels <= SIZE_RECOVERY_LABELS:
+    if head_missing and label_kind != "workflow":
         assert completed is False
         assert runner._crashed_task_pr_ids == set()
-    elif labels <= SIZE_RECOVERY_LABELS and not published_spec_changed:
+    elif label_kind != "workflow" and not published_spec_changed:
         assert runner.state.state == PipelineState.WATCH
         assert runner.state.current_pr.number == 100
         assert runner.state.current_queue[0].status == TaskStatus.DOING
@@ -654,7 +659,9 @@ def test_recover_legacy_size_error_from_git_and_pr(
     assert "status: ERROR" in task_path.read_text()
 
 
-@pytest.mark.parametrize("saved", ["missing", "malformed", "error", "suppressed"])
+@pytest.mark.parametrize("saved", [
+    "missing", "malformed", "error", "suppressed", "blank_head", "invalid_head", "stale_marker",
+])
 def test_legacy_size_recovery_preserves_unverified_state(
     tmp_path: Path, saved: str,
 ) -> None:
@@ -669,6 +676,12 @@ def test_legacy_size_recovery_preserves_unverified_state(
         number=100, branch="pr-100-size", pr_id="PR-100",
         head_sha="a" * 40, quarantine_labels={"quarantine:large_diff"},
     )
+    if saved == "blank_head":
+        pr.head_sha = ""
+    elif saved == "invalid_head":
+        pr.head_sha = "invalid"
+    elif saved == "stale_marker":
+        pr.quarantine_labels = {continued_size_label("b" * 40)}
     runner = _make_runner()
     runner.repo_path = str(tmp_path)
     runner._recovery_task_headers = {task.pr_id: parse_existing_task_header(path)}
@@ -689,6 +702,9 @@ def test_legacy_size_recovery_preserves_unverified_state(
     tasks = [task]
     if saved == "missing":
         with pytest.raises(recovery_module.LegacySizeRecoveryDeferred, match="checkout is unavailable"):
+            asyncio.run(runner._recover_legacy_size_tasks(tasks, [pr]))
+    elif saved in ("blank_head", "invalid_head", "stale_marker"):
+        with pytest.raises(recovery_module.LegacySizeRecoveryDeferred):
             asyncio.run(runner._recover_legacy_size_tasks(tasks, [pr]))
     else:
         asyncio.run(runner._recover_legacy_size_tasks(tasks, [pr]))
@@ -733,7 +749,7 @@ def test_legacy_size_recovery_fetches_external_pr_head(
     before_refs = git(repo, "show-ref")
     pr = PRInfo(
         number=100, branch="pr-100-size", pr_id="PR-100", head_sha=head_sha,
-        quarantine_labels={CONTINUED_SIZE_LABEL},
+        quarantine_labels={continued_size_label(head_sha)},
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [pr])
     monkeypatch.setattr(
@@ -789,7 +805,7 @@ def test_legacy_size_recovery_waits_for_checkout_safety(
     before_refs = git(repo, "show-ref")
     pr = PRInfo(
         number=100, branch="pr-100-size", pr_id="PR-100", head_sha=published_head,
-        quarantine_labels={CONTINUED_SIZE_LABEL},
+        quarantine_labels={continued_size_label(published_head)},
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [pr])
     monkeypatch.setattr(
@@ -822,7 +838,7 @@ def test_legacy_size_recovery_defers_unavailable_git_evidence(
     )
     pr = PRInfo(
         number=100, branch="pr-100-size", pr_id="PR-100",
-        head_sha="a" * 40, quarantine_labels={CONTINUED_SIZE_LABEL},
+        head_sha="a" * 40, quarantine_labels={continued_size_label("a" * 40)},
     )
     runner = _make_runner()
     runner.repo_path = str(tmp_path)

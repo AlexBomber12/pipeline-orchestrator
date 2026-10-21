@@ -24,7 +24,7 @@ from src.approval_commands import (
 from src.cancellation.storage import CancellationCause, cause_key, index_key
 from src.daemon import approval_commands as daemon_approval
 from src.daemon.guardrails import GuardrailViolation
-from src.daemon.quarantine import CONTINUED_SIZE_LABEL, OBSOLETE_SIZE_LABEL
+from src.daemon.quarantine import OBSOLETE_SIZE_LABEL, continued_size_label
 from src.keyspace import control_stop, pipeline_state
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 
@@ -526,21 +526,23 @@ async def test_size_only_store_recovers_without_operator_approval(approval):
 
 async def test_size_recovery_removes_only_obsolete_github_label(approval, monkeypatch):
     runner, command, _, _ = approval
+    marker = continued_size_label(command.pr.head_sha)
     calls = []
     monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append((args, kwargs)))
     await runner._run_cycle_body()
     assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
     assert calls == [
-        (["label", "create", CONTINUED_SIZE_LABEL, "--color", "0E8A16",
+        (["label", "create", marker, "--color", "0E8A16",
           "--description", "Legacy size decision continued; CI and review still required"],
          {"repo": runner.owner_repo}),
-        (["pr", "edit", "42", "--add-label", CONTINUED_SIZE_LABEL], {"repo": runner.owner_repo}),
+        (["pr", "edit", "42", "--add-label", marker], {"repo": runner.owner_repo}),
         (["pr", "edit", "42", "--remove-label", OBSOLETE_SIZE_LABEL], {"repo": runner.owner_repo}),
     ]
 
 
 async def test_size_recovery_removes_label_missing_from_error_snapshot(approval, monkeypatch):
     runner, command, _, _ = approval
+    marker = continued_size_label(command.pr.head_sha)
     runner.state.current_pr.quarantine_labels.clear()
     await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
     calls = []
@@ -548,7 +550,7 @@ async def test_size_recovery_removes_label_missing_from_error_snapshot(approval,
     await runner._run_cycle_body()
     assert runner.state.state == PipelineState.WATCH
     assert [call[:4] for call in calls] == [
-        ["label", "create", CONTINUED_SIZE_LABEL, "--color"],
+        ["label", "create", marker, "--color"],
         ["pr", "edit", "42", "--add-label"],
         ["pr", "edit", "42", "--remove-label"],
     ]
@@ -849,7 +851,7 @@ async def test_legacy_label_suppression_recovers_only_matching_size_error(approv
     assert await runner.redis.get(cause_key(runner.name, "PR-42")) is None
     assert (await load_approval(runner.redis, runner.name, command.binding)) is None
     assert [call[:4] for call in calls] == [
-        ["label", "create", CONTINUED_SIZE_LABEL, "--color"],
+        ["label", "create", continued_size_label(command.pr.head_sha), "--color"],
         ["pr", "edit", "42", "--add-label"],
         ["pr", "edit", "42", "--remove-label"],
     ]
@@ -1567,7 +1569,7 @@ async def test_successive_approvals_retain_only_independently_approved_findings(
     changed = second.model_copy(deep=True)
     changed.pr.head_sha = "other-head"
     assert runner._unapproved_labels(changed, {"quarantine:large_diff"}) == set()
-    assert runner._unapproved_labels(changed, {CONTINUED_SIZE_LABEL}) == set()
+    assert runner._unapproved_labels(changed, {continued_size_label(second.pr.head_sha)}) == set()
     changed.pr.head_sha = second.pr.head_sha
     changed.task_fingerprint = "revised-specification"
     assert runner._unapproved_labels(changed, {"quarantine:large_diff"}) == set()

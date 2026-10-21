@@ -439,7 +439,7 @@ def get_open_prs(
         quarantine_labels = {
             label.get("name", "")
             for label in labels
-            if isinstance(label, dict) and (label.get("name") or "").startswith("quarantine:")
+            if isinstance(label, dict) and (label.get("name") or "").startswith(("quarantine:", "size-ok:"))
         }
         prs.append(
             PRInfo(
@@ -513,7 +513,7 @@ def _get_open_prs_rest(
         quarantine_labels = {
             label.get("name", "")
             for label in labels
-            if isinstance(label, dict) and (label.get("name") or "").startswith("quarantine:")
+            if isinstance(label, dict) and (label.get("name") or "").startswith(("quarantine:", "size-ok:"))
         }
         prs.append(
             PRInfo(

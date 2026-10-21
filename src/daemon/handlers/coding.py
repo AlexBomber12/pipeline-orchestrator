@@ -28,7 +28,7 @@ from src.coder_registry import CoderPlugin
 from src.daemon import git_ops
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers import CoderUnavailable
-from src.daemon.quarantine import apply_quarantine_label_for_violation
+from src.daemon.quarantine import apply_quarantine_label_for_violation, is_continued_size_label
 from src.daemon.selector import CoderSelectionUnavailable
 from src.github import cache as gh_cache
 from src.github import gh_runner
@@ -257,6 +257,22 @@ class CodingMixin:
                 log_prefix="[CODING]",
             )
             return
+
+        if self.state.current_pr is not None:
+            markers = {
+                label for label in self.state.current_pr.quarantine_labels
+                if is_continued_size_label(label)
+            }
+            for marker in sorted(markers):
+                try:
+                    gh_runner.run_gh(
+                        ["pr", "edit", str(self.state.current_pr.number), "--remove-label", marker],
+                        repo=self.owner_repo,
+                    )
+                except Exception as exc:
+                    self.log_event(f"[CODING] Size continuation marker removal deferred: {exc}")
+                    return
+            self.state.current_pr.quarantine_labels.difference_update(markers)
 
         # AUTO PR dispatch: read the task spec inline before invoking the
         # coder so the daemon supplies the canonical pr_id, task_file, and

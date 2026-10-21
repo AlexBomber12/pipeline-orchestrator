@@ -21,7 +21,7 @@ from src.daemon import (
 )
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers.breach import BreachMixin
-from src.daemon.quarantine import apply_quarantine_label_for_violation
+from src.daemon.quarantine import apply_quarantine_label_for_violation, is_continued_size_label
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.daemon.selector import CoderSelectionUnavailable
 from src.github import gh_runner
@@ -276,6 +276,22 @@ class FixMixin(BreachMixin):
             self.state.state = PipelineState.WATCH
             return
 
+        if self.state.current_pr is not None:
+            markers = {
+                label for label in self.state.current_pr.quarantine_labels
+                if is_continued_size_label(label)
+            }
+            for marker in sorted(markers):
+                try:
+                    gh_runner.run_gh(
+                        ["pr", "edit", str(self.state.current_pr.number), "--remove-label", marker],
+                        repo=self.owner_repo,
+                    )
+                except Exception as exc:
+                    self.log_event(f"[FIX] Size continuation marker removal deferred: {exc}")
+                    self.state.state = PipelineState.WATCH
+                    return
+            self.state.current_pr.quarantine_labels.difference_update(markers)
         self.state.state = PipelineState.FIX
         current_pr = self.state.current_pr
         if review_origin is not None and current_pr is not None:

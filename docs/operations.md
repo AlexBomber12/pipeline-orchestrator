@@ -180,10 +180,12 @@ After upgrading, a persisted `large_diff_threshold` cancellation for a bound
 open PR is reconciled through the same task, PR, HEAD, checkout, and process
 checks as an operator approval. A previously deferred approval resumes when
 those checks pass. Before removing the obsolete `quarantine:large_diff` label,
-the daemon adds the informational `quarantine:large_diff_continued` label as
-durable recovery evidence. Either size label lets an ERROR task with a matching
-published PR and task generation return to WATCH after Redis loss. Neither
-size label blocks CI or review; other quarantine labels still block.
+the daemon adds an informational `size-ok:<PR HEAD SHA>` label as durable
+recovery evidence. The old size label or a continuation label bound to the
+current PR HEAD lets an ERROR task with a matching published PR and task
+generation return to WATCH after Redis loss. A marker for an older HEAD parks
+recovery. Neither label blocks CI or review; other quarantine labels still
+block. The continuation marker is removed before a later coder dispatch.
 Startup recovery also checks the checkout for unpublished work and active
 processes. It fetches a missing verified PR HEAD without moving local refs;
 unavailable evidence leaves recovery pending for the next cycle.

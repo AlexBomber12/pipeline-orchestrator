@@ -32,7 +32,12 @@ from src.daemon.approval_commands import (
     checkout_process_blocker,
 )
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
-from src.daemon.quarantine import SIZE_RECOVERY_LABELS, blocking_quarantine_labels
+from src.daemon.quarantine import (
+    OBSOLETE_SIZE_LABEL,
+    blocking_quarantine_labels,
+    continued_size_label,
+    is_continued_size_label,
+)
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
 from src.models import (
@@ -935,11 +940,16 @@ class RecoveryMixin:
             return
         for index, task in candidates:
             pr = find_matching_open_pr(task.pr_id, task.branch, prs)
-            if (
-                pr is None or not pr.quarantine_labels
-                or not pr.quarantine_labels <= SIZE_RECOVERY_LABELS
-                or re.fullmatch(r"[0-9a-fA-F]{40}", pr.head_sha) is None
-            ):
+            if pr is None or not pr.quarantine_labels:
+                continue
+            markers = {label for label in pr.quarantine_labels if is_continued_size_label(label)}
+            if blocking_quarantine_labels(pr.quarantine_labels):
+                continue
+            if re.fullmatch(r"[0-9a-fA-F]{40}", pr.head_sha) is None:
+                raise LegacySizeRecoveryDeferred("live PR HEAD is unavailable")
+            if markers and markers != {continued_size_label(pr.head_sha)}:
+                raise LegacySizeRecoveryDeferred("size continuation marker belongs to another PR HEAD")
+            if not markers and OBSOLETE_SIZE_LABEL not in pr.quarantine_labels:
                 continue
             if persisted is not None and not (
                 persisted.state == PipelineState.WATCH

@@ -34,9 +34,10 @@ from src.cancellation.storage import CancellationCause, cause_key, index_key, ta
 from src.daemon import git_ops
 from src.daemon.fix_escalation import _is_label_already_exists_error
 from src.daemon.quarantine import (
-    CONTINUED_SIZE_LABEL,
     OBSOLETE_SIZE_LABEL,
     blocking_quarantine_labels,
+    continued_size_label,
+    is_continued_size_label,
     quarantine_label_for_category,
 )
 from src.github import gh_runner
@@ -577,10 +578,11 @@ class ApprovalCommandMixin:
             size_only
             and OBSOLETE_SIZE_LABEL in live_labels
         ):
+            marker = continued_size_label(command.pr.head_sha)
             try:
                 gh_runner.run_gh(
                     [
-                        "label", "create", CONTINUED_SIZE_LABEL, "--color", "0E8A16",
+                        "label", "create", marker, "--color", "0E8A16",
                         "--description", "Legacy size decision continued; CI and review still required",
                     ],
                     repo=self.owner_repo,
@@ -591,7 +593,7 @@ class ApprovalCommandMixin:
                     return
             try:
                 gh_runner.run_gh(
-                    ["pr", "edit", str(command.pr.number), "--add-label", CONTINUED_SIZE_LABEL],
+                    ["pr", "edit", str(command.pr.number), "--add-label", marker],
                     repo=self.owner_repo,
                 )
                 gh_runner.run_gh(
@@ -647,12 +649,16 @@ class ApprovalCommandMixin:
         return command
 
     def _approval_filtered_pr(self, pr: Any) -> Any:
+        # Keep the continuation marker visible for the next coder dispatch.
+        markers = {label for label in pr.quarantine_labels if is_continued_size_label(label)}
         command = self._current_approval(pr)
         if command is None:
-            return pr.model_copy(update={"quarantine_labels": blocking_quarantine_labels(pr.quarantine_labels)})
+            return pr.model_copy(update={
+                "quarantine_labels": blocking_quarantine_labels(pr.quarantine_labels) | markers,
+            })
         return pr.model_copy(
             update={
-                "quarantine_labels": self._unapproved_labels(command, pr.quarantine_labels),
+                "quarantine_labels": self._unapproved_labels(command, pr.quarantine_labels) | markers,
                 "is_escalated": False,
             }
         )

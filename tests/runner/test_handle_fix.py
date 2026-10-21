@@ -27,6 +27,7 @@ from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
 from src.daemon.handlers import fix as fix_module
 from src.daemon.handlers import hung as hung_module
+from src.daemon.quarantine import continued_size_label
 from src.daemon.runner import PipelineRunner
 from src.models import (
     CIStatus,
@@ -44,6 +45,24 @@ from src.usage import UsageSnapshot
 from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
+
+
+def test_handle_fix_defers_when_size_marker_cannot_be_removed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    marker = continued_size_label("a" * 40)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-size", head_sha="a" * 40,
+        quarantine_labels={marker},
+    )
+    monkeypatch.setattr(fix_module.gh_runner, "run_gh", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert marker in runner.state.current_pr.quarantine_labels
+    assert any("marker removal deferred" in item["event"] for item in runner.state.history)
 
 
 def test_handle_fix_defers_for_credential_login_without_counting_iteration(
