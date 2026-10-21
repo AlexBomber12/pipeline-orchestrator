@@ -224,20 +224,10 @@ class CodingMixin:
             _local_branch_head_sha, self.repo_path, attempt.branch,
         )
         if local_head is not None and local_head != attempt.head_sha:
-            # FIX already owns a remote PR. A local commit is not proof of a
-            # push; retain its known head until the exact remote read agrees.
+            # Keep the known remote head and persist the local candidate so
+            # reconciliation can retry after GitHub catches up with a push.
             if attempt.pr_number is not None:
-                try:
-                    outcome = await asyncio.to_thread(
-                        gh_prs.get_exact_pr_outcome,
-                        attempt.repo, attempt.base, attempt.pr_number, local_head,
-                    )
-                except Exception as exc:
-                    self.log_event(f"[INFRA] FIX head verification deferred: {exc}")
-                else:
-                    if outcome.discovery_complete and outcome.state == gh_prs.ExactPRState.OPEN:
-                        attempt.head_sha = local_head
-                        attempt.verified = False
+                attempt.unverified_head_sha = local_head
             else:
                 attempt.verified = False
                 attempt.head_sha = local_head
@@ -298,6 +288,21 @@ class CodingMixin:
                 or current.branch != attempt.branch or current.is_cross_repository
                 or current.pr_id not in {None, attempt.task_id}):
                 return False
+            if attempt.unverified_head_sha is not None:
+                try:
+                    candidate_outcome = await asyncio.to_thread(
+                        gh_prs.get_exact_pr_outcome,
+                        attempt.repo, attempt.base, attempt.pr_number,
+                        attempt.unverified_head_sha,
+                    )
+                except Exception as exc:
+                    self.log_event(f"[INFRA] FIX head verification deferred: {exc}")
+                else:
+                    if (candidate_outcome.discovery_complete
+                        and candidate_outcome.state == gh_prs.ExactPRState.OPEN):
+                        attempt.head_sha = attempt.unverified_head_sha
+                        attempt.unverified_head_sha = None
+                        attempt.verified = False
             outcome = await asyncio.to_thread(
                 gh_prs.get_exact_pr_outcome,
                 attempt.repo, attempt.base, attempt.pr_number, attempt.head_sha,
@@ -1298,6 +1303,15 @@ class CodingMixin:
             return
 
         if code != 0 and not (publication and publication.cancelled_by_publication):
+            attempt = self.state.publication_attempt
+            if attempt is not None and attempt.pr_number is None and attempt.candidate is None:
+                # A failed coder may never have pushed. Release only proven
+                # absence so ordinary failures remain eligible for Retry.
+                remote_exists = await asyncio.to_thread(
+                    _remote_branch_exists, self.repo_path, target_branch,
+                )
+                if remote_exists is False:
+                    attempt.pending = False
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
@@ -1311,15 +1325,6 @@ class CodingMixin:
                     f"{self.state.rate_limited_until.isoformat()}."
                 )
                 return
-            attempt = self.state.publication_attempt
-            if attempt is not None and attempt.pr_number is None and attempt.candidate is None:
-                # A failed coder may never have pushed. Release only proven
-                # absence so ordinary failures remain eligible for Retry.
-                remote_exists = await asyncio.to_thread(
-                    _remote_branch_exists, self.repo_path, target_branch,
-                )
-                if remote_exists is False:
-                    attempt.pending = False
             await self._transition_to_error(
                 stderr.strip() or f"{coder_name} exit {code}",
                 publish=False,

@@ -207,6 +207,7 @@ class PublicationAttempt(BaseModel):
     started_at: datetime
     baseline_numbers: set[int] | None = None
     head_sha: str | None = None
+    unverified_head_sha: str | None = None
     pr_number: int | None = None
     candidate: PRInfo | None = None
     pending: bool = True

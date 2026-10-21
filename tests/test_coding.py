@@ -1850,16 +1850,17 @@ def test_failed_fix_only_records_new_head_after_remote_verification(monkeypatch,
     assert pr.head_sha == remote["head"]
 
 
-@pytest.mark.parametrize("raises", [False, True])
-def test_fix_head_probe_failure_preserves_known_remote_head(monkeypatch, raises):
+@pytest.mark.parametrize("probe", ["stale", "unknown", "raises"])
+@pytest.mark.parametrize("pushed", [False, True])
+def test_fix_head_probe_failure_preserves_known_remote_head(monkeypatch, probe, pushed):
     runner = _runner(monkeypatch)
     remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
     asyncio.run(runner.handle_coding())
 
     async def failed_fix(*args, **kwargs):
         monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: "b" * 40)
-        remote["exact_unknown"] = True
-        if raises:
+        remote["exact_unknown"] = probe == "unknown"
+        if probe == "raises":
             def unavailable(*args, **kwargs):
                 raise OSError("exact probe unavailable")
             monkeypatch.setattr(coding_module.gh_prs, "get_exact_pr_outcome", unavailable)
@@ -1869,9 +1870,27 @@ def test_fix_head_probe_failure_preserves_known_remote_head(monkeypatch, raises)
     asyncio.run(runner.handle_fix())
     assert runner.state.publication_attempt.head_sha == "a" * 40
     assert runner.state.current_pr.head_sha == "a" * 40
+    assert runner.state.publication_attempt.unverified_head_sha == "b" * 40
+    # Persist/reload before GitHub exposes the pushed commit. No recapture of
+    # local git state should be required for reconciliation or operator Retry.
+    runner.state = type(runner.state).model_validate_json(runner.state.model_dump_json())
+    if pushed:
+        remote["head"] = "b" * 40
     remote["exact_unknown"] = False
     monkeypatch.setattr(coding_module.gh_prs, "get_exact_pr_outcome", _REAL_EXACT_OUTCOME)
     assert asyncio.run(runner._resolve_published_attempt())
+    assert runner.state.publication_attempt.head_sha == remote["head"]
+    assert runner.state.current_pr.head_sha == remote["head"]
+    assert runner.state.publication_attempt.unverified_head_sha == (None if pushed else "b" * 40)
+    assert runner.state.publication_attempt.failure == "fix failed"
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001", bound_pr=runner.state.current_pr)
+    continuation, pr = asyncio.run(runner._select_retry_continuation(command))
+    assert continuation == "watch"
+    assert pr.head_sha == remote["head"]
 
 
 def test_baseline_outage_defers_until_publication_can_be_reconciled(monkeypatch):
@@ -1894,3 +1913,37 @@ def test_baseline_outage_defers_until_publication_can_be_reconciled(monkeypatch)
     assert remote["calls"] == 1
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr.number == 402
+
+
+@pytest.mark.parametrize("remote_exists", [False, True, None])
+@pytest.mark.parametrize("local_exists", [False, True])
+def test_rate_limited_no_publication_releases_only_proven_absence(
+    monkeypatch, remote_exists, local_exists,
+):
+    from datetime import datetime, timedelta, timezone
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+
+    async def rate_limited(*args, **kwargs):
+        remote["calls"] += 1
+        return 1, "", "rate limit exceeded"
+
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", rate_limited)
+    _patch_branch_state(monkeypatch, local_exists=local_exists, remote_exists=False)
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha",
+                        lambda *a: "a" * 40 if local_exists else None)
+    monkeypatch.setattr(coding_module, "_remote_branch_exists", lambda *a: remote_exists)
+    asyncio.run(runner.handle_coding())
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.publication_attempt.pending is (remote_exists is not False)
+    assert runner.state.rate_limited_until is not None
+    if remote_exists is False:
+        # Expiry returns to IDLE without an unresolved-publication error hold.
+        expired = datetime.now(timezone.utc) - timedelta(seconds=1)
+        runner.state.rate_limited_until = expired
+        runner.state.rate_limited_coder_until = {"claude": expired}
+        asyncio.run(runner.handle_paused())
+        assert runner.state.state == PipelineState.IDLE
+        assert not asyncio.run(runner._hold_unresolved_publication())
+    assert remote["calls"] == 1
