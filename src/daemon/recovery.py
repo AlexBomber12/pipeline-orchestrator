@@ -751,6 +751,23 @@ class RecoveryMixin:
                 log_message=f"recover_state failed: {exc}",
             )
             return False
+        if any(
+            is_fixing_size_label(label)
+            for pr in prs for label in pr.quarantine_labels
+        ) and (Path(self.repo_path) / ".git").exists():
+            try:
+                base = self.repo_config.branch
+                if not base or base.startswith("-") or git_ops._git(
+                    self.repo_path, "check-ref-format", "--branch", base, check=False,
+                ).returncode != 0:
+                    raise ValueError("invalid configured base branch")
+                git_ops._git(
+                    self.repo_path, "fetch", "--no-tags", "origin",
+                    f"refs/heads/{base}:refs/remotes/origin/{base}", timeout=120,
+                )
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                self.log_event(f"[RECOVERY] Size FIX task header refresh deferred: {exc}")
+                return False
         # PR-266b crash-no-PR fix: the headers helper derives ``DOING``
         # via ``current_task_pr_id`` when no matching open PR exists.
         # ``state.current_task`` is reset on daemon restart, so without

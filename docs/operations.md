@@ -191,7 +191,8 @@ daemon adds `size-fix:<PR HEAD SHA>` while retaining the continuation marker.
 After a successful FIX it records `status: DOING` in the task header, binds
 the continuation marker to the resulting HEAD, and removes `size-fix` last.
 WATCH retries failed label cleanup; startup can recover from the durable DOING
-header. An unresolved FIX with an ERROR header remains parked. CODING with an
+header after fetching the latest base ref. An unresolved FIX with an ERROR
+header remains parked. CODING with an
 existing continuation PR returns to WATCH.
 Startup recovery also checks the checkout for unpublished work and active
 processes. It fetches a missing verified PR HEAD without moving local refs;

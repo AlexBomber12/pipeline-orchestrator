@@ -56,8 +56,8 @@ def complete_size_fix_marker(runner: "PipelineRunner", pr: "PRInfo") -> bool:
     fixing = {label for label in pr.quarantine_labels if is_fixing_size_label(label)}
     if not fixing:
         return True
-    marker = continued_size_label(pr.head_sha)
     try:
+        marker = continued_size_label(pr.head_sha)
         try:
             gh_runner.run_gh(
                 ["label", "create", marker, "--color", "0E8A16",
