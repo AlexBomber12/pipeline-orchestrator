@@ -123,6 +123,7 @@ class ExactPROutcome:
     discovery_complete: bool
     merge_commit_sha: str | None = None
     reason: str | None = None
+    merged_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -197,11 +198,36 @@ def get_exact_pr_outcome(repo: str, base_branch: str, number: int, head_sha: str
             ExactPRState.MERGED,
             True,
             merge_sha,
+            merged_at=_parse_iso(raw.get("merged_at")),
         )
     if merged is False and state in {"open", "closed"}:
         result = ExactPRState.OPEN if state == "open" else ExactPRState.CLOSED
         return ExactPROutcome(repo, base_branch, number, head_sha, result, True)
     return unknown("inconsistent state or missing merge commit")
+
+
+def get_pr_merge_admission(repo: str, number: int, head_sha: str) -> bool | None:
+    """Check queue/auto-merge admission after a failed command; unknown defers retry."""
+    owner, name = repo.split("/", 1)
+    query = """query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          headRefOid autoMergeRequest { enabledAt } mergeQueueEntry { id }
+        }
+      }
+    }"""
+    try:
+        result = gh_runner.run_gh([
+            "api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}",
+            "-f", f"name={name}", "-F", f"number={number}",
+        ])
+        pr = result["data"]["repository"]["pullRequest"]
+        if (result.get("errors") or pr["headRefOid"] != head_sha
+                or "autoMergeRequest" not in pr or "mergeQueueEntry" not in pr):
+            return None
+        return pr["autoMergeRequest"] is not None or pr["mergeQueueEntry"] is not None
+    except (RuntimeError, subprocess.TimeoutExpired, OSError, TypeError, KeyError):
+        return None
 
 
 class GitHubPollError(Exception):

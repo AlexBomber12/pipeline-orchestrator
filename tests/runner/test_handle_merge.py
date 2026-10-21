@@ -365,6 +365,7 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
         "number": 5, "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
         "head": {"sha": "a" * 40}, "state": "closed", "merged": True,
         "merge_commit_sha": "b" * 40,
+        "merged_at": "2020-01-31T23:59:00Z",
     }
     if case == "open":
         payload.update(state="open", merged=False)
@@ -404,7 +405,8 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
     monkeypatch.setattr(merge_module.gh_runner, "run_gh", transport)
     monkeypatch.setattr(runner, "_commit_task_status_change", status)
     monkeypatch.setattr(runner, "_save_current_run_record", save)
-    monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
+    analytics = []
+    monkeypatch.setattr(merge_module, "log_merged_pr", analytics.append)
     asyncio.run(runner.handle_merge())
     merge_calls = [args for args, _ in calls if args[:2] == ["pr", "merge"]]
     assert merge_calls == [["pr", "merge", "5", "--squash", "--delete-branch",
@@ -480,6 +482,7 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
         assert runner.state.state == PipelineState.IDLE
         assert writes[0][1] == "DONE"
         assert outcomes == ["success_merged"]
+        assert analytics[0]["merged_at"] == "2020-01-31T23:59:00+00:00"
         assert runner.state.current_queue[0].status == TaskStatus.DONE
 
 
@@ -838,3 +841,36 @@ def test_done_header_retains_recoverable_run_without_pipeline_snapshot(
     runner._metrics_store = MetricsStore(h._make_runner().redis)
     assert asyncio.run(runner._recover_header_merge_attempt([task], []))
     assert runner._persisted_merge_recovery is None
+
+@pytest.mark.parametrize("admission", [False, True, None])
+def test_failed_merge_command_retries_only_without_admission(monkeypatch, admission):
+    from unittest.mock import AsyncMock, Mock
+
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(merge_module.MergeMixin, "_confirm_remote_merge", _CONFIRM_REMOTE_MERGE)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.MERGE
+    runner.state.current_pr = PRInfo(number=5, branch="feature", head_sha="a" * 40,
+                                     is_cross_repository=True)
+    command = Mock(side_effect=RuntimeError("authentication failed"))
+    monkeypatch.setattr(merge_module.gh_prs, "merge_pr", command)
+    monkeypatch.setattr(merge_module.gh_prs, "get_exact_pr_outcome", lambda *a: merge_module.gh_prs.ExactPROutcome(
+        runner.owner_repo, "main", 5, "a" * 40, merge_module.gh_prs.ExactPRState.OPEN, True,
+    ))
+    probe = Mock(return_value=admission)
+    monkeypatch.setattr(merge_module.gh_prs, "get_pr_merge_admission", probe)
+    monkeypatch.setattr(runner, "publish_state", AsyncMock())
+    asyncio.run(runner.handle_merge())
+    assert command.call_count == 1
+    # Round-trip persisted failure evidence before the next cycle.
+    runner.state = type(runner.state).model_validate_json(runner.state.model_dump_json())
+    assert runner.state.merge_command_failed is (admission is not False)
+    assert runner.state.state == (PipelineState.WATCH if admission is False else PipelineState.MERGE)
+    asyncio.run(runner.handle_merge())
+    assert command.call_count == (2 if admission is False else 1)
+    assert probe.call_count == 2
+    if admission is None:
+        probe.return_value = False
+        asyncio.run(runner.handle_merge())
+        assert runner.state.state == PipelineState.WATCH
+        assert command.call_count == 1

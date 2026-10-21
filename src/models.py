@@ -303,6 +303,8 @@ class RepoState(BaseModel):
     # ``__setattr__`` so the rendered badge subtitle disappears the moment
     # the state machine leaves MERGE. ``None`` outside MERGE.
     merge_phase: str | None = None
+    # Retain failed-command evidence across restart until admission is known.
+    merge_command_failed: bool = False
     upload_pending_count: int = 0
 
     @field_validator("state", mode="before")
@@ -367,6 +369,7 @@ class RepoState(BaseModel):
                 and value != PipelineState.MERGE
             ):
                 super().__setattr__("merge_phase", None)
+                super().__setattr__("merge_command_failed", False)
         if name == "current_queue":
             super().__setattr__(
                 "current_queue_snapshot_at",

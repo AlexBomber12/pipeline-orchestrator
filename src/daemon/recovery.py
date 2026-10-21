@@ -814,7 +814,7 @@ class RecoveryMixin:
     ) -> bool:
         """Recover unfinished merge bookkeeping without a pipeline snapshot.
 
-        DONE tasks without retained metrics need replay unless the durable
+        Pending or DONE tasks without retained metrics need replay unless the durable
         outcome log already accounts for them. Redis is only a cache.
         Discovery only selects an identity; MERGE still requires exact proof.
         """
@@ -824,7 +824,8 @@ class RecoveryMixin:
         try:
             for task in tasks:
                 header = getattr(self, "_recovery_task_headers", {}).get(task.pr_id)
-                if (header is None or task.status != TaskStatus.DONE or not task.branch
+                if (header is None or task.status not in {TaskStatus.TODO, TaskStatus.DOING, TaskStatus.DONE}
+                        or not task.branch
                         or find_matching_open_pr(task.pr_id, task.branch, open_prs) is not None):
                     continue
                 records = await self._metrics_store.list_task_runs(self.name, task.pr_id)
@@ -963,6 +964,7 @@ class RecoveryMixin:
                 self.state.active_invocation = saved_merge.active_invocation
                 self.state.state = PipelineState.MERGE
                 self.state.merge_phase = saved_merge.merge_phase
+                self.state.merge_command_failed = saved_merge.merge_command_failed
                 if self._current_run_record is None:
                     await self._restore_current_run_record()
                 self.log_event(

@@ -544,3 +544,35 @@ def test_api_outage_preserves_queue_without_dispatch_or_task_failure(
     assert asyncio.run(runner._recover_state_headers()) is True
     assert runner.state.current_queue[0].status == TaskStatus.DONE
     assert runner.state.current_task is None
+
+
+def test_restart_discovers_merged_unprefixed_pr_from_todo_header(tmp_path, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from src.github import prs as gh_prs
+
+    _populate_tasks(tmp_path, [{
+        "pr_id": "PR-401", "title": "Interrupted merge", "branch": "feature-completion",
+        "frontmatter_status": "TODO",
+    }])
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    # Neither the branch nor squash subject encodes the task ID. The real
+    # header/status parser therefore derives TODO despite merged branch evidence.
+    monkeypatch.setattr(recovery_module, "_resolve_merged_state",
+                        lambda *a, **kw: MergedState({"feature-completion"}, set(), True))
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: [])
+    pr = PRInfo(number=629, pr_id=None, title="Complete feature",
+                branch="feature-completion", head_sha="a" * 40)
+    monkeypatch.setattr(gh_prs, "get_merged_prs_discovery", lambda *a: gh_prs.PRDiscovery(
+        runner.owner_repo, "main", [pr], True,
+    ))
+    monkeypatch.setattr(runner._metrics_store, "list_task_runs", AsyncMock(return_value=[]))
+    monkeypatch.setattr(runner, "_cleanup_expected_branch", lambda: None)
+
+    assert runner._parse_tasks_from_headers()[0].status == TaskStatus.TODO
+    assert asyncio.run(runner.recover_state())
+    assert runner.state.state == PipelineState.MERGE
+    assert runner.state.current_task.pr_id == "PR-401"
+    assert runner.state.current_pr == pr
+    assert runner.state.merge_phase == "post_merge_cleanup"

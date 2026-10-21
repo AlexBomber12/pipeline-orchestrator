@@ -2514,7 +2514,8 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(
 
     monkeypatch.setattr(recovery_module.git_ops, "_git", dirty_git)
     monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {"files_touched_count": 0})
-    monkeypatch.setattr(merge_module, "log_merged_pr", lambda record: None)
+    analytics = []
+    monkeypatch.setattr(merge_module, "log_merged_pr", analytics.append)
     write = AsyncMock(return_value=True)
     monkeypatch.setattr(runner, "_commit_task_status_change", write)
 
@@ -2527,6 +2528,7 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(
             "number": 629, "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
             "head": {"sha": "a" * 40}, "state": "closed", "merged": True,
             "merge_commit_sha": "b" * 40,
+            "merged_at": "2020-01-31T23:59:00Z",
         })
 
     monkeypatch.setattr(merge_module.gh_runner, "run_gh", transport)
@@ -2542,6 +2544,7 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(
         assert record.task_id == task.pr_id and record.repo_name == runner.name
         assert record.profile_id == "recovery:unknown:container"
     assert record.exit_reason == "success_merged"
+    assert analytics[0]["merged_at"] == "2020-01-31T23:59:00+00:00"
     assert reads == [["api", "repos/octo/demo/pulls/629", "--include"]]
     assert runner._metrics_store.save.await_count == 2
 
@@ -2621,7 +2624,7 @@ def test_header_merge_recovery_uses_complete_bound_github_evidence(
     if case == "wrong_record":
         records = [replace(record, task_id="PR-999"), replace(record, repo_name="other")]
     if case == "not_done":
-        task.status = TaskStatus.TODO
+        task.status = TaskStatus.ERROR
     if case == "no_branch":
         task.branch = ""
     lookup = AsyncMock(return_value=records)
