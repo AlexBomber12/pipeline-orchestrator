@@ -27,7 +27,7 @@ from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
 from src.daemon.handlers import fix as fix_module
 from src.daemon.handlers import hung as hung_module
-from src.daemon.quarantine import continued_size_label
+from src.daemon.quarantine import continued_size_label, fixing_size_label
 from src.daemon.runner import PipelineRunner
 from src.models import (
     CIStatus,
@@ -47,7 +47,7 @@ from tests.runner import _helpers as h
 claude_cli = claude_plugin_module.claude_cli
 
 
-def test_handle_fix_defers_when_size_marker_cannot_be_removed(
+def test_handle_fix_defers_when_size_fix_marker_cannot_be_created(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
@@ -55,14 +55,47 @@ def test_handle_fix_defers_when_size_marker_cannot_be_removed(
     marker = continued_size_label("a" * 40)
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(
-        number=77, branch="pr-size", head_sha="a" * 40,
+        number=77, branch="pr-019", head_sha="a" * 40,
         quarantine_labels={marker},
     )
     monkeypatch.setattr(fix_module.gh_runner, "run_gh", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
     asyncio.run(runner.handle_fix())
     assert runner.state.state == PipelineState.WATCH
     assert marker in runner.state.current_pr.quarantine_labels
-    assert any("marker removal deferred" in item["event"] for item in runner.state.history)
+    assert any("marker creation deferred" in item["event"] for item in runner.state.history)
+
+
+def test_handle_fix_retains_marker_until_successful_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
+    marker = continued_size_label("a" * 40)
+    fixing = fixing_size_label("a" * 40)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(fix_module.gh_runner, "run_gh", lambda args, **kwargs: calls.append(args))
+    original_git = git_ops_module._git
+
+    def fixed_head(repo_path: str, *args: str, **kwargs: Any):
+        if args[:2] == ("rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, "a" * 40 + "\n", "")
+        return original_git(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops_module, "_git", fixed_head)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", head_sha="a" * 40,
+        quarantine_labels={marker},
+    )
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.quarantine_labels == {marker}
+    assert ["pr", "edit", "77", "--add-label", fixing] in calls
+    assert ["pr", "edit", "77", "--remove-label", fixing] in calls
+    assert calls.index(["pr", "edit", "77", "--add-label", fixing]) < calls.index(
+        ["pr", "edit", "77", "--remove-label", fixing]
+    )
 
 
 def test_handle_fix_defers_for_credential_login_without_counting_iteration(

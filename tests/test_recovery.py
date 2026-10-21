@@ -13,7 +13,7 @@ import pytest
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
-from src.daemon.quarantine import OBSOLETE_SIZE_LABEL, continued_size_label
+from src.daemon.quarantine import OBSOLETE_SIZE_LABEL, continued_size_label, fixing_size_label
 from src.daemon.runner import PipelineRunner
 from src.keyspace import pipeline_state
 from src.models import (
@@ -666,7 +666,7 @@ def test_recover_legacy_size_error_from_git_and_pr(
 
 @pytest.mark.parametrize("saved", [
     "missing", "malformed", "error", "suppressed", "blank_head", "invalid_head", "stale_marker",
-    "no_labels",
+    "no_labels", "fixing_marker",
 ])
 def test_legacy_size_recovery_preserves_unverified_state(
     tmp_path: Path, saved: str,
@@ -690,6 +690,8 @@ def test_legacy_size_recovery_preserves_unverified_state(
         pr.quarantine_labels = {continued_size_label("b" * 40)}
     elif saved == "no_labels":
         pr.quarantine_labels = set()
+    elif saved == "fixing_marker":
+        pr.quarantine_labels = {continued_size_label("a" * 40), fixing_size_label("a" * 40)}
     runner = _make_runner()
     runner.repo_path = str(tmp_path)
     runner._recovery_task_headers = {task.pr_id: parse_existing_task_header(path)}
@@ -711,7 +713,7 @@ def test_legacy_size_recovery_preserves_unverified_state(
     if saved == "missing":
         with pytest.raises(recovery_module.LegacySizeRecoveryDeferred, match="checkout is unavailable"):
             asyncio.run(runner._recover_legacy_size_tasks(tasks, [pr]))
-    elif saved in ("blank_head", "invalid_head", "stale_marker"):
+    elif saved in ("blank_head", "invalid_head", "stale_marker", "fixing_marker"):
         with pytest.raises(recovery_module.LegacySizeRecoveryDeferred):
             asyncio.run(runner._recover_legacy_size_tasks(tasks, [pr]))
     else:

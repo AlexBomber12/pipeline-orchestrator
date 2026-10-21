@@ -28,6 +28,7 @@ _CATEGORY_LABEL_ALIASES = {
 
 OBSOLETE_SIZE_LABEL = "quarantine:large_diff"
 CONTINUED_SIZE_PREFIX = "size-ok:"
+FIXING_SIZE_PREFIX = "size-fix:"
 
 
 def continued_size_label(head_sha: str) -> str:
@@ -39,6 +40,14 @@ def continued_size_label(head_sha: str) -> str:
 
 def is_continued_size_label(label: str) -> bool:
     return label.startswith(CONTINUED_SIZE_PREFIX)
+
+
+def fixing_size_label(head_sha: str) -> str:
+    return continued_size_label(head_sha).replace(CONTINUED_SIZE_PREFIX, FIXING_SIZE_PREFIX, 1)
+
+
+def is_fixing_size_label(label: str) -> bool:
+    return label.startswith(FIXING_SIZE_PREFIX)
 
 
 def blocking_quarantine_labels(labels: set[str]) -> set[str]:

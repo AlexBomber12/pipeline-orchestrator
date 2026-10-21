@@ -540,6 +540,22 @@ async def test_size_recovery_removes_only_obsolete_github_label(approval, monkey
     ]
 
 
+async def test_size_recovery_creates_marker_without_obsolete_label(approval, monkeypatch):
+    runner, command, _, _ = approval
+    command.pr.quarantine_labels.clear()
+    runner.state.current_pr.quarantine_labels.clear()
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    calls = []
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append(args))
+    await runner._run_cycle_body()
+    marker = continued_size_label(command.pr.head_sha)
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert [call[:4] for call in calls] == [
+        ["label", "create", marker, "--color"],
+        ["pr", "edit", "42", "--add-label"],
+    ]
+
+
 async def test_size_recovery_removes_label_missing_from_error_snapshot(approval, monkeypatch):
     runner, command, _, _ = approval
     marker = continued_size_label(command.pr.head_sha)

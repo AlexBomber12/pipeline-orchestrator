@@ -185,7 +185,12 @@ recovery evidence. The old size label or a continuation label bound to the
 current PR HEAD lets an ERROR task with a matching published PR and task
 generation return to WATCH after Redis loss. A marker for an older HEAD parks
 recovery. Neither label blocks CI or review; other quarantine labels still
-block. The continuation marker is removed before a later coder dispatch.
+block. Before FIX dispatch, the daemon adds `size-fix:<PR HEAD SHA>` while
+retaining the continuation marker. After a successful FIX it binds the
+continuation marker to the resulting HEAD and removes `size-fix` last. An
+unresolved `size-fix` marker holds WATCH and startup recovery until the FIX
+outcome can be established. CODING with an existing continuation PR returns
+to WATCH.
 Startup recovery also checks the checkout for unpublished work and active
 processes. It fetches a missing verified PR HEAD without moving local refs;
 unavailable evidence leaves recovery pending for the next cycle.

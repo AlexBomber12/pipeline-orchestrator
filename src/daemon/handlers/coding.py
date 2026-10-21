@@ -263,16 +263,10 @@ class CodingMixin:
                 label for label in self.state.current_pr.quarantine_labels
                 if is_continued_size_label(label)
             }
-            for marker in sorted(markers):
-                try:
-                    gh_runner.run_gh(
-                        ["pr", "edit", str(self.state.current_pr.number), "--remove-label", marker],
-                        repo=self.owner_repo,
-                    )
-                except Exception as exc:
-                    self.log_event(f"[CODING] Size continuation marker removal deferred: {exc}")
-                    return
-            self.state.current_pr.quarantine_labels.difference_update(markers)
+            if markers:
+                self.log_event("[CODING] Existing size-continuation PR belongs in WATCH; deferring dispatch.")
+                self.state.state = PipelineState.WATCH
+                return
 
         # AUTO PR dispatch: read the task spec inline before invoking the
         # coder so the daemon supplies the canonical pr_id, task_file, and

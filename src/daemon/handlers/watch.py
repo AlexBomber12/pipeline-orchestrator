@@ -17,7 +17,11 @@ from pathlib import Path
 from src.cancellation import CancellationCause
 from src.config import load_config
 from src.daemon import guardrails
-from src.daemon.quarantine import apply_quarantine_label_for_violation, blocking_quarantine_labels
+from src.daemon.quarantine import (
+    apply_quarantine_label_for_violation,
+    blocking_quarantine_labels,
+    is_fixing_size_label,
+)
 from src.daemon.selector import CoderPurpose, resolve_active_coder, resolve_pause_coder
 from src.github import cache as gh_cache
 from src.github import checks as gh_checks
@@ -250,6 +254,9 @@ class WatchMixin:
             }
         )
         self.state.current_pr = found
+        if any(is_fixing_size_label(label) for label in found.quarantine_labels):
+            self.log_event(f"[WATCH] PR #{found.number} size FIX outcome is unresolved; holding PR.")
+            return
         # Retry rehydrate every cycle so a transient commit-time fetch
         # failure during ``recover_state`` doesn't permanently leave
         # ``_last_push_at`` unset.

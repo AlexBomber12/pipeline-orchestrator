@@ -36,6 +36,7 @@ from src.daemon.quarantine import (
     blocking_quarantine_labels,
     continued_size_label,
     is_continued_size_label,
+    is_fixing_size_label,
 )
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
@@ -941,6 +942,8 @@ class RecoveryMixin:
             pr = find_matching_open_pr(task.pr_id, task.branch, prs)
             if pr is None or not pr.quarantine_labels:
                 continue
+            if any(is_fixing_size_label(label) for label in pr.quarantine_labels):
+                raise LegacySizeRecoveryDeferred("size FIX outcome is not yet durable")
             markers = {label for label in pr.quarantine_labels if is_continued_size_label(label)}
             if blocking_quarantine_labels(pr.quarantine_labels):
                 continue

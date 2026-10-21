@@ -20,6 +20,7 @@ from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, DaemonConfig, RepoConfig, TrustedReviewerIdentity
 from src.daemon import runner as runner_module
 from src.daemon.handlers import watch as watch_module
+from src.daemon.quarantine import fixing_size_label
 from src.daemon.runner import PipelineRunner
 from src.github import cache as gh_cache
 from src.github import reviews as gh_reviews
@@ -682,6 +683,25 @@ def test_handle_watch_rehydrates_quarantine_before_merge(
         "is quarantined; refusing to merge" in entry["event"]
         for entry in runner.state.history
     )
+
+
+def test_watch_holds_unresolved_size_fix_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    h._patch_subprocess(monkeypatch)
+    marker = fixing_size_label("a" * 40)
+    pr = PRInfo(
+        number=5, branch="pr-001", head_sha="a" * 40,
+        ci_status=CIStatus.SUCCESS, review_status=ReviewStatus.APPROVED,
+        quarantine_labels={marker},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
+    asyncio.run(runner.handle_watch())
+    assert runner.state.state == PipelineState.WATCH
+    assert marker in runner.state.current_pr.quarantine_labels
+    assert any("size FIX outcome is unresolved" in entry["event"] for entry in runner.state.history)
 
 
 def test_watch_quarantine_rehydrate_ignores_invalid_or_existing_pr() -> None:

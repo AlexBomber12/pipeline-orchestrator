@@ -574,10 +574,7 @@ class ApprovalCommandMixin:
         self._approval_commit_uncertain = False
         self._recovered = True
         self._approval_receipt = command.model_copy(update={"status": "applied"})
-        if (
-            size_only
-            and OBSOLETE_SIZE_LABEL in live_labels
-        ):
+        if size_only:
             marker = continued_size_label(command.pr.head_sha)
             try:
                 gh_runner.run_gh(
@@ -596,10 +593,11 @@ class ApprovalCommandMixin:
                     ["pr", "edit", str(command.pr.number), "--add-label", marker],
                     repo=self.owner_repo,
                 )
-                gh_runner.run_gh(
-                    ["pr", "edit", str(command.pr.number), "--remove-label", OBSOLETE_SIZE_LABEL],
-                    repo=self.owner_repo,
-                )
+                if OBSOLETE_SIZE_LABEL in live_labels:
+                    gh_runner.run_gh(
+                        ["pr", "edit", str(command.pr.number), "--remove-label", OBSOLETE_SIZE_LABEL],
+                        repo=self.owner_repo,
+                    )
             except Exception as exc:
                 self.log_event(f"[RECOVERY] Obsolete size label removal deferred: {exc}")
         logging.getLogger(__name__).info("Approval %s applied to existing PR #%s", command.binding, command.pr.number)
