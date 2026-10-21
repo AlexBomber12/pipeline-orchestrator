@@ -210,6 +210,7 @@ class PublicationAttempt(BaseModel):
     pr_number: int | None = None
     candidate: PRInfo | None = None
     pending: bool = True
+    verified: bool = False
     failure: str | None = None
 
 

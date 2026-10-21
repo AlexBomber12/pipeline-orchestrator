@@ -493,6 +493,21 @@ class RetryCommandMixin:
     async def _select_retry_continuation(
         self, command: RetryCommand
     ) -> tuple[str, PRInfo | None] | RetryDispatch:
+        attempt = self.state.publication_attempt
+        if attempt is not None and attempt.pending:
+            if not await self._resolve_published_attempt():
+                return await self._defer_retry_command(
+                    command, "Publication ownership is unresolved; prior invocation retained.",
+                )
+            pr = self.state.current_pr
+            if (
+                command.task_id != attempt.task_id or command.task_branch != attempt.branch
+                or command.bound_pr_number not in {None, pr.number}
+                or command.bound_pr_branch not in {None, pr.branch}
+                or (command.bound_pr_head_sha and command.bound_pr_head_sha != pr.head_sha)
+            ):
+                return await self._fail_retry_command(command, "Retained publication identity changed.")
+            return "watch", pr
         try:
             open_prs = await asyncio.to_thread(
                 gh_prs.get_open_prs,

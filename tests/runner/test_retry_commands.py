@@ -1712,3 +1712,69 @@ async def test_run_cycle_propagates_cancellation_during_retry_coding(
     monkeypatch.setattr(runner, "handle_coding", cancel)
     with pytest.raises(asyncio.CancelledError):
         await runner._run_cycle_body()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("available", [False, True])
+async def test_retry_reconciles_retained_publication_before_replacing_invocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, available: bool,
+) -> None:
+    from src.github import cache
+
+    pr = PRInfo(number=42, branch="fix/pr-42", pr_id="PR-42", head_sha="a" * 40)
+    runner, command, task, _repo = await _prepared_runner(
+        tmp_path, command=_command(_task_text(), bound_pr=pr),
+    )
+    runner._start_current_run_record("codex", "")
+    invocation = runner._capture_invocation_snapshot("codex", {}, phase="coding")
+    runner._begin_publication_attempt(started_at=NOW, baseline_numbers=set())
+    attempt = runner.state.publication_attempt
+    attempt.pr_number, attempt.candidate, attempt.head_sha = pr.number, pr, pr.head_sha
+    attempt.failure = "prior failure"
+
+    monkeypatch.setattr(cache, "_etag_get", lambda path: {
+        "number": 42, "state": "open", "merged": False,
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
+        "head": {"ref": pr.branch, "sha": pr.head_sha},
+    } if available else {})
+    monkeypatch.setattr(cache, "_etag_payload_observed_at", lambda *_a: None)
+    monkeypatch.setattr(runner, "_validate_retry_command", _async_value((object(), task)))
+    monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
+    monkeypatch.setattr(runner, "_clear_retry_failure_evidence", _async_value(None))
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *_a: [])
+    result = await runner._apply_retry_command(command)
+    if available:
+        assert result == RetryDispatch.WATCH
+        assert runner.state.current_pr.number == 42
+        assert runner.state.state == PipelineState.WATCH
+        assert not attempt.pending
+        assert attempt.failure == "prior failure"
+        assert runner.state.active_invocation is None
+    else:
+        assert result == RetryDispatch.HANDLED
+        assert attempt.pending
+        assert runner.state.active_invocation == invocation
+        assert runner.state.state == PipelineState.ERROR
+
+
+@pytest.mark.asyncio
+async def test_retry_does_not_rebind_retained_work_to_a_different_command(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, command, _task, _repo = await _prepared_runner(tmp_path)
+    runner._start_current_run_record("codex", "")
+    runner._capture_invocation_snapshot("codex", {}, phase="coding")
+    runner._begin_publication_attempt(started_at=NOW, baseline_numbers=set())
+    pr = PRInfo(number=42, branch="fix/pr-42", pr_id="PR-42", head_sha="a" * 40)
+    attempt = runner.state.publication_attempt
+    attempt.pr_number, attempt.candidate, attempt.head_sha = pr.number, pr, pr.head_sha
+    monkeypatch.setattr(retry_module.gh_prs, "get_exact_pr_outcome", lambda *args:
+        retry_module.gh_prs.ExactPROutcome("octo/demo", "main", 42, "a" * 40,
+                                         retry_module.gh_prs.ExactPRState.OPEN, True))
+    command.bound_pr_number = 99
+    assert await runner._select_retry_continuation(command) == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.FAILED
+    assert attempt.pending
+    assert runner.state.current_pr.number == 42

@@ -207,6 +207,8 @@ class CodingMixin:
         attempt = self.state.publication_attempt
         if attempt is None:
             return
+        if attempt.head_sha != observed.head_sha:
+            attempt.verified = False
         attempt.head_sha = observed.head_sha
         if self._publication_matches_attempt(observed):
             attempt.pr_number = observed.number
@@ -225,6 +227,8 @@ class CodingMixin:
             _local_branch_head_sha, self.repo_path, attempt.branch,
         )
         if local_head is not None:
+            if attempt.head_sha != local_head:
+                attempt.verified = False
             attempt.head_sha = local_head
         if (observed is not None and self._publication_matches_attempt(observed)):
             attempt.pr_number = observed.number
@@ -289,6 +293,7 @@ class CodingMixin:
             )
             if outcome.discovery_complete and outcome.state == gh_prs.ExactPRState.OPEN:
                 current.head_sha = attempt.head_sha
+                attempt.verified = True
                 self.state.current_pr = current
                 return True
             return False

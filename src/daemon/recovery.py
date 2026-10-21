@@ -1804,6 +1804,22 @@ class RecoveryMixin:
 
     def _admit_observed_pr(self, pr: PRInfo) -> None:
         """Initialize trust context using the PR list's own observation."""
+        attempt = self.state.publication_attempt
+        task = self.state.current_task
+        if (
+            attempt is not None and attempt.pending and attempt.verified
+            and task is not None
+            and (attempt.repo, attempt.base, attempt.task_id, attempt.branch,
+                 attempt.pr_number, attempt.head_sha) == (
+                     self.owner_repo, self.repo_config.branch or "main",
+                     task.pr_id, pr.branch, pr.number, pr.head_sha,
+                 )
+            and task.branch == pr.branch and pr.pr_id in {None, task.pr_id}
+            and not pr.is_cross_repository
+        ):
+            # An admitted WATCH continuation acknowledges this proven publication.
+            # Retain its original failure in metadata without blocking the new run.
+            attempt.pending = False
         evidence = None
         if pr.publication_observed:
             evidence = gh_prs.HeadPublicationEvidence(
