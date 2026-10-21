@@ -98,6 +98,83 @@ def test_handle_fix_retains_marker_until_successful_completion(
     )
 
 
+@pytest.mark.parametrize("failure", ["prior_fix", "apply", "complete"])
+def test_handle_fix_keeps_recovery_marker_when_fix_outcome_is_uncertain(
+    monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
+    marker = continued_size_label("a" * 40)
+    fixing = fixing_size_label("a" * 40)
+    labels = {fixing} if failure == "prior_fix" else {marker}
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", head_sha="a" * 40,
+        quarantine_labels=labels,
+    )
+
+    def run_gh(args: list[str], **kwargs: Any) -> None:
+        if failure == "apply" and args == ["pr", "edit", "77", "--add-label", fixing]:
+            raise OSError("label unavailable")
+        if failure == "complete" and args[:3] == ["label", "create", marker]:
+            raise OSError("label unavailable")
+
+    monkeypatch.setattr(fix_module.gh_runner, "run_gh", run_gh)
+    original_git = git_ops_module._git
+
+    def fixed_head(repo_path: str, *args: str, **kwargs: Any):
+        if args[:2] == ("rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, "a" * 40 + "\n", "")
+        return original_git(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops_module, "_git", fixed_head)
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    if failure == "prior_fix":
+        assert runner.state.current_pr.quarantine_labels == {fixing}
+        assert any("Prior size FIX outcome is unresolved" in item["event"] for item in runner.state.history)
+    elif failure == "apply":
+        assert runner.state.current_pr.quarantine_labels == {marker}
+        assert any("marker application deferred" in item["event"] for item in runner.state.history)
+    else:
+        assert runner.state.current_pr.quarantine_labels == {marker, fixing}
+        assert any("marker completion deferred" in item["event"] for item in runner.state.history)
+
+
+def test_handle_fix_rotates_size_marker_after_published_push(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
+    old_marker = continued_size_label("a" * 40)
+    new_marker = continued_size_label("b" * 40)
+    fixing = fixing_size_label("a" * 40)
+    calls: list[list[str]] = []
+    monkeypatch.setattr(fix_module.gh_runner, "run_gh", lambda args, **kwargs: calls.append(args))
+    original_git = git_ops_module._git
+    heads = iter(["a" * 40, "b" * 40])
+
+    def advancing_head(repo_path: str, *args: str, **kwargs: Any):
+        if args[:2] == ("rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, next(heads) + "\n", "")
+        return original_git(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops_module, "_git", advancing_head)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", head_sha="a" * 40,
+        quarantine_labels={old_marker},
+    )
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.quarantine_labels == {new_marker}
+    assert ["pr", "edit", "77", "--add-label", new_marker] in calls
+    assert ["pr", "edit", "77", "--remove-label", old_marker] in calls
+    assert ["pr", "edit", "77", "--remove-label", fixing] in calls
+
+
 def test_handle_fix_defers_for_credential_login_without_counting_iteration(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
