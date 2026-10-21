@@ -1311,6 +1311,15 @@ class CodingMixin:
                     f"{self.state.rate_limited_until.isoformat()}."
                 )
                 return
+            attempt = self.state.publication_attempt
+            if attempt is not None and attempt.pr_number is None and attempt.candidate is None:
+                # A failed coder may never have pushed. Release only proven
+                # absence so ordinary failures remain eligible for Retry.
+                remote_exists = await asyncio.to_thread(
+                    _remote_branch_exists, self.repo_path, target_branch,
+                )
+                if remote_exists is False:
+                    attempt.pending = False
             await self._transition_to_error(
                 stderr.strip() or f"{coder_name} exit {code}",
                 publish=False,

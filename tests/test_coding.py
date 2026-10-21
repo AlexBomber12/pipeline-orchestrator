@@ -1769,7 +1769,8 @@ def test_retained_failed_attempt_preserves_publication_safety_floor(monkeypatch)
 
 
 @pytest.mark.parametrize("local_exists", [False, True])
-def test_proven_no_push_releases_attempt_for_operator_retry(monkeypatch, local_exists):
+@pytest.mark.parametrize("code", [0, 1])
+def test_proven_no_push_releases_attempt_for_operator_retry(monkeypatch, local_exists, code):
     from tests.runner.test_retry_commands import _command, _task_text
 
     runner = _runner(monkeypatch)
@@ -1777,13 +1778,16 @@ def test_proven_no_push_releases_attempt_for_operator_retry(monkeypatch, local_e
     # The coder exits without publishing anything.
     async def no_publication(*args, **kwargs):
         remote["calls"] += 1
-        return 0, "", ""
+        return code, "", "coder failed" if code else ""
 
     monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", no_publication)
     _patch_branch_state(monkeypatch, local_exists=local_exists, remote_exists=False)
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: "a" * 40 if local_exists else None)
     asyncio.run(runner.handle_coding())
     assert runner.state.state == PipelineState.ERROR
     assert not runner.state.publication_attempt.pending
+    if code:
+        assert runner.state.error_message == "coder failed"
     monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
     monkeypatch.setattr(coding_module.gh_prs, "get_merged_prs", lambda *a, **kw: [])
     command = _command(_task_text(task_id="PR-001", branch="pr-001"),
@@ -1792,24 +1796,28 @@ def test_proven_no_push_releases_attempt_for_operator_retry(monkeypatch, local_e
     assert remote["calls"] == 1
 
 
-@pytest.mark.parametrize("probe_result", [128, "timeout"])
-def test_failed_remote_probe_keeps_attempt_pending(monkeypatch, probe_result):
+@pytest.mark.parametrize("probe_result", [0, 128, "timeout"])
+@pytest.mark.parametrize("code", [0, 1])
+def test_present_or_unavailable_remote_keeps_attempt_pending(monkeypatch, probe_result, code):
     runner = _runner(monkeypatch)
-    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    remote = _publication_transport(monkeypatch, runner, code=code, stderr="coder failed" if code else "")
     remote["omit"] = True
 
     def git(*args, **kwargs):
         if "ls-remote" in args:
             if probe_result == "timeout":
                 raise subprocess.TimeoutExpired("git", 30)
-            return subprocess.CompletedProcess([], probe_result, "", "offline")
+            return subprocess.CompletedProcess([], probe_result, "a" * 40 if probe_result == 0 else "", "offline")
         return subprocess.CompletedProcess([], 0, "", "")
 
     monkeypatch.setattr(git_ops, "_git", git)
     asyncio.run(runner.handle_coding())
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.publication_attempt.pending
-    assert "ownership unresolved" in runner.state.error_message
+    if code:
+        assert runner.state.error_message == "coder failed"
+    else:
+        assert "ownership unresolved" in runner.state.error_message
 
 
 @pytest.mark.parametrize("pushed", [False, True])
