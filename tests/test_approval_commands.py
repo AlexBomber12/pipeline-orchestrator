@@ -727,6 +727,266 @@ async def test_missing_github_snapshot_defers_without_clearing_size_block(approv
     assert await runner.redis.get(cause_key(runner.name, "PR-42"))
 
 
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_applied_approval_reconciles_confirmed_external_resolution(
+    approval, monkeypatch, terminal, restart,
+):
+    runner, command, repo, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: terminal)
+    commit_status = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit_status)
+    save_record = AsyncMock()
+    monkeypatch.setattr(runner, "_save_current_run_record", save_record)
+    if restart:
+        runner._recovered = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+        await runner._run_cycle_body()
+    before = snapshot(repo)
+    await runner._run_cycle_body()
+    for _ in range(2):
+        assert not await runner._consume_approval_command()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "applied" and not saved.active
+    assert not await list_approvals(runner.redis, runner.name)
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None and runner.state.current_pr is None
+    assert save_record.await_count == 1
+    assert save_record.await_args.args == ("success_merged" if terminal == "MERGED" else "closed_unmerged",)
+    assert commit_status.await_count == (1 if terminal == "MERGED" else 0)
+    assert snapshot(repo) == before
+
+
+@pytest.mark.parametrize("terminal", [None, "OPEN"])
+async def test_applied_approval_keeps_unknown_pr_evidence_retryable(approval, monkeypatch, terminal):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: terminal)
+    for _ in range(3):
+        await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.active and saved.status == "applied"
+    assert runner.state.state == PipelineState.WATCH
+    runner.handle_watch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("blocker", ["dirty", "binding", "changed_terminal", "handler"])
+async def test_terminal_approval_waits_for_safe_reconciliation(approval, monkeypatch, blocker):
+    runner, command, repo, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    states = iter(["MERGED", "OPEN"] if blocker == "changed_terminal" else ["MERGED"] * 3)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: next(states))
+    if blocker == "dirty":
+        (repo / "operator-notes").write_text("unpublished\n")
+    elif blocker == "binding":
+        runner.state.current_pr.pr_id = "PR-other"
+    elif blocker == "handler":
+        monkeypatch.setattr(
+            runner, "_handle_external_pr_resolution", AsyncMock(side_effect=RuntimeError("record unavailable")),
+        )
+    assert await runner._consume_approval_command()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.active and saved.status == "applied"
+    assert runner.state.state == PipelineState.WATCH
+    assert "deferred" in saved.reason
+
+
+async def test_terminal_resolution_receipt_recovers_after_lost_retirement(approval, monkeypatch):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "CLOSED")
+    monkeypatch.setattr(runner, "_save_current_run_record", AsyncMock())
+    retire = runner._retire_completed_approval
+    monkeypatch.setattr(
+        runner, "_retire_completed_approval", AsyncMock(side_effect=RuntimeError("receipt write lost")),
+    )
+    assert await runner._consume_approval_command()
+    assert runner.state.state == PipelineState.IDLE
+    monkeypatch.setattr(runner, "_retire_completed_approval", retire)
+    assert not await runner._consume_approval_command()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert not saved.active and not await list_approvals(runner.redis, runner.name)
+
+
+def external_published_head(repo, remote):
+    external = repo.parent / "external-new-head"
+    git(repo.parent, "clone", "--branch", "fix/pr-42", str(remote), str(external))
+    git(external, "config", "user.name", "External Author")
+    git(external, "config", "user.email", "external@example.test")
+    (external / "implementation.py").write_text("externally published work\n")
+    git(external, "commit", "-am", "publish externally")
+    head = git(external, "rev-parse", "HEAD")
+    git(external, "push", "origin", "fix/pr-42")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", head], capture_output=True,
+    ).returncode != 0
+    return head
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("transient_failure", [False, True])
+async def test_missing_verified_head_fetches_without_changing_checkout_or_refs(
+    approval, monkeypatch, automatic, transient_failure,
+):
+    runner, command, repo, remote = approval
+    head = external_published_head(repo, remote)
+    runner.state.current_pr.head_sha = head
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    fresh = command.pr.model_copy(update={"head_sha": head})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [fresh])
+    if not automatic:
+        command = build_approval(
+            runner.name, runner.state,
+            await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+        )
+        await enqueue_approval(runner.redis, command)
+    git(repo, "update-ref", "refs/rescue/operator", git(repo, "rev-parse", "HEAD"))
+    before = snapshot(repo)
+    original = subprocess.run
+    failed = False
+
+    def maybe_fail_fetch(args, **kwargs):
+        nonlocal failed
+        if transient_failure and not failed and isinstance(args, list) and "fetch" in args:
+            failed = True
+            return subprocess.CompletedProcess(args, 1, "", "transient remote error")
+        return original(args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(daemon_approval.subprocess, "run", maybe_fail_fetch)
+        await runner._run_cycle_body()
+        if transient_failure:
+            saved = (await list_approvals(runner.redis, runner.name))[0]
+            assert saved.status == "deferred" and "fetch is unavailable" in saved.reason
+            assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+            assert snapshot(repo) == before
+            await runner._run_cycle_body()
+    if automatic:
+        command = (await list_approvals(runner.redis, runner.name))[0]
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "applied"
+    assert runner.state.state == PipelineState.WATCH
+    assert not await runner.redis.get(cause_key(runner.name, "PR-42"))
+    assert snapshot(repo) == before
+    assert git(remote, "show-ref")
+
+
+@pytest.mark.parametrize("interference", ["pr", "state", "memory", "task", "dirty"])
+async def test_missing_head_fetch_rechecks_binding_and_unpublished_work(
+    approval, monkeypatch, interference,
+):
+    runner, _, repo, remote = approval
+    head = external_published_head(repo, remote)
+    runner.state.current_pr.head_sha = head
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    await enqueue_approval(runner.redis, command)
+    current = command.pr.model_copy(update={"head_sha": head})
+    heads = [current]
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: heads)
+    original = subprocess.run
+
+    def fetch_then_interfere(args, **kwargs):
+        result = original(args, **kwargs)
+        if isinstance(args, list) and "fetch" in args and result.returncode == 0:
+            if interference == "pr":
+                heads[0] = current.model_copy(update={"head_sha": "f" * 40})
+            elif interference == "state":
+                state = runner.state.model_copy(deep=True)
+                state.current_pr.number = 99
+                asyncio.run(runner.redis.set(pipeline_state(runner.name), state.model_dump_json()))
+            elif interference == "memory":
+                runner.state.current_pr.number = 99
+            elif interference == "task":
+                (repo / "tasks/PR-42.md").write_text(
+                    (repo / "tasks/PR-42.md").read_text() + "New requirement\n"
+                )
+            else:
+                (repo / "operator-notes").write_text("unpublished\n")
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(daemon_approval.subprocess, "run", fetch_then_interfere)
+        await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status in {"failed", "deferred"}
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+    assert runner.state.state == PipelineState.ERROR
+
+
+async def test_untrusted_published_head_cannot_be_fetched(approval, monkeypatch):
+    runner, _, repo, _ = approval
+    runner.state.current_pr.head_sha = "not-a-sha"
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "deferred" and "HEAD is invalid" in saved.reason
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+
+
+async def test_terminal_pr_can_resolve_when_task_object_needs_fetch(approval, monkeypatch):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "CLOSED")
+    monkeypatch.setattr(runner, "_save_current_run_record", AsyncMock())
+    original = daemon_approval.git_ops._git
+    first = True
+
+    def unavailable_once(path, *args, **kwargs):
+        nonlocal first
+        if args and args[0] == "show" and first:
+            first = False
+            return subprocess.CompletedProcess(args, 128, "", "object unavailable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(daemon_approval.git_ops, "_git", unavailable_once)
+    assert await runner._consume_approval_command()
+    assert runner.state.state == PipelineState.IDLE
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).active
+
+
+async def test_terminal_state_change_during_head_fetch_stays_retryable(approval, monkeypatch):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    states = iter(["CLOSED", "MERGED"])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: next(states))
+    original = daemon_approval.git_ops._git
+    first = True
+
+    def unavailable_once(path, *args, **kwargs):
+        nonlocal first
+        if args and args[0] == "show" and first:
+            first = False
+            return subprocess.CompletedProcess(args, 128, "", "object unavailable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(daemon_approval.git_ops, "_git", unavailable_once)
+    assert await runner._consume_approval_command()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.active and "deferred" in saved.reason
+    assert runner.state.state == PipelineState.WATCH
+
+
 async def test_automatic_size_recovery_keeps_unreadable_or_rebound_task(approval):
     runner, _, repo, _ = approval
     runner.repo_config.url = "https://github.com/other/repo.git"

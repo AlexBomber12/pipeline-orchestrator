@@ -14,6 +14,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,14 @@ from src.inhibitor import InhibitorType, derive_active_inhibitors
 from src.keyspace import control_stop, pipeline_state, upload_pending
 from src.models import PipelineState, RepoState, TaskStatus
 from src.retry_commands import load_latest_retry_command
+
+
+class BoundPRTerminal(ApprovalChanged):
+    """GitHub independently confirmed the bound PR's terminal state."""
+
+    def __init__(self, state: str) -> None:
+        self.state = state
+        super().__init__(f"The bound PR is {state.lower()}.")
 
 
 def bound_checkout_work_blocker(
@@ -209,7 +218,10 @@ class ApprovalCommandMixin:
                     continue
                 if command.status == "applied" and self._recovered and not self._approval_commit_uncertain:
                     if not matches_state(command, self.state, check_head=False):
-                        await self.redis.zrem(approval_index(self.name), command.binding)
+                        if self.state.state == PipelineState.IDLE:
+                            await self._retire_completed_approval(command, "IDLE after reconciliation")
+                        else:
+                            await self.redis.zrem(approval_index(self.name), command.binding)
                         continue
                     if self.state.state != PipelineState.WATCH:
                         continue
@@ -225,6 +237,8 @@ class ApprovalCommandMixin:
                     try:
                         pr = await self._verified_bound_pr(command)
                         reason = await self._approval_blocker(command, pr.head_sha)
+                    except BoundPRTerminal as terminal:
+                        return await self._resolve_applied_terminal_pr(command, terminal.state)
                     except Exception as exc:
                         reason = f"Continuation safety could not be verified: {exc}"
                     if reason:
@@ -323,7 +337,7 @@ class ApprovalCommandMixin:
         if pr is None:
             state = await asyncio.to_thread(gh_prs.get_pr_state, self.owner_repo, command.pr.number)
             if state in ("CLOSED", "MERGED"):
-                raise ApprovalChanged("The bound PR is closed or merged.")
+                raise BoundPRTerminal(state)
             raise RuntimeError("The bound PR is absent from the open-PR snapshot; waiting for GitHub evidence.")
         if pr.branch != command.pr.branch:
             raise ApprovalChanged("The bound PR branch changed.")
@@ -333,8 +347,53 @@ class ApprovalCommandMixin:
             raise ApprovalChanged("The bound PR now identifies a different task.")
         return pr
 
+    async def _resolve_applied_terminal_pr(self, command: ApprovalCommand, state: str) -> bool:
+        """Let WATCH perform its normal terminal bookkeeping after safety checks."""
+        try:
+            if (
+                command.repo_slug != self.name or command.repo_url != self.repo_config.url
+                or not matches_state(command, self.state, check_head=False)
+                or self.state.current_pr.pr_id not in (None, command.task.pr_id)
+            ):
+                raise ApprovalChanged("Approval task or PR binding changed.")
+            reason = await self._approval_blocker(command, command.pr.head_sha, state)
+            if reason:
+                await self._approval_result(command, "deferred", reason)
+                return True
+            # A terminal observation is independent of the open-PR snapshot.
+            # Reconfirm it after checkout/process checks and any object fetch.
+            confirmed = await asyncio.to_thread(
+                gh_prs.get_pr_state, self.owner_repo, command.pr.number,
+            )
+            if confirmed != state:
+                await self._approval_result(
+                    command, "deferred", "Bound PR terminal state changed during verification."
+                )
+                return True
+            await self._handle_external_pr_resolution(self.state.current_pr, state)
+            await self._retire_completed_approval(command, state)
+            self._approval_receipt = None
+            return True
+        except Exception as exc:
+            await self._approval_result(command, "deferred", f"Terminal resolution could not be verified: {exc}")
+            return True
+
+    async def _retire_completed_approval(self, command: ApprovalCommand, state: str) -> None:
+        key = approval_key(self.name, command.binding)
+
+        async def transaction(pipe: Any) -> None:
+            current = ApprovalCommand.model_validate_json(await pipe.get(key))
+            current.active = False
+            current.reason = f"Approval applied; bound PR resolved as {state}."
+            pipe.multi()
+            pipe.set(key, current.model_dump_json())
+            pipe.zrem(approval_index(self.name), command.binding)
+
+        await self.redis.transaction(transaction, key)
+
     async def _approval_blocker(
         self, command: ApprovalCommand, published_head_sha: str | None = None,
+        terminal_state: str | None = None,
     ) -> str | None:
         if not self.repo_config.active:
             return "Repository is disabled."
@@ -405,7 +464,47 @@ class ApprovalCommandMixin:
             check=False,
         )
         if published_task.returncode != 0:
-            return "Published task generation is unavailable in the checkout; preserving the PR."
+            head_sha = published_head_sha or command.pr.head_sha
+            if re.fullmatch(r"[0-9a-fA-F]{40}", head_sha) is None:
+                return "Verified published PR HEAD is invalid; preserving the PR."
+            fetched = await asyncio.to_thread(
+                subprocess.run,
+                ["git", "-C", self.repo_path, "fetch", "--no-tags", "--no-write-fetch-head", "origin", head_sha],
+                capture_output=True, text=True, timeout=120, check=False,
+            )
+            if fetched.returncode:
+                return "Verified published PR HEAD fetch is unavailable; preserving the PR."
+            try:
+                fresh = await self._verified_bound_pr(command)
+            except BoundPRTerminal as terminal:
+                if terminal.state != terminal_state:
+                    raise
+            else:
+                if fresh.head_sha != head_sha:
+                    raise ApprovalChanged("PR HEAD changed while fetching the published task generation.")
+            if (
+                command.repo_slug != self.name or command.repo_url != self.repo_config.url
+                or not matches_state(command, self.state, check_head=command.status != "applied")
+            ):
+                raise ApprovalChanged("Task or PR binding changed while fetching the published HEAD.")
+            raw_after_fetch = await self.redis.get(pipeline_state(self.name))
+            if not raw_after_fetch or not matches_state(
+                command, RepoState.model_validate_json(raw_after_fetch),
+                check_head=command.status != "applied",
+            ):
+                raise ApprovalChanged("Persisted task or PR binding changed while fetching the published HEAD.")
+            if task_spec_content_hash(path.read_text(encoding="utf-8")) != command.task_fingerprint:
+                raise ApprovalChanged("Task specification changed while fetching the published HEAD.")
+            reason = checkout_process_blocker(self.repo_path)
+            if not reason:
+                reason = bound_checkout_work_blocker(self.repo_path, command, head_sha)
+            if reason:
+                return reason
+            published_task = git_ops._git(
+                self.repo_path, "show", f"{head_sha}:{command.task.task_file}", check=False,
+            )
+            if published_task.returncode:
+                return "Published task generation is unavailable after fetching the verified HEAD."
         if task_spec_content_hash(published_task.stdout) != command.task_fingerprint:
             raise ApprovalChanged("Published PR and task generation disagree.")
         return bound_checkout_work_blocker(self.repo_path, command, published_head_sha)
