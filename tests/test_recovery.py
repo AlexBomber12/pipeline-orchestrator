@@ -40,6 +40,10 @@ class _FakeRedis:
         self.writes.append((key, value))
         self.store[key] = value
 
+    async def smembers(self, key: str) -> set[str]:
+        """These recovery fixtures have no retained run accounting."""
+        return set()
+
     async def zrangebyscore(self, key: str, minimum: str, maximum: str) -> list[str]:
         """No durable commands are queued in these recovery-only fixtures."""
         return []
@@ -572,6 +576,7 @@ def test_recovery_marks_error_tasks_in_crashed_set(
 def test_recovery_does_not_mark_todo_or_done(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    empty_merge_discovery: None,
 ) -> None:
     _write_task_file(tmp_path, "PR-100", "TODO", "pr-100-todo")
     _write_task_file(tmp_path, "PR-101", "DONE", "pr-101-done")
@@ -592,6 +597,7 @@ def test_recovery_does_not_mark_todo_or_done(
 def test_recovery_after_redis_flush_excludes_error_tasks(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    empty_merge_discovery: None,
 ) -> None:
     _write_task_file(tmp_path, "PR-100", "ERROR", "pr-100-error")
     _write_task_file(tmp_path, "PR-101", "TODO", "pr-101-todo")
@@ -618,6 +624,7 @@ def test_recovery_after_redis_flush_excludes_error_tasks(
 def test_crash_recovery_blocks_todo_task_and_selects_independent_work(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     use_single_error_exit: bool, status_write_succeeds: bool,
+    empty_merge_discovery: None,
 ) -> None:
     _write_task_file(tmp_path, "PR-100", "TODO", "pr-100-crashed")
     _write_task_file(tmp_path, "PR-101", "TODO", "pr-101-independent")
@@ -1760,3 +1767,12 @@ def test_rehydrate_last_push_at_rejects_backward_same_head_observation(
     )
     runner._rehydrate_last_push_at(pr)
     assert runner._last_push_at == newer
+
+
+@pytest.fixture
+def empty_merge_discovery(monkeypatch):
+    from src.github import prs as gh_prs
+
+    monkeypatch.setattr(gh_prs, "get_merged_prs_discovery", lambda repo, base: gh_prs.PRDiscovery(
+        repo, base, [], True,
+    ))

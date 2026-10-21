@@ -79,6 +79,29 @@ class MergeMixin:
             self.state.state = PipelineState.WATCH
             await self.publish_state()
             return
+        # A prior command may have merged remotely even if its response was lost.
+        # Reconcile the same identity before touching the possibly deleted branch.
+        if self.state.merge_phase in {"merging", "post_merge_cleanup"}:
+            if await self._confirm_remote_merge():
+                stats = self._compute_diff_stats(base, self.state.current_pr.head_sha)
+                if not stats:
+                    # Fresh clones only fetch base. GitHub retains the PR head
+                    # ref even after squash merging and deleting its branch.
+                    try:
+                        git_ops._git(
+                            self.repo_path, "fetch", "origin",
+                            f"refs/pull/{number}/head", timeout=60,
+                        )
+                    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+                        self.log_event(f"[MERGE] PR #{number} head fetch deferred: {exc}.")
+                        return
+                    # Use the proved SHA, never FETCH_HEAD (the ref may change).
+                    stats = self._compute_diff_stats(base, self.state.current_pr.head_sha)
+                    if not stats:
+                        self.log_event(f"[MERGE] PR #{number} diff statistics unavailable; retaining ownership.")
+                        return
+                await self._finish_confirmed_merge(stats)
+            return
         if not self.state.current_pr.is_cross_repository:
             # PR-352: dashboard sub-phase visibility during the long MERGE
             # cycle. The pre-merge sync (fetch + merge base + optional
@@ -328,6 +351,7 @@ class MergeMixin:
             )
         self.state.merge_phase = "merging"
         await self.publish_state()
+        self.state.merge_command_failed = False
         try:
             gh_prs.merge_pr(self.owner_repo, number, self.state.current_pr.head_sha)
         except gh_prs.ExpectedHeadMismatch as exc:
@@ -346,38 +370,103 @@ class MergeMixin:
             await self.publish_state()
             return
         except Exception as exc:
-            await self._transition_to_error(
-                f"merge_pr failed: {exc}",
-                publish=False,
-                log_prefix="[MERGE]",
-                log_message=str(exc),
-            )
-            return
+            self.state.merge_command_failed = True
+            await self.publish_state()
+            self.log_event(f"[MERGE] Merge response unavailable for PR #{number}: {exc}.")
 
+        if await self._confirm_remote_merge():
+            await self._finish_confirmed_merge(merged_diff_stats)
+
+    async def _confirm_remote_merge(self) -> bool:
+        """Require exact remote proof; one bounded read per reconciliation cycle."""
+        pr = self.state.current_pr
+        outcome = gh_prs.get_exact_pr_outcome(
+            self.owner_repo, self.repo_config.branch, pr.number, pr.head_sha
+        )
+        if outcome.state == gh_prs.ExactPRState.MERGED:
+            self._confirmed_merge_at = outcome.merged_at
+            return True
+        if outcome.state == gh_prs.ExactPRState.CLOSED:
+            await self._handle_external_pr_resolution(pr, "CLOSED")
+        elif outcome.reason == "head mismatch":
+            pr.review_status = ReviewStatus.PENDING
+            self.state.state = PipelineState.WATCH
+            self.log_event(f"[MERGE] PR #{pr.number} needs fresh gate evidence; returning to WATCH.")
+            await self.publish_state()
+        elif outcome.state == gh_prs.ExactPRState.OPEN:
+            if self.state.merge_command_failed:
+                admitted = gh_prs.get_pr_merge_admission(self.owner_repo, pr.number, pr.head_sha)
+                if admitted is False:
+                    self.state.state = PipelineState.WATCH
+                    self.log_event(f"[MERGE] PR #{pr.number} command failed without admission; returning to WATCH.")
+                    await self.publish_state()
+                    return False
+            self.log_event(f"[MERGE] PR #{pr.number} remains OPEN; retaining issued merge attempt.")
+        else:
+            self.log_event(
+                f"[MERGE] PR #{pr.number} merge outcome UNKNOWN; retaining attempt: {outcome.reason}."
+            )
+        return False
+
+    async def _finish_confirmed_merge(self, merged_diff_stats: dict[str, object]) -> None:
+        """Complete local bookkeeping only after the exact PR is proved merged."""
+        number = self.state.current_pr.number
+        base = self.repo_config.branch
         self.state.merge_phase = "post_merge_cleanup"
         await self.publish_state()
         current_task = self.state.current_task
+        if current_task is not None:
+            if self._current_run_record is None:
+                await self._restore_current_run_record(recover_missing_merge=True)
+            record = self._current_run_record
+            invocation = self.state.active_invocation
+            if (record is None or record.task_id != current_task.pr_id
+                    or record.repo_name != self.name
+                    or invocation is not None and invocation.run_id is not None
+                    and record.run_id != invocation.run_id):
+                self.log_event(f"[MERGE] Run record unavailable for PR #{number}; retaining ownership.")
+                return
+
+        # Persist the validated run and task index before the terminal header.
+        # If Redis is lost too, header recovery uses the durable outcome log
+        # to distinguish completed accounting from a merge that needs replay.
+        try:
+            await self._checkpoint_current_run_record()
+        except Exception as exc:
+            self.log_event(f"[MERGE] Run checkpoint deferred for PR #{number}: {exc}.")
+            return
+
         if current_task is not None and current_task.task_file:
             try:
-                await self._commit_task_status_change(
+                written = await self._commit_task_status_change(
                     current_task,
                     "DONE",
                     "PR merged",
                 )
+                if not written:
+                    self.log_event(
+                        f"[MERGE] Remote merge confirmed but status:DONE was not written to {current_task.task_file}."
+                    )
+                    return
             except Exception as exc:
                 self.log_event(
                     f"[ERROR] Failed to write status:DONE to "
                     f"{current_task.task_file}: {exc}"
                 )
+                return
 
         self._mark_task_done_in_snapshot()
 
-        await self._save_current_run_record(
-            "success_merged",
-            diff_stats=merged_diff_stats,
-            base_branch=base,
-        )
-        merged_at = datetime.now(timezone.utc)
+        try:
+            await self._save_current_run_record(
+                "success_merged",
+                diff_stats=merged_diff_stats,
+                base_branch=base,
+            )
+        except Exception as exc:
+            self.log_event(f"[MERGE] Confirmed merge bookkeeping deferred for PR #{number}: {exc}.")
+            return
+        merged_at = getattr(self, "_confirmed_merge_at", None) or datetime.now(timezone.utc)
         try:
             log_merged_pr(self._build_outcome_record(merged_at))
         except Exception as exc:

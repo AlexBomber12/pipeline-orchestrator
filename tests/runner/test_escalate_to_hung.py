@@ -8,6 +8,7 @@ import subprocess
 import types
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
@@ -110,6 +111,9 @@ def test_merge_writes_status_done_to_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(
+        "src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", AsyncMock(return_value=True)
+    )
     repo = _make_repo_with_task(tmp_path, "PR-701")
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
@@ -125,6 +129,7 @@ def test_merge_writes_status_done_to_file(
         task_file="tasks/PR-701.md",
     )
 
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     task_text = _remote_task(repo, "PR-701")
@@ -138,6 +143,9 @@ def test_merge_logs_status_commit_exception(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(
+        "src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", AsyncMock(return_value=True)
+    )
     repo = _make_repo_with_task(tmp_path, "PR-701")
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
@@ -159,6 +167,7 @@ def test_merge_logs_status_commit_exception(
 
     runner._commit_task_status_change = fail_commit  # type: ignore[method-assign]
 
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     assert any(
@@ -172,6 +181,9 @@ def test_merge_status_commit_ignores_divergent_pr_branch_task_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    monkeypatch.setattr(
+        "src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", AsyncMock(return_value=True)
+    )
     repo = _make_repo_with_task(tmp_path, "PR-701")
     _commit_pr_branch_task_status(repo, "PR-701", "DOING")
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
@@ -188,6 +200,7 @@ def test_merge_status_commit_ignores_divergent_pr_branch_task_file(
         task_file="tasks/PR-701.md",
     )
 
+    runner._start_current_run_record("claude", "opus")
     asyncio.run(runner.handle_merge())
 
     task_text = _remote_task(repo, "PR-701")

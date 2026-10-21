@@ -3316,7 +3316,9 @@ class _CleanupStallRedis(_BridgeRedis):
 
     async def get(self, key):
         self.read_started.set()
-        return await super().get(key)
+        # These tests require cancellation before cleanup starts. An immediate
+        # read can let the polling deadline expire before the timeout callback.
+        await asyncio.Future()
 
     async def _cleanup(self, operation):
         self.attempted.append(operation)

@@ -1306,11 +1306,14 @@ def test_save_current_run_record_sets_duration_none_for_invalid_started_at() -> 
 
 
 def test_merge_finalizes_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import AsyncMock
+
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
 
     runner = h._make_runner()
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(
@@ -1340,6 +1343,8 @@ def test_merge_finalizes_record(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_merge_calculates_duration(monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import AsyncMock
+
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr(runner_module.PipelineRunner, "_mark_task_done_in_snapshot", lambda self: None)
@@ -1356,6 +1361,7 @@ def test_merge_calculates_duration(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner_module, "datetime", _FixedDateTime)
 
     runner = h._make_runner()
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.state.current_task = QueueTask(
@@ -1885,3 +1891,33 @@ def test_auxiliary_awaiter_cancellation_cleans_before_propagating() -> None:
     assert managed.cleanup_calls == 1
     assert runner._current_coder_process is None
     assert runner._current_coder_supervised_process is None
+
+
+@pytest.fixture(autouse=True)
+def confirmed_remote_merge(monkeypatch):
+    async def confirmed(self):
+        return True
+
+    monkeypatch.setattr("src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", confirmed)
+
+
+@pytest.mark.parametrize("unrelated_runs", [0, 21])
+def test_restore_run_record_without_invocation_uses_task_index_after_partial_save(unrelated_runs):
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(pr_id="PR-401", title="Merge", status=TaskStatus.DONE)
+    runner._start_current_run_record("claude", "opus")
+    record = runner._current_run_record
+    asyncio.run(runner._metrics_store.save(record))
+    # Simulate failure after the record and task set were written but before
+    # the recency list was updated. A snapshot without an invocation is valid.
+    runner.redis.lists.clear()
+    # Fill the shared recency index with other tasks, beyond the lookup limit.
+    from dataclasses import replace
+
+    for index in range(unrelated_runs):
+        asyncio.run(runner._metrics_store.save(replace(
+            record, run_id=f"unrelated-{index}", task_id=f"PR-{500 + index}",
+        )))
+    runner._current_run_record = None
+    asyncio.run(runner._restore_current_run_record())
+    assert runner._current_run_record.run_id == record.run_id

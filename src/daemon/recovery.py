@@ -15,6 +15,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.analytics.outcome_logger import has_merged_outcome
 from src.branch_context import BranchContext
 from src.cancellation import (
     SUBSOURCE_VOCABULARY,
@@ -450,30 +451,25 @@ class RecoveryMixin:
         return await self._recover_state_headers()
 
     async def _hydrate_current_task_from_persisted_state(self) -> bool:
-        """Restore active CODING identity from the published Redis snapshot.
+        """Restore active dispatch identities from the published Redis snapshot.
 
         ``publish_state`` writes the live ``RepoState`` to
         ``pipeline_state(self.name)`` at the end of every cycle, so the
-        last persisted snapshot is the authoritative record of which
-        task was active when the daemon went down. The runner re-builds
+        last persisted snapshot preserves dispatch details when available.
+        Task headers and GitHub remain the startup recovery sources. The runner re-builds
         a fresh ``RepoState`` on startup with ``current_task=None``;
         without this rehydrate the headers helper's
         ``current_task_pr_id`` input is always ``None``, and a pre-push
         crash mid-CODING (no open PR yet) re-derives the task as
         ``TODO`` rather than ``DOING``.
 
-        Hydration is gated on a persisted ``CODING`` state because that
-        is the only crash-relevant scenario: ``current_task`` is set
-        without an open PR only between IDLE→CODING dispatch and the
-        coder's first push. Snapshots from WATCH/FIX/MERGE always have
-        a matching open PR by construction, so ``derive_task_status``
-        already returns ``DOING`` via ``find_matching_open_pr`` without
-        the ``current_task_pr_id`` fallback. Hydrating those snapshots
-        would misclassify a benign restart as a crash if the PR has
-        since been closed externally: ``derive_task_status`` would fall
-        through to the ``current_task_pr_id`` branch, return ``DOING``,
-        and ``_apply_recovery_decisions`` would mark the task
-        ``ERROR`` and force manual re-upload.
+        CODING snapshots retain pre-publication crash identity. Selected
+        WATCH/FIX/ERROR snapshots retain fix ownership. MERGE snapshots in
+        ``merging`` or ``post_merge_cleanup`` retain an attempted merge:
+        an already merged PR disappears from the open PR list, but its
+        status write or run-record save may still need reconciliation.
+        These attempts are bound to repository and task identity before
+        being restored by ``_apply_recovery_decisions``.
 
         The allowlisted ``active_invocation`` snapshot is hydrated alongside
         the task when both identify that same CODING dispatch. Its ``run_id``
@@ -487,6 +483,7 @@ class RecoveryMixin:
         invocation is used only when its task and unfinished run record match.
         """
         self._persisted_fix_recovery = None
+        self._persisted_merge_recovery = None
         try:
             raw = await self.redis.get(pipeline_state(self.name))
         except Exception as exc:
@@ -634,6 +631,20 @@ class RecoveryMixin:
             )
         ):
             self._persisted_fix_recovery = persisted
+        if (
+            persisted.name == self.name
+            and persisted.url == self.repo_config.url
+            and persisted.state == PipelineState.MERGE
+            and persisted.merge_phase in {"merging", "post_merge_cleanup"}
+            and persisted.current_task is not None
+            and persisted.current_pr is not None
+            and persisted.current_pr.number > 0
+            and re.fullmatch(r"[0-9a-fA-F]{40}", persisted.current_pr.head_sha) is not None
+            and bool(persisted.current_task.branch)
+            and persisted.current_task.branch == persisted.current_pr.branch
+            and persisted.current_pr.pr_id in {None, persisted.current_task.pr_id}
+        ):
+            self._persisted_merge_recovery = persisted
         if persisted.state != PipelineState.CODING:
             return True
         if self.state.current_task is None and persisted.current_task is not None:
@@ -789,11 +800,69 @@ class RecoveryMixin:
                 "IDLE regeneration."
             )
             tasks = []
+        if not await self._recover_header_merge_attempt(tasks, prs):
+            return False
         await self._apply_recovery_decisions(tasks, prs)
         # PR-263: hydrate the in-memory queue snapshot so the dashboard's
         # /api/repo/{name}/queue endpoint reflects post-restart state
         # immediately, without waiting for the next IDLE cycle.
         self.state.current_queue = list(tasks)
+        return True
+
+    async def _recover_header_merge_attempt(
+        self, tasks: list[QueueTask], open_prs: list[PRInfo]
+    ) -> bool:
+        """Recover unfinished merge bookkeeping without a pipeline snapshot.
+
+        Pending or DONE tasks without retained metrics need replay unless the durable
+        outcome log already accounts for them. Redis is only a cache.
+        Discovery only selects an identity; MERGE still requires exact proof.
+        """
+        if getattr(self, "_persisted_merge_recovery", None) is not None:
+            return True
+        candidates = []
+        try:
+            for task in tasks:
+                header = getattr(self, "_recovery_task_headers", {}).get(task.pr_id)
+                if (header is None or task.status not in {TaskStatus.TODO, TaskStatus.DOING, TaskStatus.DONE}
+                        or not task.branch
+                        or find_matching_open_pr(task.pr_id, task.branch, open_prs) is not None):
+                    continue
+                records = await self._metrics_store.list_task_runs(self.name, task.pr_id)
+                records = [r for r in records if r.task_id == task.pr_id and r.repo_name == self.name]
+                record = max(records, key=lambda r: (r.started_at, r.run_id), default=None)
+                if (record is not None and record.exit_reason != "success_merged"
+                        or header.frontmatter_status in {"todo", "doing"}
+                        or record is None and not has_merged_outcome(task.pr_id, self.name)):
+                    # A historical DONE task may lack analytics after a log
+                    # failure. Never let it hide an interrupted current merge.
+                    priority = (0 if header.frontmatter_status in {"todo", "doing"}
+                                else 1 if record is not None and record.exit_reason != "success_merged"
+                                else 2)
+                    candidates.append((priority, task, record))
+            if not candidates:
+                return True
+            discovery = gh_prs.get_merged_prs_discovery(self.owner_repo, self.repo_config.branch)
+            if not discovery.complete:
+                raise RuntimeError(discovery.reason or "incomplete merged discovery")
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Merge bookkeeping discovery deferred: {exc}.")
+            return False
+        for _, task, record in sorted(candidates, key=lambda candidate: candidate[0]):
+            matches = [pr for pr in discovery.prs
+                       if pr.pr_id in {None, task.pr_id} and pr.branch == task.branch]
+            if not matches:
+                continue
+            if len(matches) != 1:
+                self.log_event(f"[RECOVERY] Ambiguous merged identity for {task.pr_id}; retrying.")
+                return False
+            self._persisted_merge_recovery = self.state.model_copy(update={
+                "current_task": task, "current_pr": matches[0],
+                "active_invocation": record.invocations[-1] if record and record.invocations else None,
+                "state": PipelineState.MERGE, "merge_phase": "post_merge_cleanup",
+            })
+            self._current_run_record = record
+            break
         return True
 
     async def _rehydrate_quarantines_from_labels(  # pragma: no cover
@@ -883,6 +952,26 @@ class RecoveryMixin:
                 f"[INFRA] Recovered pending queue-sync branch: "
                 f"{pending_sync.branch}."
             )
+
+        saved_merge = getattr(self, "_persisted_merge_recovery", None)
+        if saved_merge is not None:
+            queued = next((task for task in tasks
+                           if task.pr_id == saved_merge.current_task.pr_id
+                           and task.branch == saved_merge.current_task.branch), None)
+            if queued is not None:
+                self.state.current_task = queued
+                self.state.current_pr = saved_merge.current_pr
+                self.state.active_invocation = saved_merge.active_invocation
+                self.state.state = PipelineState.MERGE
+                self.state.merge_phase = saved_merge.merge_phase
+                self.state.merge_command_failed = saved_merge.merge_command_failed
+                if self._current_run_record is None:
+                    await self._restore_current_run_record()
+                self.log_event(
+                    f"[RECOVERY] Restored MERGE attempt for {queued.pr_id} "
+                    f"PR #{self.state.current_pr.number} ({self.state.merge_phase})."
+                )
+                return
 
         saved = getattr(self, "_persisted_fix_recovery", None)
         if saved is not None:

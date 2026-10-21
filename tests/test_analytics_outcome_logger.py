@@ -156,7 +156,7 @@ def test_log_merged_pr_month_rollover_preserves_old_file(
 ) -> None:
     monkeypatch.setenv("PO_ANALYTICS_DIR", str(tmp_path / "analytics"))
     log_merged_pr(_full_record(merged_at="2026-04-30T23:59:59+00:00"))
-    log_merged_pr(_full_record(merged_at="2026-05-01T00:00:00+00:00"))
+    log_merged_pr(_full_record(pr_id="PR-205", merged_at="2026-05-01T00:00:00+00:00"))
     april = tmp_path / "analytics" / "2026-04.jsonl"
     may = tmp_path / "analytics" / "2026-05.jsonl"
     assert april.exists() and may.exists()
@@ -273,8 +273,9 @@ def _append_in_process(target_dir: str, pr_id: str) -> None:
     log_merged_pr(_full_record(pr_id=pr_id))
 
 
+@pytest.mark.parametrize("same_task", [False, True])
 def test_concurrent_appends_across_processes_use_flock(
-    tmp_path: Path,
+    tmp_path: Path, same_task: bool,
 ) -> None:
     """Cross-process flock: matches the multi-daemon deployment shape."""
     target_dir = tmp_path / "analytics"
@@ -282,7 +283,7 @@ def test_concurrent_appends_across_processes_use_flock(
     procs = [
         ctx.Process(
             target=_append_in_process,
-            args=(str(target_dir), f"PR-{i:04d}"),
+            args=(str(target_dir), "PR-204" if same_task else f"PR-{i:04d}"),
         )
         for i in range(8)
     ]
@@ -295,9 +296,54 @@ def test_concurrent_appends_across_processes_use_flock(
 
     target = target_dir / "2026-04.jsonl"
     lines = target.read_text(encoding="utf-8").splitlines()
-    assert len(lines) == 8
+    assert len(lines) == (1 if same_task else 8)
     parsed_ids = {json.loads(line)["pr_id"] for line in lines}
-    assert parsed_ids == {f"PR-{i:04d}" for i in range(8)}
+    assert parsed_ids == ({"PR-204"} if same_task else {f"PR-{i:04d}" for i in range(8)})
+
+
+def test_replayed_outcome_is_idempotent_across_months_and_repository_scoped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PO_ANALYTICS_DIR", str(tmp_path))
+    log_merged_pr(_full_record())
+    # A restarted finalizer supplies a new timestamp; retain the first row.
+    log_merged_pr(_full_record(merged_at="2026-05-01T00:00:00+00:00"))
+    assert not (tmp_path / "2026-05.jsonl").exists()
+    assert len((tmp_path / "2026-04.jsonl").read_text().splitlines()) == 1
+    log_merged_pr(_full_record(repo_slug="other__repo"))
+    rows = [json.loads(line) for line in (tmp_path / "2026-04.jsonl").read_text().splitlines()]
+    assert {row["repo_slug"] for row in rows} == {"owner__repo", "other__repo"}
+
+
+@pytest.mark.parametrize("tail", [b"\n", b'{"truncated":', b"\xff", b"{}"])
+def test_damaged_rows_do_not_block_new_outcomes_or_deduplication(
+    tmp_path, monkeypatch, tail,
+):
+    from src.analytics.outcome_logger import has_merged_outcome
+
+    monkeypatch.setenv("PO_ANALYTICS_DIR", str(tmp_path))
+    # Malformed rows in any historical partition must not poison the scan.
+    damage = b'\n{broken}\nnull\n[]\n42\n{}\n{"older": true}\n'
+    (tmp_path / "2026-03.jsonl").write_bytes(damage)
+    target = tmp_path / "2026-04.jsonl"
+    target.write_bytes(damage + tail)
+    assert not has_merged_outcome("PR-204", "owner__repo")
+    log_merged_pr(_full_record())
+    assert has_merged_outcome("PR-204", "owner__repo")
+    assert not has_merged_outcome("PR-204", "other__repo")
+    first = target.read_bytes()
+    log_merged_pr(_full_record())
+    assert target.read_bytes() == first
+    assert json.loads(first.splitlines()[-1])["pr_id"] == "PR-204"
+
+
+def test_outcome_lookup_propagates_storage_failure(tmp_path, monkeypatch):
+    from src.analytics.outcome_logger import has_merged_outcome
+
+    monkeypatch.setenv("PO_ANALYTICS_DIR", str(tmp_path))
+    (tmp_path / "2026-04.jsonl").mkdir()
+    with pytest.raises(OSError):
+        has_merged_outcome("PR-204", "owner__repo")
 
 
 @pytest.fixture(autouse=True)

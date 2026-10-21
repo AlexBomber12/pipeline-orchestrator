@@ -13,6 +13,7 @@ import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from src.coders import claude as claude_plugin_module
@@ -595,6 +596,9 @@ def test_retry_failed_workflow_returns_true_after_rerun(
 def test_handle_watch_approved_and_green_merges(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(
+        "src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", AsyncMock(return_value=True)
+    )
     h._patch_subprocess(monkeypatch)
     pr = PRInfo(
         number=5,

@@ -79,6 +79,8 @@ from src.task_status import MergedState
 
 from tests.runner import _helpers as h
 
+_CONFIRM_REMOTE_MERGE = merge_module.MergeMixin._confirm_remote_merge
+
 
 def test_recovery_retry_keeps_initial_publication_cutoff(
     monkeypatch: pytest.MonkeyPatch,
@@ -2326,6 +2328,20 @@ def _setup_headers_recovery_fixture(
 
     monkeypatch.setattr(recovery_module, "_resolve_merged_state", fake_resolve)
 
+    # Golden scenarios model historical completions, whose accounting has
+    # already been written. Seed durable evidence rather than relying on Redis.
+    import os
+
+    from src.analytics.outcome_logger import compute_task_id_hash
+
+    analytics_dir = Path(os.environ["PO_ANALYTICS_DIR"])
+    analytics_dir.mkdir(parents=True, exist_ok=True)
+    with (analytics_dir / "2026-04.jsonl").open("a") as outcomes:
+        for task in before.get("tasks", []):
+            outcomes.write(json.dumps({
+                "task_id_hash": compute_task_id_hash(task["pr_id"], "octo__demo"),
+            }) + "\n")
+
     runner = h._make_runner()
     runner.repo_path = str(repo)
     runner._crashed_task_pr_ids = set(before.get("crashed_task_pr_ids", []))
@@ -2418,3 +2434,289 @@ def test_megaraid_scenario_resolved_in_headers_mode(
     assert runner.state.current_task is None
     assert runner.state.current_queue is not None
     assert [t.status for t in runner.state.current_queue] == [TaskStatus.DONE]
+
+
+@pytest.mark.parametrize("pr_id", ["PR-401", None])
+@pytest.mark.parametrize("snapshot", ["valid", "absent", "damaged"])
+@pytest.mark.parametrize("phase", ["merging", "post_merge_cleanup"])
+@pytest.mark.parametrize("status,missing_record", [
+    (TaskStatus.DOING, False), (TaskStatus.DONE, False),
+    (TaskStatus.TODO, True), (TaskStatus.DOING, True), (TaskStatus.DONE, True),
+])
+def test_restart_retains_merge_until_remote_bookkeeping_finishes(
+    monkeypatch, phase, status, snapshot, missing_record, pr_id,
+):
+    from unittest.mock import AsyncMock
+
+    from src.daemon.retry_commands import RetryDispatch
+
+    monkeypatch.setattr(merge_module.MergeMixin, "_confirm_remote_merge", _CONFIRM_REMOTE_MERGE)
+    original = h._make_runner()
+    task = QueueTask(pr_id="PR-401", title="Merge", branch="pr-401",
+                     task_file="tasks/PR-401.md", status=TaskStatus.DOING)
+    original.state.current_task = task
+    original.state.current_pr = PRInfo(number=629, pr_id=pr_id, title="Confirm remote merge",
+                                       branch=task.branch, head_sha="a" * 40)
+    original.state.state = PipelineState.MERGE
+    original.state.merge_phase = phase
+    original._start_current_run_record("claude", "opus")
+    record = None if missing_record else original._current_run_record
+    runner = h._make_runner()
+    if snapshot != "absent":
+        runner.redis.store[pipeline_state(runner.name)] = (
+            original.state.model_dump_json() if snapshot == "valid" else "damaged"
+        )
+    queued = task.model_copy(update={"status": status})
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: [])
+    def parse():
+        runner._recovery_task_headers = {task.pr_id: types.SimpleNamespace(
+            frontmatter_status=status.value.lower(),
+        )}
+        return [queued.model_copy(update={"status": TaskStatus.DONE})]
+
+    monkeypatch.setattr(runner, "_parse_tasks_from_headers", parse)
+    monkeypatch.setattr(
+        runner._metrics_store, "list_task_runs", AsyncMock(return_value=[] if missing_record else [record]),
+    )
+    monkeypatch.setattr(gh_prs, "get_merged_prs_discovery", lambda *a: gh_prs.PRDiscovery(
+        runner.owner_repo, "main", [original.state.current_pr], True,
+    ))
+    monkeypatch.setattr(runner, "_cleanup_expected_branch", lambda: None)
+    monkeypatch.setattr(runner._metrics_store, "recent", AsyncMock(return_value=[] if missing_record else [record]))
+    monkeypatch.setattr(runner._metrics_store, "save", AsyncMock())
+    h._patch_subprocess(monkeypatch)
+    assert asyncio.run(runner.recover_state())
+    assert runner.state.state == PipelineState.MERGE
+    assert runner.state.merge_phase == (phase if snapshot == "valid" else "post_merge_cleanup")
+    assert runner.state.current_task.pr_id == queued.pr_id
+    assert runner.state.current_pr.head_sha == "a" * 40
+    assert runner.state.current_pr.pr_id == pr_id
+    assert runner._current_run_record is record
+
+    # The first cycle after recovery uses the retained identity, even though
+    # GitHub's open-PR list is empty and headers may already say DONE. A dirty
+    # checkout must not let preflight erase MERGE before bookkeeping replays.
+    runner._recovered = True
+    for method in ("ensure_repo_cloned", "_refresh_user_paused_from_redis"):
+        monkeypatch.setattr(runner, method, AsyncMock())
+    for method in ("_hold_for_coder_cleanup", "_consume_approval_command",
+                   "_consume_publication_migration_command"):
+        monkeypatch.setattr(runner, method, AsyncMock(return_value=False))
+    monkeypatch.setattr(runner, "_consume_retry_command", AsyncMock(return_value=RetryDispatch.NONE))
+    monkeypatch.setattr(runner, "_check_github_api_budget", AsyncMock(return_value=True))
+    preflight = AsyncMock(wraps=runner.preflight)
+    monkeypatch.setattr(runner, "preflight", preflight)
+    monkeypatch.setattr(runner, "handle_idle", AsyncMock(side_effect=AssertionError("duplicate discovery")))
+    def dirty_git(repo_path, *args, **kwargs):
+        if args == ("status", "--porcelain"):
+            return subprocess.CompletedProcess(args, 0, stdout="?? crash-leftover.txt\n")
+        pytest.fail("branch access during reconciliation")
+
+    monkeypatch.setattr(recovery_module.git_ops, "_git", dirty_git)
+    monkeypatch.setattr(runner, "_compute_diff_stats", lambda base, head_ref="HEAD": {"files_touched_count": 0})
+    analytics = []
+    monkeypatch.setattr(merge_module, "log_merged_pr", analytics.append)
+    write = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_commit_task_status_change", write)
+
+    reads = []
+
+    def transport(args, **kwargs):
+        reads.append(args)
+        assert args == ["api", "repos/octo/demo/pulls/629", "--include"]
+        return "HTTP/2.0 200 OK\r\n\r\n" + json.dumps({
+            "number": 629, "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
+            "head": {"sha": "a" * 40}, "state": "closed", "merged": True,
+            "merge_commit_sha": "b" * 40,
+            "merged_at": "2020-01-31T23:59:00Z",
+        })
+
+    monkeypatch.setattr(merge_module.gh_runner, "run_gh", transport)
+    asyncio.run(runner._run_cycle_body())
+    preflight.assert_not_awaited()
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_queue[0].status == TaskStatus.DONE
+    assert write.await_args.args[0].pr_id == queued.pr_id
+    assert write.await_args.args[1] == "DONE"
+    if missing_record:
+        record = runner._metrics_store.save.await_args.args[0]
+        assert record.task_id == task.pr_id and record.repo_name == runner.name
+        assert record.profile_id == "recovery:unknown:container"
+    assert record.exit_reason == "success_merged"
+    assert analytics[0]["merged_at"] == "2020-01-31T23:59:00+00:00"
+    assert reads == [["api", "repos/octo/demo/pulls/629", "--include"]]
+    assert runner._metrics_store.save.await_count == 2
+
+
+@pytest.mark.parametrize("mismatch", [
+    "name", "url", "phase", "task", "pr", "number", "head", "branch", "pr_id",
+    "queue_branch", "queue_task", "empty_branch",
+])
+def test_recovery_rejects_unbound_merge_snapshot(monkeypatch, mismatch):
+    runner = h._make_runner()
+    task = QueueTask(pr_id="PR-401", title="Merge", branch="pr-401", status=TaskStatus.DONE)
+    pr = PRInfo(number=629, pr_id=task.pr_id, branch=task.branch, head_sha="a" * 40)
+    saved = runner.state.model_copy(update={
+        "state": PipelineState.MERGE, "merge_phase": "merging",
+        "current_task": task, "current_pr": pr,
+    })
+    if mismatch in {"name", "url"}:
+        setattr(saved, mismatch, "other")
+    elif mismatch == "phase":
+        saved.merge_phase = "pre_merge_sync"
+    elif mismatch in {"task", "pr"}:
+        setattr(saved, f"current_{mismatch}", None)
+    elif mismatch == "number":
+        pr.number = 0
+    elif mismatch in {"head", "branch", "pr_id"}:
+        setattr(pr, {"head": "head_sha"}.get(mismatch, mismatch), "other")
+    if mismatch == "empty_branch":
+        task.branch = pr.branch = ""
+    queued = task.model_copy()
+    if mismatch == "queue_branch":
+        queued.branch = "other"
+    if mismatch == "queue_task":
+        queued.pr_id = "PR-999"
+    runner.redis.store[pipeline_state(runner.name)] = saved.model_dump_json()
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: [])
+    monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [queued])
+    monkeypatch.setattr(runner, "_cleanup_expected_branch", lambda: None)
+    assert asyncio.run(runner.recover_state())
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+
+
+@pytest.mark.parametrize("case", [
+    "pending_header", "pending_record", "historical", "finished", "wrong_record",
+    "incomplete", "metrics_error", "unmatched", "ambiguous", "open", "not_done", "no_branch",
+    "unprefixed", "wrong_pr_id", "unprefixed_ambiguous", "unprefixed_wrong_branch",
+])
+def test_header_merge_recovery_uses_complete_bound_github_evidence(
+    monkeypatch, isolate_analytics_dir, case,
+):
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    runner = h._make_runner()
+    task = QueueTask(pr_id="PR-401", title="Merge", branch="pr-401",
+                     task_file="tasks/PR-401.md", status=TaskStatus.DONE)
+    runner.state.current_task = task
+    runner._start_current_run_record("claude", "opus")
+    record = runner._current_run_record
+    runner.state.current_task = None
+    runner._current_run_record = None
+    runner._recovery_task_headers = {task.pr_id: types.SimpleNamespace(
+        frontmatter_status="todo" if case == "pending_header" else "done",
+    )}
+    records = [record]
+    if case in {"pending_header", "historical"}:
+        records = []
+    if case == "historical":
+        from src.analytics.outcome_logger import compute_task_id_hash
+
+        isolate_analytics_dir.mkdir(parents=True, exist_ok=True)
+        (isolate_analytics_dir / "2026-04.jsonl").write_text(json.dumps({
+            "task_id_hash": compute_task_id_hash(task.pr_id, runner.name),
+        }) + "\n")
+    if case == "finished":
+        record.exit_reason = "success_merged"
+    if case == "wrong_record":
+        records = [replace(record, task_id="PR-999"), replace(record, repo_name="other")]
+    if case == "not_done":
+        task.status = TaskStatus.ERROR
+    if case == "no_branch":
+        task.branch = ""
+    lookup = AsyncMock(return_value=records)
+    if case == "metrics_error":
+        lookup.side_effect = RuntimeError("metrics unavailable")
+    monkeypatch.setattr(runner._metrics_store, "list_task_runs", lookup)
+    from src.github import cache
+
+    cache.clear_etag_cache()
+    calls = []
+
+    def transport(args, **kwargs):
+        calls.append(args)
+        assert args[1].startswith("repos/octo/demo/pulls?state=closed&base=main&per_page=100")
+        if case == "incomplete":
+            return "HTTP/2.0 200 OK\r\n\r\nbroken"
+        entry = {
+            "number": 629, "title": "PR-401: Merge", "merged_at": "2026-10-20T00:00:00Z",
+            "base": {"ref": "main"}, "head": {"ref": "pr-401", "sha": "a" * 40},
+            "merge_commit_sha": "b" * 40,
+        }
+        if case.startswith("unprefixed"):
+            entry["title"] = "Confirm remote merge"
+        if case == "wrong_pr_id":
+            entry["title"] = "PR-999: Different task"
+        if case in {"unmatched", "unprefixed_wrong_branch"}:
+            entry["head"]["ref"] = "other"
+        entries = ([entry, dict(entry, number=630)]
+                   if case in {"ambiguous", "unprefixed_ambiguous"} else [entry])
+        return "HTTP/2.0 200 OK\r\n\r\n" + json.dumps(entries)
+
+    monkeypatch.setattr(gh_prs.gh_runner, "run_gh", transport)
+    open_prs = [PRInfo(number=629, pr_id=task.pr_id, branch=task.branch)] if case == "open" else []
+    if case in {"incomplete", "metrics_error"}:
+        monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: open_prs)
+        monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [task])
+        monkeypatch.setattr(runner, "_cleanup_expected_branch", lambda: None)
+        result = asyncio.run(runner.recover_state())
+        assert runner.state.current_task is None
+    else:
+        result = asyncio.run(runner._recover_header_merge_attempt([task], open_prs))
+    assert result is (case not in {"incomplete", "metrics_error", "ambiguous", "unprefixed_ambiguous"})
+    saved = getattr(runner, "_persisted_merge_recovery", None)
+    if case in {"pending_header", "pending_record", "unprefixed", "wrong_record"}:
+        assert saved.current_task is task
+        assert saved.current_pr.number == 629
+        assert saved.current_pr.head_sha == "a" * 40
+        assert saved.merge_phase == "post_merge_cleanup"
+        assert runner._current_run_record is (None if case in {"pending_header", "wrong_record"} else record)
+    else:
+        assert saved is None
+    if case in {"historical", "finished", "open", "not_done", "no_branch"}:
+        assert not calls
+
+
+@pytest.mark.parametrize("current_evidence", ["todo", "doing", "run"])
+def test_header_merge_recovery_prioritizes_unfinished_attempt(
+    monkeypatch, isolate_analytics_dir, current_evidence,
+):
+    """Missing historical analytics cannot consume the one startup recovery."""
+    from unittest.mock import AsyncMock
+
+    runner = h._make_runner()
+    historical = QueueTask(pr_id="PR-001", title="Historical", branch="pr-001",
+                           task_file="tasks/PR-001.md", status=TaskStatus.DONE)
+    current = QueueTask(pr_id="PR-401", title="Interrupted", branch="pr-401",
+                        task_file="tasks/PR-401.md", status=TaskStatus.DONE)
+    runner._recovery_task_headers = {
+        historical.pr_id: types.SimpleNamespace(frontmatter_status="done"),
+        current.pr_id: types.SimpleNamespace(
+            frontmatter_status="done" if current_evidence == "run" else current_evidence,
+        ),
+    }
+    runner.state.current_task = current
+    runner._start_current_run_record("claude", "opus")
+    record = runner._current_run_record
+    runner.state.current_task = None
+    runner._current_run_record = None
+    lookup = AsyncMock(side_effect=lambda repo, task_id:
+                       [record] if task_id == current.pr_id and current_evidence == "run" else [])
+    monkeypatch.setattr(runner._metrics_store, "list_task_runs", lookup)
+    monkeypatch.setattr(gh_prs, "get_merged_prs_discovery", lambda *a: gh_prs.PRDiscovery(
+        runner.owner_repo, "main",
+        [PRInfo(number=1, pr_id=historical.pr_id, branch=historical.branch, head_sha="b" * 40),
+         PRInfo(number=629, pr_id=current.pr_id, branch=current.branch, head_sha="a" * 40)],
+        True,
+    ))
+
+    assert asyncio.run(runner._recover_header_merge_attempt([historical, current], []))
+    saved = runner._persisted_merge_recovery
+    assert saved.current_task is current
+    assert saved.current_pr.number == 629
+    assert saved.current_pr.head_sha == "a" * 40
+    assert saved.merge_phase == "post_merge_cleanup"
+    assert runner._current_run_record is (record if current_evidence == "run" else None)

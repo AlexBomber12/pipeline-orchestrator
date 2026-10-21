@@ -1699,11 +1699,13 @@ class PipelineRunner(
                 )
                 return
 
-    def _compute_diff_stats(self, base_branch: str) -> dict[str, object]:
-        """Compute file/language/line stats for the current branch vs base."""
+    def _compute_diff_stats(
+        self, base_branch: str, head_ref: str = "HEAD",
+    ) -> dict[str, object]:
+        """Compute file/language/line stats for the selected head vs base."""
         try:
             numstat = subprocess.run(
-                ["git", "diff", "--numstat", f"origin/{base_branch}...HEAD"],
+                ["git", "diff", "--numstat", f"origin/{base_branch}...{head_ref}"],
                 cwd=self.repo_path,
                 capture_output=True,
                 text=True,
@@ -1794,17 +1796,38 @@ class PipelineRunner(
             return "recovery"
         return "coding"
 
-    async def _restore_current_run_record(self) -> None:
-        """Reload the latest persisted record for the active task."""
+    async def _restore_current_run_record(self, *, recover_missing_merge: bool = False) -> None:
+        """Restore the bound invocation, or latest task run when no binding survived."""
         task = self.state.current_task
         if task is None:
             self._current_run_record = None
             return
         try:
-            recent = await self._metrics_store.recent(
-                task_id=task.pr_id,
-                limit=20,
-                repo_name=self.name,
+            invocation = self.state.active_invocation
+            run_id = invocation.run_id if invocation is not None else None
+            if run_id is not None:
+                record = await self._metrics_store.get(run_id)
+                recent = [record] if record is not None else []
+            else:
+                # The recency index is shared by all PR tasks in this repo.
+                # Unrelated runs must not suppress task-index recovery.
+                recent = [
+                    record for record in await self._metrics_store.recent(
+                        task_id=task.pr_id, limit=20, repo_name=self.name,
+                    )
+                    if record.task_id == task.pr_id and record.repo_name == self.name
+                ]
+                if not recent:
+                    recent = sorted(
+                        (record for record in await self._metrics_store.list_task_runs(self.name, task.pr_id)
+                         if record.task_id == task.pr_id and record.repo_name == self.name),
+                        key=lambda record: (record.started_at, record.run_id), reverse=True,
+                    )
+            self._current_run_record = next(
+                (record for record in recent
+                 if record.task_id == task.pr_id and record.repo_name == self.name
+                 and (run_id is None or record.run_id == run_id)),
+                None,
             )
         except Exception as exc:
             self._current_run_record = None
@@ -1813,10 +1836,29 @@ class PipelineRunner(
                 f"{task.pr_id}: {exc}."
             )
             return
-        self._current_run_record = next(
-            (record for record in recent if record.task_id == task.pr_id),
-            None,
-        )
+        if recover_missing_merge and not recent:
+            # Exact remote merge proof allows completion after Redis loss. Do
+            # not invent lost coder usage or fall back past a mismatched record.
+            # The caller checkpoints this accounting before writing DONE.
+            self._current_run_record = RunRecord(
+                run_id=run_id if run_id is not None else str(uuid.uuid4()),
+                task_id=task.pr_id,
+                repo_name=self.name,
+                profile_id="recovery:unknown:container",
+                task_type="",
+                complexity="",
+                started_at=datetime.now(timezone.utc).isoformat(),
+                ended_at=None,
+                duration_ms=None,
+                fix_iterations=0,
+                tokens_in=0,
+                tokens_out=0,
+                exit_reason="",
+                operator_intervention=False,
+                run_phase="merge",
+                invocations=[invocation] if invocation is not None else [],
+            )
+            self.log_event(f"[MERGE] Reconstructed missing accounting for {task.pr_id}.")
         if (
             self.state.active_invocation is None
             and self._current_run_record is not None
@@ -1868,7 +1910,13 @@ class PipelineRunner(
         else:
             record.cause_subsource = None
         record.run_phase = run_phase or self._run_phase_for_metrics(exit_reason)
-        record.head_sha = self._git_rev_parse("HEAD")
+        pr = self.state.current_pr
+        # Merge cleanup and fresh-clone recovery can run on the base branch.
+        # The retained PR identity supplies the head proved merged by GitHub.
+        record.head_sha = (
+            pr.head_sha if exit_reason == "success_merged" and pr is not None
+            and pr.head_sha else self._git_rev_parse("HEAD")
+        )
         if exit_reason in ("success_merged", "coding_complete", "closed_unmerged"):
             resolved_base_branch = base_branch or self.repo_config.branch or "main"
             stats = diff_stats
@@ -3758,6 +3806,19 @@ class PipelineRunner(
             if not self._user_pause_logged:
                 self.log_event("[INFRA] Paused. Press Play to resume.")
                 self._user_pause_logged = True
+            await self.publish_state()
+            return
+
+        # An attempted merge is retained until exact remote evidence resolves it.
+        # Reconcile before preflight: a dirty checkout must not clear the retained
+        # identity via ERROR before DONE and success accounting can be replayed.
+        # It must not enter IDLE discovery or touch a possibly deleted branch.
+        if (
+            self.state.state == PipelineState.MERGE
+            and self.state.current_pr is not None
+            and self.state.merge_phase in {"merging", "post_merge_cleanup"}
+        ):
+            await self.handle_merge()
             await self.publish_state()
             return
 

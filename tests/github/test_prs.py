@@ -32,14 +32,17 @@ def test_exact_pr_outcome_by_identity(
 ) -> None:
     payload = {
         "number": 42,
-        "base": {"ref": "main"},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
         "head": {"sha": "a" * 40},
         "state": state,
         "merged": merged,
         "merge_commit_sha": merge_sha,
+        "merged_at": "2020-01-31T23:59:00Z",
     }
     monkeypatch.setattr(cache, "_etag_get", lambda path: payload)
     result = gh_prs.get_exact_pr_outcome("octo/demo", "main", 42, "a" * 40)
+    assert result.merged_at == (datetime(2020, 1, 31, 23, 59, tzinfo=timezone.utc)
+                                if expected == gh_prs.ExactPRState.MERGED else None)
     assert result.state == expected
     assert result.discovery_complete is (expected != gh_prs.ExactPRState.UNKNOWN)
     assert result.merge_commit_sha == (merge_sha if expected == gh_prs.ExactPRState.MERGED else None)
@@ -58,7 +61,7 @@ def test_exact_pr_outcome_permission_error_and_stale_cache(monkeypatch: pytest.M
         "_etag_get",
         lambda path: {
             "number": 42,
-            "base": {"ref": "main"},
+            "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
             "head": {"sha": "a" * 40},
             "state": "closed",
             "merged": False,
@@ -93,7 +96,7 @@ def test_merged_discovery_accepts_complete_identity_and_rejects_stale_cache(
 ) -> None:
     payload = [{
         "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
-        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
         "merge_commit_sha": "b" * 40,
     }]
     monkeypatch.setattr(cache, "_etag_get", lambda path: payload)
@@ -123,7 +126,7 @@ def test_merged_discovery_rejects_identity_mismatch(
 ) -> None:
     payload = {
         "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
-        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
         "merge_commit_sha": "b" * 40,
     }
     if change == "base":
@@ -146,7 +149,7 @@ def test_merged_discovery_rejects_nonpositive_pr_number(
 ) -> None:
     valid = {
         "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
-        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
         "merge_commit_sha": "b" * 40,
     }
     payload = ([valid] if valid_first else []) + [{**valid, "number": number}]
@@ -163,7 +166,7 @@ def test_merged_discovery_rejects_malformed_merge_timestamp(
 ) -> None:
     valid = {
         "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
-        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
         "merge_commit_sha": "b" * 40,
     }
     monkeypatch.setattr(cache, "_etag_get", lambda path: [valid, {**valid, "merged_at": merged_at}])
@@ -192,7 +195,7 @@ def test_pr_readers_accept_successful_revalidation_after_ttl(
     monkeypatch.setattr(cache, "_etag_cache", OrderedDict())
     payload = {
         "number": 42, "title": "PR-42: done", "merged_at": "2026-10-01T00:00:00Z",
-        "base": {"ref": "main"}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
+        "base": {"ref": "main", "repo": {"full_name": "octo/demo"}}, "head": {"ref": "pr-42-done", "sha": "a" * 40},
         "merge_commit_sha": "b" * 40, "state": "closed", "merged": True,
     }
     calls: list[list[str]] = []
@@ -500,3 +503,34 @@ def test_get_open_prs_snapshots_reviewer_policy_once_per_poll(
     assert len(observed_policies) == 2
     assert observed_policies[0] is observed_policies[1]
     assert observed_policies[0] is not None
+
+
+@pytest.mark.parametrize("case,expected", [
+    ("none", False), ("auto", True), ("queue", True), ("error", None),
+    ("missing", None), ("head", None), ("transport", None), ("null", None),
+])
+def test_merge_admission_is_exact_and_fail_closed(monkeypatch, case, expected):
+    pr = {"headRefOid": "a" * 40, "autoMergeRequest": None, "mergeQueueEntry": None}
+    result = {"data": {"repository": {"pullRequest": pr}}}
+    if case in {"auto", "queue"}:
+        pr["autoMergeRequest" if case == "auto" else "mergeQueueEntry"] = {"id": "queued"}
+    if case == "error":
+        result["errors"] = [{"message": "partial result"}]
+    if case == "missing":
+        del pr["mergeQueueEntry"]
+    if case == "head":
+        pr["headRefOid"] = "b" * 40
+    if case == "null":
+        result = None
+
+    def transport(args, **kwargs):
+        assert args[:2] == ["api", "graphql"]
+        assert kwargs == {}  # gh api has no -R flag; identity is in query variables.
+        assert "owner=octo" in args and "name=demo" in args
+        assert "number=42" in args
+        if case == "transport":
+            raise RuntimeError("offline")
+        return result
+
+    monkeypatch.setattr(gh_prs.gh_runner, "run_gh", transport)
+    assert gh_prs.get_pr_merge_admission("octo/demo", 42, "a" * 40) is expected
