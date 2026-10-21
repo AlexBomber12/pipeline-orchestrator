@@ -769,14 +769,38 @@ def test_legacy_size_recovery_preserves_unverified_state(
     if saved == "missing":
         with pytest.raises(recovery_module.LegacySizeRecoveryDeferred, match="checkout is unavailable"):
             asyncio.run(runner._recover_legacy_size_tasks(tasks, [pr]))
-    elif saved in ("blank_head", "invalid_head", "stale_marker", "fixing_marker"):
+    elif saved in ("blank_head", "invalid_head", "stale_marker"):
         with pytest.raises(recovery_module.LegacySizeRecoveryDeferred):
             asyncio.run(runner._recover_legacy_size_tasks(tasks, [pr]))
     else:
         asyncio.run(runner._recover_legacy_size_tasks(tasks, [pr]))
     assert tasks[0].status == TaskStatus.ERROR
+    if saved == "fixing_marker":
+        assert any("retaining ERROR for operator recovery" in item["event"] for item in runner.state.history)
     if saved == "malformed":
         assert any("saved state is malformed" in item["event"] for item in runner.state.history)
+
+
+def test_unresolved_size_fix_recovery_completes_in_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_task_file(tmp_path, "PR-100", "ERROR", "pr-100-size")
+    path = tmp_path / "tasks/PR-100.md"
+    path.write_text(path.read_text().replace("status: ERROR", "status: ERROR\nblocked_reason: guardrail"))
+    pr = PRInfo(
+        number=100, branch="pr-100-size", pr_id="PR-100", head_sha="a" * 40,
+        quarantine_labels={continued_size_label("a" * 40), fixing_size_label("a" * 40)},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [pr])
+    monkeypatch.setattr(
+        recovery_module, "_resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.current_queue[0].status == TaskStatus.ERROR
+    assert any("retaining ERROR for operator recovery" in item["event"] for item in runner.state.history)
 
 
 def test_legacy_size_recovery_fetches_external_pr_head(

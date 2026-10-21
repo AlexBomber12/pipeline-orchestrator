@@ -960,7 +960,11 @@ class RecoveryMixin:
             if pr is None or not pr.quarantine_labels:
                 continue
             if any(is_fixing_size_label(label) for label in pr.quarantine_labels):
-                raise LegacySizeRecoveryDeferred("size FIX outcome is not yet durable")
+                self.log_event(
+                    f"[RECOVERY] Size FIX for {task.pr_id} has no durable success; "
+                    "retaining ERROR for operator recovery."
+                )
+                continue
             markers = {label for label in pr.quarantine_labels if is_continued_size_label(label)}
             if blocking_quarantine_labels(pr.quarantine_labels):
                 continue
