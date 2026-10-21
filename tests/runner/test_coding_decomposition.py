@@ -918,7 +918,7 @@ def test_empty_publication_monitor_result_resumes_cli_completion(
     assert runner.state.state == PipelineState.WATCH
 
 
-def test_failed_publication_baseline_keeps_ordinary_completion(
+def test_failed_publication_baseline_defers_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = _runner_with_task(monkeypatch)
@@ -929,8 +929,7 @@ def test_failed_publication_baseline_keeps_ordinary_completion(
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("offline")),
     )
     async def cli_finishes(*args: object, **kwargs: object) -> tuple[int, str, str]:
-        await asyncio.sleep(0)
-        return (0, "done", "")
+        pytest.fail("coder must not start without a publication baseline")
 
     monkeypatch.setattr(plugin, "run_auto_pr", cli_finishes)
     monkeypatch.setattr(
@@ -941,7 +940,10 @@ def test_failed_publication_baseline_keeps_ordinary_completion(
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.publication_attempt is None
+    assert runner.state.active_invocation is None
+    assert not runner._coder_invocation_active
     assert any(
         "Publication baseline unavailable" in entry["event"]
         for entry in runner.state.history

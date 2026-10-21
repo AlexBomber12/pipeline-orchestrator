@@ -108,6 +108,8 @@ def test_branch_mismatch_after_coder_exit_escalates_explicitly(
     def fake_run(cmd: list[str], **_kwargs: Any) -> subprocess.CompletedProcess[str]:
         if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
             return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="pr-001-typo\n", stderr="")
+        if cmd[:2] == ["git", "ls-remote"]:
+            return subprocess.CompletedProcess(args=cmd, returncode=2, stdout="", stderr="")
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("src.branch_context.subprocess.run", fake_run)
@@ -153,7 +155,7 @@ def test_remote_branch_exists_handles_subprocess_error(
         raise subprocess.TimeoutExpired(cmd=["git"], timeout=30)
 
     monkeypatch.setattr(git_ops, "_git", fake_git)
-    assert coding_module._remote_branch_exists("/tmp/nope", "any") is False
+    assert coding_module._remote_branch_exists("/tmp/nope", "any") is None
 
 
 def test_local_branch_head_sha_requires_verified_full_sha(
@@ -186,14 +188,14 @@ def test_local_branch_head_sha_requires_verified_full_sha(
     assert coding_module._local_branch_head_sha("/repo", "pr-001") is None
 
 
-def test_remote_branch_exists_returns_false_on_empty_stdout(
+def test_remote_branch_exists_returns_unknown_on_empty_stdout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_git(*args: Any, **kwargs: Any):
         return subprocess.CompletedProcess(args=["git"], returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(git_ops, "_git", fake_git)
-    assert coding_module._remote_branch_exists("/tmp/nope", "any") is False
+    assert coding_module._remote_branch_exists("/tmp/nope", "any") is None
 
 
 def _patch_codex_reactions(
@@ -1764,3 +1766,123 @@ def test_retained_failed_attempt_preserves_publication_safety_floor(monkeypatch)
     assert restarted.state.publication_watermark == watermark
     assert restarted.state.current_pr.number == 402
     assert restarted.state.error_message == "coder failed"
+
+
+@pytest.mark.parametrize("local_exists", [False, True])
+def test_proven_no_push_releases_attempt_for_operator_retry(monkeypatch, local_exists):
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    # The coder exits without publishing anything.
+    async def no_publication(*args, **kwargs):
+        remote["calls"] += 1
+        return 0, "", ""
+
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", no_publication)
+    _patch_branch_state(monkeypatch, local_exists=local_exists, remote_exists=False)
+    asyncio.run(runner.handle_coding())
+    assert runner.state.state == PipelineState.ERROR
+    assert not runner.state.publication_attempt.pending
+    monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
+    monkeypatch.setattr(coding_module.gh_prs, "get_merged_prs", lambda *a, **kw: [])
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001")
+    assert asyncio.run(runner._select_retry_continuation(command)) == ("coding", None)
+    assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("probe_result", [128, "timeout"])
+def test_failed_remote_probe_keeps_attempt_pending(monkeypatch, probe_result):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    remote["omit"] = True
+
+    def git(*args, **kwargs):
+        if "ls-remote" in args:
+            if probe_result == "timeout":
+                raise subprocess.TimeoutExpired("git", 30)
+            return subprocess.CompletedProcess([], probe_result, "", "offline")
+        return subprocess.CompletedProcess([], 0, "", "")
+
+    monkeypatch.setattr(git_ops, "_git", git)
+    asyncio.run(runner.handle_coding())
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.publication_attempt.pending
+    assert "ownership unresolved" in runner.state.error_message
+
+
+@pytest.mark.parametrize("pushed", [False, True])
+def test_failed_fix_only_records_new_head_after_remote_verification(monkeypatch, pushed):
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+
+    async def failed_fix(*args, **kwargs):
+        monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: "b" * 40)
+        if pushed:
+            remote["head"] = "b" * 40
+        return 1, "", "fix failed"
+
+    monkeypatch.setattr(h.claude_cli, "fix_review_async", failed_fix)
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.ERROR
+    attempt = runner.state.publication_attempt
+    assert attempt.head_sha == remote["head"]
+    assert attempt.candidate.head_sha == remote["head"]
+    assert runner.state.current_pr.head_sha == remote["head"]
+    assert attempt.failure == "fix failed"
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001", bound_pr=runner.state.current_pr)
+    continuation, pr = asyncio.run(runner._select_retry_continuation(command))
+    assert continuation == "watch"
+    assert pr.number == 402
+    assert pr.head_sha == remote["head"]
+
+
+@pytest.mark.parametrize("raises", [False, True])
+def test_fix_head_probe_failure_preserves_known_remote_head(monkeypatch, raises):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+
+    async def failed_fix(*args, **kwargs):
+        monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: "b" * 40)
+        remote["exact_unknown"] = True
+        if raises:
+            def unavailable(*args, **kwargs):
+                raise OSError("exact probe unavailable")
+            monkeypatch.setattr(coding_module.gh_prs, "get_exact_pr_outcome", unavailable)
+        return 1, "", "fix failed"
+
+    monkeypatch.setattr(h.claude_cli, "fix_review_async", failed_fix)
+    asyncio.run(runner.handle_fix())
+    assert runner.state.publication_attempt.head_sha == "a" * 40
+    assert runner.state.current_pr.head_sha == "a" * 40
+    remote["exact_unknown"] = False
+    monkeypatch.setattr(coding_module.gh_prs, "get_exact_pr_outcome", _REAL_EXACT_OUTCOME)
+    assert asyncio.run(runner._resolve_published_attempt())
+
+
+def test_baseline_outage_defers_until_publication_can_be_reconciled(monkeypatch):
+    runner = _runner(monkeypatch)
+    runner.state.state = PipelineState.CODING
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+
+    def unavailable(*args, **kwargs):
+        raise OSError("baseline unavailable")
+
+    monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", unavailable)
+    asyncio.run(runner.handle_coding())
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.active_invocation is None
+    assert runner.state.publication_attempt is None
+    assert remote["calls"] == 0
+
+    monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", _REAL_PUBLICATIONS)
+    asyncio.run(runner.handle_coding())
+    assert remote["calls"] == 1
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.number == 402

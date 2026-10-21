@@ -101,15 +101,8 @@ def _local_branch_exists(repo_path: str, branch: str) -> bool:
     return probe.returncode == 0
 
 
-def _remote_branch_exists(repo_path: str, branch: str) -> bool:
-    """Return ``True`` if ``origin`` reports ``refs/heads/{branch}`` exists.
-
-    Uses ``git ls-remote --exit-code`` so a missing ref returns rc=2 and a
-    transient transport failure returns rc>=128 — both interpreted as "not
-    visible upstream" by the caller, which routes A/B through escalation and
-    back to IDLE without risking a false-positive PR-creation attempt against
-    a non-existent upstream branch.
-    """
+def _remote_branch_exists(repo_path: str, branch: str) -> bool | None:
+    """Return presence, proven absence (rc=2), or unknown on probe failure."""
     try:
         probe = git_ops._git(
             repo_path,
@@ -122,8 +115,12 @@ def _remote_branch_exists(repo_path: str, branch: str) -> bool:
             check=False,
         )
     except (subprocess.SubprocessError, OSError):
+        return None
+    if probe.returncode == 2:
         return False
-    return probe.returncode == 0 and bool(probe.stdout.strip())
+    if probe.returncode == 0 and probe.stdout.strip():
+        return True
+    return None
 
 
 def _local_branch_head_sha(repo_path: str, branch: str) -> str | None:
@@ -226,10 +223,24 @@ class CodingMixin:
         local_head = await asyncio.to_thread(
             _local_branch_head_sha, self.repo_path, attempt.branch,
         )
-        if local_head is not None:
-            if attempt.head_sha != local_head:
+        if local_head is not None and local_head != attempt.head_sha:
+            # FIX already owns a remote PR. A local commit is not proof of a
+            # push; retain its known head until the exact remote read agrees.
+            if attempt.pr_number is not None:
+                try:
+                    outcome = await asyncio.to_thread(
+                        gh_prs.get_exact_pr_outcome,
+                        attempt.repo, attempt.base, attempt.pr_number, local_head,
+                    )
+                except Exception as exc:
+                    self.log_event(f"[INFRA] FIX head verification deferred: {exc}")
+                else:
+                    if outcome.discovery_complete and outcome.state == gh_prs.ExactPRState.OPEN:
+                        attempt.head_sha = local_head
+                        attempt.verified = False
+            else:
                 attempt.verified = False
-            attempt.head_sha = local_head
+                attempt.head_sha = local_head
         if (observed is not None and self._publication_matches_attempt(observed)):
             attempt.pr_number = observed.number
             attempt.candidate = observed.to_pr_info()
@@ -606,12 +617,11 @@ class CodingMixin:
                 target_branch,
             )
         except Exception as exc:
-            publication_baseline = None
             self.log_event(
                 f"[CODING] Publication baseline unavailable for "
-                f"{target_branch!r}: {exc}; this run will use ordinary "
-                "completion handling."
+                f"{target_branch!r}: {exc}; deferring coder invocation."
             )
+            return None
         else:
             publication_baseline = {item.number for item in baseline}
 
@@ -735,11 +745,7 @@ class CodingMixin:
 
         async def refresh_as_coder_completes() -> None:
             nonlocal publication_observed
-            if (
-                publication_baseline is None
-                or self._stop_requested
-                or breach_flag["breached"]
-            ):
+            if self._stop_requested or breach_flag["breached"]:
                 return
             try:
                 publication_observed = await refresh_publication()
@@ -1385,7 +1391,12 @@ class CodingMixin:
         if await pause_for_stop_if_requested():
             return
 
-        if not remote_exists:
+        if remote_exists is False:
+            # Only a successful remote absence probe can release this attempt.
+            # Keep any positive PR evidence even if its branch was deleted.
+            attempt = self.state.publication_attempt
+            if attempt is not None and attempt.pr_number is None and attempt.candidate is None:
+                attempt.pending = False
             ctx = BranchContext.from_runner(self)
             if ctx.mismatch_reason is not None:
                 # Daemon recovery is unavailable (no upstream

@@ -875,7 +875,9 @@ def test_handle_coding_no_pr_routes_to_diagnostic(
     )
 
     def fake_git(repo_path: str, *args: str, **kwargs: Any):
-        return h._FakeCompletedProcess(args=list(args), returncode=1)
+        return h._FakeCompletedProcess(
+            args=list(args), returncode=2 if args[:1] == ("ls-remote",) else 1,
+        )
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
 
@@ -1069,7 +1071,9 @@ def test_handle_coding_rejects_unmatched_branch(
     )
 
     def fake_git(repo_path: str, *args: str, **kwargs: Any):
-        return h._FakeCompletedProcess(args=list(args), returncode=1)
+        return h._FakeCompletedProcess(
+            args=list(args), returncode=2 if args[:1] == ("ls-remote",) else 1,
+        )
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
 
