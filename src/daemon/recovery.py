@@ -27,6 +27,7 @@ from src.cancellation import (
 )
 from src.daemon import git_ops
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
+from src.daemon.quarantine import blocking_quarantine_labels
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
 from src.models import (
@@ -873,7 +874,7 @@ class RecoveryMixin:
         for pr in prs:
             if not any(
                 label.startswith("quarantine:")
-                for label in getattr(pr, "quarantine_labels", set())
+                for label in blocking_quarantine_labels(getattr(pr, "quarantine_labels", set()))
             ):
                 continue
             if not pr.pr_id:

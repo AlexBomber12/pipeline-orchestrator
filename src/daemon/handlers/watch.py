@@ -17,7 +17,7 @@ from pathlib import Path
 from src.cancellation import CancellationCause
 from src.config import load_config
 from src.daemon import guardrails
-from src.daemon.quarantine import apply_quarantine_label_for_violation
+from src.daemon.quarantine import apply_quarantine_label_for_violation, blocking_quarantine_labels
 from src.daemon.selector import CoderPurpose, resolve_active_coder, resolve_pause_coder
 from src.github import cache as gh_cache
 from src.github import checks as gh_checks
@@ -679,6 +679,12 @@ class WatchMixin:
             daemon_config=self.app_config.daemon,
             repo_config=self.repo_config,
         )
+        size_signal = guardrails.diff_size_review_signal(diff_text, self.app_config.daemon)
+        if size_signal:
+            self.log_event(
+                f"[WATCH] PR #{current_pr.number} diff size review signal: {size_signal} "
+                f"(head {current_pr.head_sha})"
+            )
         violations = [v for v in violations if not self._approval_allows_violation(current_pr, v)]
         current_pr.diff_scanned_at_sha = current_pr.head_sha
         if violations:
@@ -727,7 +733,7 @@ class WatchMixin:
 
     async def _rehydrate_quarantine_from_pr_labels(self, pr: object) -> None:  # pragma: no cover
         """Restore guardrail suppression when the open PR still has the label."""
-        labels = getattr(pr, "quarantine_labels", set()) or set()
+        labels = blocking_quarantine_labels(getattr(pr, "quarantine_labels", set()) or set())
         if not any(label.startswith("quarantine:") for label in labels):
             return
         pr_number = getattr(pr, "number", None)
@@ -812,7 +818,7 @@ class WatchMixin:
             )
             return
         labels = [label.strip() for label in result.splitlines()]
-        if any(label.startswith("quarantine:") for label in labels if label):
+        if any(label.startswith("quarantine:") for label in blocking_quarantine_labels(set(labels)) if label):
             return
         if task_id and has_guardrail_suppression:
             await self._clear_task_suppression(task_id)  # pragma: no cover

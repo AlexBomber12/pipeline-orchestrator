@@ -118,6 +118,7 @@ def test_watch_620_evidence_drives_fix_without_rereading(
     def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
         result = PRInfo(
             number=42, branch="pr-459", head_sha=head, ci_status=ci_status,
+            quarantine_labels={"quarantine:large_diff"},
             review_status=gh_reviews.get_pr_review_status(
                 repo, 42, "author", head, policy=kwargs["reviewer_policy"]
             ),
@@ -593,8 +594,10 @@ def test_retry_failed_workflow_returns_true_after_rerun(
     )
 
 
+@pytest.mark.parametrize("labels", [set(), {"quarantine:large_diff"}])
 def test_handle_watch_approved_and_green_merges(
     monkeypatch: pytest.MonkeyPatch,
+    labels: set[str],
 ) -> None:
     monkeypatch.setattr(
         "src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", AsyncMock(return_value=True)
@@ -607,6 +610,7 @@ def test_handle_watch_approved_and_green_merges(
         review_status=ReviewStatus.APPROVED,
         head_sha="green001",
         diff_scanned_at_sha="green001",
+        quarantine_labels=labels,
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
@@ -642,12 +646,12 @@ def test_handle_watch_rehydrates_quarantine_before_merge(
         review_status=ReviewStatus.APPROVED,
         head_sha="green001",
         diff_scanned_at_sha="green001",
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
     monkeypatch.setattr(
         "src.github.gh_runner.run_gh",
-        lambda cmd, **kw: "quarantine:large_diff\n",
+        lambda cmd, **kw: "quarantine:workflow\n",
     )
 
     merged: list[tuple[str, int]] = []
@@ -684,7 +688,7 @@ def test_watch_quarantine_rehydrate_ignores_invalid_or_existing_pr() -> None:
     runner = h._make_runner()
     invalid = types.SimpleNamespace(
         number="5",
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
 
     asyncio.run(runner._rehydrate_quarantine_from_pr_labels(invalid))
@@ -695,7 +699,7 @@ def test_watch_quarantine_rehydrate_ignores_invalid_or_existing_pr() -> None:
     existing = PRInfo(
         number=5,
         branch="pr-001",
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
 
     asyncio.run(runner._rehydrate_quarantine_from_pr_labels(existing))
@@ -4286,6 +4290,27 @@ def test_scan_pr_diff_once_runs_when_cache_mismatches_head_sha(
     assert fetched == [(runner.owner_repo, 8)]
     assert runner.state.current_pr.diff_scanned_at_sha == "deadbeef"
     assert runner.state.state != PipelineState.ERROR
+
+
+def test_large_diff_is_review_signal_after_each_push(monkeypatch: pytest.MonkeyPatch) -> None:
+    import re as _re
+
+    monkeypatch.setattr(watch_module.guardrails, "_DIFF_PATTERNS", {"never": _re.compile("NEVER")})
+    diff = "diff --git a/src/large.py b/src/large.py\n--- a/src/large.py\n+++ b/src/large.py\n"
+    diff += "".join(f"+line {index}\n" for index in range(1600))
+    monkeypatch.setattr("src.github.prs.get_pr_diff", lambda *_: diff)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=8, branch="pr-008", head_sha="first")
+
+    assert asyncio.run(runner._scan_pr_diff_once())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.quarantined_prs == set()
+    assert sum("[WATCH] PR #8 diff size review signal" in item["event"] for item in runner.state.history) == 1
+    assert not asyncio.run(runner._scan_pr_diff_once())
+    runner.state.current_pr.head_sha = "second"
+    assert asyncio.run(runner._scan_pr_diff_once())
+    assert sum("[WATCH] PR #8 diff size review signal" in item["event"] for item in runner.state.history) == 2
 
 
 def test_scan_pr_diff_once_leaves_cache_unchanged_on_fetch_failure(

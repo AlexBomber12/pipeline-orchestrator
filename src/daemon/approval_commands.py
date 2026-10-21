@@ -24,18 +24,80 @@ from src.approval_commands import (
     approval_index,
     approval_key,
     approval_task_path,
+    build_approval,
+    enqueue_approval,
     failure_identity,
     list_approvals,
     matches_state,
 )
 from src.cancellation.storage import CancellationCause, cause_key, index_key, task_spec_content_hash
 from src.daemon import git_ops
-from src.daemon.quarantine import quarantine_label_for_category
+from src.daemon.quarantine import blocking_quarantine_labels, quarantine_label_for_category
+from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, derive_active_inhibitors
 from src.keyspace import control_stop, pipeline_state, upload_pending
 from src.models import PipelineState, RepoState, TaskStatus
 from src.retry_commands import load_latest_retry_command
+
+
+def bound_checkout_work_blocker(
+    repo_path: str, command: ApprovalCommand, published_head_sha: str | None = None,
+) -> str | None:
+    """Protect checkout work and the bound PR ref without scanning unrelated refs.
+
+    The PR HEAD is checked against GitHub before approval is committed. A
+    matching local branch is therefore published even when its remote-tracking
+    ref is stale. A different local branch tip is preserved for inspection.
+    """
+    dirty = git_ops._git(repo_path, "--no-optional-locks", "status", "--porcelain")
+    if dirty.stdout.strip():
+        return "Checkout has staged, unstaged or untracked work; preserving it until the operator resolves it."
+    branch = command.pr.branch
+    if not branch or branch != command.task.branch or branch.startswith("-") or ".." in branch:
+        return "Bound task and PR branch are unavailable or disagree."
+    bound_ref = git_ops._git(repo_path, "rev-parse", "--verify", f"refs/heads/{branch}", check=False)
+    published_heads = {command.pr.head_sha, published_head_sha}
+    if bound_ref.returncode == 0 and bound_ref.stdout.strip() not in published_heads:
+        unpublished = git_ops._git(repo_path, "rev-list", f"refs/heads/{branch}", "--not", "--remotes")
+        if unpublished.stdout.strip():
+            return "Bound PR branch has local-only commits; preserving them until published or reviewed."
+    if bound_ref.returncode not in (0, 128):
+        return "Bound PR branch could not be verified; preserving checkout work."
+    head = git_ops._git(repo_path, "rev-parse", "--verify", "HEAD").stdout.strip()
+    if head not in published_heads:
+        local = git_ops._git(repo_path, "rev-list", "HEAD", "--not", "--remotes")
+        if local.stdout.strip():
+            return "Checkout HEAD has local-only commits; preserving them until published or reviewed."
+    return None
+
+
+def is_size_only_cause(raw: str | bytes | None, state: RepoState | None = None) -> bool:
+    """Recognize legacy size decisions without clearing mixed guardrail causes."""
+    if not raw:
+        return False
+    cause = CancellationCause.from_redis(raw)
+    payload = cause.payload
+    if payload.get("subsource") != "guardrail":
+        return False
+    categories = {payload[key] for key in ("category", "rule") if payload.get(key)}
+    reason = payload.get("reason_text", "")
+    if isinstance(reason, str) and reason.startswith("GUARDRAIL:"):
+        parts = reason.split(":", 2)
+        if len(parts) != 3:
+            return False
+        categories.add(parts[1].strip())
+    if categories == {"large_diff_threshold"}:
+        return True
+    return bool(
+        not categories
+        and payload.get("source") == "github_quarantine_label"
+        and state is not None
+        and state.current_pr is not None
+        and state.error_message
+        and "large_diff_threshold" in state.error_message
+        and state.current_pr.quarantine_labels == {"quarantine:large_diff"}
+    )
 
 
 def checkout_process_blocker(repo_path: str) -> str | None:
@@ -95,6 +157,8 @@ class ApprovalCommandMixin:
                 self.state = RepoState.model_validate_json(raw)
                 self._approval_head_refresh_uncertain = False
             commands = await list_approvals(self.redis, self.name)
+            await self._enqueue_size_only_recovery(commands)
+            commands = await list_approvals(self.redis, self.name)
             self._approval_history = [c for c in commands if c.status == "applied" and c.active]
             for command in reversed(commands):
                 if not command.active:
@@ -125,7 +189,8 @@ class ApprovalCommandMixin:
                         return True  # a newer failure must never inherit this permission
                     self._approval_receipt = command
                     try:
-                        reason = await self._approval_blocker(command)
+                        pr = await self._verified_bound_pr(command)
+                        reason = await self._approval_blocker(command, pr.head_sha)
                     except Exception as exc:
                         reason = f"Continuation safety could not be verified: {exc}"
                     if reason:
@@ -138,6 +203,11 @@ class ApprovalCommandMixin:
                         await self._approval_result(
                             command, "applied", "Approval applied; watching the existing PR with CI and review gates."
                         )
+                    if pr.head_sha != command.pr.head_sha:
+                        # A later push needs its own CI, scan and review result;
+                        # the old approval receipt must not carry across heads.
+                        self._approval_receipt = None
+                        await self.redis.zrem(approval_index(self.name), command.binding)
                     if await self._check_github_api_budget():
                         await self.handle_watch()
                     await self.publish_state()
@@ -147,6 +217,33 @@ class ApprovalCommandMixin:
         except Exception as exc:
             self.log_event(f"[RECOVERY] Approval store/application unavailable; deferring cycle: {exc}.")
             return True
+
+    async def _enqueue_size_only_recovery(self, commands: list[ApprovalCommand]) -> None:
+        """Reuse the validated approval path for a persisted obsolete size block."""
+        raw_state = await self.redis.get(pipeline_state(self.name))
+        if not raw_state:
+            return
+        state = RepoState.model_validate_json(raw_state)
+        if state.state != PipelineState.ERROR or state.current_task is None or state.current_pr is None:
+            return
+        raw_cause = await self.redis.get(cause_key(self.name, state.current_task.pr_id))
+        if not is_size_only_cause(raw_cause, state):
+            return
+        if any(
+            command.active and command.status in ("pending", "deferred")
+            and command.task.pr_id == state.current_task.pr_id
+            and command.pr.number == state.current_pr.number
+            for command in commands
+        ):
+            return
+        if state.url != self.repo_config.url:
+            self.log_event("[RECOVERY] Size-only decision retained: repository binding changed.")
+            return
+        try:
+            command = build_approval(self.name, state, raw_cause, Path(self.repo_path))
+            await enqueue_approval(self.redis, command)
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Size-only decision retained: {exc}")
 
     async def _inactive_approval_holds(self, command: ApprovalCommand) -> bool:
         """Retain preservation until a later operator action safely supersedes it.
@@ -166,10 +263,7 @@ class ApprovalCommandMixin:
         if not reason and self._current_coder_process is not None:
             reason = "Coder execution is still active."
         if not reason and Path(self.repo_path).exists():
-            dirty = git_ops._git(self.repo_path, "--no-optional-locks", "status", "--porcelain")
-            local = git_ops._git(self.repo_path, "rev-list", "--branches", "HEAD", "--not", "--remotes")
-            if dirty.stdout.strip() or local.stdout.strip():
-                reason = "Checkout still contains uncommitted work or local-only commits."
+            reason = bound_checkout_work_blocker(self.repo_path, command)
         if reason:
             await self._approval_result(command, "failed", f"Later operator action is waiting: {reason}")
             return True
@@ -188,7 +282,27 @@ class ApprovalCommandMixin:
         await self.redis.transaction(transaction, key)
         return False
 
-    async def _approval_blocker(self, command: ApprovalCommand) -> str | None:
+    async def _verified_bound_pr(self, command: ApprovalCommand) -> Any:
+        prs = await asyncio.to_thread(
+            gh_prs.get_open_prs, self.owner_repo, self.repo_config.allow_merge_without_checks,
+        )
+        pr = next((item for item in prs if item.number == command.pr.number), None)
+        if pr is None:
+            state = await asyncio.to_thread(gh_prs.get_pr_state, self.owner_repo, command.pr.number)
+            if state in ("CLOSED", "MERGED"):
+                raise ApprovalChanged("The bound PR is closed or merged.")
+            raise RuntimeError("The bound PR is absent from the open-PR snapshot; waiting for GitHub evidence.")
+        if pr.branch != command.pr.branch:
+            raise ApprovalChanged("The bound PR branch changed.")
+        if not pr.head_sha:
+            raise RuntimeError("The current PR HEAD is unavailable; waiting for a verified GitHub snapshot.")
+        if pr.pr_id not in (None, command.task.pr_id):
+            raise ApprovalChanged("The bound PR now identifies a different task.")
+        return pr
+
+    async def _approval_blocker(
+        self, command: ApprovalCommand, published_head_sha: str | None = None,
+    ) -> str | None:
         if not self.repo_config.active:
             return "Repository is disabled."
         if (
@@ -243,18 +357,21 @@ class ApprovalCommandMixin:
                 ["git", "clone", "--branch", command.pr.branch, "--", self.repo_config.url, self.repo_path],
                 capture_output=True, text=True, check=True, timeout=120,
             )
-        result = git_ops._git(self.repo_path, "--no-optional-locks", "status", "--porcelain")
-        if result.stdout.strip():
+        dirty = git_ops._git(self.repo_path, "--no-optional-locks", "status", "--porcelain")
+        if dirty.stdout.strip():
             return "Checkout has staged, unstaged or untracked work; preserving it until the operator resolves it."
         path = approval_task_path(Path(self.repo_path), command.task.task_file)
         if task_spec_content_hash(path.read_text(encoding="utf-8")) != command.task_fingerprint:
             raise ApprovalChanged("Task specification changed; this approval cannot authorize revised work.")
-        local = git_ops._git(self.repo_path, "rev-list", "--branches", "HEAD", "--not", "--remotes")
-        if local.stdout.strip():
-            return (
-                "Checkout has local-only commits; preserving them until they are published or reviewed by the operator."
-            )
-        return None
+        published_task = git_ops._git(
+            self.repo_path, "show", f"{published_head_sha or command.pr.head_sha}:{command.task.task_file}",
+            check=False,
+        )
+        if published_task.returncode != 0:
+            return "Published task generation is unavailable in the checkout; preserving the PR."
+        if task_spec_content_hash(published_task.stdout) != command.task_fingerprint:
+            raise ApprovalChanged("Published PR and task generation disagree.")
+        return bound_checkout_work_blocker(self.repo_path, command, published_head_sha)
 
     async def _apply_approval(self, command: ApprovalCommand) -> bool:
         try:
@@ -279,27 +396,16 @@ class ApprovalCommandMixin:
                         )
                         return True
                 raise ApprovalChanged("Pending failure changed; no unrelated failure was cleared.")
-            reason = await self._approval_blocker(command)
-            if reason:
-                await self._approval_result(command, "deferred", reason)
-                return True
-            prs = await asyncio.to_thread(
-                gh_prs.get_open_prs,
-                self.owner_repo,
-                self.repo_config.allow_merge_without_checks,
-            )
-            pr = next((pr for pr in prs if pr.number == command.pr.number), None)
-            if pr is None or pr.branch != command.pr.branch:
-                raise ApprovalChanged("The bound PR is closed, missing, or its branch/HEAD changed.")
-            if not pr.head_sha:
-                raise RuntimeError("The current PR HEAD is unavailable; waiting for a verified GitHub snapshot.")
-            if pr.pr_id not in (None, command.task.pr_id):
-                raise ApprovalChanged("The bound PR now identifies a different task.")
+            pr = await self._verified_bound_pr(command)
             if pr.head_sha != command.pr.head_sha:
                 await self._publish_refreshed_guardrail_head(command, pr.head_sha)
                 raise ApprovalChanged(
                     "PR HEAD changed; daemon state was refreshed. Review the current PR and approve again."
                 )
+            reason = await self._approval_blocker(command, pr.head_sha)
+            if reason:
+                await self._approval_result(command, "deferred", reason)
+                return True
             if self._unapproved_labels(command, pr.quarantine_labels):
                 await self._approval_result(
                     command, "deferred", "The PR has another quarantine finding awaiting resolution."
@@ -307,7 +413,7 @@ class ApprovalCommandMixin:
                 return True
             # Recheck after GitHub awaits. There are no checkout/index writes on
             # either side of this check, even if an external editor writes later.
-            reason = await self._approval_blocker(command)
+            reason = await self._approval_blocker(command, pr.head_sha)
             if reason:
                 await self._approval_result(command, "deferred", reason)
                 return True
@@ -425,6 +531,14 @@ class ApprovalCommandMixin:
         self._approval_commit_uncertain = False
         self._recovered = True
         self._approval_receipt = command.model_copy(update={"status": "applied"})
+        if "quarantine:large_diff" in command.pr.quarantine_labels:
+            try:
+                gh_runner.run_gh(
+                    ["pr", "edit", str(command.pr.number), "--remove-label", "quarantine:large_diff"],
+                    repo=self.owner_repo,
+                )
+            except Exception as exc:
+                self.log_event(f"[RECOVERY] Obsolete size label removal deferred: {exc}")
         logging.getLogger(__name__).info("Approval %s applied to existing PR #%s", command.binding, command.pr.number)
 
     @staticmethod
@@ -458,7 +572,9 @@ class ApprovalCommandMixin:
 
     def _unapproved_labels(self, command: ApprovalCommand, labels: set[str]) -> set[str]:
         approved = {self._approved_finding(c)[0] for c in self._matching_approvals(command)}
-        return labels - {quarantine_label_for_category(category) for category in approved if category}
+        return blocking_quarantine_labels(labels) - {
+            quarantine_label_for_category(category) for category in approved if category
+        }
 
     def _current_approval(self, pr: Any) -> ApprovalCommand | None:
         command = self._approval_receipt
@@ -472,7 +588,7 @@ class ApprovalCommandMixin:
     def _approval_filtered_pr(self, pr: Any) -> Any:
         command = self._current_approval(pr)
         if command is None:
-            return pr
+            return pr.model_copy(update={"quarantine_labels": blocking_quarantine_labels(pr.quarantine_labels)})
         return pr.model_copy(
             update={
                 "quarantine_labels": self._unapproved_labels(command, pr.quarantine_labels),

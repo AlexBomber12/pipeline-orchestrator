@@ -169,6 +169,22 @@ passes on every repository.
 
 ## Recovery from ERROR
 
+Diff size is a review signal, not a guardrail decision. The daemon logs the
+size once per scanned PR HEAD and continues through the normal CI, Codex
+review, FIX, and MERGE gates. Existing `daemon.large_diff_addition_threshold`
+and `daemon.large_diff_files_threshold` configuration values remain accepted;
+they now control only when that informational event appears. Deployments do
+not need to remove their existing settings.
+
+After upgrading, a persisted `large_diff_threshold` cancellation for a bound
+open PR is reconciled through the same task, PR, HEAD, checkout, and process
+checks as an operator approval. A previously deferred approval resumes when
+those checks pass. The daemon removes the obsolete `quarantine:large_diff`
+label after validation and ignores it for gating if label removal is unavailable,
+while retaining other quarantine labels and guardrails.
+Unavailable GitHub evidence or unpublished task work leaves the PR parked
+with a specific recovery reason; no branch synchronization is performed.
+
 When a task ships its terminal failure state to ERROR (frontmatter
 status:ERROR), the operator has two recovery affordances:
 

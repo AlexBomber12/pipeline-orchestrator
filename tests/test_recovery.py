@@ -218,7 +218,7 @@ def test_recover_rehydrates_quarantine_from_pr_labels(
         branch="pr-042-inflight",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
 
@@ -248,7 +248,7 @@ def test_recover_projects_quarantine_when_guardrail_suppression_exists(
         pr_id="PR-042",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
 

@@ -287,7 +287,7 @@ def test_label_rehydrate_projects_quarantine_without_task_id() -> None:
             PRInfo(
                 number=10,
                 branch="pr-unknown",
-                quarantine_labels={"quarantine:large_diff"},
+                quarantine_labels={"quarantine:workflow"},
             )
         )
     )
@@ -350,7 +350,7 @@ def test_label_removal_check_keeps_labeled_pr(monkeypatch: pytest.MonkeyPatch) -
     runner.state.quarantined_prs.add(10)
     monkeypatch.setattr(
         "src.github.gh_runner.run_gh",
-        lambda *a, **kw: "quarantine:large_diff\n",
+        lambda *a, **kw: "quarantine:workflow\n",
     )
 
     asyncio.run(runner._detect_external_quarantine_release(10))

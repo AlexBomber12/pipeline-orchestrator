@@ -25,6 +25,13 @@ _CATEGORY_LABEL_ALIASES = {
     "workflow_destruction": "workflow",
 }
 
+_OBSOLETE_SIZE_LABEL = "quarantine:large_diff"
+
+
+def blocking_quarantine_labels(labels: set[str]) -> set[str]:
+    """Ignore only the former size decision; retain every other quarantine."""
+    return labels - {_OBSOLETE_SIZE_LABEL}
+
 
 def quarantine_label_for_category(category: str) -> str:
     """Return the quarantine label name for a guardrail category."""

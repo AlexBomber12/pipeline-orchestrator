@@ -3772,9 +3772,15 @@ def test_run_cycle_ignores_pending_upload_probe_error(
     async def fake_get(key: str) -> str | None:
         raise RuntimeError("redis unavailable")
 
+    async def no_approval_command() -> bool:
+        # Isolate the pending-upload probe; approval recovery has its own
+        # fail-closed Redis handling and would stop this cycle first.
+        return False
+
     monkeypatch.setattr(runner, "ensure_repo_cloned", fake_ensure_repo_cloned)
     monkeypatch.setattr(runner, "recover_state", fake_recover_state)
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
+    monkeypatch.setattr(runner, "_consume_approval_command", no_approval_command)
     monkeypatch.setattr(runner.redis, "get", fake_get)
 
     asyncio.run(runner.run_cycle())
