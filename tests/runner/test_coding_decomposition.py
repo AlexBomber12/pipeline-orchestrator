@@ -40,6 +40,12 @@ from tests.runner import _helpers as h
 def _runner_with_task(monkeypatch: pytest.MonkeyPatch):
     """Return a runner with a current task and a no-op subprocess fake."""
     h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        coding_module.gh_prs, "get_exact_pr_outcome",
+        lambda repo, base, number, sha: coding_module.gh_prs.ExactPROutcome(
+            repo, base, number, sha, coding_module.gh_prs.ExactPRState.OPEN, True,
+        ),
+    )
     runner = h._make_runner()
     runner.state.current_task = QueueTask(
         pr_id="PR-001",
@@ -79,6 +85,12 @@ def _publication_snapshots(
     monkeypatch: pytest.MonkeyPatch,
     *snapshots: list[BranchPublication] | Exception,
 ) -> list[int]:
+    monkeypatch.setattr(
+        coding_module.gh_prs, "get_exact_pr_outcome",
+        lambda repo, base, number, sha: coding_module.gh_prs.ExactPROutcome(
+            repo, base, number, sha, coding_module.gh_prs.ExactPRState.OPEN, True,
+        ),
+    )
     calls: list[int] = []
     local_head = {"value": "a" * 40}
 
@@ -527,7 +539,7 @@ def test_unverified_pre_cleanup_recheck_leaves_coder_running(
     )
     _publication_snapshots(monkeypatch, [], [publication], third_read)
     if recheck == "mismatch":
-        local_heads = iter(["a" * 40, "c" * 40, "c" * 40])
+        local_heads = iter(["a" * 40] + ["c" * 40] * 10)
         monkeypatch.setattr(
             coding_module,
             "_local_branch_head_sha",
@@ -594,7 +606,7 @@ def test_publication_monitor_rearms_after_sha_mismatch(
         monitor_inputs.append((baseline_numbers, not_before))
         return observed if len(monitor_inputs) == 1 else updated
 
-    local_heads = iter(["b" * 40, "b" * 40, "b" * 40])
+    local_heads = iter(["b" * 40] * 10)
     monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", fetch)
     monkeypatch.setattr(runner, "_monitor_coding_publication", monitor)
     monkeypatch.setattr(
@@ -686,7 +698,7 @@ def test_cli_exit_during_rearm_delay_rechecks_published_head(
     observed = _publication(50, sha="a" * 40)
     updated = _publication(50, sha="b" * 40)
     publication_reads = iter([[], [observed], [updated], [updated]])
-    local_heads = iter(["b" * 40, "b" * 40, "b" * 40])
+    local_heads = iter(["b" * 40] * 10)
     allow_cli_exit = asyncio.Event()
     monitor_calls = 0
 
@@ -709,7 +721,7 @@ def test_cli_exit_during_rearm_delay_rechecks_published_head(
     monkeypatch.setattr(
         coding_module.gh_prs,
         "get_branch_publications",
-        lambda *args, **kwargs: next(publication_reads),
+        lambda *args, **kwargs: next(publication_reads, []),
     )
     monkeypatch.setattr(
         coding_module,
@@ -722,7 +734,7 @@ def test_cli_exit_during_rearm_delay_rechecks_published_head(
 
     asyncio.run(asyncio.wait_for(runner.handle_coding(), timeout=1))
 
-    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.head_sha == "b" * 40
     assert monitor_calls == 1
@@ -756,7 +768,7 @@ def test_simultaneous_cli_and_publication_completion_rechecks_head(
     monkeypatch.setattr(
         coding_module.gh_prs,
         "get_branch_publications",
-        lambda *args, **kwargs: next(publication_reads),
+        lambda *args, **kwargs: next(publication_reads, []),
     )
     monkeypatch.setattr(
         coding_module,
@@ -769,7 +781,7 @@ def test_simultaneous_cli_and_publication_completion_rechecks_head(
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 54
     assert publication_reads.__length_hint__() == 0
@@ -815,7 +827,7 @@ def test_stop_during_renewed_publication_observation_settles_monitor(
     monkeypatch.setattr(
         coding_module.gh_prs,
         "get_branch_publications",
-        lambda *args, **kwargs: next(publication_reads),
+        lambda *args, **kwargs: next(publication_reads, []),
     )
     monkeypatch.setattr(
         coding_module,
@@ -831,7 +843,7 @@ def test_stop_during_renewed_publication_observation_settles_monitor(
     asyncio.run(asyncio.wait_for(runner.handle_coding(), timeout=1))
 
     assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.current_pr is None
+    assert runner.state.current_pr.number == 49
     assert monitor_calls == 2
     assert renewed_settled.is_set()
 
@@ -929,7 +941,7 @@ def test_failed_publication_baseline_keeps_ordinary_completion(
 
     asyncio.run(runner.handle_coding())
 
-    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.state == PipelineState.ERROR
     assert any(
         "Publication baseline unavailable" in entry["event"]
         for entry in runner.state.history
@@ -1006,7 +1018,7 @@ def test_adapter_supervision_failure_blocks_publication_handoff(
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.current_pr is None
+    assert runner.state.current_pr.number == 56
     assert expected_failure in (runner.state.error_message or "")
     assert isinstance(managed.supervision_failure, ProcessSupervisionError)
     assert runner._current_coder_supervised_process is None
@@ -1093,7 +1105,7 @@ def test_publication_cleanup_keeps_invocation_supervision_failure(
 
     assert publication_reads == 2
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.current_pr is None
+    assert runner.state.current_pr.number == 57
     assert "reader broke during publication recheck" in (
         runner.state.error_message or ""
     )
@@ -1142,7 +1154,7 @@ def test_publication_cancellation_without_clean_process_result_fails_closed(
 @pytest.mark.parametrize(
     ("final_kind", "expected_state", "expected_number"),
     [
-        ("changed_identity", PipelineState.WATCH, 52),
+        ("changed_identity", PipelineState.WATCH, 51),
         ("draft", PipelineState.ERROR, None),
         ("closed", PipelineState.ERROR, None),
         ("sha_mismatch", PipelineState.ERROR, None),
@@ -1171,7 +1183,7 @@ def test_publication_refresh_rejects_stale_final_evidence(
         monkeypatch, [], [observed], [observed], final_snapshot
     )
     if final_kind == "sha_mismatch":
-        local_heads = iter(["a" * 40, "a" * 40, "c" * 40])
+        local_heads = iter(["a" * 40, "a" * 40] + ["c" * 40] * 10)
         monkeypatch.setattr(
             coding_module,
             "_local_branch_head_sha",
@@ -1184,7 +1196,7 @@ def test_publication_refresh_rejects_stale_final_evidence(
 
     assert runner.state.state == expected_state
     if expected_number is None:
-        assert runner.state.current_pr is None
+        assert runner.state.current_pr.number == 51
         if final_kind == "read_error":
             assert "refresh unavailable" in (runner.state.error_message or "")
         else:
@@ -1643,6 +1655,12 @@ def test_post_coder_resolution_transitions_to_watch_when_pr_found(
     a clean coder exit, the helper transitions to WATCH and posts the
     Codex review trigger."""
     runner = _runner_with_task(monkeypatch)
+    runner._start_current_run_record("claude", "opus")
+    runner._capture_invocation_snapshot("claude", {}, phase="coding")
+    runner._begin_publication_attempt(
+        started_at=datetime.now(timezone.utc) - timedelta(seconds=1), baseline_numbers=set(),
+    )
+    runner.state.publication_attempt.head_sha = "a" * 40
     coder_name, _plugin = runner._get_coder()
     candidate = PRInfo(number=42, branch="pr-001")
 
@@ -1659,6 +1677,8 @@ def test_post_coder_resolution_transitions_to_watch_when_pr_found(
     runner._post_codex_review = lambda pr_number: (  # type: ignore[method-assign]
         posted.append(pr_number) or True
     )
+
+    coding_module.gh_prs.get_branch_publications("octo/demo", "main", "pr-001")
 
     asyncio.run(
         runner._post_coder_resolution(
@@ -1684,6 +1704,12 @@ def test_post_coder_resolution_routes_to_diagnose_on_no_pr(
     helper hands off to ``_diagnose_exit_zero_no_pr`` for the A/B/C
     decision tree (HUNG vs daemon recovery vs branch mismatch)."""
     runner = _runner_with_task(monkeypatch)
+    runner._start_current_run_record("claude", "opus")
+    runner._capture_invocation_snapshot("claude", {}, phase="coding")
+    runner._begin_publication_attempt(
+        started_at=datetime.now(timezone.utc) - timedelta(seconds=1), baseline_numbers=set(),
+    )
+    runner.state.publication_attempt.head_sha = "a" * 40
     coder_name, _plugin = runner._get_coder()
 
     monkeypatch.setattr(

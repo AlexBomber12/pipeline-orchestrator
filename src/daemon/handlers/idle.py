@@ -712,6 +712,8 @@ class IdleMixin:
 
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
+        if await self._hold_unresolved_publication():
+            return
         self._idle_degraded_done_check_logged = False
         self._error_diagnose_policy.reset(self)
         # The 304 streak counts only cycles that actually reached

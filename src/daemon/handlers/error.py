@@ -148,6 +148,13 @@ class ErrorMixin:
         retry_task = self.state.current_task
         retry_task_id = retry_task.pr_id if retry_task is not None else None
 
+        attempt = self.state.publication_attempt
+        if attempt is not None and attempt.pending:
+            if not (context.startswith("FIX idle timeout")
+                    and await self._resolve_published_attempt()):
+                await self._hold_unresolved_publication()
+                return
+
         if context.startswith("FIX idle timeout"):
             await self._admit_fix_idle_timeout()
             return

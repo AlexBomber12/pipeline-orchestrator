@@ -39,6 +39,12 @@ async def _published_coding_runner(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ):
     h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(
+        gh_prs, "get_exact_pr_outcome",
+        lambda repo, base, number, sha: gh_prs.ExactPROutcome(
+            repo, base, number, sha, gh_prs.ExactPRState.OPEN, True,
+        ),
+    )
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
     runner.app_config.daemon.fix_iteration_cap = 3

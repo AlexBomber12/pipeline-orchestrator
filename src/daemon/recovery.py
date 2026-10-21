@@ -498,6 +498,29 @@ class RecoveryMixin:
         except Exception:
             self._publication_snapshot_damaged = True
             return True
+        if (
+            persisted.name == self.name and persisted.url == self.repo_config.url
+            and persisted.publication_attempt is not None
+            and persisted.publication_attempt.pending
+        ):
+            self.state.current_task = persisted.current_task
+            self.state.current_pr = persisted.current_pr
+            self.state.active_invocation = persisted.active_invocation
+            self.state.publication_attempt = persisted.publication_attempt
+            self.state.error_message = persisted.error_message
+            if not self._publication_attempt_matches_dispatch():
+                self.state.current_pr = None
+            self.state.user_paused = persisted.user_paused
+            self.state.rate_limited_until = persisted.rate_limited_until
+            if persisted.state == PipelineState.PAUSED:
+                self.state.state = PipelineState.PAUSED
+            if (self._publication_attempt_matches_dispatch()
+                and persisted.active_invocation.phase == "fix"
+                and persisted.current_pr is not None):
+                self._persisted_fix_recovery = persisted
+            await self._restore_current_run_record()
+            # Do not let list omissions or task status re-derivation replace it.
+            return True
         self._publication_snapshot_pr_unbound = (
             persisted.current_pr is None
             and persisted.publication_watermark is None
@@ -749,6 +772,8 @@ class RecoveryMixin:
         # current_task.
         if not await self._hydrate_current_task_from_persisted_state():
             return False
+        if await self._hold_unresolved_publication():
+            return True
         await self._hydrate_status_write_failed_task_pr_ids()
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery

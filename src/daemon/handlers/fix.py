@@ -228,6 +228,10 @@ class FixMixin(BreachMixin):
 
     async def handle_fix(self) -> None:
         """Run ``FIX FEEDBACK`` via the active coder CLI and return to WATCH."""
+        if self.state.publication_attempt is not None and self.state.publication_attempt.pending:
+            if not await self._resolve_published_attempt() or self.state.current_pr is None:
+                await self._hold_unresolved_publication()
+                return
         self._stop_requested = False
         fix_feedback_reviewer_policy = self._fix_feedback_reviewer_policy
         self._fix_feedback_reviewer_policy = None
@@ -523,6 +527,7 @@ class FixMixin(BreachMixin):
         run_record = self._current_run_record
         previous_profile_id = run_record.profile_id if run_record is not None else None
         previous_active_invocation = self.state.active_invocation
+        previous_publication_attempt = self.state.publication_attempt
         previous_fix_iterations = (
             run_record.fix_iterations if run_record is not None else None
         )
@@ -549,6 +554,7 @@ class FixMixin(BreachMixin):
                 phase="fix",
                 fix_iteration=fix_iteration,
             )
+            self._begin_publication_attempt(started_at=datetime.now(timezone.utc))
             if run_record is not None:
                 await self._checkpoint_current_run_record()
             await self.publish_state()
@@ -566,6 +572,7 @@ class FixMixin(BreachMixin):
         except BaseException:
             if captured_snapshot is not None:
                 self.state.active_invocation = previous_active_invocation
+                self.state.publication_attempt = previous_publication_attempt
                 if (
                     run_record is not None
                     and run_record.invocations
@@ -657,14 +664,19 @@ class FixMixin(BreachMixin):
                     breach_flag,
                 )
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
-            cleanup_confirmed = await self._confirm_current_coder_cleanup(
-                "FIX completion"
-            )
+            try:
+                await self._capture_published_attempt()
+            finally:
+                cleanup_confirmed = await self._confirm_current_coder_cleanup(
+                    "FIX completion"
+                )
         if pending_cancellation is not None:
             raise pending_cancellation
         if not cleanup_confirmed:
             return
         if external_state_flag["state"] is not None and not stop_cancelled:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.pending = False
             await self._handle_external_terminal_pr_state(
                 external_state_flag["state"]  # type: ignore[arg-type]
             )
@@ -1029,7 +1041,10 @@ class FixMixin(BreachMixin):
                 and await no_push_policy.maybe_escalate(self.state.current_pr)
             ):
                 return
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.pending = False
             self.state.state = PipelineState.WATCH
+            await self.publish_state()
             return
 
         if not await record_fix_push(
@@ -1040,4 +1055,7 @@ class FixMixin(BreachMixin):
             return
         if await pause_for_stop_after_bookkeeping():
             return
+        if self.state.publication_attempt is not None:
+            self.state.publication_attempt.pending = False
         self.state.state = PipelineState.WATCH
+        await self.publish_state()

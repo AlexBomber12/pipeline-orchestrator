@@ -760,6 +760,19 @@ def test_coding_post_coder_clean_stdout_proceeds_normally(
     )
     monkeypatch.setattr(runner, "_post_codex_review", lambda number: posted.append(number))
 
+    from datetime import datetime, timezone
+
+    from src.models import PublicationAttempt
+
+    runner.state.publication_attempt = PublicationAttempt(
+        repo="octo/demo", base="main", task_id="PR-289a", branch="pr-289a",
+        run_id="run", attempt_index=1, started_at=datetime.now(timezone.utc),
+    )
+    runner.state.current_pr = PRInfo(number=42, branch="pr-289a")
+    async def resolved():
+        return True
+    monkeypatch.setattr(runner, "_resolve_published_attempt", resolved)
+
     asyncio.run(
         runner._post_coder_resolution(
             "claude",
