@@ -1409,7 +1409,10 @@ def _publication_transport(monkeypatch, runner, *, code=1, stdout="", stderr="co
             raise OSError("response lost")
         return {
             "number": 402, "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
-            "head": {"ref": "pr-001", "sha": remote["head"]}, "state": "open", "merged": False,
+            "head": {"ref": "pr-001", "sha": remote["head"]},
+            "state": "closed" if remote.get("terminal") else "open",
+            "merged": remote.get("terminal") == "MERGED",
+            "merge_commit_sha": "c" * 40 if remote.get("terminal") == "MERGED" else None,
         }
 
     async def coder(*args, **kwargs):
@@ -1947,3 +1950,139 @@ def test_rate_limited_no_publication_releases_only_proven_absence(
         assert runner.state.state == PipelineState.IDLE
         assert not asyncio.run(runner._hold_unresolved_publication())
     assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+@pytest.mark.parametrize("entry", ["hold", "fix", "retry", "error", "post", "post_success"])
+def test_retained_terminal_publication_releases_task(monkeypatch, terminal, entry):
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    assert attempt.pending
+    remote["terminal"] = terminal
+    outcomes = []
+
+    async def save_outcome(outcome):
+        outcomes.append(outcome)
+
+    monkeypatch.setattr(runner, "_save_current_run_record", save_outcome)
+    if entry == "hold":
+        assert asyncio.run(runner._hold_unresolved_publication())
+    elif entry == "fix":
+        asyncio.run(runner.handle_fix())
+    elif entry == "retry":
+        command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                           task_id="PR-001", branch="pr-001")
+        asyncio.run(runner._select_retry_continuation(command))
+    elif entry == "error":
+        asyncio.run(runner.handle_error("FIX idle timeout: retained attempt"))
+    else:
+        asyncio.run(runner._post_coder_resolution(
+            "claude", 0 if entry == "post_success" else 1, "", "coder failed",
+            target_branch="pr-001", current_pr_id="PR-001",
+        ))
+    assert attempt.verified
+    assert not attempt.pending
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert runner.state.error_message is None
+    assert runner.state.state == PipelineState.IDLE
+    assert outcomes == ["success_merged" if terminal == "MERGED" else "closed_unmerged"]
+    assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("phase", ["during", "after"])
+@pytest.mark.parametrize("remote_exists", [False, True, None])
+def test_stopped_unpublished_attempt_probes_absence_after_cleanup(monkeypatch, phase, remote_exists):
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: None)
+    cleanup = []
+
+    async def confirm_cleanup(*args):
+        cleanup.append(True)
+        return True
+
+    def probe(*args):
+        assert cleanup
+        return remote_exists
+
+    async def stopped_coder(*args, **kwargs):
+        remote["calls"] += 1
+        if phase == "during":
+            runner._stop_requested = True
+            raise asyncio.CancelledError
+        return 0, "", ""
+
+    async def stop_after_exit(*args):
+        runner._stop_requested = True
+
+    monkeypatch.setattr(runner, "_confirm_current_coder_cleanup", confirm_cleanup)
+    monkeypatch.setattr(coding_module, "_remote_branch_exists", probe)
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", stopped_coder)
+    if phase == "after":
+        monkeypatch.setattr(runner, "_save_cli_log", stop_after_exit)
+    asyncio.run(runner.handle_coding())
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.user_paused
+    assert runner.state.publication_attempt.head_sha is None
+    assert runner.state.publication_attempt.pending is (remote_exists is not False)
+    if remote_exists is False:
+        runner.state.user_paused = False
+        runner.state.state = PipelineState.IDLE
+        assert not asyncio.run(runner._hold_unresolved_publication())
+        monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
+        monkeypatch.setattr(coding_module.gh_prs, "get_merged_prs", lambda *a, **kw: [])
+        command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                           task_id="PR-001", branch="pr-001")
+        assert asyncio.run(runner._select_retry_continuation(command)) == ("coding", None)
+    assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+def test_terminal_capture_retains_attempt_until_cleanup_consumer(monkeypatch, terminal):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    remote["terminal"] = terminal
+    attempt = runner.state.publication_attempt
+    # A pushed FIX head can become terminal before reconciliation catches up.
+    attempt.unverified_head_sha = remote["head"] = "b" * 40
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: "b" * 40)
+    asyncio.run(runner._capture_published_attempt())
+    assert attempt.pending
+    assert runner.state.current_task is not None
+    assert attempt.head_sha == "b" * 40
+    assert attempt.unverified_head_sha is None
+    assert asyncio.run(runner._hold_unresolved_publication())
+    assert not attempt.pending
+    assert runner.state.current_task is None
+
+
+def test_stopped_unpublished_attempt_never_probes_before_confirmed_cleanup(monkeypatch):
+    runner = _runner(monkeypatch)
+    _publication_transport(monkeypatch, runner)
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: None)
+
+    async def stopped_coder(*args, **kwargs):
+        runner._stop_requested = True
+        raise asyncio.CancelledError
+
+    async def unconfirmed_cleanup(*args):
+        await runner._transition_to_error("cleanup unconfirmed", publish=False)
+        return False
+
+    def probe(*args):
+        pytest.fail("Remote absence cannot release an attempt before confirmed cleanup")
+
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", stopped_coder)
+    monkeypatch.setattr(runner, "_confirm_current_coder_cleanup", unconfirmed_cleanup)
+    monkeypatch.setattr(coding_module, "_remote_branch_exists", probe)
+    asyncio.run(runner.handle_coding())
+    assert runner.state.publication_attempt.pending
+    assert runner.state.error_message == "cleanup unconfirmed"

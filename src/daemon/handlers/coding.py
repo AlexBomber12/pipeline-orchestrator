@@ -210,7 +210,7 @@ class CodingMixin:
         if self._publication_matches_attempt(observed):
             attempt.pr_number = observed.number
             attempt.candidate = observed.to_pr_info()
-            await self._resolve_published_attempt()
+            await self._resolve_published_attempt(resolve_terminal=False)
             await self.publish_state()
 
     async def _capture_published_attempt(
@@ -234,7 +234,7 @@ class CodingMixin:
         if (observed is not None and self._publication_matches_attempt(observed)):
             attempt.pr_number = observed.number
             attempt.candidate = observed.to_pr_info()
-        await self._resolve_published_attempt()
+        await self._resolve_published_attempt(resolve_terminal=False)
         await self.publish_state()
 
     def _publication_matches_attempt(self, item: gh_prs.BranchPublication) -> bool:
@@ -263,7 +263,7 @@ class CodingMixin:
                  )
         )
 
-    async def _resolve_published_attempt(self) -> bool:
+    async def _resolve_published_attempt(self, *, resolve_terminal: bool = True) -> bool:
         """Reconcile exact evidence; absence never authorizes another create."""
         attempt = self.state.publication_attempt
         if not self._publication_attempt_matches_dispatch() or not attempt.head_sha:
@@ -299,7 +299,10 @@ class CodingMixin:
                     self.log_event(f"[INFRA] FIX head verification deferred: {exc}")
                 else:
                     if (candidate_outcome.discovery_complete
-                        and candidate_outcome.state == gh_prs.ExactPRState.OPEN):
+                        and candidate_outcome.state in {
+                            gh_prs.ExactPRState.OPEN, gh_prs.ExactPRState.MERGED,
+                            gh_prs.ExactPRState.CLOSED,
+                        }):
                         attempt.head_sha = attempt.unverified_head_sha
                         attempt.unverified_head_sha = None
                         attempt.verified = False
@@ -307,6 +310,17 @@ class CodingMixin:
                 gh_prs.get_exact_pr_outcome,
                 attempt.repo, attempt.base, attempt.pr_number, attempt.head_sha,
             )
+            if (outcome.discovery_complete and outcome.state in {
+                gh_prs.ExactPRState.MERGED, gh_prs.ExactPRState.CLOSED,
+            }):
+                # Capture may run before process cleanup. Only consuming paths
+                # may finalize the task and release its publication hold.
+                if not resolve_terminal:
+                    return False
+                attempt.verified = True
+                attempt.pending = False
+                await self._handle_external_pr_resolution(current, outcome.state.value)
+                return True
             if outcome.discovery_complete and outcome.state == gh_prs.ExactPRState.OPEN:
                 current.head_sha = attempt.head_sha
                 attempt.verified = True
@@ -317,12 +331,25 @@ class CodingMixin:
             self.log_event(f"[INFRA] Reconciliation deferred: {exc}")
             return False
 
+    async def _release_unpublished_attempt(self, target_branch: str) -> None:
+        """After coder cleanup, release only positively proven remote absence."""
+        attempt = self.state.publication_attempt
+        if (attempt is not None and attempt.branch == target_branch
+            and attempt.pr_number is None and attempt.candidate is None):
+            remote_exists = await asyncio.to_thread(
+                _remote_branch_exists, self.repo_path, target_branch,
+            )
+            if remote_exists is False:
+                attempt.pending = False
+
     async def _hold_unresolved_publication(self) -> bool:
         """Prevent IDLE/CODING from losing an unfinished publication attempt."""
         attempt = self.state.publication_attempt
         if attempt is None or not attempt.pending:
             return False
         resolved = await self._resolve_published_attempt()
+        if resolved and self.state.current_task is None:
+            return True
         if self.state.user_paused or self.state.state == PipelineState.PAUSED:
             await self.publish_state()
             return True
@@ -916,6 +943,7 @@ class CodingMixin:
             return None
 
         if interruption == "stop":
+            await self._release_unpublished_attempt(target_branch)
             self.state.user_paused = True
             if current_pr_id is not None:
                 self._user_stopped_task_pr_ids.add(current_pr_id)
@@ -1224,6 +1252,7 @@ class CodingMixin:
                     )
             if not requested:
                 return False
+            await self._release_unpublished_attempt(target_branch)
             self.state.user_paused = True
             if current_pr_id is not None:
                 self._user_stopped_task_pr_ids.add(current_pr_id)
@@ -1303,6 +1332,9 @@ class CodingMixin:
             return
 
         if code != 0 and not (publication and publication.cancelled_by_publication):
+            resolved = await self._resolve_published_attempt()
+            if resolved and self.state.current_pr is None:
+                return
             attempt = self.state.publication_attempt
             if attempt is not None and attempt.pr_number is None and attempt.candidate is None:
                 # A failed coder may never have pushed. Release only proven
@@ -1348,7 +1380,10 @@ class CodingMixin:
                 return
         # A bounded positive identity can be retained despite list omissions.
         if self.state.publication_attempt is not None:
-            if await self._resolve_published_attempt() and self.state.current_pr is not None:
+            resolved = await self._resolve_published_attempt()
+            if resolved and self.state.current_pr is None:
+                return
+            if resolved and self.state.current_pr is not None:
                 if await pause_for_stop_if_requested():
                     return
                 await self._handoff_coding_pr_to_watch(

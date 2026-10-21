@@ -154,6 +154,8 @@ class ErrorMixin:
                     and await self._resolve_published_attempt()):
                 await self._hold_unresolved_publication()
                 return
+            if self.state.current_task is None:
+                return
 
         if context.startswith("FIX idle timeout"):
             await self._admit_fix_idle_timeout()

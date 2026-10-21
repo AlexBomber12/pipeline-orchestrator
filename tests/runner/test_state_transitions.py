@@ -1281,8 +1281,8 @@ def test_handle_coding_honors_stop_during_exact_publication_resolution(
         nonlocal post_exit
         post_exit = True
 
-    async def resolve():
-        resolved = await original()
+    async def resolve(**kwargs):
+        resolved = await original(**kwargs)
         if post_exit:
             runner._stop_requested = True
         return resolved

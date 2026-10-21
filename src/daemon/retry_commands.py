@@ -500,6 +500,10 @@ class RetryCommandMixin:
                     command, "Publication ownership is unresolved; prior invocation retained.",
                 )
             pr = self.state.current_pr
+            if pr is None:
+                return await self._fail_retry_command(
+                    command, "Retained pull request is terminal; implementation will not be rerun.",
+                )
             if (
                 command.task_id != attempt.task_id or command.task_branch != attempt.branch
                 or command.bound_pr_number not in {None, pr.number}

@@ -229,7 +229,10 @@ class FixMixin(BreachMixin):
     async def handle_fix(self) -> None:
         """Run ``FIX FEEDBACK`` via the active coder CLI and return to WATCH."""
         if self.state.publication_attempt is not None and self.state.publication_attempt.pending:
-            if not await self._resolve_published_attempt() or self.state.current_pr is None:
+            resolved = await self._resolve_published_attempt()
+            if resolved and self.state.current_task is None:
+                return
+            if not resolved or self.state.current_pr is None:
                 await self._hold_unresolved_publication()
                 return
         self._stop_requested = False
