@@ -2086,3 +2086,101 @@ def test_stopped_unpublished_attempt_never_probes_before_confirmed_cleanup(monke
     asyncio.run(runner.handle_coding())
     assert runner.state.publication_attempt.pending
     assert runner.state.error_message == "cleanup unconfirmed"
+
+
+@pytest.mark.parametrize("path", ["escalate", "inflight_breach", "late_breach"])
+@pytest.mark.parametrize("evidence", ["absent", "present", "unknown", "published"])
+@pytest.mark.parametrize("cleanup_confirmed", [True, False])
+def test_escalation_and_breach_release_only_proven_unpublished_attempts(
+    monkeypatch, path, evidence, cleanup_confirmed,
+):
+    from datetime import datetime, timedelta, timezone
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha",
+                        lambda *a: "a" * 40 if evidence == "published" else None)
+    cleaned = []
+    probes = []
+
+    async def confirm_cleanup(*args):
+        cleaned.append(cleanup_confirmed)
+        if not cleanup_confirmed:
+            await runner._transition_to_error("cleanup unconfirmed", publish=False)
+        return cleanup_confirmed
+
+    def probe(*args):
+        assert cleaned == [True]
+        assert evidence != "published"
+        probes.append(True)
+        return {"absent": False, "present": True, "unknown": None}[evidence]
+
+    def mark_breach(flag):
+        flag["breached"] = True
+        runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+
+    async def breach_monitor(breach_dir, run_id, coder_name, task, flag):
+        await asyncio.Future()
+
+    async def coder(*args, **kwargs):
+        remote["calls"] += 1
+        remote["created"] = evidence == "published"
+        if path == "inflight_breach":
+            # Exercise the monitor's flag/cancellation contract deterministically.
+            flag = breach_flags[0]
+            mark_breach(flag)
+            raise asyncio.CancelledError
+        return 0, "ESCALATE: operator recovery needed" if path == "escalate" else "", ""
+
+    breach_flags = []
+
+    def late_breach(breach_dir, run_id, coder_name, flag):
+        if path == "late_breach":
+            mark_breach(flag)
+
+    # The monitor is scheduled alongside the coder; capture its shared flag
+    # synchronously when the coroutine is created, before either task runs.
+    def monitor(breach_dir, run_id, coder_name, task, flag):
+        breach_flags.append(flag)
+        return breach_monitor(breach_dir, run_id, coder_name, task, flag)
+
+    monkeypatch.setattr(runner, "_monitor_inflight_breach", monitor)
+    monkeypatch.setattr(runner, "_check_late_breach", late_breach)
+    monkeypatch.setattr(runner, "_confirm_current_coder_cleanup", confirm_cleanup)
+    monkeypatch.setattr(coding_module, "_remote_branch_exists", probe)
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", coder)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    released = cleanup_confirmed and evidence == "absent"
+    assert attempt.pending is not released
+    assert bool(probes) is (cleanup_confirmed and evidence != "published")
+    assert remote["calls"] == 1
+    if not cleanup_confirmed:
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.error_message == "cleanup unconfirmed"
+        return
+    if evidence == "published":
+        assert attempt.pr_number == 402
+        assert attempt.head_sha == "a" * 40
+    else:
+        assert attempt.head_sha is None
+    if path == "escalate":
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.error_message == "operator recovery needed"
+    else:
+        assert runner.state.state == PipelineState.PAUSED
+        if released:
+            expired = datetime.now(timezone.utc) - timedelta(seconds=1)
+            runner.state.rate_limited_until = expired
+            runner.state.rate_limited_coder_until = {"claude": expired}
+            asyncio.run(runner.handle_paused())
+            assert runner.state.state == PipelineState.IDLE
+            assert not asyncio.run(runner._hold_unresolved_publication())
+    if released:
+        monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
+        monkeypatch.setattr(coding_module.gh_prs, "get_merged_prs", lambda *a, **kw: [])
+        command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                           task_id="PR-001", branch="pr-001")
+        assert asyncio.run(runner._select_retry_continuation(command)) == ("coding", None)

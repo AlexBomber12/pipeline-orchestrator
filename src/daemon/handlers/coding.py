@@ -962,6 +962,7 @@ class CodingMixin:
             return None
 
         if interruption == "breach":
+            await self._release_unpublished_attempt(target_branch)
             await self._record_pre_pause_pr(
                 target_branch, "before breach-cancel pause"
             )
@@ -978,6 +979,7 @@ class CodingMixin:
             return None
 
         if breach_flag["breached"]:
+            await self._release_unpublished_attempt(target_branch)
             await self._record_pre_pause_pr(
                 target_branch, "before late-breach pause"
             )
@@ -1322,6 +1324,7 @@ class CodingMixin:
             return
         escalate_reason = fix_escalation.parse_escalate_marker(stdout)
         if escalate_reason is not None:
+            await self._release_unpublished_attempt(target_branch)
             await self._transition_to_error(
                 escalate_reason, publish=False, log_prefix="[CODING]",
                 cancellation_cause=CancellationCause(
