@@ -360,6 +360,10 @@ class ApprovalCommandMixin:
         dirty = git_ops._git(self.repo_path, "--no-optional-locks", "status", "--porcelain")
         if dirty.stdout.strip():
             return "Checkout has staged, unstaged or untracked work; preserving it until the operator resolves it."
+        if command.status == "applied" and published_head_sha != command.pr.head_sha:
+            # This receipt expires on a later push. The new object may not be
+            # present locally, and WATCH will validate its own current HEAD.
+            return bound_checkout_work_blocker(self.repo_path, command, published_head_sha)
         path = approval_task_path(Path(self.repo_path), command.task.task_file)
         if task_spec_content_hash(path.read_text(encoding="utf-8")) != command.task_fingerprint:
             raise ApprovalChanged("Task specification changed; this approval cannot authorize revised work.")
@@ -417,7 +421,7 @@ class ApprovalCommandMixin:
             if reason:
                 await self._approval_result(command, "deferred", reason)
                 return True
-            await self._commit_approval_state(command)
+            await self._commit_approval_state(command, pr.quarantine_labels)
             return True
         except ApprovalChanged as exc:
             await self._approval_result(command, "failed", str(exc))
@@ -465,7 +469,7 @@ class ApprovalCommandMixin:
         self.state = await self.redis.transaction(transaction, state_key, cancellation, value_from_callable=True)
         self._approval_head_refresh_uncertain = False
 
-    async def _commit_approval_state(self, command: ApprovalCommand) -> None:
+    async def _commit_approval_state(self, command: ApprovalCommand, live_labels: set[str]) -> None:
         key = approval_key(self.name, command.binding)
         cancellation = cause_key(self.name, command.task.pr_id)
         state_key = pipeline_state(self.name)
@@ -531,7 +535,10 @@ class ApprovalCommandMixin:
         self._approval_commit_uncertain = False
         self._recovered = True
         self._approval_receipt = command.model_copy(update={"status": "applied"})
-        if "quarantine:large_diff" in command.pr.quarantine_labels:
+        if (
+            self._approved_finding(command)[0] == "large_diff_threshold"
+            and "quarantine:large_diff" in live_labels
+        ):
             try:
                 gh_runner.run_gh(
                     ["pr", "edit", str(command.pr.number), "--remove-label", "quarantine:large_diff"],

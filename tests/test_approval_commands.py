@@ -534,6 +534,18 @@ async def test_size_recovery_removes_only_obsolete_github_label(approval, monkey
     ]
 
 
+async def test_size_recovery_removes_label_missing_from_error_snapshot(approval, monkeypatch):
+    runner, command, _, _ = approval
+    runner.state.current_pr.quarantine_labels.clear()
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    calls = []
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append(args))
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.WATCH
+    assert calls == [["pr", "edit", "42", "--remove-label", "quarantine:large_diff"]]
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+
+
 async def test_size_label_cleanup_failure_does_not_reblock_watch(approval, monkeypatch):
     runner, command, _, _ = approval
     monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
@@ -707,6 +719,31 @@ async def test_published_later_push_releases_old_approval_with_stale_tracking_re
     assert runner._approval_receipt is None
     assert not await list_approvals(runner.redis, runner.name)
     assert runner.state.state == PipelineState.WATCH
+
+
+async def test_external_later_push_releases_receipt_without_local_commit(approval, monkeypatch):
+    runner, command, repo, remote = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    external = repo.parent / "external"
+    git(repo.parent, "clone", "--branch", "fix/pr-42", str(remote), str(external))
+    git(external, "config", "user.name", "External Author")
+    git(external, "config", "user.email", "external@example.test")
+    (external / "implementation.py").write_text("external fix\n")
+    git(external, "commit", "-am", "external fix")
+    new_head = git(external, "rev-parse", "HEAD")
+    git(external, "push", "origin", "fix/pr-42")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", new_head], capture_output=True,
+    ).returncode != 0
+    fresh = command.pr.model_copy(update={"head_sha": new_head})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [fresh])
+    before = snapshot(repo)
+    await runner._run_cycle_body()
+    assert runner.handle_watch.await_count == 1
+    assert runner._approval_receipt is None
+    assert not await list_approvals(runner.redis, runner.name)
+    assert snapshot(repo) == before
 
 
 @pytest.mark.parametrize("restart", [False, True])
