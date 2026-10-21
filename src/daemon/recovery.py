@@ -33,7 +33,6 @@ from src.daemon.approval_commands import (
 )
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
 from src.daemon.quarantine import (
-    OBSOLETE_SIZE_LABEL,
     blocking_quarantine_labels,
     continued_size_label,
     is_continued_size_label,
@@ -949,8 +948,6 @@ class RecoveryMixin:
                 raise LegacySizeRecoveryDeferred("live PR HEAD is unavailable")
             if markers and markers != {continued_size_label(pr.head_sha)}:
                 raise LegacySizeRecoveryDeferred("size continuation marker belongs to another PR HEAD")
-            if not markers and OBSOLETE_SIZE_LABEL not in pr.quarantine_labels:
-                continue
             if persisted is not None and not (
                 persisted.state == PipelineState.WATCH
                 and persisted.current_task is not None

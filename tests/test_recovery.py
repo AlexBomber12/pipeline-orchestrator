@@ -31,6 +31,11 @@ from src.suppression import SuppressionRecord
 from src.task_status import MergedState
 
 
+def test_size_continuation_label_requires_published_head() -> None:
+    with pytest.raises(ValueError, match="published PR HEAD"):
+        continued_size_label("invalid")
+
+
 class _FakeRedis:
     """Minimal async Redis double capturing ``set`` calls."""
 
@@ -661,6 +666,7 @@ def test_recover_legacy_size_error_from_git_and_pr(
 
 @pytest.mark.parametrize("saved", [
     "missing", "malformed", "error", "suppressed", "blank_head", "invalid_head", "stale_marker",
+    "no_labels",
 ])
 def test_legacy_size_recovery_preserves_unverified_state(
     tmp_path: Path, saved: str,
@@ -682,6 +688,8 @@ def test_legacy_size_recovery_preserves_unverified_state(
         pr.head_sha = "invalid"
     elif saved == "stale_marker":
         pr.quarantine_labels = {continued_size_label("b" * 40)}
+    elif saved == "no_labels":
+        pr.quarantine_labels = set()
     runner = _make_runner()
     runner.repo_path = str(tmp_path)
     runner._recovery_task_headers = {task.pr_id: parse_existing_task_header(path)}
