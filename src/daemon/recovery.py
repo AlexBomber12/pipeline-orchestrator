@@ -518,6 +518,9 @@ class RecoveryMixin:
                 and persisted.active_invocation.phase == "fix"
                 and persisted.current_pr is not None):
                 self._persisted_fix_recovery = persisted
+            if self._publication_attempt_matches_dispatch():
+                self.state.publication_migration = persisted.publication_migration
+                self._restore_publication_watermark(persisted)
             await self._restore_current_run_record()
             # Do not let list omissions or task status re-derivation replace it.
             return True

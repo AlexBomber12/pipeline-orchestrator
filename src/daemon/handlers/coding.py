@@ -149,7 +149,6 @@ def _local_branch_head_sha(repo_path: str, branch: str) -> str | None:
 class _PublicationResolution:
     """Final targeted publication state after coder cleanup."""
 
-    candidate: PRInfo | None = None
     failure: Exception | str | None = None
     cancelled_by_publication: bool = False
 
@@ -324,8 +323,8 @@ class CodingMixin:
         The coder owns the full git workflow per AGENTS.md: branch creation,
         commit, push, and PR creation. The daemon must not pre-create the
         task branch — doing so conflicts with AGENTS.md step 4 ("create
-        branch from origin/main"). After the CLI exits, targeted publication and exact identity reads
-        retain the owned PR. Incomplete discovery holds the attempt.
+        branch from origin/main"). After the CLI exits, targeted publication
+        and exact identity reads retain the owned PR. Incomplete discovery holds the attempt.
 
         Reads top-down as a state-machine flow with three phases:
 
@@ -1005,7 +1004,6 @@ class CodingMixin:
                 )
             else:
                 publication = _PublicationResolution(
-                    candidate=final_evidence.to_pr_info(),
                     cancelled_by_publication=publication_cancel_requested,
                 )
         return (*result, publication)
@@ -1262,9 +1260,7 @@ class CodingMixin:
                 )
             if await pause_for_stop_if_requested():
                 return
-            protected_pr = self.state.current_pr or (
-                publication.candidate if publication is not None else None
-            )
+            protected_pr = self.state.current_pr
             if protected_pr is not None:
                 pr_number = protected_pr.number
                 self.state.quarantined_prs.add(pr_number)

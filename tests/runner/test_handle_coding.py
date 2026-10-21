@@ -641,7 +641,7 @@ def test_coding_post_coder_guardrail_violation_transitions_to_error(
         "apply_quarantine_label_for_violation",
         lambda *args, **kwargs: None,
     )
-    candidate = PRInfo(number=42, branch="pr-289a", pr_id="PR-289a")
+    runner.state.current_pr = PRInfo(number=42, branch="pr-289a", pr_id="PR-289a")
 
     asyncio.run(
         runner._post_coder_resolution(
@@ -651,9 +651,6 @@ def test_coding_post_coder_guardrail_violation_transitions_to_error(
             "",
             target_branch="pr-289a",
             current_pr_id="PR-289a",
-            publication=coding_module._PublicationResolution(
-                candidate=candidate
-            ),
         )
     )
 

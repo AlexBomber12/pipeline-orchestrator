@@ -17,7 +17,6 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
-
 from src.config import FeatureFlags
 from src.inhibitor import InhibitorType, WorkInhibitor
 from src.models import (
@@ -28,7 +27,6 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
-
 from tests.runner import _helpers as h
 
 
@@ -112,6 +110,8 @@ def _stub_dispatchable_world(monkeypatch: pytest.MonkeyPatch) -> None:
     opened = PRInfo(
         number=99,
         branch="pr-330a-test",
+        pr_id=task.pr_id,
+        title=f"{task.pr_id}: published task",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
     )

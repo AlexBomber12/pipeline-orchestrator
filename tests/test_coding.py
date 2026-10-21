@@ -1596,3 +1596,168 @@ def test_failed_fix_retains_exact_pr_and_failure_on_restart(monkeypatch):
     assert restarted.state.current_pr.number == 402
     assert restarted.state.error_message == "fix failed after push"
     assert restarted.state.active_invocation.phase == "fix"
+
+
+@pytest.mark.parametrize("paused", [False, True])
+def test_restart_after_publication_checkpoint_preserves_pause_or_resumes_owned_pr(monkeypatch, paused):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+
+    async def crash_before_terminal(*args, **kwargs):
+        if paused:
+            runner.state.state = PipelineState.PAUSED
+            runner.state.user_paused = True
+            # Model the operator's persisted pause flag, which publish merges.
+            from src.keyspace import pipeline_state
+            await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+        raise RuntimeError("daemon stopped before terminal handoff")
+
+    monkeypatch.setattr(runner, "_post_coder_resolution", crash_before_terminal)
+    with pytest.raises(RuntimeError, match="daemon stopped"):
+        asyncio.run(runner.handle_coding())
+    remote["omit"] = True
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    restarted._post_codex_review = lambda *_a: True
+    monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
+    assert asyncio.run(restarted.recover_state())
+    assert restarted.state.current_pr.number == 402
+    assert restarted.state.state == (PipelineState.PAUSED if paused else PipelineState.WATCH)
+    assert restarted.state.user_paused is paused
+    assert remote["calls"] == 1
+
+
+def test_missing_publication_binding_cannot_attach_a_pr(monkeypatch):
+    from datetime import datetime, timezone
+
+    runner = _runner(monkeypatch)
+    observed = coding_module.gh_prs.BranchPublication(
+        402, "PR-001: task", "main", "pr-001", "a" * 40, "OPEN", False, False,
+        datetime.now(timezone.utc), "https://github.com/octo/demo/pull/402",
+    )
+    asyncio.run(runner._retain_observed_publication(observed))
+    assert runner.state.current_pr is None
+    asyncio.run(runner._post_coder_resolution(
+        "claude", 0, "", "", target_branch="pr-001", current_pr_id="PR-001",
+    ))
+    assert runner.state.state == PipelineState.ERROR
+    assert "Missing publication attempt" in runner.state.error_message
+
+
+def test_corrupt_candidate_and_unavailable_discovery_keep_publication_held(monkeypatch):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    binding = runner.state.publication_attempt
+    binding.candidate = binding.candidate.model_copy(update={"branch": "wrong"})
+    assert asyncio.run(runner._resolve_published_attempt()) is False
+    assert runner.state.current_pr.number == 402
+    binding.pr_number = None
+
+    def unavailable(*args, **kwargs):
+        raise OSError("targeted discovery unavailable")
+
+    monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", unavailable)
+    assert asyncio.run(runner._resolve_published_attempt()) is False
+    assert binding.pending
+    assert runner.state.error_message == "coder failed"
+    assert remote["calls"] == 1
+
+
+def test_published_pr_is_retained_when_later_stop_arrives_during_exact_read(monkeypatch):
+    runner = _runner(monkeypatch)
+    _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+    binding = runner.state.publication_attempt
+    binding.pending = True
+    original = runner._resolve_published_attempt
+
+    async def stop_after_exact_read():
+        resolved = await original()
+        runner._stop_requested = True
+        return resolved
+
+    monkeypatch.setattr(runner, "_resolve_published_attempt", stop_after_exact_read)
+    asyncio.run(runner._post_coder_resolution(
+        "claude", 0, "", "", target_branch="pr-001", current_pr_id="PR-001",
+    ))
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr.number == 402
+
+
+def test_success_exit_with_pushed_branch_and_omitted_pr_never_recreates(monkeypatch):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    remote["omit"] = True
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+    asyncio.run(runner.handle_coding())
+    assert runner.state.state == PipelineState.ERROR
+    assert "without repeating PR creation" in runner.state.error_message
+    assert runner.state.publication_attempt.pending
+    remote["omit"] = False
+    asyncio.run(runner.handle_idle())
+    asyncio.run(runner.handle_coding())
+    assert runner.state.current_pr.number == 402
+    assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("stop_call", [1, 2])
+def test_stop_during_post_coder_checks_retains_published_identity(monkeypatch, stop_call):
+    runner = _runner(monkeypatch)
+    _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+    calls = 0
+
+    async def stop():
+        nonlocal calls
+        calls += 1
+        return calls == stop_call
+
+    monkeypatch.setattr(runner, "_pop_stop_request", stop)
+    asyncio.run(runner._post_coder_resolution(
+        "claude", 0, "", "", target_branch="pr-001", current_pr_id="PR-001",
+    ))
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.current_pr.number == 402
+
+
+def test_wrong_persisted_attempt_does_not_adopt_snapshot_pr(monkeypatch):
+    from src.keyspace import pipeline_state
+
+    runner = _runner(monkeypatch)
+    _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    runner.state.publication_attempt.run_id = "wrong-attempt"
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
+    assert asyncio.run(restarted.recover_state())
+    assert restarted.state.current_pr is None
+    assert restarted.state.state == PipelineState.ERROR
+    assert restarted.state.publication_attempt.pending
+
+
+def test_retained_failed_attempt_preserves_publication_safety_floor(monkeypatch):
+    from datetime import datetime, timezone
+
+    from src.keyspace import pipeline_state
+    from src.models import PublicationWatermark
+
+    runner = _runner(monkeypatch)
+    _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    watermark = PublicationWatermark(
+        repo="octo/demo", pr_number=402, head_repo="octo/demo",
+        ref="refs/heads/pr-001", head_sha="a" * 40,
+        published_at=datetime.now(timezone.utc),
+    )
+    runner.state.publication_watermark = watermark
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
+    assert asyncio.run(restarted.recover_state())
+    assert restarted.state.publication_watermark == watermark
+    assert restarted.state.current_pr.number == 402
+    assert restarted.state.error_message == "coder failed"
