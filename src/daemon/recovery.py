@@ -25,6 +25,7 @@ from src.cancellation import (
     get_current_run_started_at,
     safe_record_cancellation_cause,
 )
+from src.cancellation.storage import task_spec_content_hash
 from src.daemon import git_ops
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
 from src.daemon.quarantine import blocking_quarantine_labels
@@ -900,6 +901,61 @@ class RecoveryMixin:
                 "from GitHub labels."
             )
 
+    async def _recover_legacy_size_tasks(
+        self, tasks: list[QueueTask], prs: list[PRInfo],
+    ) -> None:
+        """Restore a size-only ERROR task from its task header and live PR."""
+        raw_state = await self.redis.get(pipeline_state(self.name))
+        persisted = RepoState.model_validate_json(raw_state) if raw_state else None
+        for index, task in enumerate(tasks):
+            header = getattr(self, "_recovery_task_headers", {}).get(task.pr_id)
+            if (
+                task.status != TaskStatus.ERROR or header is None
+                or header.frontmatter_status != "error"
+                or header.blocked_reason != SuppressionReason.GUARDRAIL.value
+                or task.pr_id in self._crashed_task_pr_ids
+            ):
+                continue
+            pr = find_matching_open_pr(task.pr_id, task.branch, prs)
+            if (
+                pr is None or pr.quarantine_labels != {"quarantine:large_diff"}
+                or re.fullmatch(r"[0-9a-fA-F]{40}", pr.head_sha) is None
+            ):
+                continue
+            if persisted is not None and not (
+                persisted.state == PipelineState.WATCH
+                and persisted.current_task is not None
+                and persisted.current_task.pr_id == task.pr_id
+                and persisted.current_pr is not None
+                and persisted.current_pr.number == pr.number
+                and persisted.current_pr.branch == pr.branch
+            ):
+                continue
+            if await self._suppression_record_for_task(task.pr_id) is not None:
+                continue
+            try:
+                if (Path(self.repo_path) / ".git").exists():
+                    base = git_ops._git(
+                        self.repo_path, "show",
+                        f"refs/remotes/origin/{self.repo_config.branch}:{task.task_file}",
+                        check=False,
+                    )
+                    published = git_ops._git(
+                        self.repo_path, "show", f"{pr.head_sha}:{task.task_file}", check=False,
+                    )
+                    if base.returncode or published.returncode:
+                        raise ValueError("task generation is unavailable in the checkout")
+                    base_text, published_text = base.stdout, published.stdout
+                else:
+                    raise ValueError("published task generation cannot be verified without Git")
+                if task_spec_content_hash(base_text) != task_spec_content_hash(published_text):
+                    raise ValueError("published task generation differs from the ERROR task")
+            except (OSError, ValueError) as exc:
+                self.log_event(f"[RECOVERY] Legacy size PR #{pr.number} retained: {exc}.")
+                continue
+            tasks[index] = task.model_copy(update={"status": TaskStatus.DOING})
+            self.log_event(f"[RECOVERY] Legacy size-only task {task.pr_id} resumes WATCH PR #{pr.number}.")
+
     async def _apply_recovery_decisions(
         self, tasks: list[QueueTask], prs: list[PRInfo]
     ) -> None:
@@ -907,6 +963,7 @@ class RecoveryMixin:
 
         The body mirrors the original recover_state decision tree.
         """
+        await self._recover_legacy_size_tasks(tasks, prs)
         self._set_queue_progress(
             sum(1 for t in tasks if t.status == TaskStatus.DONE),
             len(tasks),

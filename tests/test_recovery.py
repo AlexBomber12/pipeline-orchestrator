@@ -573,6 +573,66 @@ def test_recovery_marks_error_tasks_in_crashed_set(
     assert runner.state.current_queue[0].status == TaskStatus.ERROR
 
 
+@pytest.mark.parametrize("labels", [
+    {"quarantine:large_diff"},
+    {"quarantine:large_diff", "quarantine:workflow"},
+])
+@pytest.mark.parametrize("published_spec_changed", [False, True])
+def test_recover_legacy_size_error_without_redis(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, labels: set[str],
+    published_spec_changed: bool,
+) -> None:
+    repo = tmp_path / "repo"
+    remote = tmp_path / "remote.git"
+
+    def git(path: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), *args], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git(tmp_path, "init", "--bare", str(remote))
+    git(tmp_path, "init", "-b", "main", str(repo))
+    git(repo, "config", "user.name", "Recovery Test")
+    git(repo, "config", "user.email", "recovery@example.test")
+    _write_task_file(repo, "PR-100", "ERROR", "pr-100-size")
+    task_path = repo / "tasks/PR-100.md"
+    task_path.write_text(task_path.read_text().replace("status: ERROR", "status: ERROR\nblocked_reason: guardrail"))
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "legacy size decision")
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "-u", "origin", "main")
+    git(repo, "checkout", "-b", "pr-100-size")
+    if published_spec_changed:
+        task_path.write_text(task_path.read_text() + "\nRevised requirements.\n")
+    (repo / "implementation.py").write_text("published work\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "published work")
+    git(repo, "push", "-u", "origin", "pr-100-size")
+    pr = PRInfo(
+        number=100, branch="pr-100-size", pr_id="PR-100",
+        head_sha=git(repo, "rev-parse", "HEAD"), quarantine_labels=labels,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [pr])
+    monkeypatch.setattr(
+        recovery_module, "_resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+    runner = _make_runner()
+    runner.repo_path = str(repo)
+    asyncio.run(runner.recover_state())
+
+    if labels == {"quarantine:large_diff"} and not published_spec_changed:
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_pr.number == 100
+        assert runner.state.current_queue[0].status == TaskStatus.DOING
+        assert runner._crashed_task_pr_ids == set()
+    else:
+        assert runner.state.state == PipelineState.IDLE
+        assert runner.state.current_queue[0].status == TaskStatus.ERROR
+        assert runner._crashed_task_pr_ids == {"PR-100"}
+    assert "status: ERROR" in task_path.read_text()
+
+
 def test_recovery_does_not_mark_todo_or_done(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

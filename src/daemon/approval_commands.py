@@ -435,7 +435,11 @@ class ApprovalCommandMixin:
             if reason:
                 await self._approval_result(command, "deferred", reason)
                 return True
-            await self._commit_approval_state(command, pr.quarantine_labels)
+            raw_state = await self.redis.get(pipeline_state(self.name))
+            persisted = RepoState.model_validate_json(raw_state) if raw_state else None
+            await self._commit_approval_state(
+                command, pr.quarantine_labels, is_size_only_cause(command.failure, persisted)
+            )
             return True
         except ApprovalChanged as exc:
             await self._approval_result(command, "failed", str(exc))
@@ -483,7 +487,9 @@ class ApprovalCommandMixin:
         self.state = await self.redis.transaction(transaction, state_key, cancellation, value_from_callable=True)
         self._approval_head_refresh_uncertain = False
 
-    async def _commit_approval_state(self, command: ApprovalCommand, live_labels: set[str]) -> None:
+    async def _commit_approval_state(
+        self, command: ApprovalCommand, live_labels: set[str], size_only: bool,
+    ) -> None:
         key = approval_key(self.name, command.binding)
         cancellation = cause_key(self.name, command.task.pr_id)
         state_key = pipeline_state(self.name)
@@ -550,7 +556,7 @@ class ApprovalCommandMixin:
         self._recovered = True
         self._approval_receipt = command.model_copy(update={"status": "applied"})
         if (
-            self._approved_finding(command)[0] == "large_diff_threshold"
+            size_only
             and "quarantine:large_diff" in live_labels
         ):
             try:

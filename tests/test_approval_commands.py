@@ -784,7 +784,7 @@ async def test_size_only_recovery_retains_other_quarantine(approval, restart):
     assert (repo / "tasks/PR-42.md").exists()
 
 
-async def test_legacy_label_suppression_recovers_only_matching_size_error(approval):
+async def test_legacy_label_suppression_recovers_only_matching_size_error(approval, monkeypatch):
     runner, command, _, _ = approval
     legacy = CancellationCause(
         category="ERROR",
@@ -797,10 +797,13 @@ async def test_legacy_label_suppression_recovers_only_matching_size_error(approv
     runner.state.current_pr.quarantine_labels.add("quarantine:workflow")
     assert not daemon_approval.is_size_only_cause(legacy, runner.state)
     runner.state.current_pr.quarantine_labels.remove("quarantine:workflow")
+    calls = []
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append(args))
     await runner._run_cycle_body()
     assert runner.state.state == PipelineState.WATCH
     assert await runner.redis.get(cause_key(runner.name, "PR-42")) is None
     assert (await load_approval(runner.redis, runner.name, command.binding)) is None
+    assert calls == [["pr", "edit", "42", "--remove-label", "quarantine:large_diff"]]
 
 
 @pytest.mark.parametrize("prior", [PipelineState.CODING, PipelineState.FIX])
