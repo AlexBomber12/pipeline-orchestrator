@@ -14,15 +14,17 @@ from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
 from src.daemon.runner import PipelineRunner
+from src.keyspace import pipeline_state
 from src.models import (
     CIStatus,
     PipelineState,
     PRInfo,
     QueueTask,
+    RepoState,
     ReviewStatus,
     TaskStatus,
 )
-from src.queue_parser import QueueValidationError, write_frontmatter_status
+from src.queue_parser import QueueValidationError, parse_existing_task_header, write_frontmatter_status
 from src.subsource_registry import SuppressionReason
 from src.suppression import SuppressionRecord
 from src.task_status import MergedState
@@ -578,9 +580,11 @@ def test_recovery_marks_error_tasks_in_crashed_set(
     {"quarantine:large_diff", "quarantine:workflow"},
 ])
 @pytest.mark.parametrize("published_spec_changed", [False, True])
-def test_recover_legacy_size_error_without_redis(
+@pytest.mark.parametrize("head_missing", [False, True])
+@pytest.mark.parametrize("saved_watch", [False, True])
+def test_recover_legacy_size_error_from_git_and_pr(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, labels: set[str],
-    published_spec_changed: bool,
+    published_spec_changed: bool, head_missing: bool, saved_watch: bool,
 ) -> None:
     repo = tmp_path / "repo"
     remote = tmp_path / "remote.git"
@@ -610,7 +614,8 @@ def test_recover_legacy_size_error_without_redis(
     git(repo, "push", "-u", "origin", "pr-100-size")
     pr = PRInfo(
         number=100, branch="pr-100-size", pr_id="PR-100",
-        head_sha=git(repo, "rev-parse", "HEAD"), quarantine_labels=labels,
+        head_sha="a" * 40 if head_missing else git(repo, "rev-parse", "HEAD"),
+        quarantine_labels=labels,
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [pr])
     monkeypatch.setattr(
@@ -619,9 +624,18 @@ def test_recover_legacy_size_error_without_redis(
     )
     runner = _make_runner()
     runner.repo_path = str(repo)
+    if saved_watch:
+        runner.redis.store[pipeline_state(runner.name)] = RepoState(
+            name=runner.name, url=runner.repo_config.url, state=PipelineState.WATCH,
+            current_task=QueueTask(
+                pr_id="PR-100", title="Legacy size", status=TaskStatus.DOING,
+                branch="pr-100-size", task_file="tasks/PR-100.md",
+            ),
+            current_pr=pr,
+        ).model_dump_json()
     asyncio.run(runner.recover_state())
 
-    if labels == {"quarantine:large_diff"} and not published_spec_changed:
+    if labels == {"quarantine:large_diff"} and not published_spec_changed and not head_missing:
         assert runner.state.state == PipelineState.WATCH
         assert runner.state.current_pr.number == 100
         assert runner.state.current_queue[0].status == TaskStatus.DOING
@@ -631,6 +645,47 @@ def test_recover_legacy_size_error_without_redis(
         assert runner.state.current_queue[0].status == TaskStatus.ERROR
         assert runner._crashed_task_pr_ids == {"PR-100"}
     assert "status: ERROR" in task_path.read_text()
+
+
+@pytest.mark.parametrize("saved", ["missing", "malformed", "error", "suppressed"])
+def test_legacy_size_recovery_preserves_unverified_state(
+    tmp_path: Path, saved: str,
+) -> None:
+    _write_task_file(tmp_path, "PR-100", "ERROR", "pr-100-size")
+    path = tmp_path / "tasks/PR-100.md"
+    path.write_text(path.read_text().replace("status: ERROR", "status: ERROR\nblocked_reason: guardrail"))
+    task = QueueTask(
+        pr_id="PR-100", title="Legacy size", status=TaskStatus.ERROR,
+        branch="pr-100-size", task_file="tasks/PR-100.md",
+    )
+    pr = PRInfo(
+        number=100, branch="pr-100-size", pr_id="PR-100",
+        head_sha="a" * 40, quarantine_labels={"quarantine:large_diff"},
+    )
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._recovery_task_headers = {task.pr_id: parse_existing_task_header(path)}
+    if saved == "malformed":
+        runner.redis.store[pipeline_state(runner.name)] = "{broken"
+    elif saved == "error":
+        runner.redis.store[pipeline_state(runner.name)] = RepoState(
+            name=runner.name, url=runner.repo_config.url, state=PipelineState.ERROR,
+            current_task=task, current_pr=pr,
+        ).model_dump_json()
+    elif saved == "suppressed":
+        async def existing_suppression(_task_id: str) -> SuppressionRecord:
+            return SuppressionRecord(
+                task_id="PR-100", reason=SuppressionReason.GUARDRAIL, detail={},
+            )
+
+        runner._suppression_record_for_task = existing_suppression
+    tasks = [task]
+    asyncio.run(runner._recover_legacy_size_tasks(tasks, [pr]))
+    assert tasks[0].status == TaskStatus.ERROR
+    if saved == "missing":
+        assert any("without Git" in item["event"] for item in runner.state.history)
+    elif saved == "malformed":
+        assert any("saved state is malformed" in item["event"] for item in runner.state.history)
 
 
 def test_recovery_does_not_mark_todo_or_done(

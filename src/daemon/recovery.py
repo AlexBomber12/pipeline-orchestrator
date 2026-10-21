@@ -905,17 +905,23 @@ class RecoveryMixin:
         self, tasks: list[QueueTask], prs: list[PRInfo],
     ) -> None:
         """Restore a size-only ERROR task from its task header and live PR."""
+        candidates = [
+            (index, task) for index, task in enumerate(tasks)
+            if task.status == TaskStatus.ERROR
+            and (header := getattr(self, "_recovery_task_headers", {}).get(task.pr_id)) is not None
+            and header.frontmatter_status == "error"
+            and header.blocked_reason == SuppressionReason.GUARDRAIL.value
+            and task.pr_id not in self._crashed_task_pr_ids
+        ]
+        if not candidates:
+            return
         raw_state = await self.redis.get(pipeline_state(self.name))
-        persisted = RepoState.model_validate_json(raw_state) if raw_state else None
-        for index, task in enumerate(tasks):
-            header = getattr(self, "_recovery_task_headers", {}).get(task.pr_id)
-            if (
-                task.status != TaskStatus.ERROR or header is None
-                or header.frontmatter_status != "error"
-                or header.blocked_reason != SuppressionReason.GUARDRAIL.value
-                or task.pr_id in self._crashed_task_pr_ids
-            ):
-                continue
+        try:
+            persisted = RepoState.model_validate_json(raw_state) if raw_state else None
+        except ValueError:
+            self.log_event("[RECOVERY] Legacy size task retained: saved state is malformed.")
+            return
+        for index, task in candidates:
             pr = find_matching_open_pr(task.pr_id, task.branch, prs)
             if (
                 pr is None or pr.quarantine_labels != {"quarantine:large_diff"}
