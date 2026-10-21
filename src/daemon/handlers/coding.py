@@ -332,15 +332,28 @@ class CodingMixin:
             return False
 
     async def _release_unpublished_attempt(self, target_branch: str) -> None:
-        """After coder cleanup, release only positively proven remote absence."""
+        """After cleanup, require both branch absence and all-state PR absence."""
         attempt = self.state.publication_attempt
         if (attempt is not None and attempt.branch == target_branch
             and attempt.pr_number is None and attempt.candidate is None):
             remote_exists = await asyncio.to_thread(
                 _remote_branch_exists, self.repo_path, target_branch,
             )
-            if remote_exists is False:
-                attempt.pending = False
+            if remote_exists is False and attempt.baseline_numbers is not None:
+                # A closed PR survives deletion of its head branch. Recheck all
+                # states after the ref probe; failed/earlier discovery cannot
+                # authorize another create. Retain even candidates whose HEAD
+                # or metadata cannot yet be matched to this dispatch.
+                try:
+                    publications = await asyncio.to_thread(
+                        gh_prs.get_branch_publications,
+                        attempt.repo, attempt.base, attempt.branch,
+                    )
+                except Exception as exc:
+                    self.log_event(f"[INFRA] Unpublished attempt release deferred: {exc}")
+                    return
+                if not any(item.number not in attempt.baseline_numbers for item in publications):
+                    attempt.pending = False
 
     async def _hold_unresolved_publication(self) -> bool:
         """Prevent IDLE/CODING from losing an unfinished publication attempt."""
@@ -1338,15 +1351,7 @@ class CodingMixin:
             resolved = await self._resolve_published_attempt()
             if resolved and self.state.current_pr is None:
                 return
-            attempt = self.state.publication_attempt
-            if attempt is not None and attempt.pr_number is None and attempt.candidate is None:
-                # A failed coder may never have pushed. Release only proven
-                # absence so ordinary failures remain eligible for Retry.
-                remote_exists = await asyncio.to_thread(
-                    _remote_branch_exists, self.repo_path, target_branch,
-                )
-                if remote_exists is False:
-                    attempt.pending = False
+            await self._release_unpublished_attempt(target_branch)
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
@@ -1444,11 +1449,7 @@ class CodingMixin:
             return
 
         if remote_exists is False:
-            # Only a successful remote absence probe can release this attempt.
-            # Keep any positive PR evidence even if its branch was deleted.
-            attempt = self.state.publication_attempt
-            if attempt is not None and attempt.pr_number is None and attempt.candidate is None:
-                attempt.pending = False
+            await self._release_unpublished_attempt(target_branch)
             ctx = BranchContext.from_runner(self)
             if ctx.mismatch_reason is not None:
                 # Daemon recovery is unavailable (no upstream

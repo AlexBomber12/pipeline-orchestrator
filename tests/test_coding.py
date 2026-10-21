@@ -1392,6 +1392,7 @@ def _publication_transport(monkeypatch, runner, *, code=1, stdout="", stderr="co
     def transport(args, **kwargs):
         assert kwargs["repo"] == runner.owner_repo
         assert args[:2] == ["pr", "list"]  # No second create is authorized.
+        assert args[args.index("--state") + 1] == "all"
         if not remote["created"] or remote["omit"]:
             return []
         return [{
@@ -2184,3 +2185,77 @@ def test_escalation_and_breach_release_only_proven_unpublished_attempts(
         command = _command(_task_text(task_id="PR-001", branch="pr-001"),
                            task_id="PR-001", branch="pr-001")
         assert asyncio.run(runner._select_retry_continuation(command)) == ("coding", None)
+
+
+@pytest.mark.parametrize("code", [0, 1])
+@pytest.mark.parametrize("discovery", ["unavailable", "closed", "different_head", "empty", "baseline"])
+def test_deleted_branch_requires_fresh_all_state_publication_lookup(monkeypatch, discovery, code):
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=code)
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=False)
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: "a" * 40)
+    lookups = []
+    probed = []
+
+    def branch_absent(*args):
+        probed.append(True)
+        return False
+
+    monkeypatch.setattr(coding_module, "_remote_branch_exists", branch_absent)
+
+    def publications(*args):
+        lookups.append(args)
+        if not probed:
+            # Baseline and capture omit the PR until the post-cleanup ref probe.
+            remote["omit"] = True
+            return _REAL_PUBLICATIONS(*args)
+        if discovery == "unavailable":
+            raise OSError("all-state lookup unavailable")
+        remote["omit"] = discovery == "empty"
+        remote["update"] = {"state": "CLOSED"}
+        if discovery == "different_head":
+            remote["update"]["headRefOid"] = "b" * 40
+        if discovery == "baseline":
+            runner.state.publication_attempt.baseline_numbers = {402}
+        return _REAL_PUBLICATIONS(*args)
+
+    monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", publications)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    assert probed
+    assert len(lookups) >= 3
+    assert attempt.pending is (discovery not in {"empty", "baseline"})
+    assert runner.state.state == PipelineState.ERROR
+    assert remote["calls"] == 1
+
+    if discovery in {"unavailable", "closed", "different_head"}:
+        # Persist/reload and Retry cannot discard the hold and choose CODING.
+        runner.state = type(runner.state).model_validate_json(runner.state.model_dump_json())
+        command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                           task_id="PR-001", branch="pr-001")
+        remote["terminal"] = "CLOSED"
+        if discovery != "closed":
+            assert asyncio.run(runner._select_retry_continuation(command)) != ("coding", None)
+            assert runner.state.publication_attempt.pending
+        # When complete identity is visible, reconcile the closed publication.
+        remote["omit"] = False
+        remote["update"] = {"state": "CLOSED"}
+        monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", _REAL_PUBLICATIONS)
+        assert asyncio.run(runner._hold_unresolved_publication())
+        assert not runner.state.publication_attempt.pending
+        assert runner.state.current_task is None
+        assert remote["calls"] == 1
+
+
+def test_deleted_branch_without_publication_baseline_keeps_hold(monkeypatch):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    remote["omit"] = True
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    attempt.baseline_numbers = None
+    monkeypatch.setattr(coding_module, "_remote_branch_exists", lambda *a: False)
+    asyncio.run(runner._release_unpublished_attempt(attempt.branch))
+    assert attempt.pending
