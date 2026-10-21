@@ -717,11 +717,15 @@ async def test_published_later_push_releases_old_approval_with_stale_tracking_re
     await runner._run_cycle_body()
     assert runner.handle_watch.await_count == 1
     assert runner._approval_receipt is None
-    assert not await list_approvals(runner.redis, runner.name)
+    assert (await list_approvals(runner.redis, runner.name))[0].status == "applied"
+    assert runner._current_approval(fresh) is None
     assert runner.state.state == PipelineState.WATCH
 
 
-async def test_external_later_push_releases_receipt_without_local_commit(approval, monkeypatch):
+@pytest.mark.parametrize("restart_before_observation", [False, True])
+async def test_external_later_push_releases_receipt_without_local_commit(
+    approval, monkeypatch, restart_before_observation,
+):
     runner, command, repo, remote = approval
     await enqueue_approval(runner.redis, command)
     await runner._run_cycle_body()
@@ -739,10 +743,27 @@ async def test_external_later_push_releases_receipt_without_local_commit(approva
     fresh = command.pr.model_copy(update={"head_sha": new_head})
     monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [fresh])
     before = snapshot(repo)
+    if restart_before_observation:
+        runner._recovered = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+        runner._approval_receipt = None
+        await runner._run_cycle_body()
+        assert runner.state.state == PipelineState.WATCH
     await runner._run_cycle_body()
     assert runner.handle_watch.await_count == 1
     assert runner._approval_receipt is None
-    assert not await list_approvals(runner.redis, runner.name)
+    assert (await list_approvals(runner.redis, runner.name))[0].status == "applied"
+    assert runner._current_approval(fresh) is None
+    assert runner.state.state == PipelineState.WATCH
+    runner._recovered = False
+    runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    runner._approval_receipt = None
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.WATCH
+    await runner._run_cycle_body()
+    assert runner.handle_watch.await_count == 2
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_approval(fresh) is None
     assert snapshot(repo) == before
 
 

@@ -161,6 +161,21 @@ class ApprovalCommandMixin:
             commands = await list_approvals(self.redis, self.name)
             self._approval_history = [c for c in commands if c.status == "applied" and c.active]
             for command in reversed(commands):
+                if command.status == "applied" and not self._recovered:
+                    raw = await self.redis.get(pipeline_state(self.name))
+                    if raw:
+                        persisted = RepoState.model_validate_json(raw)
+                        if (
+                            persisted.state == PipelineState.WATCH
+                            and matches_state(command, persisted, check_head=False)
+                        ):
+                            # Restore the approved WATCH before header recovery
+                            # sees the legacy ERROR task. A later HEAD still
+                            # gets no permission from this old receipt.
+                            self.state = persisted
+                            self._recovered = True
+                            if not await self.redis.get(cause_key(self.name, command.task.pr_id)):
+                                return True
                 if not command.active:
                     snapshot = self.state
                     if not self._recovered:
@@ -174,7 +189,7 @@ class ApprovalCommandMixin:
                         await self.redis.zrem(approval_index(self.name), command.binding)
                     continue
                 if command.status == "applied" and self._recovered and not self._approval_commit_uncertain:
-                    if not matches_state(command, self.state):
+                    if not matches_state(command, self.state, check_head=False):
                         await self.redis.zrem(approval_index(self.name), command.binding)
                         continue
                     if self.state.state != PipelineState.WATCH:
@@ -205,9 +220,8 @@ class ApprovalCommandMixin:
                         )
                     if pr.head_sha != command.pr.head_sha:
                         # A later push needs its own CI, scan and review result;
-                        # the old approval receipt must not carry across heads.
+                        # retain the old command only for restart recovery.
                         self._approval_receipt = None
-                        await self.redis.zrem(approval_index(self.name), command.binding)
                     if await self._check_github_api_budget():
                         await self.handle_watch()
                     await self.publish_state()
