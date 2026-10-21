@@ -13,7 +13,12 @@ import pytest
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
-from src.daemon.quarantine import OBSOLETE_SIZE_LABEL, continued_size_label, fixing_size_label
+from src.daemon.quarantine import (
+    OBSOLETE_SIZE_LABEL,
+    complete_size_fix_marker,
+    continued_size_label,
+    fixing_size_label,
+)
 from src.daemon.runner import PipelineRunner
 from src.keyspace import pipeline_state
 from src.models import (
@@ -34,6 +39,12 @@ from src.task_status import MergedState
 def test_size_continuation_label_requires_published_head() -> None:
     with pytest.raises(ValueError, match="published PR HEAD"):
         continued_size_label("invalid")
+
+
+def test_size_fix_completion_is_idempotent_without_marker() -> None:
+    pr = PRInfo(number=17, branch="pr-042-inflight", head_sha="a" * 40)
+    assert complete_size_fix_marker(_make_runner(), pr)
+    assert pr.quarantine_labels == set()
 
 
 class _FakeRedis:
@@ -244,6 +255,20 @@ def test_recover_rehydrates_quarantine_from_pr_labels(
         in e["event"]
         for e in runner.state.history
     )
+
+
+def test_recover_completed_size_fix_from_doing_header(monkeypatch: pytest.MonkeyPatch) -> None:
+    task = _doing_task()
+    pr = PRInfo(
+        number=17, branch="pr-042-inflight", head_sha="a" * 40,
+        quarantine_labels={fixing_size_label("a" * 40)},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    runner = _make_runner()
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.state == PipelineState.WATCH
+    assert fixing_size_label("a" * 40) in runner.state.current_pr.quarantine_labels
 
 
 def test_recover_projects_quarantine_when_guardrail_suppression_exists(

@@ -23,7 +23,7 @@ from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers.breach import BreachMixin
 from src.daemon.quarantine import (
     apply_quarantine_label_for_violation,
-    continued_size_label,
+    complete_size_fix_marker,
     fixing_size_label,
     is_continued_size_label,
     is_fixing_size_label,
@@ -805,42 +805,17 @@ class FixMixin(BreachMixin):
                 )
                 return None
 
-        def finish_size_fix_marker(head_after: str) -> None:
-            if size_fix_marker is None or current_pr is None:
+        async def finish_size_fix_marker(head_after: str) -> None:
+            if size_fix_marker is None or current_pr is None or self.state.current_task is None:
                 return
-            next_marker = continued_size_label(head_after)
-            try:
-                try:
-                    gh_runner.run_gh(
-                        ["label", "create", next_marker, "--color", "0E8A16",
-                         "--description", "Legacy size decision continued; CI and review still required"],
-                        repo=self.owner_repo,
-                    )
-                except Exception as exc:
-                    if not fix_escalation._is_label_already_exists_error(exc):
-                        raise
-                gh_runner.run_gh(
-                    ["pr", "edit", str(current_pr.number), "--add-label", next_marker],
-                    repo=self.owner_repo,
-                )
-                old_markers = {
-                    label for label in current_pr.quarantine_labels
-                    if is_continued_size_label(label) and label != next_marker
-                }
-                for marker in sorted(old_markers):
-                    gh_runner.run_gh(
-                        ["pr", "edit", str(current_pr.number), "--remove-label", marker],
-                        repo=self.owner_repo,
-                    )
-                gh_runner.run_gh(
-                    ["pr", "edit", str(current_pr.number), "--remove-label", size_fix_marker],
-                    repo=self.owner_repo,
-                )
-            except Exception as exc:
-                self.log_event(f"[FIX] Size FIX marker completion deferred: {exc}")
+            committed = await self._commit_task_status_change(
+                self.state.current_task, "DOING", "Size FIX completed; continuing published PR",
+            )
+            if not committed:
+                self.log_event("[FIX] Size FIX task status update deferred; retaining recovery marker.")
                 return
-            current_pr.quarantine_labels.difference_update(old_markers | {size_fix_marker})
-            current_pr.quarantine_labels.add(next_marker)
+            current_pr.head_sha = head_after
+            complete_size_fix_marker(self, current_pr)
 
         def remote_branch_contains_head(branch: str, head_after: str) -> bool:
             return (
@@ -1104,7 +1079,7 @@ class FixMixin(BreachMixin):
                 and await no_push_policy.maybe_escalate(self.state.current_pr)
             ):
                 return
-            finish_size_fix_marker(current_pr.head_sha if remote_no_push and current_pr else head_after)
+            await finish_size_fix_marker(current_pr.head_sha if remote_no_push and current_pr else head_after)
             self.state.state = PipelineState.WATCH
             return
 
@@ -1116,5 +1091,5 @@ class FixMixin(BreachMixin):
             return
         if await pause_for_stop_after_bookkeeping():
             return
-        finish_size_fix_marker(head_after)
+        await finish_size_fix_marker(head_after)
         self.state.state = PipelineState.WATCH

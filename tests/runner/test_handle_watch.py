@@ -697,11 +697,44 @@ def test_watch_holds_unresolved_size_fix_marker(monkeypatch: pytest.MonkeyPatch)
     runner = h._make_runner()
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
-    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.ERROR)
     asyncio.run(runner.handle_watch())
     assert runner.state.state == PipelineState.WATCH
     assert marker in runner.state.current_pr.quarantine_labels
     assert any("size FIX outcome is unresolved" in entry["event"] for entry in runner.state.history)
+
+
+@pytest.mark.parametrize("status_committed", [False, True])
+def test_watch_retries_completed_size_fix_marker(
+    monkeypatch: pytest.MonkeyPatch, status_committed: bool,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    marker = fixing_size_label("a" * 40)
+    pr = PRInfo(
+        number=5, branch="pr-001", head_sha="a" * 40,
+        ci_status=CIStatus.SUCCESS, review_status=ReviewStatus.APPROVED,
+        quarantine_labels={marker},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    calls: list[list[str]] = []
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args, **kw: calls.append(args))
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
+    monkeypatch.setattr(
+        runner, "_commit_task_status_change", AsyncMock(return_value=status_committed),
+    )
+    asyncio.run(runner.handle_watch())
+    assert runner.state.state == PipelineState.WATCH
+    if status_committed:
+        assert marker not in runner.state.current_pr.quarantine_labels
+        assert ["pr", "edit", "5", "--remove-label", marker] in calls
+        assert any("marker completed" in entry["event"] for entry in runner.state.history)
+    else:
+        assert marker in runner.state.current_pr.quarantine_labels
+        assert not any(call[:2] == ["label", "create"] for call in calls)
+        assert any("marker retry deferred" in entry["event"] for entry in runner.state.history)
 
 
 def test_watch_quarantine_rehydrate_ignores_invalid_or_existing_pr() -> None:

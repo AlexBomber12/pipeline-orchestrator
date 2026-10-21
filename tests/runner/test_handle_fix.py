@@ -88,6 +88,10 @@ def test_handle_fix_retains_marker_until_successful_completion(
         number=77, branch="pr-019", head_sha="a" * 40,
         quarantine_labels={marker},
     )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019",
+    )
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     asyncio.run(runner.handle_fix())
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr.quarantine_labels == {marker}
@@ -98,7 +102,7 @@ def test_handle_fix_retains_marker_until_successful_completion(
     )
 
 
-@pytest.mark.parametrize("failure", ["prior_fix", "apply", "complete"])
+@pytest.mark.parametrize("failure", ["prior_fix", "apply", "status", "complete"])
 def test_handle_fix_keeps_recovery_marker_when_fix_outcome_is_uncertain(
     monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
@@ -112,6 +116,12 @@ def test_handle_fix_keeps_recovery_marker_when_fix_outcome_is_uncertain(
     runner.state.current_pr = PRInfo(
         number=77, branch="pr-019", head_sha="a" * 40,
         quarantine_labels=labels,
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019",
+    )
+    monkeypatch.setattr(
+        runner, "_commit_task_status_change", AsyncMock(return_value=failure != "status"),
     )
 
     def run_gh(args: list[str], **kwargs: Any) -> None:
@@ -137,9 +147,12 @@ def test_handle_fix_keeps_recovery_marker_when_fix_outcome_is_uncertain(
     elif failure == "apply":
         assert runner.state.current_pr.quarantine_labels == {marker}
         assert any("marker application deferred" in item["event"] for item in runner.state.history)
-    else:
+    elif failure == "complete":
         assert runner.state.current_pr.quarantine_labels == {marker, fixing}
         assert any("marker completion deferred" in item["event"] for item in runner.state.history)
+    else:
+        assert runner.state.current_pr.quarantine_labels == {marker, fixing}
+        assert any("task status update deferred" in item["event"] for item in runner.state.history)
 
 
 def test_handle_fix_rotates_size_marker_after_published_push(
@@ -167,6 +180,10 @@ def test_handle_fix_rotates_size_marker_after_published_push(
         number=77, branch="pr-019", head_sha="a" * 40,
         quarantine_labels={old_marker},
     )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019",
+    )
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     asyncio.run(runner.handle_fix())
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr.quarantine_labels == {new_marker}

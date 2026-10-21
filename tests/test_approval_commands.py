@@ -556,6 +556,21 @@ async def test_size_recovery_creates_marker_without_obsolete_label(approval, mon
     ]
 
 
+async def test_size_recovery_keeps_failure_when_first_marker_is_unavailable(approval, monkeypatch):
+    runner, command, _, _ = approval
+    command.pr.quarantine_labels.clear()
+    runner.state.current_pr.quarantine_labels.clear()
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    monkeypatch.setattr(
+        daemon_approval.gh_runner, "run_gh",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("offline")),
+    )
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "deferred"
+    assert runner.state.state == PipelineState.ERROR
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) is not None
+
+
 async def test_size_recovery_removes_label_missing_from_error_snapshot(approval, monkeypatch):
     runner, command, _, _ = approval
     marker = continued_size_label(command.pr.head_sha)

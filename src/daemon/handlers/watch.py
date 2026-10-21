@@ -20,6 +20,7 @@ from src.daemon import guardrails
 from src.daemon.quarantine import (
     apply_quarantine_label_for_violation,
     blocking_quarantine_labels,
+    complete_size_fix_marker,
     is_fixing_size_label,
 )
 from src.daemon.selector import CoderPurpose, resolve_active_coder, resolve_pause_coder
@@ -31,7 +32,7 @@ from src.github import reviews as gh_reviews
 from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
-from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus
+from src.models import CIStatus, FeedbackCheckResult, PipelineState, ReviewStatus, TaskStatus
 from src.queue_parser import parse_existing_task_header as parse_task_header
 from src.subsource_registry import SuppressionReason
 from src.task_status import find_matching_open_pr
@@ -255,7 +256,17 @@ class WatchMixin:
         )
         self.state.current_pr = found
         if any(is_fixing_size_label(label) for label in found.quarantine_labels):
-            self.log_event(f"[WATCH] PR #{found.number} size FIX outcome is unresolved; holding PR.")
+            task = self.state.current_task
+            if task is None or task.status != TaskStatus.DOING:
+                self.log_event(f"[WATCH] PR #{found.number} size FIX outcome is unresolved; holding PR.")
+                return
+            committed = await self._commit_task_status_change(
+                task, "DOING", "Size FIX completed; continuing published PR",
+            )
+            if not committed or not complete_size_fix_marker(self, found):
+                self.log_event(f"[WATCH] PR #{found.number} size FIX marker retry deferred.")
+                return
+            self.log_event(f"[WATCH] PR #{found.number} size FIX marker completed; refreshing PR.")
             return
         # Retry rehydrate every cycle so a transient commit-time fetch
         # failure during ``recover_state`` doesn't permanently leave

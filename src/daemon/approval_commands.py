@@ -514,6 +514,23 @@ class ApprovalCommandMixin:
         state_key = pipeline_state(self.name)
         stop_key = control_stop(self.name)
         upload_key = upload_pending(self.name)
+        marker = continued_size_label(command.pr.head_sha) if size_only else None
+        # When the old GitHub label is absent, publish recovery evidence before
+        # the transaction clears the only remaining cancellation record.
+        if marker is not None and OBSOLETE_SIZE_LABEL not in live_labels and marker not in live_labels:
+            try:
+                gh_runner.run_gh(
+                    ["label", "create", marker, "--color", "0E8A16",
+                     "--description", "Legacy size decision continued; CI and review still required"],
+                    repo=self.owner_repo,
+                )
+            except Exception as exc:
+                if not _is_label_already_exists_error(exc):
+                    raise RuntimeError(f"Size recovery marker unavailable: {exc}") from exc
+            gh_runner.run_gh(
+                ["pr", "edit", str(command.pr.number), "--add-label", marker],
+                repo=self.owner_repo,
+            )
 
         async def transaction(pipe: Any) -> RepoState:
             current = ApprovalCommand.model_validate_json(await pipe.get(key))
@@ -574,8 +591,7 @@ class ApprovalCommandMixin:
         self._approval_commit_uncertain = False
         self._recovered = True
         self._approval_receipt = command.model_copy(update={"status": "applied"})
-        if size_only:
-            marker = continued_size_label(command.pr.head_sha)
+        if marker is not None and OBSOLETE_SIZE_LABEL in live_labels:
             try:
                 gh_runner.run_gh(
                     [
