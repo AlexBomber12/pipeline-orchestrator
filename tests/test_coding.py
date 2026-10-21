@@ -1636,6 +1636,7 @@ def test_missing_publication_binding_cannot_attach_a_pr(monkeypatch):
         datetime.now(timezone.utc), "https://github.com/octo/demo/pull/402",
     )
     asyncio.run(runner._retain_observed_publication(observed))
+    asyncio.run(runner._record_pre_pause_pr("pr-001", "before pause"))
     assert runner.state.current_pr is None
     asyncio.run(runner._post_coder_resolution(
         "claude", 0, "", "", target_branch="pr-001", current_pr_id="PR-001",
@@ -1660,6 +1661,8 @@ def test_corrupt_candidate_and_unavailable_discovery_keep_publication_held(monke
     monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", unavailable)
     assert asyncio.run(runner._resolve_published_attempt()) is False
     assert binding.pending
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message == "coder failed"
     assert remote["calls"] == 1
 

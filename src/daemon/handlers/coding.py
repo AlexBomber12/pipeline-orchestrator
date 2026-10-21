@@ -298,7 +298,7 @@ class CodingMixin:
                 return True
             return False
         except Exception as exc:
-            self.log_event(f"[PUBLICATION] Reconciliation deferred: {exc}")
+            self.log_event(f"[INFRA] Reconciliation deferred: {exc}")
             return False
 
     async def _hold_unresolved_publication(self) -> bool:
@@ -318,7 +318,7 @@ class CodingMixin:
         await self._transition_to_error(
             attempt.failure or self.state.error_message
             or "Publication ownership unresolved; retaining coder attempt",
-            save_run_record_as=None, publish=True, log_prefix="[PUBLICATION]",
+            save_run_record_as=None, publish=True, log_prefix="[INFRA]",
         )
         return True
 
@@ -1061,33 +1061,14 @@ class CodingMixin:
         target_branch: str,
         log_suffix: str,
     ) -> None:
-        """Best-effort: record a PR opened before a breach-induced pause.
-
-        PR list visibility is eventually consistent, so retry up to 3
-        times. Failures are silently ignored — the pause is still correct
-        without the PR record, and the runner picks up the PR on the next
-        cycle once the rate-limit window clears.
-        """
-        for attempt in range(3):
-            try:
-                prs = gh_prs.get_open_prs(
-                    self.owner_repo,
-                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
-                )
-                match = next(
-                    (pr for pr in prs if pr.branch == target_branch),
-                    None,
-                )
-                if match:
-                    self.state.current_pr = match
-                    self.log_event(
-                        f"[CODING] Recorded PR #{match.number} {log_suffix}."
-                    )
-                    return
-            except Exception:
-                pass  # best-effort; the pause is still correct
-            if attempt < 2:
-                await asyncio.sleep(5)
+        """Retain only dispatch-bound publication evidence before pausing."""
+        attempt = self.state.publication_attempt
+        if attempt is None or attempt.branch != target_branch:
+            return
+        if await self._resolve_published_attempt() and self.state.current_pr is not None:
+            self.log_event(
+                f"[CODING] Recorded PR #{self.state.current_pr.number} {log_suffix}."
+            )
 
     def _expected_branch_path(self) -> Path:
         """Return the path of the daemon's ``expected-branch`` marker file.

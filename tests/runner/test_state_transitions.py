@@ -1256,57 +1256,40 @@ def test_handle_coding_honors_persisted_stop_after_fast_cli_exit(
     assert any("after coder exit" in entry["event"].lower() for entry in runner.state.history)
 
 
-def test_handle_coding_honors_stop_requested_during_pr_retry_after_cli_exit(
+def test_handle_coding_honors_stop_during_exact_publication_resolution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(claude_cli, "run_auto_pr_async", h._async_cli_result(0, "ok", ""))
     monkeypatch.setattr(
-        claude_cli,
-        "run_auto_pr_async",
-        h._async_cli_result(0, "ok", ""),
+        "src.github.prs.get_open_prs",
+        lambda *a, **kw: [PRInfo(number=127, pr_id="PR-127", branch="pr-127-control-endpoints-backend")],
     )
-
-    attempts = {"count": 0}
-
-    def fake_get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
-        attempts["count"] += 1
-        if attempts["count"] == 1:
-            return []
-        return [PRInfo(number=127, branch="pr-127-control-endpoints-backend")]
-
-    async def stale_stop_monitor(
-        _cli_task: asyncio.Task[tuple[int, str, str]],
-    ) -> None:
-        return None
-
-    pop_calls = {"count": 0}
-
-    async def fake_pop_stop_request() -> bool:
-        pop_calls["count"] += 1
-        return pop_calls["count"] == 4
-
-    async def instant_sleep(_seconds: float) -> None:
-        return None
-
     runner = h._make_runner()
     runner.state.current_task = QueueTask(
-        pr_id="PR-127",
-        title="Pause controls",
-        status=TaskStatus.DOING,
+        pr_id="PR-127", title="Pause controls", status=TaskStatus.DOING,
         branch="pr-127-control-endpoints-backend",
     )
-    monkeypatch.setattr("src.github.prs.get_open_prs", fake_get_open_prs)
-    monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
-    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
-    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
+    post_exit = False
+    original = runner._resolve_published_attempt
 
+    async def save_cli_log(*args, **kwargs):
+        nonlocal post_exit
+        post_exit = True
+
+    async def resolve():
+        resolved = await original()
+        if post_exit:
+            runner._stop_requested = True
+        return resolved
+
+    monkeypatch.setattr(runner, "_save_cli_log", save_cli_log)
+    monkeypatch.setattr(runner, "_resolve_published_attempt", resolve)
     asyncio.run(runner.handle_coding())
-
     assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.user_paused is True
-    assert runner.state.current_pr is None
-    assert attempts["count"] == 1
-    assert any("after coder exit" in entry["event"].lower() for entry in runner.state.history)
+    assert runner.state.user_paused
+    assert runner.state.current_pr.number == 127
+    assert runner.state.error_message is None
 
 
 def test_handle_coding_errors_when_task_has_no_branch(
@@ -1341,12 +1324,10 @@ def test_handle_coding_errors_when_task_has_no_branch(
     assert not any(cmd[:2] == ["git", "push"] for cmd in calls)
 
 
-def test_handle_coding_retries_pr_detection(
+def test_handle_coding_reconciles_targeted_publication_without_list_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """GitHub's open-PR list is eventually consistent: a PR opened by
-    Claude may not appear on the first poll. ``handle_coding`` must retry
-    up to 3 times before giving up."""
+    """Positive targeted identity resolves a delayed list without repeating create."""
     h._patch_subprocess(monkeypatch)
     monkeypatch.setattr(
         claude_cli,
@@ -1384,18 +1365,15 @@ def test_handle_coding_retries_pr_detection(
     assert runner.state.current_pr is not None
     assert runner.state.current_pr.number == 42
     assert call_count["n"] == 2
-    assert 5 in slept
-    assert any("PR not found for 'pr-001'" in e["event"] and "1/3" in e["event"] for e in runner.state.history)
+    assert 5 not in slept
+    assert runner.state.publication_attempt.pr_number == 42
+    assert not runner.state.publication_attempt.pending
 
 
-def test_handle_coding_runs_three_retries_before_diagnostic(
+def test_handle_coding_holds_empty_publication_before_no_push_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """After 3 consecutive empty get_open_prs results the runner must
-        invoke ``_diagnose_exit_zero_no_pr`` rather than flipping straight
-        through the framework. That diagnostic distinguishes A/B/C and
-        routes the "did nothing" outcome through ``_commit_and_park_in_error``
-        (PR-317) so the task ends in ERROR with status:ERROR on the file."""
+    """Empty discovery cannot authorize another invocation or PR creation."""
     h._patch_subprocess(monkeypatch)
     call_count = {"n": 0}
 
@@ -1440,8 +1418,10 @@ def test_handle_coding_runs_three_retries_before_diagnostic(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.skip_ai_error_diagnose is False
     assert "[codex]" in (runner.state.error_message or "")
-    assert call_count["n"] == 3
-    assert slept.count(5) == 2
+    assert call_count["n"] >= 1
+    assert 5 not in slept
+    assert runner.state.publication_attempt.pending
+    assert runner.state.publication_attempt.pr_number is None
 
 
 
@@ -2555,8 +2535,9 @@ def test_handle_coding_errors_when_get_open_prs_raises(
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.error_message == "get_open_prs failed: gh unavailable"
-    assert any(entry["event"] == "[CODING] get_open_prs failed: gh unavailable." for entry in runner.state.history)
+    assert runner.state.publication_attempt.pending
+    assert runner.state.current_pr is None
+    assert any("Reconciliation deferred: gh unavailable" in entry["event"] for entry in runner.state.history)
 
 
 def test_handle_coding_uses_codex_cli_when_coder_is_codex(
@@ -2626,55 +2607,30 @@ def test_handle_coding_uses_codex_cli_when_coder_is_codex(
     assert runner.state.state == PipelineState.WATCH
 
 
-def test_handle_coding_honors_stop_requested_after_pr_poll_exhaustion(
+def test_handle_coding_honors_stop_before_unresolved_publication_diagnostic(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        claude_cli,
-        "run_auto_pr_async",
-        h._async_cli_result(0, "ok", ""),
-    )
-
-    async def stale_stop_monitor(
-        _cli_task: asyncio.Task[tuple[int, str, str]],
-    ) -> None:
-        return None
-
-    pop_calls = {"count": 0}
-    attempts = {"count": 0}
-
-    async def fake_pop_stop_request() -> bool:
-        pop_calls["count"] += 1
-        return pop_calls["count"] == 6
-
-    async def instant_sleep(_seconds: float) -> None:
-        return None
-
+    monkeypatch.setattr(claude_cli, "run_auto_pr_async", h._async_cli_result(0, "ok", ""))
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *a, **kw: [])
     runner = h._make_runner()
     runner.state.current_task = QueueTask(
-        pr_id="PR-127",
-        title="Pause controls",
-        status=TaskStatus.DOING,
+        pr_id="PR-127", title="Pause controls", status=TaskStatus.DOING,
         branch="pr-127-control-endpoints-backend",
     )
+    original = runner._diagnose_exit_zero_no_pr
 
-    def fake_get_open_prs(repo: str, **kw: Any) -> list[PRInfo]:
-        attempts["count"] += 1
-        return []
+    async def diagnose(*args, **kwargs):
+        runner._stop_requested = True
+        await original(*args, **kwargs)
 
-    monkeypatch.setattr("src.github.prs.get_open_prs", fake_get_open_prs)
-    monkeypatch.setattr(runner, "_pop_stop_request", fake_pop_stop_request)
-    monkeypatch.setattr(runner_module.asyncio, "sleep", instant_sleep)
-    monkeypatch.setattr(runner, "_monitor_stop_request", stale_stop_monitor)
-
+    monkeypatch.setattr(runner, "_diagnose_exit_zero_no_pr", diagnose)
     asyncio.run(runner.handle_coding())
-
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.error_message is None
     assert runner.state.current_pr is None
-    assert attempts["count"] == 3
-    assert any(entry["event"] == "[CODING] CODING aborted: user stop requested." for entry in runner.state.history)
+    assert runner.state.publication_attempt.pending
+    assert runner.state.user_paused
 
 
 @pytest.fixture(autouse=True)
