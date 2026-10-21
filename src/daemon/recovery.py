@@ -28,7 +28,7 @@ from src.cancellation import (
 from src.cancellation.storage import task_spec_content_hash
 from src.daemon import git_ops
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
-from src.daemon.quarantine import blocking_quarantine_labels
+from src.daemon.quarantine import SIZE_RECOVERY_LABELS, blocking_quarantine_labels
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
 from src.models import (
@@ -924,7 +924,8 @@ class RecoveryMixin:
         for index, task in candidates:
             pr = find_matching_open_pr(task.pr_id, task.branch, prs)
             if (
-                pr is None or pr.quarantine_labels != {"quarantine:large_diff"}
+                pr is None or not pr.quarantine_labels
+                or not pr.quarantine_labels <= SIZE_RECOVERY_LABELS
                 or re.fullmatch(r"[0-9a-fA-F]{40}", pr.head_sha) is None
             ):
                 continue

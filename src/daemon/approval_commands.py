@@ -32,7 +32,13 @@ from src.approval_commands import (
 )
 from src.cancellation.storage import CancellationCause, cause_key, index_key, task_spec_content_hash
 from src.daemon import git_ops
-from src.daemon.quarantine import blocking_quarantine_labels, quarantine_label_for_category
+from src.daemon.fix_escalation import _is_label_already_exists_error
+from src.daemon.quarantine import (
+    CONTINUED_SIZE_LABEL,
+    OBSOLETE_SIZE_LABEL,
+    blocking_quarantine_labels,
+    quarantine_label_for_category,
+)
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, derive_active_inhibitors
@@ -557,11 +563,27 @@ class ApprovalCommandMixin:
         self._approval_receipt = command.model_copy(update={"status": "applied"})
         if (
             size_only
-            and "quarantine:large_diff" in live_labels
+            and OBSOLETE_SIZE_LABEL in live_labels
         ):
             try:
                 gh_runner.run_gh(
-                    ["pr", "edit", str(command.pr.number), "--remove-label", "quarantine:large_diff"],
+                    [
+                        "label", "create", CONTINUED_SIZE_LABEL, "--color", "0E8A16",
+                        "--description", "Legacy size decision continued; CI and review still required",
+                    ],
+                    repo=self.owner_repo,
+                )
+            except Exception as exc:
+                if not _is_label_already_exists_error(exc):
+                    self.log_event(f"[RECOVERY] Size label migration deferred: {exc}")
+                    return
+            try:
+                gh_runner.run_gh(
+                    ["pr", "edit", str(command.pr.number), "--add-label", CONTINUED_SIZE_LABEL],
+                    repo=self.owner_repo,
+                )
+                gh_runner.run_gh(
+                    ["pr", "edit", str(command.pr.number), "--remove-label", OBSOLETE_SIZE_LABEL],
                     repo=self.owner_repo,
                 )
             except Exception as exc:

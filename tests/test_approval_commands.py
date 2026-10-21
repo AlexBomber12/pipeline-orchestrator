@@ -24,6 +24,7 @@ from src.approval_commands import (
 from src.cancellation.storage import CancellationCause, cause_key, index_key
 from src.daemon import approval_commands as daemon_approval
 from src.daemon.guardrails import GuardrailViolation
+from src.daemon.quarantine import CONTINUED_SIZE_LABEL, OBSOLETE_SIZE_LABEL
 from src.keyspace import control_stop, pipeline_state
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 
@@ -530,7 +531,11 @@ async def test_size_recovery_removes_only_obsolete_github_label(approval, monkey
     await runner._run_cycle_body()
     assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
     assert calls == [
-        (["pr", "edit", "42", "--remove-label", "quarantine:large_diff"], {"repo": runner.owner_repo})
+        (["label", "create", CONTINUED_SIZE_LABEL, "--color", "0E8A16",
+          "--description", "Legacy size decision continued; CI and review still required"],
+         {"repo": runner.owner_repo}),
+        (["pr", "edit", "42", "--add-label", CONTINUED_SIZE_LABEL], {"repo": runner.owner_repo}),
+        (["pr", "edit", "42", "--remove-label", OBSOLETE_SIZE_LABEL], {"repo": runner.owner_repo}),
     ]
 
 
@@ -542,7 +547,11 @@ async def test_size_recovery_removes_label_missing_from_error_snapshot(approval,
     monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append(args))
     await runner._run_cycle_body()
     assert runner.state.state == PipelineState.WATCH
-    assert calls == [["pr", "edit", "42", "--remove-label", "quarantine:large_diff"]]
+    assert [call[:4] for call in calls] == [
+        ["label", "create", CONTINUED_SIZE_LABEL, "--color"],
+        ["pr", "edit", "42", "--add-label"],
+        ["pr", "edit", "42", "--remove-label"],
+    ]
     assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
 
 
@@ -552,7 +561,40 @@ async def test_size_label_cleanup_failure_does_not_reblock_watch(approval, monke
     await runner._run_cycle_body()
     assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
     assert runner.state.state == PipelineState.WATCH
-    assert any("size label removal deferred" in event["event"] for event in runner.state.history)
+    assert any("Size label migration deferred" in event["event"] for event in runner.state.history)
+
+
+async def test_size_label_is_retained_if_continuation_marker_cannot_be_added(approval, monkeypatch):
+    runner, command, _, _ = approval
+    calls = []
+
+    def run_gh(args, **kwargs):
+        calls.append(args)
+        if "--add-label" in args:
+            raise OSError("GitHub label update unavailable")
+
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", run_gh)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert runner.state.state == PipelineState.WATCH
+    assert len(calls) == 2
+    assert "--add-label" in calls[-1]
+    assert all("--remove-label" not in args for args in calls)
+
+
+async def test_existing_continuation_label_still_allows_size_label_cleanup(approval, monkeypatch):
+    runner, command, _, _ = approval
+    calls = []
+
+    def run_gh(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["label", "create"]:
+            raise RuntimeError("label already exists")
+
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", run_gh)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert [args[3] for args in calls[1:]] == ["--add-label", "--remove-label"]
 
 
 @pytest.mark.parametrize("restart", [False, True])
@@ -803,7 +845,11 @@ async def test_legacy_label_suppression_recovers_only_matching_size_error(approv
     assert runner.state.state == PipelineState.WATCH
     assert await runner.redis.get(cause_key(runner.name, "PR-42")) is None
     assert (await load_approval(runner.redis, runner.name, command.binding)) is None
-    assert calls == [["pr", "edit", "42", "--remove-label", "quarantine:large_diff"]]
+    assert [call[:4] for call in calls] == [
+        ["label", "create", CONTINUED_SIZE_LABEL, "--color"],
+        ["pr", "edit", "42", "--add-label"],
+        ["pr", "edit", "42", "--remove-label"],
+    ]
 
 
 @pytest.mark.parametrize("prior", [PipelineState.CODING, PipelineState.FIX])
@@ -1518,6 +1564,7 @@ async def test_successive_approvals_retain_only_independently_approved_findings(
     changed = second.model_copy(deep=True)
     changed.pr.head_sha = "other-head"
     assert runner._unapproved_labels(changed, {"quarantine:large_diff"}) == set()
+    assert runner._unapproved_labels(changed, {CONTINUED_SIZE_LABEL}) == set()
     changed.pr.head_sha = second.pr.head_sha
     changed.task_fingerprint = "revised-specification"
     assert runner._unapproved_labels(changed, {"quarantine:large_diff"}) == set()

@@ -179,9 +179,11 @@ not need to remove their existing settings.
 After upgrading, a persisted `large_diff_threshold` cancellation for a bound
 open PR is reconciled through the same task, PR, HEAD, checkout, and process
 checks as an operator approval. A previously deferred approval resumes when
-those checks pass. The daemon removes the obsolete `quarantine:large_diff`
-label after validation and ignores it for gating if label removal is unavailable,
-while retaining other quarantine labels and guardrails.
+those checks pass. Before removing the obsolete `quarantine:large_diff` label,
+the daemon adds the informational `quarantine:large_diff_continued` label as
+durable recovery evidence. Either size label lets an ERROR task with a matching
+published PR and task generation return to WATCH after Redis loss. Neither
+size label blocks CI or review; other quarantine labels still block.
 Unavailable GitHub evidence or unpublished task work leaves the PR parked
 with a specific recovery reason; no branch synchronization is performed.
 

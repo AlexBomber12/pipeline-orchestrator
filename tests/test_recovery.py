@@ -13,6 +13,7 @@ import pytest
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
+from src.daemon.quarantine import CONTINUED_SIZE_LABEL, OBSOLETE_SIZE_LABEL, SIZE_RECOVERY_LABELS
 from src.daemon.runner import PipelineRunner
 from src.keyspace import pipeline_state
 from src.models import (
@@ -576,8 +577,10 @@ def test_recovery_marks_error_tasks_in_crashed_set(
 
 
 @pytest.mark.parametrize("labels", [
-    {"quarantine:large_diff"},
-    {"quarantine:large_diff", "quarantine:workflow"},
+    {OBSOLETE_SIZE_LABEL},
+    {CONTINUED_SIZE_LABEL},
+    SIZE_RECOVERY_LABELS,
+    {OBSOLETE_SIZE_LABEL, "quarantine:workflow"},
 ])
 @pytest.mark.parametrize("published_spec_changed", [False, True])
 @pytest.mark.parametrize("head_missing", [False, True])
@@ -635,7 +638,7 @@ def test_recover_legacy_size_error_from_git_and_pr(
         ).model_dump_json()
     asyncio.run(runner.recover_state())
 
-    if labels == {"quarantine:large_diff"} and not published_spec_changed and not head_missing:
+    if labels <= SIZE_RECOVERY_LABELS and not published_spec_changed and not head_missing:
         assert runner.state.state == PipelineState.WATCH
         assert runner.state.current_pr.number == 100
         assert runner.state.current_queue[0].status == TaskStatus.DOING
