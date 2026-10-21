@@ -384,11 +384,13 @@ class MergeMixin:
             return True
         if outcome.state == gh_prs.ExactPRState.CLOSED:
             await self._handle_external_pr_resolution(pr, "CLOSED")
-        elif outcome.state == gh_prs.ExactPRState.OPEN or outcome.reason == "head mismatch":
+        elif outcome.reason == "head mismatch":
             pr.review_status = ReviewStatus.PENDING
             self.state.state = PipelineState.WATCH
             self.log_event(f"[MERGE] PR #{pr.number} needs fresh gate evidence; returning to WATCH.")
             await self.publish_state()
+        elif outcome.state == gh_prs.ExactPRState.OPEN:
+            self.log_event(f"[MERGE] PR #{pr.number} remains OPEN; retaining issued merge attempt.")
         else:
             self.log_event(
                 f"[MERGE] PR #{pr.number} merge outcome UNKNOWN; retaining attempt: {outcome.reason}."

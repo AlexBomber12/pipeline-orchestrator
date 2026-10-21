@@ -833,7 +833,12 @@ class RecoveryMixin:
                 if (record is not None and record.exit_reason != "success_merged"
                         or header.frontmatter_status in {"todo", "doing"}
                         or record is None and not has_merged_outcome(task.pr_id, self.name)):
-                    candidates.append((task, record))
+                    # A historical DONE task may lack analytics after a log
+                    # failure. Never let it hide an interrupted current merge.
+                    priority = (0 if header.frontmatter_status in {"todo", "doing"}
+                                else 1 if record is not None and record.exit_reason != "success_merged"
+                                else 2)
+                    candidates.append((priority, task, record))
             if not candidates:
                 return True
             discovery = gh_prs.get_merged_prs_discovery(self.owner_repo, self.repo_config.branch)
@@ -842,7 +847,7 @@ class RecoveryMixin:
         except Exception as exc:
             self.log_event(f"[RECOVERY] Merge bookkeeping discovery deferred: {exc}.")
             return False
-        for task, record in candidates:
+        for _, task, record in sorted(candidates, key=lambda candidate: candidate[0]):
             matches = [pr for pr in discovery.prs
                        if pr.pr_id in {None, task.pr_id} and pr.branch == task.branch]
             if not matches:

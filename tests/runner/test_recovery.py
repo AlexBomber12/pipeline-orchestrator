@@ -2675,3 +2675,45 @@ def test_header_merge_recovery_uses_complete_bound_github_evidence(
         assert saved is None
     if case in {"historical", "finished", "open", "not_done", "no_branch"}:
         assert not calls
+
+
+@pytest.mark.parametrize("current_evidence", ["todo", "doing", "run"])
+def test_header_merge_recovery_prioritizes_unfinished_attempt(
+    monkeypatch, isolate_analytics_dir, current_evidence,
+):
+    """Missing historical analytics cannot consume the one startup recovery."""
+    from unittest.mock import AsyncMock
+
+    runner = h._make_runner()
+    historical = QueueTask(pr_id="PR-001", title="Historical", branch="pr-001",
+                           task_file="tasks/PR-001.md", status=TaskStatus.DONE)
+    current = QueueTask(pr_id="PR-401", title="Interrupted", branch="pr-401",
+                        task_file="tasks/PR-401.md", status=TaskStatus.DONE)
+    runner._recovery_task_headers = {
+        historical.pr_id: types.SimpleNamespace(frontmatter_status="done"),
+        current.pr_id: types.SimpleNamespace(
+            frontmatter_status="done" if current_evidence == "run" else current_evidence,
+        ),
+    }
+    runner.state.current_task = current
+    runner._start_current_run_record("claude", "opus")
+    record = runner._current_run_record
+    runner.state.current_task = None
+    runner._current_run_record = None
+    lookup = AsyncMock(side_effect=lambda repo, task_id:
+                       [record] if task_id == current.pr_id and current_evidence == "run" else [])
+    monkeypatch.setattr(runner._metrics_store, "list_task_runs", lookup)
+    monkeypatch.setattr(gh_prs, "get_merged_prs_discovery", lambda *a: gh_prs.PRDiscovery(
+        runner.owner_repo, "main",
+        [PRInfo(number=1, pr_id=historical.pr_id, branch=historical.branch, head_sha="b" * 40),
+         PRInfo(number=629, pr_id=current.pr_id, branch=current.branch, head_sha="a" * 40)],
+        True,
+    ))
+
+    assert asyncio.run(runner._recover_header_merge_attempt([historical, current], []))
+    saved = runner._persisted_merge_recovery
+    assert saved.current_task is current
+    assert saved.current_pr.number == 629
+    assert saved.current_pr.head_sha == "a" * 40
+    assert saved.merge_phase == "post_merge_cleanup"
+    assert runner._current_run_record is (record if current_evidence == "run" else None)

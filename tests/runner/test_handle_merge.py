@@ -393,7 +393,7 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
         writes.append(args)
         if case == "status_error" and len(writes) == 1:
             raise RuntimeError("status push failed")
-        return case != "status_false" or len(writes) > 1
+        return case not in {"status_false", "open"} or len(writes) > 1
 
     async def save(reason, **kwargs):
         if case == "metrics_error" and not outcomes:
@@ -410,7 +410,7 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
     assert merge_calls == [["pr", "merge", "5", "--squash", "--delete-branch",
                             "--match-head-commit", "a" * 40]]
     assert calls[1][1]["repo"] == "octo/demo"
-    if case in {"unknown", "base", "repo", "metrics_error", "status_error", "status_false"}:
+    if case in {"unknown", "open", "base", "repo", "metrics_error", "status_error", "status_false"}:
         assert runner.state.state == PipelineState.MERGE
         assert runner.state.current_task is task
         if case in {"status_error", "status_false"}:
@@ -441,6 +441,20 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
             assert runner.state.state == PipelineState.MERGE
             assert runner.state.current_task is task
             assert not writes and not outcomes
+        if case == "open":
+            # Queue admission is not terminal proof. Repeated OPEN reads retain
+            # the attempt without another merge command or a DONE write.
+            for _ in range(2):
+                asyncio.run(runner.handle_merge())
+                assert runner.state.state == PipelineState.MERGE
+                assert runner.state.merge_phase == "merging"
+                assert runner.state.current_task is task
+                assert not writes and not outcomes
+            payload.update(state="closed", merged=True)
+            asyncio.run(runner.handle_merge())
+            assert runner.state.merge_phase == "post_merge_cleanup"
+            assert runner.state.current_task is task
+            assert len(writes) == 1 and not outcomes
         reads_fail = False
         payload["base"] = {"ref": "main", "repo": {"full_name": "octo/demo"}}
         if case == "unknown":
@@ -451,9 +465,9 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
         assert runner.state.state == PipelineState.IDLE
         assert outcomes[-1] == "success_merged"
         assert runner.state.current_queue[0].status == TaskStatus.DONE
-        if case in {"status_error", "status_false"}:
+        if case in {"status_error", "status_false", "open"}:
             assert len(writes) == 2
-    elif case in {"open", "head"}:
+    elif case == "head":
         assert runner.state.state == PipelineState.WATCH
         assert runner.state.current_pr.review_status == ReviewStatus.PENDING
         assert runner.state.current_task is task
