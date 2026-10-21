@@ -56,14 +56,26 @@ def bound_checkout_work_blocker(
     matching local branch is therefore published even when its remote-tracking
     ref is stale. A different local branch tip is preserved for inspection.
     """
-    dirty = git_ops._git(repo_path, "--no-optional-locks", "status", "--porcelain")
-    if dirty.stdout.strip():
-        return "Checkout has staged, unstaged or untracked work; preserving it until the operator resolves it."
     branch = command.pr.branch
     if not branch or branch != command.task.branch or branch.startswith("-") or ".." in branch:
         return "Bound task and PR branch are unavailable or disagree."
+    return bound_checkout_work_blocker_for_ref(
+        repo_path, branch, {command.pr.head_sha, published_head_sha}
+    )
+
+
+def bound_checkout_work_blocker_for_ref(
+    repo_path: str, branch: str, published_heads: set[str | None],
+) -> str | None:
+    """Check checkout and bound branch work against verified published heads."""
+    if not branch or git_ops._git(
+        repo_path, "check-ref-format", "--branch", branch, check=False,
+    ).returncode != 0:
+        return "Bound task and PR branch are unavailable or disagree."
+    dirty = git_ops._git(repo_path, "--no-optional-locks", "status", "--porcelain")
+    if dirty.stdout.strip():
+        return "Checkout has staged, unstaged or untracked work; preserving it until the operator resolves it."
     bound_ref = git_ops._git(repo_path, "rev-parse", "--verify", f"refs/heads/{branch}", check=False)
-    published_heads = {command.pr.head_sha, published_head_sha}
     if bound_ref.returncode == 0 and bound_ref.stdout.strip() not in published_heads:
         unpublished = git_ops._git(repo_path, "rev-list", f"refs/heads/{branch}", "--not", "--remotes")
         if unpublished.stdout.strip():

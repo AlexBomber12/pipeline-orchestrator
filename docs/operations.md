@@ -184,6 +184,9 @@ the daemon adds the informational `quarantine:large_diff_continued` label as
 durable recovery evidence. Either size label lets an ERROR task with a matching
 published PR and task generation return to WATCH after Redis loss. Neither
 size label blocks CI or review; other quarantine labels still block.
+Startup recovery also checks the checkout for unpublished work and active
+processes. It fetches a missing verified PR HEAD without moving local refs;
+unavailable evidence leaves recovery pending for the next cycle.
 Unavailable GitHub evidence or unpublished task work leaves the PR parked
 with a specific recovery reason; no branch synchronization is performed.
 

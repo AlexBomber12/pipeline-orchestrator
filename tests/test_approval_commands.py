@@ -639,6 +639,9 @@ async def test_bound_checkout_rejects_invalid_or_unverifiable_ref(approval, monk
     changed = command.model_copy(deep=True)
     changed.task.branch = "other-branch"
     assert "disagree" in daemon_approval.bound_checkout_work_blocker(str(repo), changed)
+    assert "disagree" in daemon_approval.bound_checkout_work_blocker_for_ref(
+        str(repo), "bad..branch", {command.pr.head_sha}
+    )
     original = daemon_approval.git_ops._git
 
     def failed_ref(path, *args, **kwargs):

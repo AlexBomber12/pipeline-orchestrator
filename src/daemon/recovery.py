@@ -27,6 +27,10 @@ from src.cancellation import (
 )
 from src.cancellation.storage import task_spec_content_hash
 from src.daemon import git_ops
+from src.daemon.approval_commands import (
+    bound_checkout_work_blocker_for_ref,
+    checkout_process_blocker,
+)
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
 from src.daemon.quarantine import SIZE_RECOVERY_LABELS, blocking_quarantine_labels
 from src.github import prs as gh_prs
@@ -76,6 +80,10 @@ from src.task_status import (
 logger = logging.getLogger(__name__)
 
 _PR_NUMBER_RE = re.compile(r"^PR-(\d+)(.*)$")
+
+
+class LegacySizeRecoveryDeferred(RuntimeError):
+    """Keep startup recovery retryable while size-only evidence is uncertain."""
 
 
 def _task_pr_sort_key(pr_id: str) -> tuple[int, int | str, str]:
@@ -804,7 +812,11 @@ class RecoveryMixin:
             tasks = []
         if not await self._recover_header_merge_attempt(tasks, prs):
             return False
-        await self._apply_recovery_decisions(tasks, prs)
+        try:
+            await self._apply_recovery_decisions(tasks, prs)
+        except LegacySizeRecoveryDeferred as exc:
+            self.log_event(f"[RECOVERY] Legacy size continuation waiting: {exc}.")
+            return False
         # PR-263: hydrate the in-memory queue snapshot so the dashboard's
         # /api/repo/{name}/queue endpoint reflects post-restart state
         # immediately, without waiting for the next IDLE cycle.
@@ -941,23 +953,45 @@ class RecoveryMixin:
             if await self._suppression_record_for_task(task.pr_id) is not None:
                 continue
             try:
-                if (Path(self.repo_path) / ".git").exists():
-                    base = git_ops._git(
-                        self.repo_path, "show",
-                        f"refs/remotes/origin/{self.repo_config.branch}:{task.task_file}",
-                        check=False,
+                if not (Path(self.repo_path) / ".git").exists():
+                    raise LegacySizeRecoveryDeferred("checkout is unavailable for task verification")
+                reason = checkout_process_blocker(self.repo_path)
+                if not reason:
+                    reason = bound_checkout_work_blocker_for_ref(
+                        self.repo_path, task.branch, {pr.head_sha}
                     )
+                if reason:
+                    raise LegacySizeRecoveryDeferred(reason)
+                base = git_ops._git(
+                    self.repo_path, "show",
+                    f"refs/remotes/origin/{self.repo_config.branch}:{task.task_file}",
+                    check=False,
+                )
+                if base.returncode:
+                    raise LegacySizeRecoveryDeferred("base task generation is unavailable")
+                published = git_ops._git(
+                    self.repo_path, "show", f"{pr.head_sha}:{task.task_file}", check=False,
+                )
+                if published.returncode:
+                    fetched = subprocess.run(
+                        ["git", "-C", self.repo_path, "fetch", "--no-tags", "origin", pr.head_sha],
+                        capture_output=True, text=True, timeout=120, check=False,
+                    )
+                    if fetched.returncode:
+                        raise LegacySizeRecoveryDeferred("live PR HEAD fetch is unavailable")
                     published = git_ops._git(
                         self.repo_path, "show", f"{pr.head_sha}:{task.task_file}", check=False,
                     )
-                    if base.returncode or published.returncode:
-                        raise ValueError("task generation is unavailable in the checkout")
-                    base_text, published_text = base.stdout, published.stdout
-                else:
-                    raise ValueError("published task generation cannot be verified without Git")
+                    if published.returncode:
+                        raise LegacySizeRecoveryDeferred("published task generation is unavailable")
+                base_text, published_text = base.stdout, published.stdout
                 if task_spec_content_hash(base_text) != task_spec_content_hash(published_text):
                     raise ValueError("published task generation differs from the ERROR task")
-            except (OSError, ValueError) as exc:
+            except LegacySizeRecoveryDeferred:
+                raise
+            except (OSError, subprocess.SubprocessError) as exc:
+                raise LegacySizeRecoveryDeferred(f"checkout verification is unavailable: {exc}") from exc
+            except ValueError as exc:
                 self.log_event(f"[RECOVERY] Legacy size PR #{pr.number} retained: {exc}.")
                 continue
             tasks[index] = task.model_copy(update={"status": TaskStatus.DOING})

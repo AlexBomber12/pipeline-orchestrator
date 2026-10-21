@@ -636,9 +636,12 @@ def test_recover_legacy_size_error_from_git_and_pr(
             ),
             current_pr=pr,
         ).model_dump_json()
-    asyncio.run(runner.recover_state())
+    completed = asyncio.run(runner.recover_state())
 
-    if labels <= SIZE_RECOVERY_LABELS and not published_spec_changed and not head_missing:
+    if head_missing and labels <= SIZE_RECOVERY_LABELS:
+        assert completed is False
+        assert runner._crashed_task_pr_ids == set()
+    elif labels <= SIZE_RECOVERY_LABELS and not published_spec_changed:
         assert runner.state.state == PipelineState.WATCH
         assert runner.state.current_pr.number == 100
         assert runner.state.current_queue[0].status == TaskStatus.DOING
@@ -683,12 +686,161 @@ def test_legacy_size_recovery_preserves_unverified_state(
 
         runner._suppression_record_for_task = existing_suppression
     tasks = [task]
-    asyncio.run(runner._recover_legacy_size_tasks(tasks, [pr]))
-    assert tasks[0].status == TaskStatus.ERROR
     if saved == "missing":
-        assert any("without Git" in item["event"] for item in runner.state.history)
-    elif saved == "malformed":
+        with pytest.raises(recovery_module.LegacySizeRecoveryDeferred, match="checkout is unavailable"):
+            asyncio.run(runner._recover_legacy_size_tasks(tasks, [pr]))
+    else:
+        asyncio.run(runner._recover_legacy_size_tasks(tasks, [pr]))
+    assert tasks[0].status == TaskStatus.ERROR
+    if saved == "malformed":
         assert any("saved state is malformed" in item["event"] for item in runner.state.history)
+
+
+def test_legacy_size_recovery_fetches_external_pr_head(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo, remote, external = (tmp_path / name for name in ("repo", "remote.git", "external"))
+
+    def git(path: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), *args], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git(tmp_path, "init", "--bare", str(remote))
+    git(tmp_path, "init", "-b", "main", str(repo))
+    git(repo, "config", "user.name", "Recovery Test")
+    git(repo, "config", "user.email", "recovery@example.test")
+    _write_task_file(repo, "PR-100", "ERROR", "pr-100-size")
+    task_path = repo / "tasks/PR-100.md"
+    task_path.write_text(task_path.read_text().replace("status: ERROR", "status: ERROR\nblocked_reason: guardrail"))
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "legacy size decision")
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "-u", "origin", "main")
+    git(tmp_path, "clone", "--branch", "main", str(remote), str(external))
+    git(external, "config", "user.name", "External Test")
+    git(external, "config", "user.email", "external@example.test")
+    git(external, "checkout", "-b", "pr-100-size")
+    (external / "implementation.py").write_text("external push\n")
+    git(external, "add", ".")
+    git(external, "commit", "-m", "external push")
+    git(external, "push", "origin", "pr-100-size")
+    head_sha = git(external, "rev-parse", "HEAD")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", head_sha], capture_output=True,
+    ).returncode != 0
+    before_refs = git(repo, "show-ref")
+    pr = PRInfo(
+        number=100, branch="pr-100-size", pr_id="PR-100", head_sha=head_sha,
+        quarantine_labels={CONTINUED_SIZE_LABEL},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [pr])
+    monkeypatch.setattr(
+        recovery_module, "_resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+    runner = _make_runner()
+    runner.repo_path = str(repo)
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.state == PipelineState.WATCH
+    assert git(repo, "show-ref") == before_refs
+    assert git(repo, "status", "--porcelain") == ""
+    git(repo, "cat-file", "-e", head_sha)
+
+
+@pytest.mark.parametrize("blocker", ["dirty", "unpublished", "process"])
+def test_legacy_size_recovery_waits_for_checkout_safety(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocker: str,
+) -> None:
+    repo, remote = tmp_path / "repo", tmp_path / "remote.git"
+
+    def git(path: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), *args], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git(tmp_path, "init", "--bare", str(remote))
+    git(tmp_path, "init", "-b", "main", str(repo))
+    git(repo, "config", "user.name", "Recovery Test")
+    git(repo, "config", "user.email", "recovery@example.test")
+    _write_task_file(repo, "PR-100", "ERROR", "pr-100-size")
+    path = repo / "tasks/PR-100.md"
+    path.write_text(path.read_text().replace("status: ERROR", "status: ERROR\nblocked_reason: guardrail"))
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "legacy size decision")
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "-u", "origin", "main")
+    git(repo, "checkout", "-b", "pr-100-size")
+    (repo / "implementation.py").write_text("published work\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "published work")
+    git(repo, "push", "-u", "origin", "pr-100-size")
+    published_head = git(repo, "rev-parse", "HEAD")
+    if blocker == "dirty":
+        (repo / "notes.txt").write_text("uncommitted work\n")
+    elif blocker == "unpublished":
+        (repo / "implementation.py").write_text("unpublished work\n")
+        git(repo, "commit", "-am", "local only")
+    else:
+        monkeypatch.setattr(recovery_module, "checkout_process_blocker", lambda _: "Coder process is active")
+    before_head = git(repo, "rev-parse", "HEAD")
+    before_refs = git(repo, "show-ref")
+    pr = PRInfo(
+        number=100, branch="pr-100-size", pr_id="PR-100", head_sha=published_head,
+        quarantine_labels={CONTINUED_SIZE_LABEL},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [pr])
+    monkeypatch.setattr(
+        recovery_module, "_resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+    runner = _make_runner()
+    runner.repo_path = str(repo)
+    assert asyncio.run(runner.recover_state()) is False
+    assert runner._crashed_task_pr_ids == set()
+    assert git(repo, "rev-parse", "HEAD") == before_head
+    assert git(repo, "show-ref") == before_refs
+    if blocker == "dirty":
+        assert (repo / "notes.txt").read_text() == "uncommitted work\n"
+
+
+@pytest.mark.parametrize("fault", ["base", "published_after_fetch", "io_error"])
+def test_legacy_size_recovery_defers_unavailable_git_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fault: str,
+) -> None:
+    _write_task_file(tmp_path, "PR-100", "ERROR", "pr-100-size")
+    path = tmp_path / "tasks/PR-100.md"
+    path.write_text(path.read_text().replace("status: ERROR", "status: ERROR\nblocked_reason: guardrail"))
+    (tmp_path / ".git").mkdir()
+    task = QueueTask(
+        pr_id="PR-100", title="Legacy size", status=TaskStatus.ERROR,
+        branch="pr-100-size", task_file="tasks/PR-100.md",
+    )
+    pr = PRInfo(
+        number=100, branch="pr-100-size", pr_id="PR-100",
+        head_sha="a" * 40, quarantine_labels={CONTINUED_SIZE_LABEL},
+    )
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._recovery_task_headers = {task.pr_id: parse_existing_task_header(path)}
+    monkeypatch.setattr(recovery_module, "checkout_process_blocker", lambda _: None)
+    monkeypatch.setattr(recovery_module, "bound_checkout_work_blocker_for_ref", lambda *args: None)
+
+    def git_show(_repo, *args, **kwargs):
+        if fault == "io_error":
+            raise OSError("checkout unavailable")
+        if args[0] == "show" and args[1].startswith("refs/remotes/"):
+            return subprocess.CompletedProcess(args, int(fault == "base"), path.read_text(), "")
+        return subprocess.CompletedProcess(args, 1, "", "missing published task")
+
+    monkeypatch.setattr(recovery_module.git_ops, "_git", git_show)
+    if fault == "published_after_fetch":
+        monkeypatch.setattr(
+            recovery_module.subprocess, "run",
+            lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, "", ""),
+        )
+    with pytest.raises(recovery_module.LegacySizeRecoveryDeferred):
+        asyncio.run(runner._recover_legacy_size_tasks([task], [pr]))
 
 
 def test_recovery_does_not_mark_todo_or_done(
