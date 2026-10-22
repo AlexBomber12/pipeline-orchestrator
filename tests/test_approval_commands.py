@@ -445,6 +445,34 @@ async def test_reused_prelaunch_failed_validation_restores_persisted_watch(
     assert await runner._metrics_store.get(old.run_id) == old
 
 
+async def test_reused_prelaunch_failed_rollback_releases_credentials(approval, monkeypatch):
+    runner, old, admitted, snapshot, dispatched = await checkpointed_prelaunch_approval(
+        approval, monkeypatch,
+    )
+    work = Path(runner.repo_path) / "implementation.py"
+    publish = runner.publish_state
+
+    async def fail_watch_rollback():
+        if runner.state.state == PipelineState.WATCH:
+            raise OSError("WATCH publication unavailable")
+        await publish()
+        if runner.state.state == PipelineState.FIX:
+            work.write_text("work arrived during admission\n")
+
+    monkeypatch.setattr(runner, "publish_state", fail_watch_rollback)
+    with pytest.raises(OSError, match="WATCH publication unavailable"):
+        await runner.handle_fix()
+    assert runner._coder_credential_reservation is None
+    assert runner._coder_invocation_active is False
+    assert dispatched.await_count == 0
+    assert runner._current_run_record.run_id == old.run_id
+    persisted = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert persisted.state == PipelineState.FIX
+    assert persisted.active_invocation == snapshot
+    assert (await runner._metrics_store.get(admitted.run_id)).invocations == [snapshot]
+    assert await runner._metrics_store.get(old.run_id) == old
+
+
 @pytest.mark.parametrize(
     "damage", ["snapshot", "missing_state", "changed_ownership", "settings", "publish_failure"],
 )
@@ -744,7 +772,7 @@ async def test_persisted_fix_invocation_does_not_dispatch_twice(
     assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
 
 
-@pytest.mark.parametrize("blocker", ["process", "accounting"])
+@pytest.mark.parametrize("blocker", ["process", "missing_record", "missing_invocation"])
 async def test_persisted_fix_approval_waits_for_uncertain_ownership(
     approval, monkeypatch, blocker,
 ):
@@ -757,20 +785,35 @@ async def test_persisted_fix_approval_waits_for_uncertain_ownership(
     await runner.publish_state()
     if blocker == "process":
         monkeypatch.setattr(daemon_approval, "checkout_process_blocker", lambda *a: "coder owns checkout")
-    else:
+    elif blocker == "missing_record":
         monkeypatch.setattr(runner._metrics_store, "get", AsyncMock(return_value=None))
+    else:
+        admitted.invocations.clear()
+        admitted.fix_iterations -= 1
+        await runner._metrics_store.save(admitted)
     runner._recovered = False
     runner._current_run_record = None
     runner._approval_receipt = None
     runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
     await runner._run_cycle_body()
     persisted = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
-    assert persisted.state == PipelineState.FIX
     assert persisted.active_invocation == snapshot
-    assert runner.state.state == PipelineState.IDLE
-    assert runner._recovered is False
+    if blocker == "process":
+        assert persisted.state == PipelineState.FIX
+        assert runner.state.state == PipelineState.IDLE
+        assert runner._recovered is False
+    else:
+        assert persisted.state == PipelineState.ERROR
+        assert runner.state.state == PipelineState.ERROR
+        assert runner._recovered is True
+        assert runner._current_run_record is None
+        assert not await runner._consume_approval_command()
     assert runner.ensure_repo_cloned.await_count == 0
     assert dispatched.await_count == 0
+    if blocker == "missing_invocation":
+        saved = await runner._metrics_store.get(admitted.run_id)
+        assert saved.invocations == []
+        assert saved.fix_iterations == admitted.fix_iterations
 
 
 async def test_persisted_fix_park_preserves_newer_suppression(approval, monkeypatch):
@@ -833,6 +876,53 @@ async def test_persisted_fix_park_retries_lost_publication(approval, monkeypatch
     ).state == PipelineState.ERROR
     assert await runner._metrics_store.get(old.run_id) == old
     assert (await runner._metrics_store.get(admitted.run_id)).invocations == [snapshot]
+    assert dispatched.await_count == 0
+
+
+async def test_lost_fix_ack_and_rollback_publication_parks_on_restart(
+    approval, monkeypatch,
+):
+    runner, _, old = await finalized_guardrail_approval(approval, monkeypatch)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    publish = runner.publish_state
+    fix_published = False
+
+    async def lose_fix_ack_and_watch_rollback():
+        nonlocal fix_published
+        if runner.state.state == PipelineState.FIX and not fix_published:
+            await publish()
+            fix_published = True
+            raise OSError("FIX publication acknowledgement lost")
+        if runner.state.state == PipelineState.WATCH and fix_published:
+            raise OSError("WATCH rollback unavailable")
+        await publish()
+
+    monkeypatch.setattr(runner, "publish_state", lose_fix_ack_and_watch_rollback)
+    with pytest.raises(OSError, match="FIX publication acknowledgement lost"):
+        await runner.handle_fix()
+    persisted = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert persisted.state == PipelineState.FIX
+    assert persisted.active_invocation.phase == "fix"
+    admitted = next(
+        record for record in await runner._metrics_store.list_task_runs(runner.name, "PR-42")
+        if record.run_id != old.run_id
+    )
+    assert admitted.invocations == []
+    assert admitted.fix_iterations == old.fix_iterations
+    assert runner._coder_credential_reservation is None
+    assert dispatched.await_count == 0
+
+    monkeypatch.setattr(runner, "publish_state", publish)
+    runner._recovered = False
+    runner._current_run_record = None
+    runner._approval_receipt = None
+    runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.ERROR
+    assert runner._recovered is True
+    assert runner._current_run_record is None
+    assert await runner._metrics_store.get(old.run_id) == old
+    assert await runner._metrics_store.get(admitted.run_id) == admitted
     assert dispatched.await_count == 0
 
 

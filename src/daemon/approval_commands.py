@@ -207,7 +207,7 @@ class ApprovalCommandMixin:
                                 await self._metrics_store.get(invocation.run_id)
                                 if invocation is not None and invocation.run_id is not None else None
                             )
-                            if (
+                            invalid_record = bool(
                                 record is None or invocation is None
                                 or invocation.phase != "fix"
                                 or record.run_id != invocation.run_id
@@ -218,11 +218,14 @@ class ApprovalCommandMixin:
                                 or record.ended_at is not None
                                 or not record.invocations
                                 or record.invocations[-1] != invocation
-                            ):
-                                self.log_event("[FIX] Persisted invocation accounting unavailable; deferring recovery.")
-                                return True
+                            )
+                            if invalid_record:
+                                self.log_event(
+                                    "[FIX] Persisted invocation accounting changed; "
+                                    "parking for operator Retry."
+                                )
                             self.state = persisted
-                            self._current_run_record = record
+                            self._current_run_record = None if invalid_record else record
                             active_cause = await self.redis.get(cause_key(self.name, command.task.pr_id))
                             await self._transition_to_error(
                                 "Persisted FIX invocation ownership is uncertain; operator Retry required",

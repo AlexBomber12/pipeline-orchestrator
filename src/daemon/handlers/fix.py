@@ -841,38 +841,40 @@ class FixMixin(BreachMixin):
             )
             idle_flag["started_at"] = fix_supervision.time.monotonic()
         except BaseException:
-            if captured_snapshot is not None and not reused_prelaunch:
-                self.state.active_invocation = previous_active_invocation
-                if (
-                    run_record is not None
-                    and run_record.invocations
-                    and run_record.invocations[-1] == captured_snapshot
-                ):
-                    run_record.invocations.pop()
-                    assert previous_fix_iterations is not None
-                    run_record.fix_iterations = previous_fix_iterations
-                    run_record.profile_id = previous_profile_id
-                if pending_fix_record is not None:
+            try:
+                if captured_snapshot is not None and not reused_prelaunch:
+                    self.state.active_invocation = previous_active_invocation
+                    if (
+                        run_record is not None
+                        and run_record.invocations
+                        and run_record.invocations[-1] == captured_snapshot
+                    ):
+                        run_record.invocations.pop()
+                        assert previous_fix_iterations is not None
+                        run_record.fix_iterations = previous_fix_iterations
+                        run_record.profile_id = previous_profile_id
+                    if pending_fix_record is not None:
+                        self._current_run_record = prelaunch_previous_record
+                        self.state.active_invocation = prelaunch_previous_invocation
+                        self.state.state = PipelineState.WATCH
+                    rollback_writes = [self.publish_state()]
+                    if run_record is not None:
+                        rollback_writes.append(
+                            self._metrics_store.save(run_record) if pending_fix_record is not None
+                            else self._checkpoint_current_run_record()
+                        )
+                    await asyncio.gather(*rollback_writes, return_exceptions=True)
+                elif reused_prelaunch:
                     self._current_run_record = prelaunch_previous_record
                     self.state.active_invocation = prelaunch_previous_invocation
                     self.state.state = PipelineState.WATCH
-                rollback_writes = [self.publish_state()]
-                if run_record is not None:
-                    rollback_writes.append(
-                        self._metrics_store.save(run_record) if pending_fix_record is not None
-                        else self._checkpoint_current_run_record()
-                    )
-                await asyncio.gather(*rollback_writes, return_exceptions=True)
-            elif reused_prelaunch:
-                self._current_run_record = prelaunch_previous_record
-                self.state.active_invocation = prelaunch_previous_invocation
-                self.state.state = PipelineState.WATCH
-                await self.publish_state()
-            if heartbeat is not None:
-                heartbeat.cancel()
-                await asyncio.gather(heartbeat, return_exceptions=True)
-            self._coder_invocation_active = False
-            self._release_coder_credentials()
+                    await self.publish_state()
+            finally:
+                if heartbeat is not None:
+                    heartbeat.cancel()
+                    await asyncio.gather(heartbeat, return_exceptions=True)
+                self._coder_invocation_active = False
+                self._release_coder_credentials()
             raise
         assert heartbeat is not None
         stop_monitor = asyncio.create_task(self._monitor_stop_request(claude_task))
