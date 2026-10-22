@@ -127,7 +127,9 @@ class FixMixin(BreachMixin):
             return None
         return command if await self._approved_fix_checkout_safe(command, current_pr) else None
 
-    async def _approved_fix_checkout_safe(self, command, current_pr) -> bool:
+    async def _approved_fix_checkout_safe(
+        self, command, current_pr, *, require_fetched_head: bool = False,
+    ) -> bool:
         """Recheck approval and checkout ownership at destructive/launch boundaries."""
         task = self.state.current_task
         if (
@@ -139,7 +141,7 @@ class FixMixin(BreachMixin):
             return False
         try:
             persisted = await load_approval(self.redis, self.name, command.binding)
-            return bool(
+            bound = bool(
                 persisted is not None and persisted.status == "applied" and persisted.active
                 and persisted.binding == command.binding
                 and persisted.failure == command.failure
@@ -151,6 +153,23 @@ class FixMixin(BreachMixin):
                     self.repo_path, current_pr.branch, {current_pr.head_sha},
                 )
             )
+            if not bound:
+                return False
+            remote_ref = f"refs/heads/{current_pr.branch}"
+            live = git_ops._git(
+                self.repo_path, "ls-remote", "--exit-code", "origin", remote_ref,
+                check=False,
+            )
+            if live.returncode != 0 or live.stdout.strip() != f"{command.pr.head_sha}\t{remote_ref}":
+                return False
+            if require_fetched_head:
+                fetched = git_ops._git(
+                    self.repo_path, "rev-parse", "--verify",
+                    f"refs/remotes/origin/{current_pr.branch}", check=False,
+                )
+                if fetched.returncode != 0 or fetched.stdout.strip() != command.pr.head_sha:
+                    return False
+            return True
         except (OSError, RuntimeError, ValueError):
             return False
 
@@ -591,14 +610,14 @@ class FixMixin(BreachMixin):
                     operation_name=f"git fetch origin {branch}",
                 )
                 if approved_continuation is not None and not await self._approved_fix_checkout_safe(
-                    approved_continuation, current_pr,
+                    approved_continuation, current_pr, require_fetched_head=True,
                 ):
                     self.log_event("[FIX] Approved checkout changed before refresh; deferring dispatch.")
                     self.state.state = PipelineState.WATCH
                     return
                 git_ops._git(self.repo_path, "checkout", branch)
                 if approved_continuation is not None and not await self._approved_fix_checkout_safe(
-                    approved_continuation, current_pr,
+                    approved_continuation, current_pr, require_fetched_head=True,
                 ):
                     self.log_event("[FIX] Approved checkout changed before reset; deferring dispatch.")
                     self.state.state = PipelineState.WATCH
@@ -807,7 +826,7 @@ class FixMixin(BreachMixin):
                     await self._checkpoint_current_run_record()
             await self.publish_state()
             if approved_continuation is not None and not await self._approved_fix_checkout_safe(
-                approved_continuation, current_pr,
+                approved_continuation, current_pr, require_fetched_head=True,
             ):
                 raise RuntimeError("Approved checkout changed before FIX launch")
             heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))

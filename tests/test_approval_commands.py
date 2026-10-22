@@ -606,6 +606,63 @@ async def test_approved_guardrail_fix_preserves_work_arriving_after_admission(
     assert await runner._metrics_store.get(old.run_id) == old
 
 
+@pytest.mark.parametrize("push_boundary", ["before_fetch", "after_fetch"])
+async def test_approved_guardrail_fix_rejects_new_remote_head(
+    approval, monkeypatch, push_boundary,
+):
+    runner, _, old = await finalized_guardrail_approval(approval, monkeypatch)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    remote = approval[3]
+    other = Path(runner.repo_path).parent / "other-writer"
+    git(other.parent, "clone", str(remote), str(other))
+    git(other, "config", "user.name", "Other Writer")
+    git(other, "config", "user.email", "other@example.test")
+    git(other, "checkout", "fix/pr-42")
+    (other / "implementation.py").write_text("new published revision\n")
+    git(other, "commit", "-am", "new revision")
+    new_head = git(other, "rev-parse", "HEAD")
+    original_fetch = daemon_fix.retry_transient
+
+    def push_near_fetch(operation, **kwargs):
+        if push_boundary == "before_fetch":
+            git(other, "push", "origin", "fix/pr-42")
+        result = original_fetch(operation, **kwargs)
+        if push_boundary == "after_fetch":
+            git(other, "push", "origin", "fix/pr-42")
+        return result
+
+    monkeypatch.setattr(daemon_fix, "retry_transient", push_near_fetch)
+    await runner.handle_fix()
+    assert dispatched.await_count == 0
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == old.run_id
+    assert git(runner.repo_path, "rev-parse", "HEAD") == old.head_sha
+    assert git(other, "rev-parse", "HEAD") == new_head
+    assert await runner._metrics_store.get(old.run_id) == old
+
+
+async def test_approved_guardrail_fix_rejects_mismatched_tracking_ref(approval, monkeypatch):
+    runner, _, old = await finalized_guardrail_approval(approval, monkeypatch)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    original_fetch = daemon_fix.retry_transient
+
+    def change_tracking_ref(operation, **kwargs):
+        result = original_fetch(operation, **kwargs)
+        git(
+            runner.repo_path, "update-ref", "refs/remotes/origin/fix/pr-42",
+            git(runner.repo_path, "rev-parse", "HEAD~1"),
+        )
+        return result
+
+    monkeypatch.setattr(daemon_fix, "retry_transient", change_tracking_ref)
+    await runner.handle_fix()
+    assert dispatched.await_count == 0
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == old.run_id
+    assert git(runner.repo_path, "rev-parse", "HEAD") == old.head_sha
+    assert await runner._metrics_store.get(old.run_id) == old
+
+
 @pytest.mark.parametrize("restart", [False, True])
 async def test_persisted_fix_invocation_does_not_dispatch_twice(
     approval, monkeypatch, restart,
