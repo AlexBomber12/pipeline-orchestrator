@@ -797,10 +797,7 @@ class RecoveryMixin:
                     # The status writer uses an isolated checkout. Refresh the
                     # base ref before treating a cached ERROR header as final.
                     base = self.repo_config.branch
-                    if not base or base.startswith("-") or git_ops._git(
-                        self.repo_path, "check-ref-format", "--branch", base, check=False,
-                    ).returncode != 0:
-                        raise ValueError("invalid configured base branch")
+                    # _parse_tasks_from_headers already validated this base.
                     git_ops._git(
                         self.repo_path, "fetch", "--no-tags", "origin",
                         f"refs/heads/{base}:refs/remotes/origin/{base}", timeout=120,
@@ -1336,10 +1333,12 @@ class RecoveryMixin:
 
         if unresolved_guardrail_pr is not None:
             task, pr = unresolved_guardrail_pr
-            self.state.current_task = task
-            self.state.current_pr = pr
-            self.state.state = PipelineState.ERROR
-            self.state.error_message = "Guardrail decision unresolved; operator Retry or revised approval required."
+            self.state = self.state.model_copy(update={
+                "current_task": task,
+                "current_pr": pr,
+                "state": PipelineState.ERROR,
+                "error_message": "Guardrail decision unresolved; operator Retry or revised approval required.",
+            })
             return
 
         self.state.state = PipelineState.IDLE

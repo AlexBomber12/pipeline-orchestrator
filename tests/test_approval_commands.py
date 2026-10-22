@@ -722,7 +722,7 @@ async def test_size_status_write_failure_retries_then_recovers_without_redis(app
     async def flaky_writer(*args, **kwargs):
         nonlocal attempts
         attempts += 1
-        return False if attempts == 1 else await writer(*args, **kwargs)
+        return False if attempts <= 2 else await writer(*args, **kwargs)
 
     monkeypatch.setattr(runner, "_commit_task_status_change", flaky_writer)
     labels = {OBSOLETE_SIZE_LABEL}
@@ -737,6 +737,10 @@ async def test_size_status_write_failure_retries_then_recovers_without_redis(app
     assert before.state.state == PipelineState.ERROR
     await runner._run_cycle_body()
     assert attempts == 2
+    runner.handle_watch.assert_not_awaited()
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).task_status_committed
+    await runner._run_cycle_body()
+    assert attempts == 3
     assert (await load_approval(runner.redis, runner.name, command.binding)).task_status_committed
     assert git(remote, "show", "main:tasks/PR-42.md").startswith("---\nstatus: TODO")
     after = await recover_without_redis(repo, remote, live, monkeypatch, suffix="fresh-after-retry")
@@ -774,6 +778,37 @@ async def test_size_marker_write_failure_retries_after_durable_clearance(approva
     fail = False
     await runner._run_cycle_body()
     assert labels == {continued_size_label(command.pr.head_sha)}
+
+
+async def test_size_status_confirmation_rechecks_binding_and_new_cause(approval, monkeypatch):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    applied = await load_approval(runner.redis, runner.name, command.binding)
+    assert applied.status == "applied"
+    unconfirmed = applied.model_copy(update={"task_status_committed": False})
+    await runner.redis.set(approval_key(runner.name, command.binding), unconfirmed.model_dump_json())
+    changed_repo = unconfirmed.model_copy(update={"repo_url": "https://example.invalid/other.git"})
+    assert not await runner._finish_size_approval(changed_repo, set())
+    runner.state.current_pr.number = 99
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    assert not await runner._finish_size_approval(unconfirmed, set())
+    runner.state.current_pr.number = command.pr.number
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+
+    async def newer_cause_after_status_write(*args, **kwargs):
+        await runner.redis.set(
+            cause_key(runner.name, command.task.pr_id),
+            CancellationCause(
+                category="ERROR", payload={"subsource": "guardrail", "category": "repo_delete"},
+            ).to_redis(),
+        )
+        return True
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", newer_cause_after_status_write)
+    with pytest.raises(ApprovalChanged, match="before status confirmation"):
+        await runner._finish_size_approval(unconfirmed, set())
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).task_status_committed
 
 
 async def test_new_guardrail_after_success_overrides_stale_size_marker(approval, monkeypatch):
