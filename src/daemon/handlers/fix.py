@@ -533,8 +533,8 @@ class FixMixin(BreachMixin):
                 self.state.state = PipelineState.WATCH
                 return
             if any(is_continued_size_label(label) for label in current_pr.quarantine_labels):
-                size_fix_marker = fixing_size_label(current_pr.head_sha)
                 try:
+                    size_fix_marker = fixing_size_label(current_pr.head_sha)
                     gh_runner.run_gh(
                         ["label", "create", size_fix_marker, "--color", "B60205",
                          "--description", "Size continuation FIX in progress"],

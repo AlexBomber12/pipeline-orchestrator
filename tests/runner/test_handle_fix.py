@@ -65,6 +65,31 @@ def test_handle_fix_defers_when_size_fix_marker_cannot_be_created(
     assert any("marker creation deferred" in item["event"] for item in runner.state.history)
 
 
+@pytest.mark.parametrize("head_sha", ["", "not-a-sha"])
+def test_handle_fix_releases_reservation_for_invalid_size_head(
+    monkeypatch: pytest.MonkeyPatch, head_sha: str,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", head_sha=head_sha,
+        quarantine_labels={continued_size_label("a" * 40)},
+    )
+    released: list[bool] = []
+    monkeypatch.setattr(runner, "_reserve_coder_credentials", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(runner, "_release_coder_credentials", lambda: released.append(True))
+    monkeypatch.setattr(
+        fix_module.gh_runner, "run_gh", lambda *a, **k: pytest.fail("invalid HEAD reached GitHub"),
+    )
+
+    asyncio.run(runner.handle_fix())
+
+    assert released == [True]
+    assert runner.state.state == PipelineState.WATCH
+    assert any("published PR HEAD is required" in item["event"] for item in runner.state.history)
+
+
 def test_handle_fix_retains_marker_until_successful_completion(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
