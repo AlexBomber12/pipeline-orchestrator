@@ -40,7 +40,7 @@ def continued_size_label(head_sha: str) -> str:
 
 
 def is_continued_size_label(label: str) -> bool:
-    return label.startswith(CONTINUED_SIZE_PREFIX)
+    return re.fullmatch(rf"{CONTINUED_SIZE_PREFIX}[0-9a-fA-F]{{40}}", label) is not None
 
 
 def fixing_size_label(head_sha: str) -> str:
@@ -48,7 +48,7 @@ def fixing_size_label(head_sha: str) -> str:
 
 
 def is_fixing_size_label(label: str) -> bool:
-    return label.startswith(FIXING_SIZE_PREFIX)
+    return re.fullmatch(rf"{FIXING_SIZE_PREFIX}[0-9a-fA-F]{{40}}", label) is not None
 
 
 def complete_size_fix_marker(runner: "PipelineRunner", pr: "PRInfo") -> bool:
