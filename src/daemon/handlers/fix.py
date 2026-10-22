@@ -380,6 +380,9 @@ class FixMixin(BreachMixin):
         fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
         task = self.state.current_task
         reused_prelaunch = False
+        pending_fix_record = None
+        prelaunch_previous_record = None
+        prelaunch_previous_invocation = None
         if task is not None and current_pr is not None:
             if (
                 (task.branch and current_pr.branch != task.branch)
@@ -463,18 +466,21 @@ class FixMixin(BreachMixin):
                         )
                         if not reused_prelaunch:
                             raise RuntimeError("admitted FIX invocation ownership changed")
+                        prelaunch_previous_record = record
+                        prelaunch_previous_invocation = previous_snapshot
                     elif admitted.fix_iterations != record.fix_iterations:
                         raise RuntimeError("admitted FIX accounting changed")
-                    self._current_run_record = admitted
+                    pending_fix_record = admitted
+                    prelaunch_previous_record = record
+                    prelaunch_previous_invocation = previous_snapshot
+                    self._current_run_record = record
                 except Exception as exc:
                     self._current_run_record = record
                     self.state.active_invocation = previous_snapshot
                     self.log_event(f"[FIX] Could not persist active FIX run: {exc}.")
                     self.state.state = PipelineState.WATCH
                     return
-                self.state.active_invocation = (
-                    admitted.invocations[-1] if reused_prelaunch else None
-                )
+                self.state.active_invocation = previous_snapshot
         record = self._current_run_record
         if (
             record is not None and current_pr is not None
@@ -483,7 +489,7 @@ class FixMixin(BreachMixin):
             await self._escalate_fix_iteration_cap(current_pr)
             return
         prior = self.state.active_invocation
-        if prior is not None and prior.phase == "fix" and prior.run_id is not None:
+        if pending_fix_record is None and prior is not None and prior.phase == "fix" and prior.run_id is not None:
             record = self._current_run_record
             if (
                 record is None or record.run_id != prior.run_id
@@ -627,7 +633,7 @@ class FixMixin(BreachMixin):
                     self.state.state = PipelineState.WATCH
                     return
         if reused_prelaunch:
-            snapshot = self.state.active_invocation
+            snapshot = pending_fix_record.invocations[-1]
             if (
                 snapshot.plugin_id != coder_name
                 or snapshot.model_override != self._invocation_override(fix_kwargs.get("model"))
@@ -704,6 +710,11 @@ class FixMixin(BreachMixin):
                     return
                 current_pr.quarantine_labels.add(size_fix_marker)
         heartbeat: asyncio.Task[None] | None = None
+        if pending_fix_record is not None:
+            self._current_run_record = pending_fix_record
+            self.state.active_invocation = (
+                pending_fix_record.invocations[-1] if reused_prelaunch else None
+            )
         run_record = self._current_run_record
         previous_profile_id = run_record.profile_id if run_record is not None else None
         previous_active_invocation = self.state.active_invocation
@@ -762,11 +773,20 @@ class FixMixin(BreachMixin):
                     assert previous_fix_iterations is not None
                     run_record.fix_iterations = previous_fix_iterations
                     run_record.profile_id = previous_profile_id
+                if pending_fix_record is not None:
+                    self._current_run_record = prelaunch_previous_record
+                    self.state.active_invocation = prelaunch_previous_invocation
+                    self.state.state = PipelineState.WATCH
                 rollback_writes = [self.publish_state()]
                 if run_record is not None:
-                    rollback_writes.append(self._checkpoint_current_run_record())
+                    rollback_writes.append(
+                        self._metrics_store.save(run_record) if pending_fix_record is not None
+                        else self._checkpoint_current_run_record()
+                    )
                 await asyncio.gather(*rollback_writes, return_exceptions=True)
             elif reused_prelaunch:
+                self._current_run_record = prelaunch_previous_record
+                self.state.active_invocation = prelaunch_previous_invocation
                 self.state.state = PipelineState.WATCH
             if heartbeat is not None:
                 heartbeat.cancel()

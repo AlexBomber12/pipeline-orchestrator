@@ -447,9 +447,41 @@ async def test_approved_guardrail_fix_prelaunch_requires_exact_ownership(
     assert runner.state.state == PipelineState.WATCH
     assert runner._current_run_record.run_id in (old.run_id, admitted.run_id)
     assert await runner._metrics_store.get(old.run_id) == old
+    if damage in {"settings", "publish_failure"}:
+        assert runner._current_run_record.run_id == old.run_id
+        assert runner.state.active_invocation == old.invocations[-1]
+    if damage == "settings":
+        await runner.handle_fix()
+        assert dispatched.await_count == 0
+        assert runner._current_run_record.run_id == old.run_id
+        assert (await runner._metrics_store.get(admitted.run_id)).invocations == admitted.invocations
     if damage == "publish_failure":
         await runner._run_cycle_body()
         assert dispatched.await_count == 1
+        assert runner._current_run_record.run_id == admitted.run_id
+        assert runner._current_run_record.fix_iterations == old.fix_iterations + 1
+        assert runner._current_run_record.invocations == [snapshot]
+
+
+async def test_approved_guardrail_fix_later_deferral_preserves_watch_ownership(
+    approval, monkeypatch,
+):
+    runner, old, admitted, snapshot, dispatched = await checkpointed_prelaunch_approval(
+        approval, monkeypatch,
+    )
+    marker = fixing_size_label(runner.state.current_pr.head_sha)
+    runner.state.current_pr.quarantine_labels.add(marker)
+    await runner.handle_fix()
+    assert dispatched.await_count == 0
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == old.run_id
+    assert runner.state.active_invocation == old.invocations[-1]
+    runner.state.current_pr.quarantine_labels.remove(marker)
+    await runner.handle_fix()
+    assert dispatched.await_count == 1
+    assert runner._current_run_record.run_id == admitted.run_id
+    assert runner._current_run_record.invocations == [snapshot]
+    assert runner._current_run_record.fix_iterations == old.fix_iterations + 1
 
 
 @pytest.mark.parametrize("damage", ["counter", "attempt_index"])
