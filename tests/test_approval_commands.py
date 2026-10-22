@@ -1075,6 +1075,37 @@ async def test_applied_approval_reconciles_confirmed_external_resolution(
     assert snapshot(repo) == before
 
 
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+async def test_terminal_approval_clones_base_after_pr_branch_deletion(
+    approval, monkeypatch, terminal,
+):
+    runner, command, repo, remote = approval
+    runner.repo_config.url = runner.state.url = command.repo_url = str(remote)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    preserved = repo.with_name("preserved-pr-checkout")
+    before = snapshot(repo)
+    repo.rename(preserved)
+    git(remote, "update-ref", "refs/pull/42/head", command.pr.head_sha)
+    git(remote, "update-ref", "-d", "refs/heads/fix/pr-42")
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: terminal)
+    monkeypatch.setattr(runner, "_save_current_run_record", AsyncMock())
+    commit_status = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit_status)
+
+    assert await runner._consume_approval_command()
+
+    assert runner.state.state == PipelineState.IDLE, (
+        (await load_approval(runner.redis, runner.name, command.binding)).reason, runner.state.history[-5:]
+    )
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).active
+    assert git(repo, "branch", "--show-current") == "main"
+    assert snapshot(preserved) == before
+    assert commit_status.await_count == (1 if terminal == "MERGED" else 0)
+
+
 @pytest.mark.parametrize("terminal", [None, "OPEN"])
 async def test_applied_approval_keeps_unknown_pr_evidence_retryable(approval, monkeypatch, terminal):
     runner, command, _, _ = approval

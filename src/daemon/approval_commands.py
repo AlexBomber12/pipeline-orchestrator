@@ -446,9 +446,10 @@ class ApprovalCommandMixin:
             # Restore an absent checkout without the ordinary clone helper's
             # partial-clone deletion or scaffolding. Git refuses a destination
             # that acquired files meanwhile; failures retain any partial work.
+            clone_branch = self.repo_config.branch if terminal_state else command.pr.branch
             await asyncio.to_thread(
                 subprocess.run,
-                ["git", "clone", "--branch", command.pr.branch, "--", self.repo_config.url, self.repo_path],
+                ["git", "clone", "--branch", clone_branch, "--", self.repo_config.url, self.repo_path],
                 capture_output=True, text=True, check=True, timeout=120,
             )
         dirty = git_ops._git(self.repo_path, "--no-optional-locks", "status", "--porcelain")
