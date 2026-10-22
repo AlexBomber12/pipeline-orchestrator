@@ -6,6 +6,7 @@ import asyncio
 import os
 import subprocess
 import uuid
+from dataclasses import replace
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -350,10 +351,7 @@ async def test_approved_guardrail_fix_checkpoint_retry_reuses_attempt(
     assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
 
 
-@pytest.mark.parametrize("restart", [False, True])
-async def test_approved_guardrail_fix_recovers_prelaunch_invocation(
-    approval, monkeypatch, restart,
-):
+async def checkpointed_prelaunch_approval(approval, monkeypatch):
     runner, command, old = await finalized_guardrail_approval(approval, monkeypatch)
     dispatched = real_watch_with_mock_coder(runner, monkeypatch)
     coder_name, plugin = runner._get_coder(allow_exploration=False)
@@ -380,6 +378,16 @@ async def test_approved_guardrail_fix_recovers_prelaunch_invocation(
     # the approved WATCH state and the finalized run's invocation.
     runner._current_run_record = old
     runner.state.active_invocation = old.invocations[-1]
+    return runner, old, admitted, prelaunch, dispatched
+
+
+@pytest.mark.parametrize("restart", [False, True])
+async def test_approved_guardrail_fix_recovers_prelaunch_invocation(
+    approval, monkeypatch, restart,
+):
+    runner, old, admitted, prelaunch, dispatched = await checkpointed_prelaunch_approval(
+        approval, monkeypatch,
+    )
     if restart:
         runner._recovered = False
         runner._current_run_record = None
@@ -397,7 +405,57 @@ async def test_approved_guardrail_fix_recovers_prelaunch_invocation(
     assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
 
 
-async def test_approved_guardrail_fix_rejects_changed_admitted_accounting(approval, monkeypatch):
+@pytest.mark.parametrize(
+    "damage", ["snapshot", "missing_state", "changed_ownership", "settings", "publish_failure"],
+)
+async def test_approved_guardrail_fix_prelaunch_requires_exact_ownership(
+    approval, monkeypatch, damage,
+):
+    runner, old, admitted, snapshot, dispatched = await checkpointed_prelaunch_approval(
+        approval, monkeypatch,
+    )
+    publish = runner.publish_state
+    if damage == "snapshot":
+        admitted.invocations[0] = replace(snapshot, fix_iteration=99)
+        await runner._metrics_store.save(admitted)
+    elif damage == "missing_state":
+        await runner.redis.delete(pipeline_state(runner.name))
+    elif damage == "changed_ownership":
+        persisted = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+        persisted.active_invocation = None
+        await runner.redis.set(pipeline_state(runner.name), persisted.model_dump_json())
+    elif damage == "settings":
+        admitted.invocations[0] = replace(snapshot, model_override="different-model")
+        await runner._metrics_store.save(admitted)
+    elif damage == "publish_failure":
+        attempts = 0
+
+        async def fail_once():
+            nonlocal attempts
+            if runner.state.state == PipelineState.FIX and attempts == 0:
+                attempts += 1
+                raise OSError("state publication unavailable")
+            await publish()
+
+        monkeypatch.setattr(runner, "publish_state", fail_once)
+    if damage == "publish_failure":
+        with pytest.raises(OSError, match="state publication unavailable"):
+            await runner.handle_fix()
+    else:
+        await runner.handle_fix()
+    assert dispatched.await_count == 0
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id in (old.run_id, admitted.run_id)
+    assert await runner._metrics_store.get(old.run_id) == old
+    if damage == "publish_failure":
+        await runner._run_cycle_body()
+        assert dispatched.await_count == 1
+
+
+@pytest.mark.parametrize("damage", ["counter", "attempt_index"])
+async def test_approved_guardrail_fix_rejects_changed_admitted_accounting(
+    approval, monkeypatch, damage,
+):
     runner, _, old = await finalized_guardrail_approval(approval, monkeypatch)
     dispatched = real_watch_with_mock_coder(runner, monkeypatch)
     checkpoint = runner._checkpoint_current_run_record
@@ -414,7 +472,10 @@ async def test_approved_guardrail_fix_rejects_changed_admitted_accounting(approv
         record for record in await runner._metrics_store.list_task_runs(runner.name, "PR-42")
         if record.run_id != old.run_id
     )
-    admitted.fix_iterations += 1
+    if damage == "counter":
+        admitted.fix_iterations += 1
+    else:
+        admitted.attempt_index += 1
     await runner._metrics_store.save(admitted)
     monkeypatch.setattr(runner, "_checkpoint_current_run_record", checkpoint)
     await runner._run_cycle_body()
