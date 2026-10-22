@@ -575,9 +575,29 @@ async def test_coding_complete_admission_reused_across_prelaunch_deferrals(
         assert runner._current_run_record.run_id == old.run_id
         assert dispatched.await_count == 0
         assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
+    admitted = next(
+        record for record in await runner._metrics_store.list_task_runs(runner.name, "PR-42")
+        if record.run_id != old.run_id
+    )
+    coder_name, plugin = runner._get_coder(allow_exploration=False)
+    breach_dir, breach_run_id = runner._breach_env()
+    run_kwargs = plugin.build_run_kwargs(
+        daemon_config=runner.app_config.daemon, breach_dir=breach_dir,
+        breach_run_id=breach_run_id,
+    )
+    runner._current_run_record = admitted
+    admitted.fix_iterations += 1
+    prelaunch = runner._capture_invocation_snapshot(
+        coder_name, run_kwargs, phase="fix", fix_iteration=admitted.fix_iterations,
+    )
+    await runner._checkpoint_current_run_record()
+    runner._current_run_record = old
+    runner.state.active_invocation = old.invocations[-1]
+    await runner.publish_state()
     runner.state.current_pr.quarantine_labels.remove(marker)
     await runner.handle_fix()
     assert dispatched.await_count == 1
+    assert runner._current_run_record.invocations == [prelaunch]
     assert runner._current_run_record.fix_iterations == old.fix_iterations + 1
     assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
 
