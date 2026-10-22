@@ -944,6 +944,36 @@ async def test_lost_fix_ack_and_rollback_publication_parks_on_restart(
     assert dispatched.await_count == 0
 
 
+async def test_persisted_fix_park_retries_failed_status_write(approval, monkeypatch):
+    runner, old, admitted, snapshot, dispatched = await checkpointed_prelaunch_approval(
+        approval, monkeypatch,
+    )
+    runner._current_run_record = admitted
+    runner.state.active_invocation = snapshot
+    runner.state.state = PipelineState.FIX
+    await runner.publish_state()
+    status_write = AsyncMock(side_effect=[False, False, True])
+    monkeypatch.setattr(runner, "_commit_task_status_change", status_write)
+    runner._recovered = False
+    runner._current_run_record = None
+    runner._approval_receipt = None
+    runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.ERROR
+    assert "PR-42" in runner._status_write_failed_task_pr_ids
+    monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+    monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+    await runner._run_cycle_body()
+    assert "PR-42" in runner._status_write_failed_task_pr_ids
+    await runner._run_cycle_body()
+    assert "PR-42" not in runner._status_write_failed_task_pr_ids
+    assert status_write.await_count == 3
+    assert runner.state.state == PipelineState.ERROR
+    assert await runner._metrics_store.get(old.run_id) == old
+    assert (await runner._metrics_store.get(admitted.run_id)).invocations == [snapshot]
+    assert dispatched.await_count == 0
+
+
 async def test_coding_complete_admission_reused_across_prelaunch_deferrals(
     approval, monkeypatch,
 ):
