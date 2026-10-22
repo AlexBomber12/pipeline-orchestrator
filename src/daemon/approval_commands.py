@@ -230,8 +230,15 @@ class ApprovalCommandMixin:
                     cause = await self.redis.get(cause_key(self.name, command.task.pr_id))
                     if cause:
                         self._approval_receipt = None
-                        if CancellationCause.from_redis(cause).payload.get("subsource") == "operator_reject":
-                            await self._approval_result(command, "failed", "A later operator rejection ended approval.")
+                        await self._transition_to_error(
+                            "A newer suppression decision superseded the approved PR continuation.",
+                            save_run_record_as=None,
+                            cancellation_cause=CancellationCause.from_redis(cause),
+                            commit_task_status=True,
+                        )
+                        await self._approval_result(
+                            command, "failed", "A newer suppression decision ended approval."
+                        )
                         return True  # a newer failure must never inherit this permission
                     self._approval_receipt = command
                     try:

@@ -1356,13 +1356,19 @@ async def test_pending_terminal_approval_keeps_binding_and_operator_controls(
         await runner.redis.set(control_stop(runner.name), "1")
 
     await runner._consume_approval_command()
-    assert write_status.await_count == 1
-    assert runner.state.state == PipelineState.WATCH
+    if changed == "suppression":
+        assert [call.args[1] for call in write_status.await_args_list] == ["DONE", "ERROR"]
+        assert runner.state.state == PipelineState.ERROR
+        assert not (await load_approval(runner.redis, runner.name, command.binding)).active
+    else:
+        assert write_status.await_count == 1
+        assert runner.state.state == PipelineState.WATCH
     assert "status: ERROR" in git(remote, "show", "main:tasks/PR-42.md")
     runner.handle_coding.assert_not_awaited()
 
 
-async def test_new_suppression_during_done_write_survives_terminal_retry(approval, monkeypatch):
+@pytest.mark.parametrize("restart", [False, True])
+async def test_new_suppression_during_done_write_survives_terminal_retry(approval, monkeypatch, restart):
     runner, _, repo, remote = approval
     use_real_status_writer(runner, remote, monkeypatch)
     await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
@@ -1378,6 +1384,8 @@ async def test_new_suppression_during_done_write_survives_terminal_retry(approva
     ).to_redis()
 
     async def interrupted_writer(task, status, reason, **kwargs):
+        if status == "ERROR":
+            return await real_writer(task, status, reason, **kwargs)
         assert status == "DONE"
         assert await real_writer(task, status, reason, **kwargs)
         await runner.redis.set(cause_key(runner.name, "PR-42"), newer)
@@ -1392,6 +1400,21 @@ async def test_new_suppression_during_done_write_survives_terminal_retry(approva
     assert await runner.redis.get(cause_key(runner.name, "PR-42")) == newer
     assert "status: DONE" in git(remote, "show", "main:tasks/PR-42.md")
     runner.handle_coding.assert_not_awaited()
+
+    if restart:
+        runner._recovered = False
+        runner._approval_receipt = None
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.ERROR
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).active
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) == newer
+    assert "status: ERROR" in git(remote, "show", "main:tasks/PR-42.md")
+    runner.handle_coding.assert_not_awaited()
+    assert not await runner._consume_approval_command()
+    assert not await list_approvals(runner.redis, runner.name)
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) == newer
 
 
 @pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
