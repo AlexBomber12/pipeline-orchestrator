@@ -1175,11 +1175,10 @@ class RecoveryMixin:
                         or record.task_spec_hash not in ("", completion.task_spec_hash)
                     ):
                         self.state.size_fix_completion = None
-                        self.state.state = PipelineState.ERROR
-                        self.state.error_message = (
-                            "Size FIX completion accounting unavailable; operator Retry or revised approval required."
+                        await self._transition_to_error(
+                            "Size FIX completion accounting unavailable; operator Retry or revised approval required.",
+                            save_run_record_as=None, publish=False, log_prefix="[RECOVERY]",
                         )
-                        self.log_event("[RECOVERY] Size FIX completion receipt lacks its bound run; parked ERROR.")
                         return
                 self.log_event(
                     f"[RECOVERY] Restored bound FIX PR #{bound.number} for "

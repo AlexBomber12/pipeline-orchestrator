@@ -777,7 +777,12 @@ def test_watch_does_not_clear_in_progress_size_fix_after_restart(monkeypatch: py
     assert any("outcome is unresolved" in entry["event"] for entry in runner.state.history)
 
 
-@pytest.mark.parametrize("changed", ["task", "head", "guardrail", "reason", "rejection", "cleanup_done"])
+@pytest.mark.parametrize("changed", [
+    "task", "head", "guardrail", "reason", "rejection", "cleanup_done",
+    "missing_revision", "task_unavailable", "suppression_unavailable",
+    "remote_unavailable", "marker_missing", "pending_suppression_unavailable",
+    "pending_guardrail", "pending_todo",
+])
 def test_watch_pending_size_fix_does_not_cross_changed_binding_or_decision(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, changed: str,
 ) -> None:
@@ -824,13 +829,47 @@ def test_watch_pending_size_fix_does_not_cross_changed_binding_or_decision(
         reason = SuppressionReason.OPERATOR_REJECT
     elif changed == "cleanup_done":
         pr.quarantine_labels = {continued_size_label("a" * 40)}
+    elif changed == "task_unavailable":
+        task_path.unlink()
+        monkeypatch.setattr(runner, "_detect_external_quarantine_release", AsyncMock())
+        original_read_text = Path.read_text
+
+        def unavailable_task(path: Path, *args, **kwargs):
+            if path == task_path:
+                raise OSError("task missing")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", unavailable_task)
+    elif changed == "marker_missing":
+        pr.quarantine_labels.clear()
+    elif changed == "pending_guardrail":
+        runner.state.size_fix_completion = None
+        pr.quarantine_labels.add("quarantine:workflow")
+    elif changed in {"pending_todo", "pending_suppression_unavailable"}:
+        runner.state.size_fix_completion = None
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_args, **_kwargs: [pr])
     monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_args, **_kwargs: "OPEN")
+    remote_todo_cases = {"cleanup_done", "pending_guardrail", "pending_suppression_unavailable"}
     monkeypatch.setattr(
         runner, "_remote_frontmatter_error_status_for_current_task",
-        lambda: (("todo", None, "t" * 64) if changed == "cleanup_done"
+        lambda: (("todo", None, "t" * 64) if changed in remote_todo_cases
+                 else (None, None, None) if changed == "remote_unavailable"
+                 else ("error", reason, None) if changed == "missing_revision"
                  else ("error", reason, "e" * 64)),
     )
+    if changed in {"suppression_unavailable", "pending_suppression_unavailable"}:
+        suppression_calls = {"count": 0}
+
+        async def unavailable_after_rehydration(_task_id: str):
+            suppression_calls["count"] += 1
+            if suppression_calls["count"] > 1:
+                raise OSError("Redis unavailable")
+            return None
+
+        monkeypatch.setattr(
+            runner, "_suppression_record_for_task",
+            unavailable_after_rehydration,
+        )
     monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker", lambda *_args: None)
     monkeypatch.setattr("src.daemon.handlers.watch.bound_checkout_work_blocker_for_ref", lambda *_args: None)
     write = AsyncMock(return_value=True)
@@ -841,9 +880,16 @@ def test_watch_pending_size_fix_does_not_cross_changed_binding_or_decision(
         assert runner.state.state == PipelineState.WATCH
         assert runner.state.size_fix_completion is None
         return
+    if changed in {
+        "missing_revision", "task_unavailable", "suppression_unavailable",
+        "remote_unavailable", "pending_suppression_unavailable", "pending_guardrail", "pending_todo",
+    }:
+        assert runner.state.state == PipelineState.WATCH
+        return
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.size_fix_completion is None
-    assert marker in runner.state.current_pr.quarantine_labels
+    if changed != "marker_missing":
+        assert marker in runner.state.current_pr.quarantine_labels
 
 
 @pytest.mark.parametrize("blocker", ["active", "unavailable"])

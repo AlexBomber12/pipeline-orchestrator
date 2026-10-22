@@ -169,6 +169,8 @@ def test_successful_size_fix_retries_failed_todo_write_in_watch(
     runner.state.state = PipelineState.WATCH
     pr = PRInfo(number=77, branch="pr-019", pr_id="PR-019", head_sha="a" * 40,
                 quarantine_labels={marker})
+    if failure == "label":
+        pr.quarantine_labels.add(continued_size_label("b" * 40))
     runner.state.current_pr = pr
     runner.state.current_task = QueueTask(
         pr_id="PR-019", title="t", status=TaskStatus.DOING,
@@ -243,6 +245,80 @@ def test_successful_size_fix_retries_failed_todo_write_in_watch(
     assert runner.state.size_fix_completion is None
     assert fixing not in runner.state.current_pr.quarantine_labels
     assert remote["status"] == "todo"
+
+
+@pytest.mark.parametrize("changed", [
+    "head", "status", "suppression_unavailable", "suppressed", "task_unavailable", "task_changed",
+])
+def test_size_fix_requires_completion_evidence_before_todo(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, changed: str,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    task_path = tmp_path / "tasks" / "PR-019.md"
+    task_path.parent.mkdir()
+    task_path.write_text("task generation\n")
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.WATCH
+    marker = continued_size_label("a" * 40)
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", pr_id="PR-019", head_sha="a" * 40,
+        quarantine_labels={marker},
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-019", title="t", status=TaskStatus.DOING,
+        branch="pr-019", task_file="tasks/PR-019.md",
+    )
+
+    async def coder(*_args, **_kwargs):
+        if changed == "task_unavailable":
+            task_path.unlink()
+            original_read_text = Path.read_text
+
+            def unavailable_task(path: Path, *args, **kwargs):
+                if path == task_path:
+                    raise OSError("task missing")
+                return original_read_text(path, *args, **kwargs)
+
+            monkeypatch.setattr(Path, "read_text", unavailable_task)
+        elif changed == "task_changed":
+            runner._current_run_record.task_spec_hash = "different"
+        return (0, "", "")
+
+    monkeypatch.setattr(claude_cli, "fix_review_async", coder)
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task",
+        lambda: (("todo", None, "t" * 64) if changed == "status"
+                 else ("error", SuppressionReason.CRASH, "e" * 64)),
+    )
+    if changed in {"suppression_unavailable", "suppressed"}:
+        async def suppression(_task_id: str):
+            if changed == "suppression_unavailable":
+                raise OSError("Redis unavailable")
+            return object()
+
+        monkeypatch.setattr(runner, "_suppression_record_for_task", suppression)
+    writes: list[str] = []
+
+    async def status_write(_task, status, _reason, **_kwargs):
+        writes.append(status)
+        return True
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", status_write)
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *_args, **_kwargs: None)
+    original_git = git_ops_module._git
+
+    def fixed_head(repo_path: str, *args: str, **kwargs: Any):
+        if args[:2] == ("rev-parse", "HEAD"):
+            head = "invalid" if changed == "head" else "a" * 40
+            return subprocess.CompletedProcess(args, 0, head + "\n", "")
+        return original_git(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops_module, "_git", fixed_head)
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.size_fix_completion is None
+    assert "TODO" not in writes
 
 
 @pytest.mark.parametrize("failure", ["prior_fix", "apply", "status"])

@@ -263,21 +263,17 @@ class WatchMixin:
         completion = self.state.size_fix_completion
         fixing_labels = {label for label in live_quarantine_labels if is_fixing_size_label(label)}
         if completion is not None or fixing_labels:
-            def park_changed_completion(reason: str) -> None:
+            async def park_changed_completion(reason: str) -> None:
                 self.state.size_fix_completion = None
-                self.state.state = PipelineState.ERROR
-                self.state.error_message = (
-                    "Size FIX completion changed; operator Retry or revised approval required. " + reason
+                await self._transition_to_error(
+                    "Size FIX completion changed; operator Retry or revised approval required. " + reason,
+                    save_run_record_as=None, publish=False, log_prefix="[WATCH]",
                 )
-                self.log_event(f"[WATCH] PR #{found.number} size FIX completion parked: {reason}")
 
             task = self.state.current_task
             remote_status, remote_reason, revision = (
                 self._remote_frontmatter_error_status_for_current_task()
             )
-            if task is None or (completion is None and not fixing_labels):
-                self.log_event(f"[WATCH] PR #{found.number} size FIX outcome is unresolved; holding PR.")
-                return
             if remote_status is not None and revision is None:
                 self.log_event(f"[WATCH] PR #{found.number} size FIX task revision unavailable; retrying.")
                 return
@@ -296,7 +292,7 @@ class WatchMixin:
                     or record.task_spec_hash not in ("", completion.task_spec_hash)
                     or blocking_quarantine_labels(live_quarantine_labels) - {completion.fixing_label}
                 ):
-                    park_changed_completion("Task, PR, invocation, revision, or guardrail binding changed.")
+                    await park_changed_completion("Task, PR, invocation, revision, or guardrail binding changed.")
                     return
                 try:
                     task_hash = task_spec_content_hash(
@@ -306,7 +302,7 @@ class WatchMixin:
                     self.log_event(f"[WATCH] PR #{found.number} size FIX task unavailable: {exc}")
                     return
                 if task_hash != completion.task_spec_hash:
-                    park_changed_completion("Task generation changed.")
+                    await park_changed_completion("Task generation changed.")
                     return
                 try:
                     suppression = await self._suppression_record_for_task(task.pr_id)
@@ -322,13 +318,13 @@ class WatchMixin:
                     if remote_status is None and suppression is None:
                         self.log_event(f"[WATCH] PR #{found.number} size FIX remote status unavailable; retrying.")
                         return
-                    park_changed_completion("Task status or suppression changed.")
+                    await park_changed_completion("Task status or suppression changed.")
                     return
                 if not fixing_labels and (
                     remote_status != "todo"
                     or continued_size_label(found.head_sha) not in live_quarantine_labels
                 ):
-                    park_changed_completion("Size FIX marker disappeared before completion.")
+                    await park_changed_completion("Size FIX marker disappeared before completion.")
                     return
             elif task.status != TaskStatus.DOING or remote_status != "todo":
                 # A size label or stale DOING snapshot cannot prove success.

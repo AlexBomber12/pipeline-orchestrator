@@ -834,8 +834,6 @@ class FixMixin(BreachMixin):
         async def finish_size_fix_marker(head_after: str) -> bool:
             if size_fix_marker is None:
                 return True
-            if current_pr is None or self.state.current_task is None:
-                return False
             try:
                 continued_size_label(head_after)
             except ValueError:

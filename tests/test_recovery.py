@@ -730,8 +730,9 @@ def test_unresolved_size_fix_recovery_completes_in_error(
     assert "operator Retry" in runner.state.error_message
 
 
+@pytest.mark.parametrize("feature_flag,run_match", [(False, True), (True, True), (True, False)])
 def test_retained_successful_size_fix_retries_error_header_after_restart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, feature_flag: bool, run_match: bool,
 ) -> None:
     task_file = tmp_path / "tasks" / "PR-100.md"
     task_file.parent.mkdir()
@@ -758,11 +759,13 @@ def test_retained_successful_size_fix_retries_error_header_after_restart(
         current_pr=pr, active_invocation=invocation, size_fix_completion=receipt,
     )
     record = SimpleNamespace(
-        run_id="run-100", task_id=queued.pr_id, invocations=[invocation],
+        run_id="run-100" if run_match else "different-run", task_id=queued.pr_id,
+        invocations=[invocation],
         fix_iterations=1, attempt_index=1, task_spec_hash=task_hash,
     )
     runner = _make_runner()
     runner.repo_path = str(tmp_path)
+    runner.repo_config.feature_flags.use_single_error_exit = feature_flag
     runner._persisted_fix_recovery = RepoState.model_validate_json(saved.model_dump_json())
     runner._recovery_task_headers = {
         queued.pr_id: SimpleNamespace(
@@ -777,6 +780,10 @@ def test_retained_successful_size_fix_retries_error_header_after_restart(
     monkeypatch.setattr(runner, "_restore_current_run_record", restore_record)
     monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda *_args: None)
     asyncio.run(runner._apply_recovery_decisions([queued], [pr]))
+    if not run_match:
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.size_fix_completion is None
+        return
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.size_fix_completion == receipt
 
