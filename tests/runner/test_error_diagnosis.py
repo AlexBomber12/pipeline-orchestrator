@@ -63,6 +63,18 @@ from tests.runner import _helpers as h
 claude_cli = claude_plugin_module.claude_cli
 
 
+def test_unresolved_size_fix_stays_parked_for_operator_retry() -> None:
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Size FIX outcome unresolved; operator Retry or revised approval required."
+
+    assert runner.state.error_message.startswith("Size FIX outcome unresolved")
+    asyncio.run(runner.handle_error(runner.state.error_message))
+
+    assert runner.state.state == PipelineState.ERROR
+    assert any("parked for operator Retry" in item["event"] for item in runner.state.history)
+
+
 def _patch_plugin_diagnose(
     monkeypatch: pytest.MonkeyPatch,
     runner: Any,

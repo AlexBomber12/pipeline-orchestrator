@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from pathlib import Path
 from src.cancellation import CancellationCause
 from src.config import load_config
 from src.daemon import guardrails
+from src.daemon.approval_commands import bound_checkout_work_blocker_for_ref, checkout_process_blocker
 from src.daemon.quarantine import (
     apply_quarantine_label_for_violation,
     blocking_quarantine_labels,
@@ -257,8 +259,23 @@ class WatchMixin:
         self.state.current_pr = found
         if any(is_fixing_size_label(label) for label in found.quarantine_labels):
             task = self.state.current_task
-            if task is None or task.status != TaskStatus.DOING:
+            # FIX first commits ERROR before publishing size-fix, then TODO
+            # only after its coder has finished. Redis can retain a stale
+            # DOING snapshot across restart, so read the confirmed base.
+            remote_status = self._remote_frontmatter_error_status_for_current_task()[0]
+            if task is None or task.status != TaskStatus.DOING or remote_status != "todo":
                 self.log_event(f"[WATCH] PR #{found.number} size FIX outcome is unresolved; holding PR.")
+                return
+            try:
+                reason = checkout_process_blocker(self.repo_path)
+                if not reason:
+                    reason = bound_checkout_work_blocker_for_ref(
+                        self.repo_path, found.branch, {found.head_sha},
+                    )
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                reason = f"Checkout verification unavailable: {exc}"
+            if reason:
+                self.log_event(f"[WATCH] PR #{found.number} size FIX marker retained: {reason}")
                 return
             committed = await self._commit_task_status_change(
                 task, "TODO", "Size FIX completed; continuing published PR",

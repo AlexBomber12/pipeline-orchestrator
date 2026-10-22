@@ -702,12 +702,13 @@ def test_guardrail_error_with_open_pr_remains_parked_after_redis_loss(
     assert "status: ERROR" in task_path.read_text()
 
 
+@pytest.mark.parametrize("blocked_reason", ["guardrail", "crash"])
 def test_unresolved_size_fix_recovery_completes_in_error(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocked_reason: str,
 ) -> None:
     _write_task_file(tmp_path, "PR-100", "ERROR", "pr-100-size")
     path = tmp_path / "tasks/PR-100.md"
-    path.write_text(path.read_text().replace("status: ERROR", "status: ERROR\nblocked_reason: guardrail"))
+    path.write_text(path.read_text().replace("status: ERROR", f"status: ERROR\nblocked_reason: {blocked_reason}"))
     pr = PRInfo(
         number=100, branch="pr-100-size", pr_id="PR-100", head_sha="a" * 40,
         quarantine_labels={continued_size_label("a" * 40), fixing_size_label("a" * 40)},

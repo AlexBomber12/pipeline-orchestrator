@@ -191,12 +191,15 @@ are retried while the receipt is available. These labels are not authority to
 clear an ERROR task: they can survive a later, unrelated guardrail whose label
 write failed. An ERROR task with a matching open PR stays in ERROR for operator
 recovery after Redis loss, even if an old size label remains. Before FIX
-dispatch, the daemon adds `size-fix:<PR HEAD SHA>` while retaining the
-continuation marker. After a successful FIX it commits `status: TODO`, binds
-the continuation marker to the resulting HEAD, and removes `size-fix` last.
-WATCH retries failed label cleanup; startup refreshes the base ref and derives
-DOING from the TODO header and matching open PR. An unresolved FIX with an
-ERROR header recovers into ERROR for operator Retry. CODING with an existing
+dispatch, the daemon first commits `status: ERROR` with a crash reason, then
+adds `size-fix:<PR HEAD SHA>` while retaining the continuation marker. After
+a successful FIX it commits `status: TODO`, binds the continuation marker to
+the resulting HEAD, and removes `size-fix` last. WATCH only retries failed
+marker cleanup after confirming the TODO header on the remote base and a
+quiescent checkout. Marker setup failures after the ERROR write park the task
+for operator Retry. Startup refreshes the base ref and derives DOING from the
+TODO header and matching open PR. An unresolved FIX with an ERROR header
+recovers into ERROR for operator Retry. CODING with an existing
 continuation PR returns to WATCH.
 Startup recovery also checks the checkout for unpublished work and active
 processes. It fetches a missing verified PR HEAD without moving local refs;

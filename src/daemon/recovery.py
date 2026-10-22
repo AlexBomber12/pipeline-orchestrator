@@ -941,10 +941,10 @@ class RecoveryMixin:
                 "from GitHub labels."
             )
 
-    async def _recover_guardrail_error_pr(
+    async def _recover_unresolved_error_pr(
         self, tasks: list[QueueTask], prs: list[PRInfo],
     ) -> tuple[QueueTask, PRInfo] | None:
-        """Park an ERROR guardrail PR; labels cannot authorize continuation.
+        """Park an ERROR guardrail or unfinished size FIX with its bound PR.
 
         A size-ok or legacy size label can outlive a later guardrail whose
         GitHub label write failed. A confirmed TODO task header with a matching
@@ -955,13 +955,15 @@ class RecoveryMixin:
             if (
                 task.status != TaskStatus.ERROR or header is None
                 or header.frontmatter_status != "error"
-                or header.blocked_reason != SuppressionReason.GUARDRAIL.value
             ):
                 continue
             pr = find_matching_open_pr(task.pr_id, task.branch, prs)
-            if pr is not None:
+            if pr is not None and (
+                header.blocked_reason == SuppressionReason.GUARDRAIL.value
+                or any(is_fixing_size_label(label) for label in pr.quarantine_labels)
+            ):
                 self.log_event(
-                    f"[RECOVERY] Guardrail ERROR task {task.pr_id} retains PR #{pr.number}; "
+                    f"[RECOVERY] ERROR task {task.pr_id} retains PR #{pr.number}; "
                     "task header does not authorize continuation."
                 )
                 return task, pr
@@ -974,7 +976,7 @@ class RecoveryMixin:
 
         The body mirrors the original recover_state decision tree.
         """
-        unresolved_guardrail_pr = await self._recover_guardrail_error_pr(tasks, prs)
+        unresolved_error_pr = await self._recover_unresolved_error_pr(tasks, prs)
         self._set_queue_progress(
             sum(1 for t in tasks if t.status == TaskStatus.DONE),
             len(tasks),
@@ -1331,13 +1333,17 @@ class RecoveryMixin:
             )
             return
 
-        if unresolved_guardrail_pr is not None:
-            task, pr = unresolved_guardrail_pr
+        if unresolved_error_pr is not None:
+            task, pr = unresolved_error_pr
+            fixing = any(is_fixing_size_label(label) for label in pr.quarantine_labels)
             self.state = self.state.model_copy(update={
                 "current_task": task,
                 "current_pr": pr,
                 "state": PipelineState.ERROR,
-                "error_message": "Guardrail decision unresolved; operator Retry or revised approval required.",
+                "error_message": (
+                    "Size FIX outcome unresolved; operator Retry or revised approval required."
+                    if fixing else "Guardrail decision unresolved; operator Retry or revised approval required."
+                ),
             })
             return
 

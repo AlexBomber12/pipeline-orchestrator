@@ -58,11 +58,36 @@ def test_handle_fix_defers_when_size_fix_marker_cannot_be_created(
         number=77, branch="pr-019", head_sha="a" * 40,
         quarantine_labels={marker},
     )
+    runner.state.current_task = QueueTask(pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019")
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     monkeypatch.setattr(fix_module.gh_runner, "run_gh", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
     asyncio.run(runner.handle_fix())
-    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.state == PipelineState.ERROR
     assert marker in runner.state.current_pr.quarantine_labels
+    assert runner._commit_task_status_change.await_args_list[0].args[1] == "ERROR"
     assert any("marker creation deferred" in item["event"] for item in runner.state.history)
+
+
+def test_handle_fix_does_not_publish_marker_before_error_status(monkeypatch: pytest.MonkeyPatch) -> None:
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    marker = continued_size_label("a" * 40)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=77, branch="pr-019", head_sha="a" * 40, quarantine_labels={marker},
+    )
+    runner.state.current_task = QueueTask(pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019")
+    status_write = AsyncMock(return_value=False)
+    monkeypatch.setattr(runner, "_commit_task_status_change", status_write)
+    monkeypatch.setattr(runner, "_reserve_coder_credentials", lambda *a, **kw: pytest.fail("coder reserved"))
+    monkeypatch.setattr(fix_module.gh_runner, "run_gh", lambda *a, **kw: pytest.fail("marker published"))
+
+    asyncio.run(runner.handle_fix())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.quarantine_labels == {marker}
+    assert status_write.await_args.args[:2] == (runner.state.current_task, "ERROR")
+    assert any("task status update deferred" in item["event"] for item in runner.state.history)
 
 
 @pytest.mark.parametrize("head_sha", ["", "not-a-sha"])
@@ -76,6 +101,8 @@ def test_handle_fix_releases_reservation_for_invalid_size_head(
         number=77, branch="pr-019", head_sha=head_sha,
         quarantine_labels={continued_size_label("a" * 40)},
     )
+    runner.state.current_task = QueueTask(pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019")
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     released: list[bool] = []
     monkeypatch.setattr(runner, "_reserve_coder_credentials", lambda *_args, **_kwargs: True)
     monkeypatch.setattr(runner, "_release_coder_credentials", lambda: released.append(True))
@@ -86,7 +113,7 @@ def test_handle_fix_releases_reservation_for_invalid_size_head(
     asyncio.run(runner.handle_fix())
 
     assert released == [True]
-    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.state == PipelineState.ERROR
     assert any("published PR HEAD is required" in item["event"] for item in runner.state.history)
 
 
@@ -165,7 +192,7 @@ def test_handle_fix_keeps_recovery_marker_when_fix_outcome_is_uncertain(
 
     monkeypatch.setattr(git_ops_module, "_git", fixed_head)
     asyncio.run(runner.handle_fix())
-    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.state == (PipelineState.ERROR if failure == "apply" else PipelineState.WATCH)
     if failure == "prior_fix":
         assert runner.state.current_pr.quarantine_labels == {fixing}
         assert any("Prior size FIX outcome is unresolved" in item["event"] for item in runner.state.history)
@@ -176,7 +203,7 @@ def test_handle_fix_keeps_recovery_marker_when_fix_outcome_is_uncertain(
         assert runner.state.current_pr.quarantine_labels == {marker, fixing}
         assert any("marker completion deferred" in item["event"] for item in runner.state.history)
     else:
-        assert runner.state.current_pr.quarantine_labels == {marker, fixing}
+        assert runner.state.current_pr.quarantine_labels == {marker}
         assert any("task status update deferred" in item["event"] for item in runner.state.history)
 
 

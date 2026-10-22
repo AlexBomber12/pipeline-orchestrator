@@ -33,7 +33,7 @@ from src.daemon.selector import CoderSelectionUnavailable
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github.reviewer_policy import ReviewerPolicy
-from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
+from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus, TaskStatus
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
 
@@ -516,6 +516,22 @@ class FixMixin(BreachMixin):
                     self.log_event("[FIX] PR HEAD changed before review dispatch; returning to WATCH.")
                     self.state.state = PipelineState.WATCH
                     return
+        if current_pr is not None and any(
+            is_fixing_size_label(label) for label in current_pr.quarantine_labels
+        ):
+            self.log_event("[FIX] Prior size FIX outcome is unresolved; deferring dispatch.")
+            self.state.state = PipelineState.WATCH
+            return
+        if current_pr is not None and any(
+            is_continued_size_label(label) for label in current_pr.quarantine_labels
+        ):
+            if self.state.current_task is None or not await self._commit_task_status_change(
+                self.state.current_task, "ERROR", "Size FIX in progress",
+                blocked_reason=SuppressionReason.CRASH,
+            ):
+                self.log_event("[FIX] Size FIX task status update deferred; retaining continuation marker.")
+                self.state.state = PipelineState.WATCH
+                return
         if not self._reserve_coder_credentials(
             coder_name,
             invocation_kwargs=fix_kwargs,
@@ -526,12 +542,22 @@ class FixMixin(BreachMixin):
             )
             return
         size_fix_marker: str | None = None
+
+        async def park_size_fix_setup(reason: str) -> None:
+            self._release_coder_credentials()
+            await self._transition_to_error(
+                f"Size FIX outcome unresolved; operator Retry or revised approval required. {reason}",
+                save_run_record_as=None, publish=False, log_prefix="[FIX]", commit_task_status=True,
+            )
+            task = self.state.current_task
+            if task is not None:
+                self.state.current_task = task.model_copy(update={"status": TaskStatus.ERROR})
+                self.state.current_queue = [
+                    self.state.current_task if item.pr_id == task.pr_id else item
+                    for item in (self.state.current_queue or [task])
+                ]
+
         if current_pr is not None:
-            if any(is_fixing_size_label(label) for label in current_pr.quarantine_labels):
-                self.log_event("[FIX] Prior size FIX outcome is unresolved; deferring dispatch.")
-                self._release_coder_credentials()
-                self.state.state = PipelineState.WATCH
-                return
             if any(is_continued_size_label(label) for label in current_pr.quarantine_labels):
                 try:
                     size_fix_marker = fixing_size_label(current_pr.head_sha)
@@ -543,8 +569,7 @@ class FixMixin(BreachMixin):
                 except Exception as exc:
                     if not fix_escalation._is_label_already_exists_error(exc):
                         self.log_event(f"[FIX] Size FIX marker creation deferred: {exc}")
-                        self._release_coder_credentials()
-                        self.state.state = PipelineState.WATCH
+                        await park_size_fix_setup(str(exc))
                         return
                 try:
                     gh_runner.run_gh(
@@ -553,8 +578,7 @@ class FixMixin(BreachMixin):
                     )
                 except Exception as exc:
                     self.log_event(f"[FIX] Size FIX marker application deferred: {exc}")
-                    self._release_coder_credentials()
-                    self.state.state = PipelineState.WATCH
+                    await park_size_fix_setup(str(exc))
                     return
                 current_pr.quarantine_labels.add(size_fix_marker)
         heartbeat: asyncio.Task[None] | None = None
