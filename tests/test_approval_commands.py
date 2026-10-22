@@ -484,6 +484,40 @@ async def test_approved_guardrail_fix_later_deferral_preserves_watch_ownership(
     assert runner._current_run_record.fix_iterations == old.fix_iterations + 1
 
 
+async def test_approved_guardrail_fix_new_invocation_publish_failure_rolls_back(
+    approval, monkeypatch,
+):
+    runner, _, old = await finalized_guardrail_approval(approval, monkeypatch)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    publish = runner.publish_state
+    attempts = 0
+
+    async def fail_once():
+        nonlocal attempts
+        if runner.state.state == PipelineState.FIX and attempts == 0:
+            attempts += 1
+            raise OSError("state publication unavailable")
+        await publish()
+
+    monkeypatch.setattr(runner, "publish_state", fail_once)
+    with pytest.raises(OSError, match="state publication unavailable"):
+        await runner.handle_fix()
+    assert dispatched.await_count == 0
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == old.run_id
+    assert runner.state.active_invocation == old.invocations[-1]
+    admitted = next(
+        record for record in await runner._metrics_store.list_task_runs(runner.name, "PR-42")
+        if record.run_id != old.run_id
+    )
+    assert admitted.invocations == [] and admitted.fix_iterations == old.fix_iterations
+    await runner._run_cycle_body()
+    assert dispatched.await_count == 1
+    assert runner._current_run_record.run_id == admitted.run_id
+    assert runner._current_run_record.fix_iterations == old.fix_iterations + 1
+    assert await runner._metrics_store.get(old.run_id) == old
+
+
 @pytest.mark.parametrize("damage", ["counter", "attempt_index"])
 async def test_approved_guardrail_fix_rejects_changed_admitted_accounting(
     approval, monkeypatch, damage,
