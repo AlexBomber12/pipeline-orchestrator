@@ -29,6 +29,7 @@ from src.daemon import git_ops
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
 from src.daemon.quarantine import (
     blocking_quarantine_labels,
+    is_continued_size_label,
     is_fixing_size_label,
 )
 from src.github import prs as gh_prs
@@ -948,7 +949,8 @@ class RecoveryMixin:
 
         A size-ok or legacy size label can outlive a later guardrail whose
         GitHub label write failed. A confirmed TODO task header with a matching
-        open PR is durable evidence that this approval completed.
+        open PR is durable evidence that this approval completed. Size labels
+        only help retain an ERROR PR here; they never promote it to WATCH.
         """
         for task in tasks:
             header = getattr(self, "_recovery_task_headers", {}).get(task.pr_id)
@@ -961,6 +963,10 @@ class RecoveryMixin:
             if pr is not None and (
                 header.blocked_reason == SuppressionReason.GUARDRAIL.value
                 or any(is_fixing_size_label(label) for label in pr.quarantine_labels)
+                or (
+                    header.blocked_reason == SuppressionReason.CRASH.value
+                    and any(is_continued_size_label(label) for label in pr.quarantine_labels)
+                )
             ):
                 self.log_event(
                     f"[RECOVERY] ERROR task {task.pr_id} retains PR #{pr.number}; "
@@ -1335,7 +1341,11 @@ class RecoveryMixin:
 
         if unresolved_error_pr is not None:
             task, pr = unresolved_error_pr
-            fixing = any(is_fixing_size_label(label) for label in pr.quarantine_labels)
+            header = self._recovery_task_headers.get(task.pr_id)
+            fixing = any(is_fixing_size_label(label) for label in pr.quarantine_labels) or (
+                header is not None and header.blocked_reason == SuppressionReason.CRASH.value
+                and any(is_continued_size_label(label) for label in pr.quarantine_labels)
+            )
             self.state = self.state.model_copy(update={
                 "current_task": task,
                 "current_pr": pr,

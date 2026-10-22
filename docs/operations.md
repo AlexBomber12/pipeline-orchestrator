@@ -197,8 +197,10 @@ a successful FIX it commits `status: TODO`, binds the continuation marker to
 the resulting HEAD, and removes `size-fix` last. WATCH only retries failed
 marker cleanup after confirming the TODO header on the remote base and a
 quiescent checkout. Marker setup failures after the ERROR write park the task
-for operator Retry. Startup refreshes the base ref and derives DOING from the
-TODO header and matching open PR. An unresolved FIX with an ERROR header
+for operator Retry. If Redis is lost between the ERROR write and attaching
+`size-fix`, the existing `size-ok` label helps recovery retain the matching PR
+in ERROR; it never authorizes WATCH. Startup refreshes the base ref and
+derives DOING from the TODO header and matching open PR. An unresolved FIX with an ERROR header
 recovers into ERROR for operator Retry. CODING with an existing
 continuation PR returns to WATCH.
 Startup recovery also checks the checkout for unpublished work and active

@@ -871,7 +871,10 @@ async def test_status_clearance_rehydrates_stale_base_ref_after_redis_loss(appro
     assert git(repo, "rev-parse", "refs/remotes/origin/main") != stale_base
 
 
-async def test_in_progress_size_fix_recovers_as_error_with_empty_redis(approval, monkeypatch):
+@pytest.mark.parametrize("marker_attached", [False, True])
+async def test_in_progress_size_fix_recovers_as_error_with_empty_redis(
+    approval, monkeypatch, marker_attached,
+):
     runner, _, repo, remote = approval
     use_real_status_writer(runner, remote, monkeypatch)
     await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
@@ -895,15 +898,18 @@ async def test_in_progress_size_fix_recovers_as_error_with_empty_redis(approval,
     assert await runner._commit_task_status_change(
         command.task, "ERROR", "Size FIX in progress", blocked_reason=SuppressionReason.CRASH,
     )
-    labels.add(fixing_size_label(command.pr.head_sha))
+    if marker_attached:
+        labels.add(fixing_size_label(command.pr.head_sha))
 
-    fresh = await recover_without_redis(repo, remote, live, monkeypatch, suffix="fresh-in-progress-fix")
+    fresh = await recover_without_redis(
+        repo, remote, live, monkeypatch, suffix=f"fresh-in-progress-fix-{marker_attached}",
+    )
 
     assert fresh.state.state == PipelineState.ERROR
     assert fresh.state.current_pr.number == command.pr.number
     assert fresh.state.current_task.status == TaskStatus.ERROR
     assert "Size FIX outcome unresolved" in fresh.state.error_message
-    assert fixing_size_label(command.pr.head_sha) in fresh.state.current_pr.quarantine_labels
+    assert (fixing_size_label(command.pr.head_sha) in fresh.state.current_pr.quarantine_labels) == marker_attached
 
 
 async def test_size_recovery_keeps_committed_status_when_marker_is_unavailable(approval, monkeypatch):
