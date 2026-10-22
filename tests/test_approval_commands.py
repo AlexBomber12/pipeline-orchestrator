@@ -553,7 +553,9 @@ async def test_approved_guardrail_fix_credential_deferral_retries_from_watch(
     assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
 
 
-@pytest.mark.parametrize("boundary", ["before_reset", "before_launch"])
+@pytest.mark.parametrize(
+    "boundary", ["before_reset", "after_checkout", "before_launch", "pause_before_launch"],
+)
 async def test_approved_guardrail_fix_preserves_work_arriving_after_admission(
     approval, monkeypatch, boundary,
 ):
@@ -570,19 +572,35 @@ async def test_approved_guardrail_fix_preserves_work_arriving_after_admission(
 
         monkeypatch.setattr(daemon_fix, "retry_transient", edit_during_fetch)
         await runner.handle_fix()
+    elif boundary == "after_checkout":
+        git_call = daemon_fix.git_ops._git
+
+        def edit_after_checkout(repo_path, *args, **kwargs):
+            result = git_call(repo_path, *args, **kwargs)
+            if args[:2] == ("checkout", "fix/pr-42"):
+                work.write_text("new editor work\n")
+            return result
+
+        monkeypatch.setattr(daemon_fix.git_ops, "_git", edit_after_checkout)
+        await runner.handle_fix()
     else:
         publish = runner.publish_state
 
         async def edit_after_publish():
             await publish()
             if runner.state.state == PipelineState.FIX:
-                work.write_text("new editor work\n")
+                if boundary == "pause_before_launch":
+                    runner.state.user_paused = True
+                else:
+                    work.write_text("new editor work\n")
 
         monkeypatch.setattr(runner, "publish_state", edit_after_publish)
         with pytest.raises(RuntimeError, match="Approved checkout changed before FIX launch"):
             await runner.handle_fix()
     assert dispatched.await_count == 0
-    assert work.read_text() == "new editor work\n"
+    assert work.read_text() == (
+        "implementation\n" if boundary == "pause_before_launch" else "new editor work\n"
+    )
     assert runner.state.state == PipelineState.WATCH
     assert runner._current_run_record.run_id == old.run_id
     assert await runner._metrics_store.get(old.run_id) == old
