@@ -178,10 +178,14 @@ def test_get_pr_state_returns_none_continues_normal_watch(
 def test_log_event_on_external_merged(monkeypatch: pytest.MonkeyPatch) -> None:
     pr = _watch_pr(number=5)
     runner = _seed_watch_runner(monkeypatch, pr, pr_state="MERGED")
+
+    async def fake_commit(*args: Any, **kwargs: Any) -> bool:
+        return True
+
     monkeypatch.setattr(
         PipelineRunner,
         "_commit_task_status_change",
-        lambda *args, **kwargs: True,
+        fake_commit,
     )
 
     asyncio.run(runner.handle_watch())

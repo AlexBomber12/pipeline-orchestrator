@@ -1618,32 +1618,6 @@ def scan_pr_diff(
                 )
             )
     config = daemon_config or DaemonConfig()
-    adds, _dels, _files, files_with_adds = _count_diff_size(diff_text)
-    lockfile_paths = _classify_files_lockfile_exempt(diff_text)
-    lockfile_additions = _count_additions_in_paths(diff_text, lockfile_paths)
-    effective_additions = adds - lockfile_additions
-
-    if (
-        effective_additions >= config.large_diff_addition_threshold
-        or files_with_adds >= config.large_diff_files_threshold
-    ):
-        excerpt = (
-            f"+{effective_additions} LOC across {files_with_adds} files "
-            f"({len(lockfile_paths)} lockfile excluded). "
-            f"Threshold: +{config.large_diff_addition_threshold} LOC or "
-            f"{config.large_diff_files_threshold} files."
-        )
-        violations.append(
-            GuardrailViolation(
-                tier=2,
-                category="large_diff_threshold",
-                excerpt=_clip_excerpt(excerpt),
-                rule=(
-                    "AGENTS.md prohibits scope expansion beyond task spec. "
-                    "Large diffs require operator review."
-                ),
-            )
-        )
     for file_path, line_in_diff, category in _scan_secrets_group_a_in_additions(
         diff_text
     ):
@@ -1745,3 +1719,22 @@ def scan_pr_diff(
                 )
             )
     return violations
+
+
+def diff_size_review_signal(diff_text: str, daemon_config: DaemonConfig | None = None) -> str | None:
+    """Describe an unusually large diff for review without blocking the PR."""
+    config = daemon_config or DaemonConfig()
+    adds, _dels, _files, files_with_adds = _count_diff_size(diff_text)
+    lockfile_paths = _classify_files_lockfile_exempt(diff_text)
+    effective_additions = adds - _count_additions_in_paths(diff_text, lockfile_paths)
+    if (
+        effective_additions >= config.large_diff_addition_threshold
+        or files_with_adds >= config.large_diff_files_threshold
+    ):
+        return (
+            f"+{effective_additions} LOC across {files_with_adds} files "
+            f"({len(lockfile_paths)} lockfile excluded). "
+            f"Review signal: +{config.large_diff_addition_threshold} LOC or "
+            f"{config.large_diff_files_threshold} files."
+        )
+    return None

@@ -475,14 +475,25 @@ def test_reset_testbed_session_resets_repo_and_redis_once() -> None:
         calls.append(f"clear:{slug}")
         return 2
 
+    def restart(cmd, **kwargs):
+        calls.append("restart")
+        assert cmd == ["docker", "compose", "-f", "docker-compose.test.yml", "restart", "daemon-test"]
+        assert kwargs["check"] is True
+        return _completed()
+
     sys.modules.pop(module_name, None)
     try:
         with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
             e2e_conftest = importlib.import_module(module_name)
 
         with (
+            patch.object(
+                e2e_conftest, "_stop_daemon_and_wait_paused",
+                side_effect=lambda slug: calls.append(f"stop:{slug}"),
+            ),
             patch.object(e2e_conftest, "reset_testbed_full", side_effect=reset_full),
             patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=clear_redis),
+            patch.object(e2e_conftest.subprocess, "run", side_effect=restart),
         ):
             fixture = e2e_conftest._reset_testbed_session.__wrapped__()
             assert next(fixture) == {"prs_closed": 0, "redis_keys_deleted": 2}
@@ -491,7 +502,12 @@ def test_reset_testbed_session_resets_repo_and_redis_once() -> None:
     finally:
         sys.modules.pop(module_name, None)
 
-    assert calls == [f"reset:{e2e_conftest.TESTBED_SLUG}", f"clear:{e2e_conftest.TESTBED_SLUG}"]
+    assert calls == [
+        f"stop:{e2e_conftest.TESTBED_SLUG}",
+        f"reset:{e2e_conftest.TESTBED_SLUG}",
+        f"clear:{e2e_conftest.TESTBED_SLUG}",
+        "restart",
+    ]
 
 
 def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:

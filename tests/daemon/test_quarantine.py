@@ -13,7 +13,11 @@ from src.daemon import runner as runner_module
 from src.daemon.guardrails import GuardrailViolation
 from src.daemon.handlers import merge as merge_module
 from src.daemon.handlers import watch as watch_module
-from src.daemon.quarantine import apply_quarantine_label_for_violation
+from src.daemon.quarantine import (
+    apply_quarantine_label_for_violation,
+    is_continued_size_label,
+    is_fixing_size_label,
+)
 from src.models import (
     CIStatus,
     PipelineState,
@@ -32,6 +36,17 @@ def _violation(category: str = "large_diff_threshold") -> GuardrailViolation:
         excerpt="+900 LOC",
         rule="Large diffs require operator review",
     )
+
+
+@pytest.mark.parametrize(
+    ("predicate", "prefix"),
+    [(is_continued_size_label, "size-ok:"), (is_fixing_size_label, "size-fix:")],
+)
+def test_size_markers_require_published_head(predicate, prefix: str) -> None:
+    assert predicate(prefix + "a" * 40)
+    assert predicate(prefix + "A" * 40)
+    for suffix in ("", "pending", "a" * 39, "a" * 41, "g" * 40):
+        assert not predicate(prefix + suffix)
 
 
 def test_quarantine_apply_creates_label_and_comment(
@@ -287,7 +302,7 @@ def test_label_rehydrate_projects_quarantine_without_task_id() -> None:
             PRInfo(
                 number=10,
                 branch="pr-unknown",
-                quarantine_labels={"quarantine:large_diff"},
+                quarantine_labels={"quarantine:workflow"},
             )
         )
     )
@@ -350,7 +365,7 @@ def test_label_removal_check_keeps_labeled_pr(monkeypatch: pytest.MonkeyPatch) -
     runner.state.quarantined_prs.add(10)
     monkeypatch.setattr(
         "src.github.gh_runner.run_gh",
-        lambda *a, **kw: "quarantine:large_diff\n",
+        lambda *a, **kw: "quarantine:workflow\n",
     )
 
     asyncio.run(runner._detect_external_quarantine_release(10))

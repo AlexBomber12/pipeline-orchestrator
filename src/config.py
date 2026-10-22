@@ -296,6 +296,7 @@ class DaemonConfig(BaseModel):
     guardrail_notification_min_tier: int = Field(default=1, ge=1, le=2)
     guardrail_notification_timeout_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
     dashboard_base_url: str | None = Field(default=None)
+    # Retained for existing config files; these now trigger a review event only.
     large_diff_addition_threshold: int = Field(default=1500, ge=100)
     large_diff_files_threshold: int = Field(default=30, ge=2)
     mass_deletion_threshold: int = Field(default=20, ge=1)

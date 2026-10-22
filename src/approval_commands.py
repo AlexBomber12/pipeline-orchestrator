@@ -37,6 +37,8 @@ class ApprovalCommand(BaseModel):
     requested_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     active: bool = True
     superseded: bool = False
+    size_only: bool = False
+    task_status_committed: bool = False
 
 
 def approval_key(repo: str, binding: str) -> str:

@@ -766,6 +766,7 @@ def test_scan_pr_diff_under_threshold_no_violation() -> None:
     assert "large_diff_threshold" not in [
         violation.category for violation in scan_pr_diff(diff_text)
     ]
+    assert guardrails.diff_size_review_signal(diff_text) is None
 
 
 def test_scan_pr_diff_uses_supplied_daemon_config_thresholds() -> None:
@@ -775,18 +776,17 @@ def test_scan_pr_diff_uses_supplied_daemon_config_thresholds() -> None:
         large_diff_files_threshold=30,
     )
 
-    violations = scan_pr_diff(diff_text, daemon_config=daemon_config)
-
-    assert [violation.category for violation in violations] == [
-        "large_diff_threshold"
-    ]
-    assert "Threshold: +100 LOC or 30 files." in violations[0].excerpt
+    assert scan_pr_diff(diff_text, daemon_config=daemon_config) == []
+    assert "Review signal: +100 LOC or 30 files." in guardrails.diff_size_review_signal(
+        diff_text, daemon_config
+    )
 
 
 def test_scan_pr_diff_over_addition_threshold_flagged() -> None:
     diff_text = _diff_for_file("src/large.py", additions=1600)
 
-    _assert_diff_categories(diff_text, ["large_diff_threshold"])
+    _assert_diff_categories(diff_text, [])
+    assert "+1600 LOC" in guardrails.diff_size_review_signal(diff_text)
 
 
 def test_scan_pr_diff_over_file_threshold_flagged() -> None:
@@ -794,7 +794,8 @@ def test_scan_pr_diff_over_file_threshold_flagged() -> None:
         _diff_for_file(f"src/file_{index}.py", additions=50) for index in range(31)
     )
 
-    _assert_diff_categories(diff_text, ["large_diff_threshold"])
+    _assert_diff_categories(diff_text, [])
+    assert "31 files" in guardrails.diff_size_review_signal(diff_text)
 
 
 def test_scan_pr_diff_lockfile_additions_excluded() -> None:
@@ -816,13 +817,11 @@ def test_scan_pr_diff_excerpt_includes_counts() -> None:
         "src/large.py", additions=1600
     )
 
-    violations = scan_pr_diff(diff_text)
-
-    assert len(violations) == 1
-    assert violations[0].category == "large_diff_threshold"
-    assert "+1600 LOC" in violations[0].excerpt
-    assert "2 files" in violations[0].excerpt
-    assert "1 lockfile excluded" in violations[0].excerpt
+    assert scan_pr_diff(diff_text) == []
+    signal = guardrails.diff_size_review_signal(diff_text)
+    assert "+1600 LOC" in signal
+    assert "2 files" in signal
+    assert "1 lockfile excluded" in signal
 
 
 def test_scan_pr_diff_tier_1_violations_still_flagged() -> None:
@@ -834,7 +833,7 @@ def test_scan_pr_diff_tier_1_violations_still_flagged() -> None:
     )
 
     _assert_diff_categories(
-        diff_text, ["permissions_escalation", "large_diff_threshold"]
+        diff_text, ["permissions_escalation"]
     )
 
 
@@ -901,7 +900,7 @@ def test_scan_pr_diff_prior_violations_still_flagged() -> None:
         _delete_diff_for_file(f"src/file_{index}.py") for index in range(20)
     )
 
-    _assert_diff_categories(diff_text, ["large_diff_threshold", "mass_file_deletion"])
+    _assert_diff_categories(diff_text, ["mass_file_deletion"])
 
 
 def _governance_violations(diff_text: str) -> list[GuardrailViolation]:
@@ -1043,7 +1042,7 @@ def test_scan_governance_prior_layers_still_flagged() -> None:
 
     _assert_diff_categories(
         diff_text,
-        ["large_diff_threshold", "governance_file_modified"],
+        ["governance_file_modified"],
     )
 
 

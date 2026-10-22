@@ -169,6 +169,54 @@ passes on every repository.
 
 ## Recovery from ERROR
 
+Diff size is a review signal, not a guardrail decision. The daemon logs the
+size once per scanned PR HEAD and continues through the normal CI, Codex
+review, FIX, and MERGE gates. Existing `daemon.large_diff_addition_threshold`
+and `daemon.large_diff_files_threshold` configuration values remain accepted;
+they now control only when that informational event appears. Deployments do
+not need to remove their existing settings.
+
+After upgrading, a persisted `large_diff_threshold` cancellation for a bound
+open PR is reconciled through the same task, PR, HEAD, checkout, and process
+checks as an operator approval. A previously deferred approval resumes when
+those checks pass. The Redis approval transaction validates the current
+cancellation and clears it before any GitHub label write. The daemon then
+commits `status: TODO` to the task header on the configured base branch. A
+matching open PR makes that durable header derive DOING during startup
+recovery. A failed status write stays retryable through the applied approval
+receipt; no continuation label is written until the status commit succeeds.
+Afterward, the daemon adds the informational `size-ok:<PR HEAD SHA>` label and
+removes the obsolete `quarantine:large_diff` label. Failed GitHub label writes
+are retried while the receipt is available. These labels are not authority to
+clear an ERROR task: they can survive a later, unrelated guardrail whose label
+write failed. An ERROR task with a matching open PR stays in ERROR for operator
+recovery after Redis loss, even if an old size label remains. Before FIX
+dispatch, the daemon first commits `status: ERROR` with a crash reason, then
+adds `size-fix:<PR HEAD SHA>` while retaining the continuation marker. After
+the coder exits successfully and cleanup is confirmed, the daemon saves a
+completion receipt bound to its invocation, task generation, PR, and resulting
+HEAD. WATCH verifies the live PR and quiescent checkout before writing
+`status: TODO`; a transient status-write failure is retried on later WATCH
+cycles without rerunning the coder. It then binds the continuation marker to
+the resulting HEAD and removes `size-fix` last. Failed label cleanup is also
+retried. A retained Redis receipt allows restart recovery while the remote
+header is still ERROR. If that receipt is lost before TODO is durable, the
+ERROR header remains parked for operator Retry; labels and stale DOING state
+do not reconstruct successful coder completion. Marker setup failures after
+the ERROR write also park the task. If Redis is lost between the ERROR write and attaching
+`size-fix`, the existing `size-ok` label helps recovery retain the matching PR
+in ERROR; it never authorizes WATCH. Startup refreshes the base ref and
+derives DOING from the TODO header and matching open PR. An unresolved FIX with an ERROR header
+recovers into ERROR for operator Retry. CODING with an existing
+continuation PR returns to WATCH.
+An externally merged PR remains in WATCH until its DONE task-status write is
+confirmed; a transient write failure is retried on the next WATCH cycle.
+Startup recovery also checks the checkout for unpublished work and active
+processes. It fetches a missing verified PR HEAD without moving local refs;
+unavailable evidence leaves recovery pending for the next cycle.
+Unavailable GitHub evidence or unpublished task work leaves the PR parked
+with a specific recovery reason; no branch synchronization is performed.
+
 When a task ships its terminal failure state to ERROR (frontmatter
 status:ERROR), the operator has two recovery affordances:
 

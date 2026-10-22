@@ -6,12 +6,14 @@ import asyncio
 import logging
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 from src.branch_context import BranchContext
 from src.cancellation import (
     CancellationCause,
     safe_record_cancellation_cause,
 )
+from src.cancellation.storage import task_spec_content_hash
 from src.daemon import (
     fix_codex_trigger,
     fix_escalation,
@@ -21,13 +23,19 @@ from src.daemon import (
 )
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers.breach import BreachMixin
-from src.daemon.quarantine import apply_quarantine_label_for_violation
+from src.daemon.quarantine import (
+    apply_quarantine_label_for_violation,
+    continued_size_label,
+    fixing_size_label,
+    is_continued_size_label,
+    is_fixing_size_label,
+)
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.daemon.selector import CoderSelectionUnavailable
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github.reviewer_policy import ReviewerPolicy
-from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus
+from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus, SizeFixCompletion, TaskStatus
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
 
@@ -510,6 +518,22 @@ class FixMixin(BreachMixin):
                     self.log_event("[FIX] PR HEAD changed before review dispatch; returning to WATCH.")
                     self.state.state = PipelineState.WATCH
                     return
+        if current_pr is not None and any(
+            is_fixing_size_label(label) for label in current_pr.quarantine_labels
+        ):
+            self.log_event("[FIX] Prior size FIX outcome is unresolved; deferring dispatch.")
+            self.state.state = PipelineState.WATCH
+            return
+        if current_pr is not None and any(
+            is_continued_size_label(label) for label in current_pr.quarantine_labels
+        ):
+            if self.state.current_task is None or not await self._commit_task_status_change(
+                self.state.current_task, "ERROR", "Size FIX in progress",
+                blocked_reason=SuppressionReason.CRASH,
+            ):
+                self.log_event("[FIX] Size FIX task status update deferred; retaining continuation marker.")
+                self.state.state = PipelineState.WATCH
+                return
         if not self._reserve_coder_credentials(
             coder_name,
             invocation_kwargs=fix_kwargs,
@@ -519,6 +543,46 @@ class FixMixin(BreachMixin):
                 "its credential location."
             )
             return
+        size_fix_marker: str | None = None
+
+        async def park_size_fix_setup(reason: str) -> None:
+            self._release_coder_credentials()
+            await self._transition_to_error(
+                f"Size FIX outcome unresolved; operator Retry or revised approval required. {reason}",
+                save_run_record_as=None, publish=False, log_prefix="[FIX]", commit_task_status=True,
+            )
+            task = self.state.current_task
+            if task is not None:
+                self.state.current_task = task.model_copy(update={"status": TaskStatus.ERROR})
+                self.state.current_queue = [
+                    self.state.current_task if item.pr_id == task.pr_id else item
+                    for item in (self.state.current_queue or [task])
+                ]
+
+        if current_pr is not None:
+            if any(is_continued_size_label(label) for label in current_pr.quarantine_labels):
+                try:
+                    size_fix_marker = fixing_size_label(current_pr.head_sha)
+                    gh_runner.run_gh(
+                        ["label", "create", size_fix_marker, "--color", "B60205",
+                         "--description", "Size continuation FIX in progress"],
+                        repo=self.owner_repo,
+                    )
+                except Exception as exc:
+                    if not fix_escalation._is_label_already_exists_error(exc):
+                        self.log_event(f"[FIX] Size FIX marker creation deferred: {exc}")
+                        await park_size_fix_setup(str(exc))
+                        return
+                try:
+                    gh_runner.run_gh(
+                        ["pr", "edit", str(current_pr.number), "--add-label", size_fix_marker],
+                        repo=self.owner_repo,
+                    )
+                except Exception as exc:
+                    self.log_event(f"[FIX] Size FIX marker application deferred: {exc}")
+                    await park_size_fix_setup(str(exc))
+                    return
+                current_pr.quarantine_labels.add(size_fix_marker)
         heartbeat: asyncio.Task[None] | None = None
         run_record = self._current_run_record
         previous_profile_id = run_record.profile_id if run_record is not None else None
@@ -766,6 +830,63 @@ class FixMixin(BreachMixin):
                     log_prefix="[FIX]",
                 )
                 return None
+
+        async def finish_size_fix_marker(head_after: str) -> bool:
+            if size_fix_marker is None:
+                return True
+            try:
+                continued_size_label(head_after)
+            except ValueError:
+                self.log_event("[FIX] Published size FIX HEAD unavailable; retaining recovery marker.")
+                return False
+            task = self.state.current_task
+            invocation = self.state.active_invocation
+            record = self._current_run_record
+            remote_status, remote_reason, revision = (
+                self._remote_frontmatter_error_status_for_current_task()
+            )
+            if (
+                remote_status != "error" or remote_reason != SuppressionReason.CRASH
+                or revision is None or invocation is None or invocation.phase != "fix"
+                or invocation.run_id is None or record is None
+                or record.run_id != invocation.run_id or record.task_id != task.pr_id
+                or not record.invocations or record.invocations[-1] != invocation
+            ):
+                self.log_event("[FIX] Size FIX completion evidence unavailable; retaining recovery marker.")
+                return False
+            try:
+                suppression = await self._suppression_record_for_task(task.pr_id)
+            except Exception as exc:
+                self.log_event(f"[FIX] Size FIX suppression check deferred: {exc}")
+                return False
+            if suppression is not None:
+                self.log_event("[FIX] Later task suppression prevents size FIX completion.")
+                return False
+            try:
+                local_hash = task_spec_content_hash(
+                    (Path(self.repo_path) / (task.task_file or "")).read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError) as exc:
+                self.log_event(f"[FIX] Size FIX task generation unavailable: {exc}")
+                return False
+            if record.task_spec_hash and record.task_spec_hash != local_hash:
+                self.log_event("[FIX] Size FIX task generation changed; retaining recovery marker.")
+                return False
+            receipt = SizeFixCompletion(
+                task_id=task.pr_id, branch=task.branch or "", pr_number=current_pr.number,
+                head_sha=head_after, fixing_label=size_fix_marker,
+                error_revision=revision, task_spec_hash=local_hash, invocation=invocation,
+            )
+            self.state.size_fix_completion = receipt
+            self.state.state = PipelineState.WATCH
+            try:
+                await self.publish_state()
+            except Exception as exc:
+                self.log_event(f"[FIX] Size FIX completion receipt unavailable: {exc}")
+            # WATCH verifies the live PR revision and checkout before it
+            # attempts the final status write. An unavailable Redis receipt
+            # remains usable in this process; losing it parks the ERROR task.
+            return True
 
         def remote_branch_contains_head(branch: str, head_after: str) -> bool:
             return (
@@ -1029,6 +1150,12 @@ class FixMixin(BreachMixin):
                 and await no_push_policy.maybe_escalate(self.state.current_pr)
             ):
                 return
+            if not await finish_size_fix_marker(current_pr.head_sha if remote_no_push and current_pr else head_after):
+                await self._transition_to_error(
+                    "Size FIX completion evidence unavailable; operator Retry or revised approval required.",
+                    save_run_record_as=None, publish=False, log_prefix="[FIX]",
+                )
+                return
             self.state.state = PipelineState.WATCH
             return
 
@@ -1039,5 +1166,11 @@ class FixMixin(BreachMixin):
         ):
             return
         if await pause_for_stop_after_bookkeeping():
+            return
+        if not await finish_size_fix_marker(head_after):
+            await self._transition_to_error(
+                "Size FIX completion evidence unavailable; operator Retry or revised approval required.",
+                save_run_record_as=None, publish=False, log_prefix="[FIX]",
+            )
             return
         self.state.state = PipelineState.WATCH

@@ -16,10 +16,12 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from src.cancellation.storage import task_spec_content_hash
 from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, DaemonConfig, RepoConfig, TrustedReviewerIdentity
 from src.daemon import runner as runner_module
 from src.daemon.handlers import watch as watch_module
+from src.daemon.quarantine import continued_size_label, fixing_size_label
 from src.daemon.runner import PipelineRunner
 from src.github import cache as gh_cache
 from src.github import reviews as gh_reviews
@@ -27,12 +29,14 @@ from src.keyspace import pipeline_state
 from src.models import (
     CIStatus,
     FeedbackCheckResult,
+    InvocationSnapshot,
     PipelineState,
     PRInfo,
     PublicationMigration,
     QueueTask,
     RepoState,
     ReviewStatus,
+    SizeFixCompletion,
     TaskStatus,
 )
 from src.publication_migration import (
@@ -43,6 +47,7 @@ from src.publication_migration import (
     command_key as migration_command_key,
 )
 from src.publication_migration import enqueue as enqueue_migration
+from src.subsource_registry import SuppressionReason
 
 from tests.runner import _helpers as h
 
@@ -118,6 +123,7 @@ def test_watch_620_evidence_drives_fix_without_rereading(
     def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
         result = PRInfo(
             number=42, branch="pr-459", head_sha=head, ci_status=ci_status,
+            quarantine_labels={"quarantine:large_diff"},
             review_status=gh_reviews.get_pr_review_status(
                 repo, 42, "author", head, policy=kwargs["reviewer_policy"]
             ),
@@ -593,8 +599,10 @@ def test_retry_failed_workflow_returns_true_after_rerun(
     )
 
 
+@pytest.mark.parametrize("labels", [set(), {"quarantine:large_diff"}])
 def test_handle_watch_approved_and_green_merges(
     monkeypatch: pytest.MonkeyPatch,
+    labels: set[str],
 ) -> None:
     monkeypatch.setattr(
         "src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", AsyncMock(return_value=True)
@@ -607,6 +615,7 @@ def test_handle_watch_approved_and_green_merges(
         review_status=ReviewStatus.APPROVED,
         head_sha="green001",
         diff_scanned_at_sha="green001",
+        quarantine_labels=labels,
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
@@ -642,12 +651,12 @@ def test_handle_watch_rehydrates_quarantine_before_merge(
         review_status=ReviewStatus.APPROVED,
         head_sha="green001",
         diff_scanned_at_sha="green001",
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
     monkeypatch.setattr(
         "src.github.gh_runner.run_gh",
-        lambda cmd, **kw: "quarantine:large_diff\n",
+        lambda cmd, **kw: "quarantine:workflow\n",
     )
 
     merged: list[tuple[str, int]] = []
@@ -680,11 +689,249 @@ def test_handle_watch_rehydrates_quarantine_before_merge(
     )
 
 
+def test_watch_holds_unresolved_size_fix_marker(monkeypatch: pytest.MonkeyPatch) -> None:
+    h._patch_subprocess(monkeypatch)
+    marker = fixing_size_label("a" * 40)
+    pr = PRInfo(
+        number=5, branch="pr-001", head_sha="a" * 40,
+        ci_status=CIStatus.SUCCESS, review_status=ReviewStatus.APPROVED,
+        quarantine_labels={marker},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.ERROR)
+    asyncio.run(runner.handle_watch())
+    assert runner.state.state == PipelineState.WATCH
+    assert marker in runner.state.current_pr.quarantine_labels
+    assert any("size FIX outcome is unresolved" in entry["event"] for entry in runner.state.history)
+
+
+@pytest.mark.parametrize("status_committed", [False, True])
+def test_watch_retries_completed_size_fix_marker(
+    monkeypatch: pytest.MonkeyPatch, status_committed: bool,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    marker = fixing_size_label("a" * 40)
+    pr = PRInfo(
+        number=5, branch="pr-001", head_sha="a" * 40,
+        ci_status=CIStatus.SUCCESS, review_status=ReviewStatus.APPROVED,
+        quarantine_labels={marker},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    calls: list[list[str]] = []
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args, **kw: calls.append(args))
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
+    monkeypatch.setattr(
+        runner, "_commit_task_status_change", AsyncMock(return_value=status_committed),
+    )
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task", lambda: ("todo", None, "revision"),
+    )
+    monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker", lambda *_args: None)
+    monkeypatch.setattr("src.daemon.handlers.watch.bound_checkout_work_blocker_for_ref", lambda *a: None)
+    asyncio.run(runner.handle_watch())
+    assert runner.state.state == PipelineState.WATCH
+    if status_committed:
+        assert marker not in runner.state.current_pr.quarantine_labels
+        assert ["pr", "edit", "5", "--remove-label", marker] in calls
+        assert any("marker completed" in entry["event"] for entry in runner.state.history)
+    else:
+        assert marker in runner.state.current_pr.quarantine_labels
+        assert not any(call[:2] == ["label", "create"] for call in calls)
+        assert any("marker retry deferred" in entry["event"] for entry in runner.state.history)
+
+
+def test_watch_does_not_clear_in_progress_size_fix_after_restart(monkeypatch: pytest.MonkeyPatch) -> None:
+    h._patch_subprocess(monkeypatch)
+    marker = fixing_size_label("a" * 40)
+    pr = PRInfo(
+        number=5, branch="pr-001", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE, quarantine_labels={marker},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task", lambda: ("error", None, "revision"),
+    )
+    status_write = AsyncMock()
+    monkeypatch.setattr(runner, "_commit_task_status_change", status_write)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *a, **kw: "OPEN")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args, **kw: calls.append(args))
+
+    for _ in range(3):
+        asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert marker in runner.state.current_pr.quarantine_labels
+    status_write.assert_not_awaited()
+    assert not any("--remove-label" in args for args in calls)
+    assert any("outcome is unresolved" in entry["event"] for entry in runner.state.history)
+
+
+@pytest.mark.parametrize("changed", [
+    "task", "head", "guardrail", "reason", "rejection", "cleanup_done",
+    "missing_revision", "task_unavailable", "suppression_unavailable",
+    "remote_unavailable", "marker_missing", "pending_suppression_unavailable",
+    "pending_guardrail", "pending_todo",
+])
+def test_watch_pending_size_fix_does_not_cross_changed_binding_or_decision(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, changed: str,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    task_path = tmp_path / "tasks" / "PR-001.md"
+    task_path.parent.mkdir()
+    task_path.write_text("approved generation\n")
+    task_hash = task_spec_content_hash(task_path.read_text())
+    marker = fixing_size_label("a" * 40)
+    pr = PRInfo(number=5, branch="pr-001", pr_id="PR-001", head_sha="a" * 40,
+                quarantine_labels={marker})
+    invocation = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="run-1", attempt_index=1, phase="fix", fix_iteration=1,
+    )
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = pr
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING,
+        branch="pr-001", task_file="tasks/PR-001.md",
+    )
+    runner.state.active_invocation = invocation
+    runner.state.size_fix_completion = SizeFixCompletion(
+        task_id="PR-001", branch="pr-001", pr_number=5,
+        head_sha="a" * 40, fixing_label=marker, error_revision="e" * 64,
+        task_spec_hash=task_hash, invocation=invocation,
+    )
+    runner._current_run_record = types.SimpleNamespace(
+        run_id="run-1", task_id="PR-001", invocations=[invocation],
+        fix_iterations=1, attempt_index=1, task_spec_hash=task_hash,
+    )
+    reason = SuppressionReason.CRASH
+    if changed == "task":
+        task_path.write_text("different generation\n")
+    elif changed == "head":
+        pr.head_sha = "b" * 40
+    elif changed == "guardrail":
+        pr.quarantine_labels.add("quarantine:workflow")
+    elif changed == "reason":
+        reason = SuppressionReason.GUARDRAIL
+    elif changed == "rejection":
+        reason = SuppressionReason.OPERATOR_REJECT
+    elif changed == "cleanup_done":
+        pr.quarantine_labels = {continued_size_label("a" * 40)}
+    elif changed == "task_unavailable":
+        task_path.unlink()
+        monkeypatch.setattr(runner, "_detect_external_quarantine_release", AsyncMock())
+        original_read_text = Path.read_text
+
+        def unavailable_task(path: Path, *args, **kwargs):
+            if path == task_path:
+                raise OSError("task missing")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", unavailable_task)
+    elif changed == "marker_missing":
+        pr.quarantine_labels.clear()
+    elif changed == "pending_guardrail":
+        runner.state.size_fix_completion = None
+        pr.quarantine_labels.add("quarantine:workflow")
+    elif changed in {"pending_todo", "pending_suppression_unavailable"}:
+        runner.state.size_fix_completion = None
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_args, **_kwargs: [pr])
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_args, **_kwargs: "OPEN")
+    remote_todo_cases = {"cleanup_done", "pending_guardrail", "pending_suppression_unavailable"}
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task",
+        lambda: (("todo", None, "t" * 64) if changed in remote_todo_cases
+                 else (None, None, None) if changed == "remote_unavailable"
+                 else ("error", reason, None) if changed == "missing_revision"
+                 else ("error", reason, "e" * 64)),
+    )
+    if changed in {"suppression_unavailable", "pending_suppression_unavailable"}:
+        suppression_calls = {"count": 0}
+
+        async def unavailable_after_rehydration(_task_id: str):
+            suppression_calls["count"] += 1
+            if suppression_calls["count"] > 1:
+                raise OSError("Redis unavailable")
+            return None
+
+        monkeypatch.setattr(
+            runner, "_suppression_record_for_task",
+            unavailable_after_rehydration,
+        )
+    monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker", lambda *_args: None)
+    monkeypatch.setattr("src.daemon.handlers.watch.bound_checkout_work_blocker_for_ref", lambda *_args: None)
+    write = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_commit_task_status_change", write)
+    asyncio.run(runner.handle_watch())
+    write.assert_not_awaited()
+    if changed == "cleanup_done":
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.size_fix_completion is None
+        return
+    if changed in {
+        "missing_revision", "task_unavailable", "suppression_unavailable",
+        "remote_unavailable", "pending_suppression_unavailable", "pending_guardrail", "pending_todo",
+    }:
+        assert runner.state.state == PipelineState.WATCH
+        return
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.size_fix_completion is None
+    if changed != "marker_missing":
+        assert marker in runner.state.current_pr.quarantine_labels
+
+
+@pytest.mark.parametrize("blocker", ["active", "unavailable"])
+def test_watch_keeps_size_fix_marker_while_coder_owns_checkout(
+    monkeypatch: pytest.MonkeyPatch, blocker: str,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    marker = fixing_size_label("a" * 40)
+    pr = PRInfo(number=5, branch="pr-001", head_sha="a" * 40, quarantine_labels={marker})
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *a, **kw: "OPEN")
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001")
+    runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task", lambda: ("todo", None, "revision"),
+    )
+    def process_blocker(*_args):
+        if blocker == "unavailable":
+            raise OSError("process inspection unavailable")
+        return "Coder still uses checkout"
+
+    monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker", process_blocker)
+    status_write = AsyncMock()
+    monkeypatch.setattr(runner, "_commit_task_status_change", status_write)
+    calls: list[list[str]] = []
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args, **kw: calls.append(args))
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.WATCH
+    assert marker in runner.state.current_pr.quarantine_labels
+    status_write.assert_not_awaited()
+    assert not any("--remove-label" in args for args in calls)
+
+
 def test_watch_quarantine_rehydrate_ignores_invalid_or_existing_pr() -> None:
     runner = h._make_runner()
     invalid = types.SimpleNamespace(
         number="5",
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
 
     asyncio.run(runner._rehydrate_quarantine_from_pr_labels(invalid))
@@ -695,7 +942,7 @@ def test_watch_quarantine_rehydrate_ignores_invalid_or_existing_pr() -> None:
     existing = PRInfo(
         number=5,
         branch="pr-001",
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
 
     asyncio.run(runner._rehydrate_quarantine_from_pr_labels(existing))
@@ -1723,6 +1970,33 @@ def test_handle_watch_captures_success_merged_on_external_merge(
     )
     assert len(recent) == 1
     assert recent[0].exit_reason == "success_merged"
+
+
+def test_external_merge_retries_failed_done_status_before_releasing_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_args, **_kwargs: "MERGED")
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001", pr_id="PR-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.ERROR,
+        branch="pr-001", task_file="tasks/PR-001.md",
+    )
+    write = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(runner, "_commit_task_status_change", write)
+    saved = AsyncMock()
+    monkeypatch.setattr(runner, "_save_current_run_record", saved)
+    asyncio.run(runner.handle_watch())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task.pr_id == "PR-001"
+    saved.assert_not_awaited()
+    asyncio.run(runner.handle_watch())
+    assert write.await_count == 2
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    saved.assert_awaited_once()
 
 
 def test_handle_watch_captures_closed_unmerged(
@@ -4286,6 +4560,27 @@ def test_scan_pr_diff_once_runs_when_cache_mismatches_head_sha(
     assert fetched == [(runner.owner_repo, 8)]
     assert runner.state.current_pr.diff_scanned_at_sha == "deadbeef"
     assert runner.state.state != PipelineState.ERROR
+
+
+def test_large_diff_is_review_signal_after_each_push(monkeypatch: pytest.MonkeyPatch) -> None:
+    import re as _re
+
+    monkeypatch.setattr(watch_module.guardrails, "_DIFF_PATTERNS", {"never": _re.compile("NEVER")})
+    diff = "diff --git a/src/large.py b/src/large.py\n--- a/src/large.py\n+++ b/src/large.py\n"
+    diff += "".join(f"+line {index}\n" for index in range(1600))
+    monkeypatch.setattr("src.github.prs.get_pr_diff", lambda *_: diff)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=8, branch="pr-008", head_sha="first")
+
+    assert asyncio.run(runner._scan_pr_diff_once())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.quarantined_prs == set()
+    assert sum("[WATCH] PR #8 diff size review signal" in item["event"] for item in runner.state.history) == 1
+    assert not asyncio.run(runner._scan_pr_diff_once())
+    runner.state.current_pr.head_sha = "second"
+    assert asyncio.run(runner._scan_pr_diff_once())
+    assert sum("[WATCH] PR #8 diff size review signal" in item["event"] for item in runner.state.history) == 2
 
 
 def test_scan_pr_diff_once_leaves_cache_unchanged_on_fetch_failure(

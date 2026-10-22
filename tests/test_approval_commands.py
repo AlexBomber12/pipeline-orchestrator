@@ -23,9 +23,13 @@ from src.approval_commands import (
 )
 from src.cancellation.storage import CancellationCause, cause_key, index_key
 from src.daemon import approval_commands as daemon_approval
+from src.daemon import recovery as daemon_recovery
 from src.daemon.guardrails import GuardrailViolation
+from src.daemon.quarantine import OBSOLETE_SIZE_LABEL, continued_size_label, fixing_size_label
 from src.keyspace import control_stop, pipeline_state
 from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
+from src.subsource_registry import SuppressionReason
+from src.task_status import MergedState
 
 from tests.runner import _helpers as h
 
@@ -70,7 +74,7 @@ def git(repo, *args):
 
 def snapshot(repo):
     return (
-        git(repo, "symbolic-ref", "HEAD"),
+        git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
         git(repo, "rev-parse", "HEAD"),
         git(repo, "show-ref"),
         (repo / ".git/index").read_bytes(),
@@ -79,6 +83,30 @@ def snapshot(repo):
             for p in repo.rglob("*")
             if p.is_file() and ".git" not in p.relative_to(repo).parts
         },
+    )
+
+
+async def recover_without_redis(repo, remote, pr, monkeypatch, *, suffix="fresh"):
+    """Rebuild from the remote task header and modeled live GitHub PR."""
+    fresh_repo = repo.parent / suffix
+    git(repo.parent, "clone", "--branch", "main", str(remote), str(fresh_repo))
+    fresh = h._make_runner()
+    fresh.repo_path = str(fresh_repo)
+    fresh.repo_config.url = fresh.state.url = str(remote)
+    monkeypatch.setattr(daemon_recovery.gh_prs, "get_open_prs", lambda *a, **k: [pr])
+    monkeypatch.setattr(
+        daemon_recovery, "_resolve_merged_state", lambda *a, **k: MergedState(set(), set(), True),
+    )
+    assert fresh.redis.store == {}
+    assert await fresh.recover_state()
+    return fresh
+
+
+def use_real_status_writer(runner, remote, monkeypatch):
+    runner.repo_config.url = runner.state.url = str(remote)
+    monkeypatch.setattr(
+        runner, "_commit_task_status_change",
+        runner.__class__._commit_task_status_change.__get__(runner),
     )
 
 
@@ -141,11 +169,13 @@ async def approval(tmp_path, monkeypatch):
     await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
     command = build_approval(runner.name, runner.state, raw, repo)
     monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda *a, **k: "")
     monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock(side_effect=AssertionError("approval must not clone")))
     monkeypatch.setattr(runner, "preflight", AsyncMock(side_effect=AssertionError("approval must not reset")))
     monkeypatch.setattr(runner, "handle_coding", AsyncMock(side_effect=AssertionError("approval must not code")))
     monkeypatch.setattr(runner, "handle_watch", AsyncMock())
     monkeypatch.setattr(runner, "_check_github_api_budget", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     return runner, command, repo, remote
 
 
@@ -245,6 +275,7 @@ async def test_stale_approval_never_clears_other_work(approval, monkeypatch, cha
         git(repo, "commit", "-am", "revised requirements")
     elif changed == "pr":
         monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+        monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "CLOSED")
     elif changed == "failure":
         await runner.redis.set(
             cause_key(runner.name, "PR-42"),
@@ -514,9 +545,1295 @@ async def test_missing_recovery_record_fails_closed(approval):
         await list_approvals(runner.redis, runner.name)
 
 
-async def test_empty_store_leaves_pipeline_unchanged(approval):
+async def test_size_only_store_recovers_without_operator_approval(approval):
     runner, _, _, _ = approval
+    assert await runner._consume_approval_command()
+    assert runner.state.state == PipelineState.WATCH
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) is None
+
+
+async def test_size_recovery_removes_only_obsolete_github_label(approval, monkeypatch):
+    runner, command, _, _ = approval
+    marker = continued_size_label(command.pr.head_sha)
+    calls = []
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append((args, kwargs)))
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert calls == [
+        (["label", "create", marker, "--color", "0E8A16",
+          "--description", "Legacy size decision continued; CI and review still required"],
+         {"repo": runner.owner_repo}),
+        (["pr", "edit", "42", "--add-label", marker], {"repo": runner.owner_repo}),
+        (["pr", "edit", "42", "--remove-label", OBSOLETE_SIZE_LABEL], {"repo": runner.owner_repo}),
+    ]
+
+
+async def test_size_recovery_creates_marker_without_obsolete_label(approval, monkeypatch):
+    runner, command, _, _ = approval
+    command.pr.quarantine_labels.clear()
+    runner.state.current_pr.quarantine_labels.clear()
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    calls = []
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append(args))
+    await runner._run_cycle_body()
+    marker = continued_size_label(command.pr.head_sha)
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert [call[:4] for call in calls] == [
+        ["label", "create", marker, "--color"],
+        ["pr", "edit", "42", "--add-label"],
+    ]
+
+
+async def test_aborted_size_approval_never_publishes_continuation_marker(approval, monkeypatch):
+    runner, command, _, _ = approval
+    command.pr.quarantine_labels.clear()
+    runner.state.current_pr.quarantine_labels.clear()
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    calls = []
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append(args))
+    original = runner.redis.transaction
+
+    async def abort_commit(fn, *keys, **kwargs):
+        if len(keys) == 5:
+            raise RuntimeError("approval transaction aborted")
+        return await original(fn, *keys, **kwargs)
+
+    monkeypatch.setattr(runner.redis, "transaction", abort_commit)
+    await runner._run_cycle_body()
+    assert calls == []
+    assert all(continued_size_label(command.pr.head_sha) not in call for call in calls)
+    assert runner.state.state == PipelineState.ERROR
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+
+
+@pytest.mark.parametrize("interrupt", ["replaced_cause", "abrupt_exit", "task", "pr"])
+async def test_uncommitted_size_migration_stays_error_after_redis_loss(
+    approval, monkeypatch, interrupt,
+):
+    runner, command, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    runner.state.current_pr.quarantine_labels.clear()
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    command.pr.quarantine_labels.clear()
+    await enqueue_approval(runner.redis, command)
+    labels = set()
+    live = command.pr.model_copy(update={"quarantine_labels": labels})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a, **k: [live])
+    gh_calls = []
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **k: gh_calls.append(args))
+    original = runner.redis.transaction
+
+    async def interrupt_at_commit(fn, *keys, **kwargs):
+        if len(keys) == 5:
+            if interrupt == "abrupt_exit":
+                raise KeyboardInterrupt("abrupt exit before Redis commit")
+            if interrupt == "replaced_cause":
+                await runner.redis.set(
+                    cause_key(runner.name, "PR-42"),
+                    CancellationCause(
+                        category="ERROR", payload={"subsource": "guardrail", "category": "repo_delete"},
+                    ).to_redis(),
+                )
+                # The new guardrail's best-effort GitHub label write failed.
+            elif interrupt == "task":
+                (repo / "tasks/PR-42.md").write_text(
+                    (repo / "tasks/PR-42.md").read_text() + "Changed requirements\n"
+                )
+            else:
+                state = runner.state.model_copy(deep=True)
+                state.current_pr.number = 99
+                await runner.redis.set(pipeline_state(runner.name), state.model_dump_json())
+        return await original(fn, *keys, **kwargs)
+
+    monkeypatch.setattr(runner.redis, "transaction", interrupt_at_commit)
+    if interrupt == "abrupt_exit":
+        with pytest.raises(KeyboardInterrupt):
+            await runner._run_cycle_body()
+    else:
+        await runner._run_cycle_body()
+    assert gh_calls == []
+    assert git(remote, "show", "main:tasks/PR-42.md").startswith("---\nstatus: ERROR")
+    if interrupt == "replaced_cause":
+        assert "repo_delete" in await runner.redis.get(cause_key(runner.name, "PR-42"))
+    fresh = await recover_without_redis(repo, remote, live, monkeypatch, suffix=f"fresh-{interrupt}")
+    assert fresh.state.state == PipelineState.ERROR
+    assert fresh.state.current_task.pr_id == "PR-42"
+    assert fresh.state.current_pr.number == 42
+    assert fresh.state.current_task.status == TaskStatus.ERROR
+
+
+@pytest.mark.parametrize("obsolete_label", [False, True])
+async def test_committed_size_migration_recovers_after_redis_loss(
+    approval, monkeypatch, obsolete_label,
+):
+    runner, _, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    labels = {OBSOLETE_SIZE_LABEL} if obsolete_label else set()
+    runner.state.current_pr.quarantine_labels = set(labels)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    await enqueue_approval(runner.redis, command)
+    live = command.pr.model_copy(update={"quarantine_labels": labels})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a, **k: [live])
+
+    def update_labels(args, **kwargs):
+        if "--add-label" in args:
+            labels.add(args[-1])
+        elif "--remove-label" in args:
+            labels.discard(args[-1])
+
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", update_labels)
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "applied" and saved.task_status_committed, runner.state.history[-5:]
+    assert git(remote, "show", "main:tasks/PR-42.md").startswith("---\nstatus: TODO")
+    assert labels == {continued_size_label(command.pr.head_sha)}
+    fresh = await recover_without_redis(repo, remote, live, monkeypatch, suffix=f"fresh-{obsolete_label}")
+    assert fresh.state.state == PipelineState.WATCH
+    assert fresh.state.current_task.status == TaskStatus.DOING
+    assert fresh.state.current_pr.number == 42
+
+
+@pytest.mark.parametrize("legacy_cause", [False, True])
+async def test_size_status_write_failure_retries_then_recovers_without_redis(approval, monkeypatch, legacy_cause):
+    runner, _, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    if legacy_cause:
+        runner.state.error_message = "[GUARDRAIL] tier=2 large_diff_threshold: +1800 LOC"
+        await runner.redis.set(
+            cause_key(runner.name, "PR-42"),
+            CancellationCause(
+                category="ERROR",
+                payload={"subsource": "guardrail", "source": "github_quarantine_label", "pr_number": 42},
+            ).to_redis(),
+        )
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    await enqueue_approval(runner.redis, command)
+    writer = runner._commit_task_status_change
+    attempts = 0
+
+    async def flaky_writer(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        return False if attempts <= 2 else await writer(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", flaky_writer)
+    labels = {OBSOLETE_SIZE_LABEL}
+    live = command.pr.model_copy(update={"quarantine_labels": labels})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a, **k: [live])
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda *a, **k: None)
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.size_only and not saved.task_status_committed
+    assert git(remote, "show", "main:tasks/PR-42.md").startswith("---\nstatus: ERROR")
+    before = await recover_without_redis(repo, remote, live, monkeypatch, suffix="fresh-before-retry")
+    assert before.state.state == PipelineState.ERROR
+    await runner._run_cycle_body()
+    assert attempts == 2
+    runner.handle_watch.assert_not_awaited()
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).task_status_committed
+    await runner._run_cycle_body()
+    assert attempts == 3
+    assert (await load_approval(runner.redis, runner.name, command.binding)).task_status_committed
+    assert git(remote, "show", "main:tasks/PR-42.md").startswith("---\nstatus: TODO")
+    after = await recover_without_redis(repo, remote, live, monkeypatch, suffix="fresh-after-retry")
+    assert after.state.state == PipelineState.WATCH
+
+
+async def test_size_marker_write_failure_retries_after_durable_clearance(approval, monkeypatch):
+    runner, _, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    await enqueue_approval(runner.redis, command)
+    labels = {OBSOLETE_SIZE_LABEL}
+    live = command.pr.model_copy(update={"quarantine_labels": labels})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a, **k: [live])
+    fail = True
+
+    def flaky_github(args, **kwargs):
+        nonlocal fail
+        if fail:
+            raise OSError("GitHub label unavailable")
+        if "--add-label" in args:
+            labels.add(args[-1])
+        elif "--remove-label" in args:
+            labels.discard(args[-1])
+
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", flaky_github)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).task_status_committed
+    assert labels == {OBSOLETE_SIZE_LABEL}
+    fresh = await recover_without_redis(repo, remote, live, monkeypatch, suffix="fresh-marker-failed")
+    assert fresh.state.state == PipelineState.WATCH
+    fail = False
+    await runner._run_cycle_body()
+    assert labels == {continued_size_label(command.pr.head_sha)}
+
+
+async def test_size_status_confirmation_rechecks_binding_and_new_cause(approval, monkeypatch):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    applied = await load_approval(runner.redis, runner.name, command.binding)
+    assert applied.status == "applied"
+    unconfirmed = applied.model_copy(update={"task_status_committed": False})
+    await runner.redis.set(approval_key(runner.name, command.binding), unconfirmed.model_dump_json())
+    changed_repo = unconfirmed.model_copy(update={"repo_url": "https://example.invalid/other.git"})
+    assert not await runner._finish_size_approval(changed_repo, set())
+    runner.state.current_pr.number = 99
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    assert not await runner._finish_size_approval(unconfirmed, set())
+    runner.state.current_pr.number = command.pr.number
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+
+    async def newer_cause_after_status_write(*args, **kwargs):
+        await runner.redis.set(
+            cause_key(runner.name, command.task.pr_id),
+            CancellationCause(
+                category="ERROR", payload={"subsource": "guardrail", "category": "repo_delete"},
+            ).to_redis(),
+        )
+        return True
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", newer_cause_after_status_write)
+    with pytest.raises(ApprovalChanged, match="before status confirmation"):
+        await runner._finish_size_approval(unconfirmed, set())
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).task_status_committed
+
+
+async def test_new_guardrail_after_success_overrides_stale_size_marker(approval, monkeypatch):
+    runner, _, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    await enqueue_approval(runner.redis, command)
+    labels = {OBSOLETE_SIZE_LABEL}
+    live = command.pr.model_copy(update={"quarantine_labels": labels})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a, **k: [live])
+
+    def update_labels(args, **kwargs):
+        if "--add-label" in args:
+            labels.add(args[-1])
+        elif "--remove-label" in args:
+            labels.discard(args[-1])
+
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", update_labels)
+    await runner._run_cycle_body()
+    assert labels == {continued_size_label(command.pr.head_sha)}
+    assert await runner._commit_task_status_change(
+        command.task, "ERROR", "new repository deletion guardrail", blocked_reason="guardrail",
+    )
+    assert git(remote, "show", "main:tasks/PR-42.md").startswith("---\nstatus: ERROR")
+    # The newer guardrail's GitHub label write fails; only the old size-ok
+    # label survives. It must not authorize the newer ERROR task.
+    fresh = await recover_without_redis(repo, remote, live, monkeypatch, suffix="fresh-new-guardrail")
+    assert fresh.state.state == PipelineState.ERROR
+    assert fresh.state.current_task.status == TaskStatus.ERROR
+
+
+async def test_status_clearance_rehydrates_stale_base_ref_after_redis_loss(approval, monkeypatch):
+    runner, _, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    await enqueue_approval(runner.redis, command)
+    live = command.pr.model_copy(update={"quarantine_labels": {OBSOLETE_SIZE_LABEL}})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a, **k: [live])
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda *a, **k: None)
+    stale_base = git(repo, "rev-parse", "refs/remotes/origin/main")
+    await runner._run_cycle_body()
+    assert git(repo, "rev-parse", "refs/remotes/origin/main") == stale_base
+    fresh = h._make_runner()
+    fresh.repo_path = str(repo)
+    fresh.repo_config.url = fresh.state.url = str(remote)
+    monkeypatch.setattr(daemon_recovery.gh_prs, "get_open_prs", lambda *a, **k: [live])
+    monkeypatch.setattr(
+        daemon_recovery, "_resolve_merged_state", lambda *a, **k: MergedState(set(), set(), True),
+    )
+    assert fresh.redis.store == {}
+    assert await fresh.recover_state()
+    assert fresh.state.state == PipelineState.WATCH
+    assert git(repo, "rev-parse", "refs/remotes/origin/main") != stale_base
+
+
+@pytest.mark.parametrize("marker_attached", [False, True])
+async def test_in_progress_size_fix_recovers_as_error_with_empty_redis(
+    approval, monkeypatch, marker_attached,
+):
+    runner, _, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    await enqueue_approval(runner.redis, command)
+    labels = {OBSOLETE_SIZE_LABEL}
+    live = command.pr.model_copy(update={"quarantine_labels": labels})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a, **k: [live])
+
+    def update_labels(args, **kwargs):
+        if "--add-label" in args:
+            labels.add(args[-1])
+        elif "--remove-label" in args:
+            labels.discard(args[-1])
+
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", update_labels)
+    await runner._run_cycle_body()
+    assert git(remote, "show", "main:tasks/PR-42.md").startswith("---\nstatus: TODO")
+    assert await runner._commit_task_status_change(
+        command.task, "ERROR", "Size FIX in progress", blocked_reason=SuppressionReason.CRASH,
+    )
+    if marker_attached:
+        labels.add(fixing_size_label(command.pr.head_sha))
+
+    fresh = await recover_without_redis(
+        repo, remote, live, monkeypatch, suffix=f"fresh-in-progress-fix-{marker_attached}",
+    )
+
+    assert fresh.state.state == PipelineState.ERROR
+    assert fresh.state.current_pr.number == command.pr.number
+    assert fresh.state.current_task.status == TaskStatus.ERROR
+    assert "Size FIX outcome unresolved" in fresh.state.error_message
+    assert (fixing_size_label(command.pr.head_sha) in fresh.state.current_pr.quarantine_labels) == marker_attached
+
+
+async def test_size_recovery_keeps_committed_status_when_marker_is_unavailable(approval, monkeypatch):
+    runner, command, _, _ = approval
+    command.pr.quarantine_labels.clear()
+    runner.state.current_pr.quarantine_labels.clear()
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    monkeypatch.setattr(
+        daemon_approval.gh_runner, "run_gh",
+        lambda *a, **k: (_ for _ in ()).throw(OSError("offline")),
+    )
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "applied" and saved.task_status_committed
+    assert runner.state.state == PipelineState.WATCH
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) is None
+
+
+async def test_size_recovery_removes_label_missing_from_error_snapshot(approval, monkeypatch):
+    runner, command, _, _ = approval
+    marker = continued_size_label(command.pr.head_sha)
+    runner.state.current_pr.quarantine_labels.clear()
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    calls = []
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append(args))
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.WATCH
+    assert [call[:4] for call in calls] == [
+        ["label", "create", marker, "--color"],
+        ["pr", "edit", "42", "--add-label"],
+        ["pr", "edit", "42", "--remove-label"],
+    ]
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+
+
+async def test_size_label_cleanup_failure_does_not_reblock_watch(approval, monkeypatch):
+    runner, command, _, _ = approval
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda *a, **k: (_ for _ in ()).throw(OSError("offline")))
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert runner.state.state == PipelineState.WATCH
+    assert any("Size label migration deferred" in event["event"] for event in runner.state.history)
+
+
+async def test_size_label_is_retained_if_continuation_marker_cannot_be_added(approval, monkeypatch):
+    runner, command, _, _ = approval
+    calls = []
+
+    def run_gh(args, **kwargs):
+        calls.append(args)
+        if "--add-label" in args:
+            raise OSError("GitHub label update unavailable")
+
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", run_gh)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert runner.state.state == PipelineState.WATCH
+    assert len(calls) == 2
+    assert "--add-label" in calls[-1]
+    assert all("--remove-label" not in args for args in calls)
+
+
+async def test_existing_continuation_label_still_allows_size_label_cleanup(approval, monkeypatch):
+    runner, command, _, _ = approval
+    calls = []
+
+    def run_gh(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["label", "create"]:
+            raise RuntimeError("label already exists")
+
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", run_gh)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert [args[3] for args in calls[1:]] == ["--add-label", "--remove-label"]
+
+
+@pytest.mark.parametrize("restart", [False, True])
+async def test_unrelated_rescue_branch_does_not_block_bound_pr(approval, restart):
+    runner, command, repo, remote = approval
+    git(repo, "checkout", "main")
+    git(repo, "checkout", "-b", "rescue/old-work")
+    (repo / "rescue.txt").write_text("preserve historical work\n")
+    git(repo, "add", "rescue.txt")
+    git(repo, "commit", "-m", "preserved rescue")
+    rescue_sha = git(repo, "rev-parse", "HEAD")
+    git(repo, "checkout", "main")
+    before, remote_before = snapshot(repo), git(remote, "show-ref")
+    await enqueue_approval(runner.redis, command)
+    if restart:
+        runner._recovered = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert runner.state.state == PipelineState.WATCH
+    assert git(repo, "rev-parse", "refs/heads/rescue/old-work") == rescue_sha
+    assert snapshot(repo) == before and git(remote, "show-ref") == remote_before
+
+
+async def test_main_checkout_does_not_hide_unpublished_bound_branch(approval):
+    runner, command, repo, remote = approval
+    (repo / "implementation.py").write_text("unpublished task change\n")
+    git(repo, "commit", "-am", "unpublished task work")
+    bound_sha = git(repo, "rev-parse", "refs/heads/fix/pr-42")
+    git(repo, "checkout", "main")
+    before, remote_before = snapshot(repo), git(remote, "show-ref")
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "deferred" and "Bound PR branch" in saved.reason
+    assert git(repo, "rev-parse", "refs/heads/fix/pr-42") == bound_sha
+    assert snapshot(repo) == before and git(remote, "show-ref") == remote_before
+
+
+async def test_bound_checkout_rejects_invalid_or_unverifiable_ref(approval, monkeypatch):
+    runner, command, repo, _ = approval
+    changed = command.model_copy(deep=True)
+    changed.task.branch = "other-branch"
+    assert "disagree" in daemon_approval.bound_checkout_work_blocker(str(repo), changed)
+    assert "disagree" in daemon_approval.bound_checkout_work_blocker_for_ref(
+        str(repo), "bad..branch", {command.pr.head_sha}
+    )
+    original = daemon_approval.git_ops._git
+
+    def failed_ref(path, *args, **kwargs):
+        if args[:2] == ("rev-parse", "--verify") and len(args) == 3:
+            return subprocess.CompletedProcess(args, 1, "", "ref unavailable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(daemon_approval.git_ops, "_git", failed_ref)
+    assert "could not be verified" in daemon_approval.bound_checkout_work_blocker(str(repo), command)
+
+
+async def test_detached_unpublished_head_is_preserved(approval):
+    runner, command, repo, _ = approval
+    git(repo, "checkout", "--detach", "HEAD")
+    (repo / "detached.txt").write_text("unpublished detached work\n")
+    git(repo, "add", "detached.txt")
+    git(repo, "commit", "-m", "detached work")
+    before = snapshot(repo)
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "deferred" and "HEAD has local-only commits" in saved.reason
+    assert snapshot(repo) == before
+
+
+async def test_size_only_recovery_rejects_revised_task_generation(approval):
+    runner, _, repo, _ = approval
+    git(repo, "checkout", "main")
+    with (repo / "tasks/PR-42.md").open("a") as handle:
+        handle.write("Revised requirements after PR publication.\n")
+    git(repo, "commit", "-am", "revise task")
+    git(repo, "push", "origin", "main")
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.ERROR
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+    approvals = await list_approvals(runner.redis, runner.name)
+    assert len(approvals) == 1
+    assert approvals[0].status == "failed"
+    assert "task generation" in approvals[0].reason
+
+
+async def test_missing_github_snapshot_defers_without_clearing_size_block(approval, monkeypatch):
+    runner, command, _, _ = approval
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: None)
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "deferred" and "waiting for GitHub evidence" in saved.reason
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+
+
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_applied_approval_reconciles_confirmed_external_resolution(
+    approval, monkeypatch, terminal, restart,
+):
+    runner, command, repo, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: terminal)
+    commit_status = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit_status)
+    save_record = AsyncMock()
+    monkeypatch.setattr(runner, "_save_current_run_record", save_record)
+    if restart:
+        runner._recovered = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+        await runner._run_cycle_body()
+    before = snapshot(repo)
+    await runner._run_cycle_body()
+    for _ in range(2):
+        assert not await runner._consume_approval_command()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "applied" and not saved.active
+    assert not await list_approvals(runner.redis, runner.name)
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None and runner.state.current_pr is None
+    assert save_record.await_count == 1
+    assert save_record.await_args.args == ("success_merged" if terminal == "MERGED" else "closed_unmerged",)
+    assert commit_status.await_count == (1 if terminal == "MERGED" else 0)
+    assert snapshot(repo) == before
+
+
+@pytest.mark.parametrize("failure", ["false", "raise", "lost_ack"])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("guardrail", ["size", "workflow"])
+async def test_terminal_approval_retries_done_bookkeeping(
+    approval, monkeypatch, failure, restart, guardrail,
+):
+    runner, command, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    if guardrail == "workflow":
+        cause = CancellationCause(
+            category="ERROR",
+            payload={
+                "subsource": "guardrail",
+                "category": "workflow_destruction",
+                "excerpt": "workflow change",
+            },
+        ).to_redis()
+        runner.state.current_pr.quarantine_labels = {"quarantine:workflow"}
+        await runner.redis.set(cause_key(runner.name, "PR-42"), cause)
+    else:
+        cause = await runner.redis.get(cause_key(runner.name, "PR-42"))
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(runner.name, runner.state, cause, repo)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert ("status: ERROR" in git(remote, "show", "main:tasks/PR-42.md")) == (guardrail == "workflow")
+    before = snapshot(repo)
+
+    real_writer = runner.__class__._commit_task_status_change.__get__(runner)
+    done_attempts = 0
+
+    async def flaky_writer(task, status, reason, **kwargs):
+        nonlocal done_attempts
+        if status != "DONE":
+            return await real_writer(task, status, reason, **kwargs)
+        done_attempts += 1
+        if done_attempts == 1:
+            if failure == "raise":
+                raise OSError("temporary status-write failure")
+            if failure == "lost_ack":
+                assert await real_writer(task, status, reason, **kwargs)
+            return False
+        return await real_writer(task, status, reason, **kwargs)
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", flaky_writer)
+    save_record = AsyncMock()
+    monkeypatch.setattr(runner, "_save_current_run_record", save_record)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "MERGED")
+    await runner._run_cycle_body()
+    pending = await load_approval(runner.redis, runner.name, command.binding)
+    assert pending.active and pending.status == "applied"
+    assert "bookkeeping is pending" in pending.reason
+    assert runner._approval_receipt is not None
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task.pr_id == "PR-42"
+    assert runner.state.current_pr.number == 42
+    assert await list_approvals(runner.redis, runner.name)
+    save_record.assert_not_awaited()
+    assert ("status: DONE" in git(remote, "show", "main:tasks/PR-42.md")) == (failure == "lost_ack")
+    assert snapshot(repo) == before
+
+    if restart:
+        runner._recovered = False
+        runner._approval_receipt = None
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+        await runner._run_cycle_body()
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_task.pr_id == "PR-42"
+        assert runner.state.current_pr.number == 42
+        assert (await load_approval(runner.redis, runner.name, command.binding)).active
+
+    await runner._run_cycle_body()
+    completed = await load_approval(runner.redis, runner.name, command.binding)
+    assert not completed.active and completed.status == "applied"
+    assert not await list_approvals(runner.redis, runner.name)
+    assert runner._approval_receipt is None
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None and runner.state.current_pr is None
+    assert "status: DONE" in git(remote, "show", "main:tasks/PR-42.md")
+    assert done_attempts == 2
+    save_record.assert_awaited_once_with("success_merged")
+    runner.handle_coding.assert_not_awaited()
+    runner.preflight.assert_not_awaited()
+    assert snapshot(repo) == before
+
+
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+@pytest.mark.parametrize("lost_ack", [False, True])
+async def test_terminal_approval_retries_after_run_record_saved(
+    approval, monkeypatch, terminal, lost_ack,
+):
+    runner, _, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    cause = CancellationCause(
+        category="ERROR",
+        payload={
+            "subsource": "guardrail",
+            "category": "workflow_destruction",
+            "excerpt": "workflow change",
+        },
+    ).to_redis()
+    runner.state.current_pr.quarantine_labels = {"quarantine:workflow"}
+    await runner.redis.set(cause_key(runner.name, "PR-42"), cause)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(runner.name, runner.state, cause, repo)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    runner._start_current_run_record("claude", "test")
+    run_id = runner._current_run_record.run_id
+    before = snapshot(repo)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: terminal)
+
+    publish = runner.publish_state
+    failures = 0
+
+    async def flaky_publish():
+        nonlocal failures
+        if runner.state.state == PipelineState.IDLE and failures == 0:
+            failures += 1
+            if lost_ack:
+                await publish()
+            raise OSError("temporary state-write failure")
+        await publish()
+
+    monkeypatch.setattr(runner, "publish_state", flaky_publish)
+    await runner._run_cycle_body()
+    pending = await load_approval(runner.redis, runner.name, command.binding)
+    assert pending.active and pending.status == "applied"
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.number == 42
+    assert runner._current_run_record.run_id == run_id
+    assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 1
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.IDLE
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).active
+    runs = await runner._metrics_store.list_task_runs(runner.name, "PR-42")
+    assert len(runs) == 1 and runs[0].run_id == run_id
+    assert runs[0].exit_reason == ("success_merged" if terminal == "MERGED" else "closed_unmerged")
+    assert len(await runner._metrics_store.recent("PR-42", repo_name=runner.name)) == 1
+    assert ("status: DONE" in git(remote, "show", "main:tasks/PR-42.md")) == (terminal == "MERGED")
+    runner.handle_coding.assert_not_awaited()
+    assert snapshot(repo) == before
+
+
+async def test_terminal_approval_restart_restores_bound_run_accounting(approval, monkeypatch):
+    runner, _, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    cause = CancellationCause(
+        category="ERROR",
+        payload={
+            "subsource": "guardrail",
+            "category": "workflow_destruction",
+            "excerpt": "workflow change",
+        },
+    ).to_redis()
+    runner.state.current_pr.quarantine_labels = {"quarantine:workflow"}
+    await runner.redis.set(cause_key(runner.name, "PR-42"), cause)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(runner.name, runner.state, cause, repo)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    runner._start_current_run_record("claude", "test")
+    run_id = runner._current_run_record.run_id
+    await runner._metrics_store.save(runner._current_run_record)
+    real_writer = runner.__class__._commit_task_status_change.__get__(runner)
+    first_attempt = True
+
+    async def flaky_writer(task, status, reason, **kwargs):
+        nonlocal first_attempt
+        if status == "DONE" and first_attempt:
+            first_attempt = False
+            return False
+        return await real_writer(task, status, reason, **kwargs)
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", flaky_writer)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "MERGED")
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).active
+    assert "status: ERROR" in git(remote, "show", "main:tasks/PR-42.md")
+
+    runner._recovered = False
+    runner._approval_receipt = None
+    runner._current_run_record = None
+    runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == run_id
+    await runner._run_cycle_body()
+    assert "status: DONE" in git(remote, "show", "main:tasks/PR-42.md")
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).active
+    runs = await runner._metrics_store.list_task_runs(runner.name, "PR-42")
+    assert len(runs) == 1 and runs[0].run_id == run_id
+    assert runs[0].exit_reason == "success_merged"
+    runner.handle_coding.assert_not_awaited()
+
+
+@pytest.mark.parametrize("changed", ["task", "pr", "generation", "suppression", "pause", "stop"])
+async def test_pending_terminal_approval_keeps_binding_and_operator_controls(
+    approval, monkeypatch, changed,
+):
+    runner, command, repo, remote = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "MERGED")
+    write_status = AsyncMock(return_value=False)
+    monkeypatch.setattr(runner, "_commit_task_status_change", write_status)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).active
+
+    if changed == "task":
+        runner.state.current_task.pr_id = "PR-43"
+    elif changed == "pr":
+        runner.state.current_pr.number = 43
+    elif changed == "generation":
+        task_path = repo / "tasks/PR-42.md"
+        task_path.write_text(task_path.read_text() + "\nRevised requirements.\n")
+        git(repo, "add", "tasks/PR-42.md")
+        git(repo, "commit", "-m", "revise task generation")
+    elif changed == "suppression":
+        newer = CancellationCause(
+            category="ERROR", payload={"subsource": "operator_reject", "excerpt": "newer decision"},
+        )
+        await runner.redis.set(cause_key(runner.name, "PR-42"), newer.to_redis())
+    elif changed == "pause":
+        persisted = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+        persisted.user_paused = True
+        await runner.redis.set(pipeline_state(runner.name), persisted.model_dump_json())
+    else:
+        await runner.redis.set(control_stop(runner.name), "1")
+
+    await runner._consume_approval_command()
+    if changed == "suppression":
+        assert [call.args[1] for call in write_status.await_args_list] == ["DONE", "ERROR"]
+        assert runner.state.state == PipelineState.ERROR
+        assert not (await load_approval(runner.redis, runner.name, command.binding)).active
+    else:
+        assert write_status.await_count == 1
+        assert runner.state.state == PipelineState.WATCH
+    assert "status: ERROR" in git(remote, "show", "main:tasks/PR-42.md")
+    runner.handle_coding.assert_not_awaited()
+
+
+@pytest.mark.parametrize("restart", [False, True])
+async def test_new_suppression_during_done_write_survives_terminal_retry(approval, monkeypatch, restart):
+    runner, _, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    real_writer = runner.__class__._commit_task_status_change.__get__(runner)
+    newer = CancellationCause(
+        category="ERROR", payload={"subsource": "guardrail", "category": "repo_delete"},
+    ).to_redis()
+
+    async def interrupted_writer(task, status, reason, **kwargs):
+        if status == "ERROR":
+            return await real_writer(task, status, reason, **kwargs)
+        assert status == "DONE"
+        assert await real_writer(task, status, reason, **kwargs)
+        await runner.redis.set(cause_key(runner.name, "PR-42"), newer)
+        return True
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", interrupted_writer)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "MERGED")
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.WATCH
+    assert (await load_approval(runner.redis, runner.name, command.binding)).active
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) == newer
+    assert "status: DONE" in git(remote, "show", "main:tasks/PR-42.md")
+    runner.handle_coding.assert_not_awaited()
+
+    if restart:
+        runner._recovered = False
+        runner._approval_receipt = None
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.ERROR
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).active
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) == newer
+    assert "status: ERROR" in git(remote, "show", "main:tasks/PR-42.md")
+    runner.handle_coding.assert_not_awaited()
     assert not await runner._consume_approval_command()
+    assert not await list_approvals(runner.redis, runner.name)
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) == newer
+
+
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+async def test_terminal_approval_clones_base_after_pr_branch_deletion(
+    approval, monkeypatch, terminal,
+):
+    runner, command, repo, remote = approval
+    runner.repo_config.url = runner.state.url = command.repo_url = str(remote)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    preserved = repo.with_name("preserved-pr-checkout")
+    before = snapshot(repo)
+    repo.rename(preserved)
+    git(remote, "update-ref", "refs/pull/42/head", command.pr.head_sha)
+    git(remote, "update-ref", "-d", "refs/heads/fix/pr-42")
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: terminal)
+    monkeypatch.setattr(runner, "_save_current_run_record", AsyncMock())
+    commit_status = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit_status)
+
+    assert await runner._consume_approval_command()
+
+    assert runner.state.state == PipelineState.IDLE, (
+        (await load_approval(runner.redis, runner.name, command.binding)).reason, runner.state.history[-5:]
+    )
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).active
+    assert git(repo, "branch", "--show-current") == "main"
+    assert snapshot(preserved) == before
+    assert commit_status.await_count == (1 if terminal == "MERGED" else 0)
+
+
+@pytest.mark.parametrize("terminal", [None, "OPEN"])
+async def test_applied_approval_keeps_unknown_pr_evidence_retryable(approval, monkeypatch, terminal):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: terminal)
+    for _ in range(3):
+        await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.active and saved.status == "applied"
+    assert runner.state.state == PipelineState.WATCH
+    runner.handle_watch.assert_not_awaited()
+
+
+@pytest.mark.parametrize("blocker", ["dirty", "binding", "changed_terminal", "handler"])
+async def test_terminal_approval_waits_for_safe_reconciliation(approval, monkeypatch, blocker):
+    runner, command, repo, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    states = iter(["MERGED", "OPEN"] if blocker == "changed_terminal" else ["MERGED"] * 3)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: next(states))
+    if blocker == "dirty":
+        (repo / "operator-notes").write_text("unpublished\n")
+    elif blocker == "binding":
+        runner.state.current_pr.pr_id = "PR-other"
+    elif blocker == "handler":
+        monkeypatch.setattr(
+            runner, "_handle_external_pr_resolution", AsyncMock(side_effect=RuntimeError("record unavailable")),
+        )
+    assert await runner._consume_approval_command()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.active and saved.status == "applied"
+    assert runner.state.state == PipelineState.WATCH
+    assert "deferred" in saved.reason
+
+
+async def test_terminal_resolution_receipt_recovers_after_lost_retirement(approval, monkeypatch):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "CLOSED")
+    monkeypatch.setattr(runner, "_save_current_run_record", AsyncMock())
+    retire = runner._retire_completed_approval
+    monkeypatch.setattr(
+        runner, "_retire_completed_approval", AsyncMock(side_effect=RuntimeError("receipt write lost")),
+    )
+    assert await runner._consume_approval_command()
+    assert runner.state.state == PipelineState.IDLE
+    monkeypatch.setattr(runner, "_retire_completed_approval", retire)
+    assert not await runner._consume_approval_command()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert not saved.active and not await list_approvals(runner.redis, runner.name)
+
+
+def external_published_head(repo, remote):
+    external = repo.parent / "external-new-head"
+    git(repo.parent, "clone", "--branch", "fix/pr-42", str(remote), str(external))
+    git(external, "config", "user.name", "External Author")
+    git(external, "config", "user.email", "external@example.test")
+    (external / "implementation.py").write_text("externally published work\n")
+    git(external, "commit", "-am", "publish externally")
+    head = git(external, "rev-parse", "HEAD")
+    git(external, "push", "origin", "fix/pr-42")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", head], capture_output=True,
+    ).returncode != 0
+    return head
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+@pytest.mark.parametrize("transient_failure", [False, True])
+async def test_missing_verified_head_fetches_without_changing_checkout_or_refs(
+    approval, monkeypatch, automatic, transient_failure,
+):
+    runner, command, repo, remote = approval
+    head = external_published_head(repo, remote)
+    runner.state.current_pr.head_sha = head
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    fresh = command.pr.model_copy(update={"head_sha": head})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [fresh])
+    if not automatic:
+        command = build_approval(
+            runner.name, runner.state,
+            await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+        )
+        await enqueue_approval(runner.redis, command)
+    git(repo, "update-ref", "refs/rescue/operator", git(repo, "rev-parse", "HEAD"))
+    before = snapshot(repo)
+    original = subprocess.run
+    failed = False
+
+    def maybe_fail_fetch(args, **kwargs):
+        nonlocal failed
+        if transient_failure and not failed and isinstance(args, list) and "fetch" in args:
+            failed = True
+            return subprocess.CompletedProcess(args, 1, "", "transient remote error")
+        return original(args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(daemon_approval.subprocess, "run", maybe_fail_fetch)
+        await runner._run_cycle_body()
+        if transient_failure:
+            saved = (await list_approvals(runner.redis, runner.name))[0]
+            assert saved.status == "deferred" and "fetch is unavailable" in saved.reason
+            assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+            assert snapshot(repo) == before
+            await runner._run_cycle_body()
+    if automatic:
+        command = (await list_approvals(runner.redis, runner.name))[0]
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "applied"
+    assert runner.state.state == PipelineState.WATCH
+    assert not await runner.redis.get(cause_key(runner.name, "PR-42"))
+    assert snapshot(repo) == before
+    assert git(remote, "show-ref")
+
+
+@pytest.mark.parametrize("interference", ["pr", "state", "memory", "task", "dirty"])
+async def test_missing_head_fetch_rechecks_binding_and_unpublished_work(
+    approval, monkeypatch, interference,
+):
+    runner, _, repo, remote = approval
+    head = external_published_head(repo, remote)
+    runner.state.current_pr.head_sha = head
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    await enqueue_approval(runner.redis, command)
+    current = command.pr.model_copy(update={"head_sha": head})
+    heads = [current]
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: heads)
+    original = subprocess.run
+
+    def fetch_then_interfere(args, **kwargs):
+        result = original(args, **kwargs)
+        if isinstance(args, list) and "fetch" in args and result.returncode == 0:
+            if interference == "pr":
+                heads[0] = current.model_copy(update={"head_sha": "f" * 40})
+            elif interference == "state":
+                state = runner.state.model_copy(deep=True)
+                state.current_pr.number = 99
+                asyncio.run(runner.redis.set(pipeline_state(runner.name), state.model_dump_json()))
+            elif interference == "memory":
+                runner.state.current_pr.number = 99
+            elif interference == "task":
+                (repo / "tasks/PR-42.md").write_text(
+                    (repo / "tasks/PR-42.md").read_text() + "New requirement\n"
+                )
+            else:
+                (repo / "operator-notes").write_text("unpublished\n")
+        return result
+
+    with monkeypatch.context() as patch:
+        patch.setattr(daemon_approval.subprocess, "run", fetch_then_interfere)
+        await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status in {"failed", "deferred"}
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+    assert runner.state.state == PipelineState.ERROR
+
+
+async def test_untrusted_published_head_cannot_be_fetched(approval, monkeypatch):
+    runner, _, repo, _ = approval
+    runner.state.current_pr.head_sha = "not-a-sha"
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "deferred" and "HEAD is invalid" in saved.reason
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+
+
+async def test_terminal_pr_can_resolve_when_task_object_needs_fetch(approval, monkeypatch):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "CLOSED")
+    monkeypatch.setattr(runner, "_save_current_run_record", AsyncMock())
+    original = daemon_approval.git_ops._git
+    first = True
+
+    def unavailable_once(path, *args, **kwargs):
+        nonlocal first
+        if args and args[0] == "show" and first:
+            first = False
+            return subprocess.CompletedProcess(args, 128, "", "object unavailable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(daemon_approval.git_ops, "_git", unavailable_once)
+    assert await runner._consume_approval_command()
+    assert runner.state.state == PipelineState.IDLE
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).active
+
+
+async def test_terminal_state_change_during_head_fetch_stays_retryable(approval, monkeypatch):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    states = iter(["CLOSED", "MERGED"])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: next(states))
+    original = daemon_approval.git_ops._git
+    first = True
+
+    def unavailable_once(path, *args, **kwargs):
+        nonlocal first
+        if args and args[0] == "show" and first:
+            first = False
+            return subprocess.CompletedProcess(args, 128, "", "object unavailable")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(daemon_approval.git_ops, "_git", unavailable_once)
+    assert await runner._consume_approval_command()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.active and "deferred" in saved.reason
+    assert runner.state.state == PipelineState.WATCH
+
+
+async def test_automatic_size_recovery_keeps_unreadable_or_rebound_task(approval):
+    runner, _, repo, _ = approval
+    runner.repo_config.url = "https://github.com/other/repo.git"
+    assert not await runner._consume_approval_command()
+    assert any("repository binding changed" in event["event"] for event in runner.state.history)
+    runner.repo_config.url = runner.state.url
+    (repo / "tasks/PR-42.md").unlink()
+    assert not await runner._consume_approval_command()
+    assert any("Size-only decision retained" in event["event"] for event in runner.state.history)
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+
+
+async def test_changed_bound_pr_branch_fails_without_clearing_cause(approval, monkeypatch):
+    runner, command, _, _ = approval
+    changed = command.pr.model_copy(update={"branch": "different-branch"})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [changed])
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "failed" and "branch changed" in saved.reason
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+
+
+async def test_unavailable_published_task_generation_defers(approval, monkeypatch):
+    runner, command, _, _ = approval
+    original = daemon_approval.git_ops._git
+
+    def missing_task(path, *args, **kwargs):
+        if args and args[0] == "show":
+            return subprocess.CompletedProcess(args, 128, "", "missing object")
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(daemon_approval.git_ops, "_git", missing_task)
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "deferred" and "task generation is unavailable" in saved.reason
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+
+
+async def test_second_checkout_check_defers_if_work_arrives_during_application(approval, monkeypatch):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    monkeypatch.setattr(
+        runner, "_approval_blocker", AsyncMock(side_effect=[None, "Checkout changed during verification."])
+    )
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "deferred" and "Checkout changed" in saved.reason
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+
+
+async def test_published_later_push_releases_old_approval_with_stale_tracking_ref(
+    approval, monkeypatch,
+):
+    runner, command, repo, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    (repo / "implementation.py").write_text("later published fix\n")
+    git(repo, "commit", "-am", "later fix")
+    new_head = git(repo, "rev-parse", "HEAD")
+    git(repo, "push", "origin", "fix/pr-42")
+    git(repo, "update-ref", "refs/remotes/origin/fix/pr-42", command.pr.head_sha)
+    fresh = command.pr.model_copy(update={"head_sha": new_head})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [fresh])
+    await runner._run_cycle_body()
+    assert runner.handle_watch.await_count == 1
+    assert runner._approval_receipt is None
+    assert (await list_approvals(runner.redis, runner.name))[0].status == "applied"
+    assert runner._current_approval(fresh) is None
+    assert runner.state.state == PipelineState.WATCH
+
+
+@pytest.mark.parametrize("restart_before_observation", [False, True])
+async def test_external_later_push_releases_receipt_without_local_commit(
+    approval, monkeypatch, restart_before_observation,
+):
+    runner, command, repo, remote = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    external = repo.parent / "external"
+    git(repo.parent, "clone", "--branch", "fix/pr-42", str(remote), str(external))
+    git(external, "config", "user.name", "External Author")
+    git(external, "config", "user.email", "external@example.test")
+    (external / "implementation.py").write_text("external fix\n")
+    git(external, "commit", "-am", "external fix")
+    new_head = git(external, "rev-parse", "HEAD")
+    git(external, "push", "origin", "fix/pr-42")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "cat-file", "-e", new_head], capture_output=True,
+    ).returncode != 0
+    fresh = command.pr.model_copy(update={"head_sha": new_head})
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [fresh])
+    before = snapshot(repo)
+    if restart_before_observation:
+        runner._recovered = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+        runner._approval_receipt = None
+        await runner._run_cycle_body()
+        assert runner.state.state == PipelineState.WATCH
+    await runner._run_cycle_body()
+    assert runner.handle_watch.await_count == 1
+    assert runner._approval_receipt is None
+    assert (await list_approvals(runner.redis, runner.name))[0].status == "applied"
+    assert runner._current_approval(fresh) is None
+    assert runner.state.state == PipelineState.WATCH
+    runner._recovered = False
+    runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    runner._approval_receipt = None
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.WATCH
+    await runner._run_cycle_body()
+    assert runner.handle_watch.await_count == 2
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_approval(fresh) is None
+    assert snapshot(repo) == before
+
+
+@pytest.mark.parametrize("restart", [False, True])
+async def test_size_only_recovery_retains_other_quarantine(approval, restart):
+    runner, command, repo, _ = approval
+    runner.state.current_pr.quarantine_labels.add("quarantine:workflow")
+    command.pr.quarantine_labels.add("quarantine:workflow")
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    if restart:
+        runner._recovered = False
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "deferred" and "another quarantine" in saved.reason
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+    assert runner.state.state != PipelineState.WATCH
+    assert (repo / "tasks/PR-42.md").exists()
+
+
+async def test_legacy_label_suppression_recovers_only_matching_size_error(approval, monkeypatch):
+    runner, command, _, _ = approval
+    legacy = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "guardrail", "source": "github_quarantine_label", "pr_number": 42},
+    ).to_redis()
+    runner.state.error_message = "[GUARDRAIL] tier=2 large_diff_threshold: +1800 LOC"
+    await runner.redis.set(cause_key(runner.name, "PR-42"), legacy)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    assert daemon_approval.is_size_only_cause(legacy, runner.state)
+    runner.state.current_pr.quarantine_labels.add("quarantine:workflow")
+    assert not daemon_approval.is_size_only_cause(legacy, runner.state)
+    runner.state.current_pr.quarantine_labels.remove("quarantine:workflow")
+    calls = []
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append(args))
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.WATCH
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) is None
+    assert (await load_approval(runner.redis, runner.name, command.binding)) is None
+    assert [call[:4] for call in calls] == [
+        ["label", "create", continued_size_label(command.pr.head_sha), "--color"],
+        ["pr", "edit", "42", "--add-label"],
+        ["pr", "edit", "42", "--remove-label"],
+    ]
 
 
 @pytest.mark.parametrize("prior", [PipelineState.CODING, PipelineState.FIX])
@@ -631,7 +1948,16 @@ async def test_changed_task_invalidates_cached_permission(approval):
     await runner._run_cycle_body()
     (repo / "tasks/PR-42.md").write_text("different specification")
     assert runner._current_approval(command.pr) is None
-    assert runner._approval_filtered_pr(command.pr) == command.pr
+    assert runner._approval_filtered_pr(command.pr).quarantine_labels == set()
+
+
+async def test_missing_task_invalidates_cached_permission_without_watch_failure(approval):
+    runner, command, repo, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    (repo / "tasks/PR-42.md").unlink()
+    assert runner._current_approval(command.pr) is None
+    assert runner._approval_filtered_pr(command.pr).quarantine_labels == set()
 
 
 def test_process_inspection_handles_exits_and_uncertain_ownership(tmp_path, monkeypatch):
@@ -829,6 +2155,21 @@ async def test_approval_cycles_are_serialized(approval):
 
 def test_failure_identity_ignores_json_field_order():
     assert failure_identity('{"a":1,"b":2}') == failure_identity(b'{"b":2,"a":1}')
+
+
+def test_size_cause_does_not_accept_malformed_or_mixed_findings():
+    assert not daemon_approval.is_size_only_cause(None)
+    assert not daemon_approval.is_size_only_cause(
+        CancellationCause(
+            category="ERROR", payload={"subsource": "guardrail", "reason_text": "GUARDRAIL:broken"}
+        ).to_redis()
+    )
+    assert not daemon_approval.is_size_only_cause(
+        CancellationCause(
+            category="ERROR",
+            payload={"subsource": "guardrail", "category": "large_diff_threshold", "rule": "workflow_destruction"},
+        ).to_redis()
+    )
 
 
 @pytest.mark.parametrize("single", [False, True])
@@ -1212,13 +2553,14 @@ async def test_successive_approvals_retain_only_independently_approved_findings(
     assert runner._unapproved_labels(second, {"quarantine:other"}) == {"quarantine:other"}
     assert second.pr.quarantine_labels == {"quarantine:large_diff", "quarantine:workflow"}
     assert snapshot(repo) == before and git(remote, "show-ref") == remote_before
-    # Earlier permission cannot bleed into a different HEAD or specification.
+    # The retired size label never blocks, regardless of an approval's scope.
     changed = second.model_copy(deep=True)
     changed.pr.head_sha = "other-head"
-    assert runner._unapproved_labels(changed, {"quarantine:large_diff"}) == {"quarantine:large_diff"}
+    assert runner._unapproved_labels(changed, {"quarantine:large_diff"}) == set()
+    assert runner._unapproved_labels(changed, {continued_size_label(second.pr.head_sha)}) == set()
     changed.pr.head_sha = second.pr.head_sha
     changed.task_fingerprint = "revised-specification"
-    assert runner._unapproved_labels(changed, {"quarantine:large_diff"}) == {"quarantine:large_diff"}
+    assert runner._unapproved_labels(changed, {"quarantine:large_diff"}) == set()
 
 
 @pytest.mark.parametrize("single", [False, True])
@@ -1315,6 +2657,9 @@ async def test_completed_approvals_leave_active_index_but_keep_bounded_recent_hi
     from datetime import timedelta
 
     runner, command, _, _ = approval
+    # Keep the legacy size incident out of this index-cleanup test.
+    runner.state.state = PipelineState.IDLE
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
     for i in range(40):
         old = command.model_copy(deep=True)
         old.binding = f"past-{i}"
@@ -1330,12 +2675,14 @@ async def test_completed_approvals_leave_active_index_but_keep_bounded_recent_hi
     get = AsyncMock(wraps=runner.redis.get)
     monkeypatch.setattr(runner.redis, "get", get)
     assert not await runner._consume_approval_command()
-    get.assert_not_awaited()
+    get.reset_mock()
     recent = await list_approvals(runner.redis, runner.name, recent=True)
     assert [c.binding for c in recent] == [f"past-{i}" for i in range(20, 40)]
     assert get.await_count == 20
     assert await load_approval(runner.redis, runner.name, "past-0") is not None
     # A live request stays recoverable independently of the recent display limit.
+    runner.state.state = PipelineState.ERROR
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
     await enqueue_approval(runner.redis, command)
     await runner._run_cycle_body()
     assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"

@@ -152,6 +152,10 @@ class ErrorMixin:
             await self._admit_fix_idle_timeout()
             return
 
+        if context.startswith("Size FIX outcome unresolved; operator Retry"):
+            self.log_event("[RECOVERY] Size FIX remains parked for operator Retry.")
+            return
+
         if "status:ERROR write failed; operator Retry required" in context:
             reason_text = context.partition(":")[0]
             try:
