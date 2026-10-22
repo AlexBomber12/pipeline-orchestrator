@@ -170,7 +170,7 @@ class FixMixin(BreachMixin):
                 if fetched.returncode != 0 or fetched.stdout.strip() != command.pr.head_sha:
                     return False
             return True
-        except (OSError, RuntimeError, ValueError):
+        except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             return False
 
     async def _recover_fix_prelaunch(self, admitted, previous, approval) -> bool:

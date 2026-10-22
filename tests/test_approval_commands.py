@@ -730,6 +730,24 @@ async def test_approved_guardrail_fix_rejects_mismatched_tracking_ref(approval, 
     assert await runner._metrics_store.get(old.run_id) == old
 
 
+async def test_approved_guardrail_fix_defers_on_git_probe_timeout(approval, monkeypatch):
+    runner, _, old = await finalized_guardrail_approval(approval, monkeypatch)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    git_call = daemon_fix.git_ops._git
+
+    def timeout_remote_probe(repo_path, *args, **kwargs):
+        if args[:2] == ("ls-remote", "--exit-code"):
+            raise subprocess.TimeoutExpired(["git", *args], 30)
+        return git_call(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(daemon_fix.git_ops, "_git", timeout_remote_probe)
+    await runner.handle_fix()
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == old.run_id
+    assert await runner._metrics_store.get(old.run_id) == old
+    assert dispatched.await_count == 0
+
+
 @pytest.mark.parametrize("restart", [False, True])
 async def test_persisted_fix_invocation_does_not_dispatch_twice(
     approval, monkeypatch, restart,
