@@ -1651,6 +1651,15 @@ async def test_changed_task_invalidates_cached_permission(approval):
     assert runner._approval_filtered_pr(command.pr).quarantine_labels == set()
 
 
+async def test_missing_task_invalidates_cached_permission_without_watch_failure(approval):
+    runner, command, repo, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    (repo / "tasks/PR-42.md").unlink()
+    assert runner._current_approval(command.pr) is None
+    assert runner._approval_filtered_pr(command.pr).quarantine_labels == set()
+
+
 def test_process_inspection_handles_exits_and_uncertain_ownership(tmp_path, monkeypatch):
     from types import SimpleNamespace
 

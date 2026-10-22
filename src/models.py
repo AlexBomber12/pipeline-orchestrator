@@ -195,6 +195,19 @@ class InvocationSnapshot:
     fix_iteration: int | None = None
 
 
+class SizeFixCompletion(BaseModel):
+    """Confirmed FIX exit awaiting a status write or marker cleanup."""
+
+    task_id: str
+    branch: str
+    pr_number: int
+    head_sha: str
+    fixing_label: str
+    error_revision: str
+    task_spec_hash: str
+    invocation: InvocationSnapshot
+
+
 class PublicationWatermark(BaseModel):
     """Durable safety floor for one PR branch across its HEAD changes."""
 
@@ -261,6 +274,7 @@ class RepoState(BaseModel):
     usage_api_degraded: bool = False
     coder: str | None = None
     active_invocation: InvocationSnapshot | None = None
+    size_fix_completion: SizeFixCompletion | None = None
     last_stale_retrigger_at: datetime | None = None
     last_codex_retrigger_at: datetime | None = None
     # PR-358: set True after WATCH posts the single ``@codex review`` repost
@@ -360,6 +374,7 @@ class RepoState(BaseModel):
             super().__setattr__("current_pr", None)
             super().__setattr__("error_message", None)
             super().__setattr__("active_invocation", None)
+            super().__setattr__("size_fix_completion", None)
             super().__setattr__("review_timeout_repost_attempted", False)
             super().__setattr__("review_timeout_repost_at", None)
         if name == "state":

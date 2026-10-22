@@ -8,8 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
+from src.cancellation.storage import task_spec_content_hash
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
@@ -23,11 +25,13 @@ from src.daemon.runner import PipelineRunner
 from src.keyspace import pipeline_state
 from src.models import (
     CIStatus,
+    InvocationSnapshot,
     PipelineState,
     PRInfo,
     QueueTask,
     RepoState,
     ReviewStatus,
+    SizeFixCompletion,
     TaskStatus,
 )
 from src.queue_parser import QueueValidationError, write_frontmatter_status
@@ -724,6 +728,74 @@ def test_unresolved_size_fix_recovery_completes_in_error(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_queue[0].status == TaskStatus.ERROR
     assert "operator Retry" in runner.state.error_message
+
+
+def test_retained_successful_size_fix_retries_error_header_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_file = tmp_path / "tasks" / "PR-100.md"
+    task_file.parent.mkdir()
+    task_file.write_text("same task generation\n")
+    task_hash = task_spec_content_hash(task_file.read_text())
+    marker = fixing_size_label("a" * 40)
+    pr = PRInfo(number=100, branch="pr-100-size", pr_id="PR-100", head_sha="a" * 40,
+                quarantine_labels={marker})
+    queued = QueueTask(pr_id="PR-100", title="size", status=TaskStatus.ERROR,
+                       branch=pr.branch, task_file="tasks/PR-100.md")
+    invocation = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="run-100", attempt_index=1, phase="fix", fix_iteration=1,
+    )
+    receipt = SizeFixCompletion(
+        task_id=queued.pr_id, branch=pr.branch, pr_number=pr.number,
+        head_sha=pr.head_sha, fixing_label=marker, error_revision="e" * 64,
+        task_spec_hash=task_hash, invocation=invocation,
+    )
+    saved = RepoState(
+        name="octo__demo", url="https://github.com/octo/demo.git",
+        state=PipelineState.WATCH,
+        current_task=queued.model_copy(update={"status": TaskStatus.DOING}),
+        current_pr=pr, active_invocation=invocation, size_fix_completion=receipt,
+    )
+    record = SimpleNamespace(
+        run_id="run-100", task_id=queued.pr_id, invocations=[invocation],
+        fix_iterations=1, attempt_index=1, task_spec_hash=task_hash,
+    )
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._persisted_fix_recovery = RepoState.model_validate_json(saved.model_dump_json())
+    runner._recovery_task_headers = {
+        queued.pr_id: SimpleNamespace(
+            pr_id=queued.pr_id, branch=queued.branch,
+            frontmatter_status="error", blocked_reason="crash",
+        ),
+    }
+
+    async def restore_record() -> None:
+        runner._current_run_record = record
+
+    monkeypatch.setattr(runner, "_restore_current_run_record", restore_record)
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda *_args: None)
+    asyncio.run(runner._apply_recovery_decisions([queued], [pr]))
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.size_fix_completion == receipt
+
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_args, **_kwargs: [pr])
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_args, **_kwargs: "OPEN")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task",
+        lambda: ("error", SuppressionReason.CRASH, "e" * 64),
+    )
+    monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker", lambda *_args: None)
+    monkeypatch.setattr("src.daemon.handlers.watch.bound_checkout_work_blocker_for_ref", lambda *_args: None)
+    write = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_commit_task_status_change", write)
+    asyncio.run(runner.handle_watch())
+    assert write.await_count == 1
+    assert write.await_args.kwargs["expected_task_sha256"] == "e" * 64
+    assert runner.state.size_fix_completion is None
+    assert runner.state.current_task.status == TaskStatus.DOING
 
 
 def test_recovery_does_not_mark_todo_or_done(

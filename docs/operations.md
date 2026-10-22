@@ -193,16 +193,24 @@ write failed. An ERROR task with a matching open PR stays in ERROR for operator
 recovery after Redis loss, even if an old size label remains. Before FIX
 dispatch, the daemon first commits `status: ERROR` with a crash reason, then
 adds `size-fix:<PR HEAD SHA>` while retaining the continuation marker. After
-a successful FIX it commits `status: TODO`, binds the continuation marker to
-the resulting HEAD, and removes `size-fix` last. WATCH only retries failed
-marker cleanup after confirming the TODO header on the remote base and a
-quiescent checkout. Marker setup failures after the ERROR write park the task
-for operator Retry. If Redis is lost between the ERROR write and attaching
+the coder exits successfully and cleanup is confirmed, the daemon saves a
+completion receipt bound to its invocation, task generation, PR, and resulting
+HEAD. WATCH verifies the live PR and quiescent checkout before writing
+`status: TODO`; a transient status-write failure is retried on later WATCH
+cycles without rerunning the coder. It then binds the continuation marker to
+the resulting HEAD and removes `size-fix` last. Failed label cleanup is also
+retried. A retained Redis receipt allows restart recovery while the remote
+header is still ERROR. If that receipt is lost before TODO is durable, the
+ERROR header remains parked for operator Retry; labels and stale DOING state
+do not reconstruct successful coder completion. Marker setup failures after
+the ERROR write also park the task. If Redis is lost between the ERROR write and attaching
 `size-fix`, the existing `size-ok` label helps recovery retain the matching PR
 in ERROR; it never authorizes WATCH. Startup refreshes the base ref and
 derives DOING from the TODO header and matching open PR. An unresolved FIX with an ERROR header
 recovers into ERROR for operator Retry. CODING with an existing
 continuation PR returns to WATCH.
+An externally merged PR remains in WATCH until its DONE task-status write is
+confirmed; a transient write failure is retried on the next WATCH cycle.
 Startup recovery also checks the checkout for unpublished work and active
 processes. It fetches a missing verified PR HEAD without moving local refs;
 unavailable evidence leaves recovery pending for the next cycle.

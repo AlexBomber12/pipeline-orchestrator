@@ -6,12 +6,14 @@ import asyncio
 import logging
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 from src.branch_context import BranchContext
 from src.cancellation import (
     CancellationCause,
     safe_record_cancellation_cause,
 )
+from src.cancellation.storage import task_spec_content_hash
 from src.daemon import (
     fix_codex_trigger,
     fix_escalation,
@@ -23,7 +25,7 @@ from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers.breach import BreachMixin
 from src.daemon.quarantine import (
     apply_quarantine_label_for_violation,
-    complete_size_fix_marker,
+    continued_size_label,
     fixing_size_label,
     is_continued_size_label,
     is_fixing_size_label,
@@ -33,7 +35,7 @@ from src.daemon.selector import CoderSelectionUnavailable
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github.reviewer_policy import ReviewerPolicy
-from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus, TaskStatus
+from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus, SizeFixCompletion, TaskStatus
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
 
@@ -829,17 +831,64 @@ class FixMixin(BreachMixin):
                 )
                 return None
 
-        async def finish_size_fix_marker(head_after: str) -> None:
-            if size_fix_marker is None or current_pr is None or self.state.current_task is None:
-                return
-            committed = await self._commit_task_status_change(
-                self.state.current_task, "TODO", "Size FIX completed; continuing published PR",
+        async def finish_size_fix_marker(head_after: str) -> bool:
+            if size_fix_marker is None:
+                return True
+            if current_pr is None or self.state.current_task is None:
+                return False
+            try:
+                continued_size_label(head_after)
+            except ValueError:
+                self.log_event("[FIX] Published size FIX HEAD unavailable; retaining recovery marker.")
+                return False
+            task = self.state.current_task
+            invocation = self.state.active_invocation
+            record = self._current_run_record
+            remote_status, remote_reason, revision = (
+                self._remote_frontmatter_error_status_for_current_task()
             )
-            if not committed:
-                self.log_event("[FIX] Size FIX task status update deferred; retaining recovery marker.")
-                return
-            current_pr.head_sha = head_after
-            complete_size_fix_marker(self, current_pr)
+            if (
+                remote_status != "error" or remote_reason != SuppressionReason.CRASH
+                or revision is None or invocation is None or invocation.phase != "fix"
+                or invocation.run_id is None or record is None
+                or record.run_id != invocation.run_id or record.task_id != task.pr_id
+                or not record.invocations or record.invocations[-1] != invocation
+            ):
+                self.log_event("[FIX] Size FIX completion evidence unavailable; retaining recovery marker.")
+                return False
+            try:
+                suppression = await self._suppression_record_for_task(task.pr_id)
+            except Exception as exc:
+                self.log_event(f"[FIX] Size FIX suppression check deferred: {exc}")
+                return False
+            if suppression is not None:
+                self.log_event("[FIX] Later task suppression prevents size FIX completion.")
+                return False
+            try:
+                local_hash = task_spec_content_hash(
+                    (Path(self.repo_path) / (task.task_file or "")).read_text(encoding="utf-8")
+                )
+            except (OSError, UnicodeError) as exc:
+                self.log_event(f"[FIX] Size FIX task generation unavailable: {exc}")
+                return False
+            if record.task_spec_hash and record.task_spec_hash != local_hash:
+                self.log_event("[FIX] Size FIX task generation changed; retaining recovery marker.")
+                return False
+            receipt = SizeFixCompletion(
+                task_id=task.pr_id, branch=task.branch or "", pr_number=current_pr.number,
+                head_sha=head_after, fixing_label=size_fix_marker,
+                error_revision=revision, task_spec_hash=local_hash, invocation=invocation,
+            )
+            self.state.size_fix_completion = receipt
+            self.state.state = PipelineState.WATCH
+            try:
+                await self.publish_state()
+            except Exception as exc:
+                self.log_event(f"[FIX] Size FIX completion receipt unavailable: {exc}")
+            # WATCH verifies the live PR revision and checkout before it
+            # attempts the final status write. An unavailable Redis receipt
+            # remains usable in this process; losing it parks the ERROR task.
+            return True
 
         def remote_branch_contains_head(branch: str, head_after: str) -> bool:
             return (
@@ -1103,7 +1152,12 @@ class FixMixin(BreachMixin):
                 and await no_push_policy.maybe_escalate(self.state.current_pr)
             ):
                 return
-            await finish_size_fix_marker(current_pr.head_sha if remote_no_push and current_pr else head_after)
+            if not await finish_size_fix_marker(current_pr.head_sha if remote_no_push and current_pr else head_after):
+                await self._transition_to_error(
+                    "Size FIX completion evidence unavailable; operator Retry or revised approval required.",
+                    save_run_record_as=None, publish=False, log_prefix="[FIX]",
+                )
+                return
             self.state.state = PipelineState.WATCH
             return
 
@@ -1115,5 +1169,10 @@ class FixMixin(BreachMixin):
             return
         if await pause_for_stop_after_bookkeeping():
             return
-        await finish_size_fix_marker(head_after)
+        if not await finish_size_fix_marker(head_after):
+            await self._transition_to_error(
+                "Size FIX completion evidence unavailable; operator Retry or revised approval required.",
+                save_run_record_as=None, publish=False, log_prefix="[FIX]",
+            )
+            return
         self.state.state = PipelineState.WATCH

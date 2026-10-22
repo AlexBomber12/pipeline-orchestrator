@@ -780,8 +780,12 @@ class ApprovalCommandMixin:
         command = self._approval_receipt
         if command is None or pr.number != command.pr.number or pr.head_sha != command.pr.head_sha:
             return None
-        path = approval_task_path(Path(self.repo_path), command.task.task_file)
-        if task_spec_content_hash(path.read_text(encoding="utf-8")) != command.task_fingerprint:
+        try:
+            path = approval_task_path(Path(self.repo_path), command.task.task_file)
+            task_hash = task_spec_content_hash(path.read_text(encoding="utf-8"))
+        except (ApprovalChanged, OSError, UnicodeError):
+            return None
+        if task_hash != command.task_fingerprint:
             return None
         return command
 

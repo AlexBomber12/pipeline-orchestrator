@@ -993,6 +993,15 @@ class RecoveryMixin:
             for queued in tasks:
                 if queued.status != TaskStatus.ERROR:
                     continue
+                saved_fix = getattr(self, "_persisted_fix_recovery", None)
+                if (
+                    saved_fix is not None and saved_fix.size_fix_completion is not None
+                    and saved_fix.size_fix_completion.task_id == queued.pr_id
+                ):
+                    # The completion receipt is checked against the bound
+                    # run and remote header below. Do not add a new CRASH
+                    # suppression that would defeat its pending TODO retry.
+                    continue
                 record = await self._suppression_record_for_task(queued.pr_id)
                 if record is None:
                     await self._suppress_task(
@@ -1056,6 +1065,26 @@ class RecoveryMixin:
             queued = next((task for task in tasks if task.pr_id == saved_task.pr_id), None)
             recovered_state = saved.state
             confirmed_timeout = False
+            completion = saved.size_fix_completion
+            live_completion_pr = next(
+                (pr for pr in prs if pr.number == bound.number and pr.branch == bound.branch),
+                None,
+            )
+            pending_size_completion = (
+                completion is not None and saved.state == PipelineState.WATCH
+                and queued is not None and queued.status == TaskStatus.ERROR
+                and completion.task_id == queued.pr_id
+                and completion.branch == queued.branch
+                and completion.pr_number == bound.number
+                and saved.active_invocation == completion.invocation
+                and completion.invocation.run_id is not None
+                and live_completion_pr is not None
+                and live_completion_pr.head_sha == completion.head_sha
+                and completion.fixing_label in live_completion_pr.quarantine_labels
+                and (header := self._recovery_task_headers.get(queued.pr_id)) is not None
+                and header.frontmatter_status == "error"
+                and header.blocked_reason == SuppressionReason.CRASH.value
+            )
             if queued is not None and saved.state != PipelineState.ERROR:
                 if queued.pr_id in self._status_write_failed_task_pr_ids:
                     recovered_state = PipelineState.ERROR
@@ -1096,7 +1125,8 @@ class RecoveryMixin:
                 and find_matching_open_pr(queued.pr_id, queued.branch, [bound]) is bound
                 and queued.status in {TaskStatus.ERROR, TaskStatus.TODO, TaskStatus.DOING}
                 and recovered_state != PipelineState.FIX
-                and (queued.status != TaskStatus.ERROR or recovered_state == PipelineState.ERROR)
+                and (queued.status != TaskStatus.ERROR or recovered_state == PipelineState.ERROR
+                     or pending_size_completion)
                 and not (
                     recovered_state == PipelineState.WATCH
                     and not any(item.number == bound.number for item in prs)
@@ -1123,6 +1153,7 @@ class RecoveryMixin:
                     })
                 self.state.current_pr = live_bound or bound
                 self.state.active_invocation = saved.active_invocation
+                self.state.size_fix_completion = completion if pending_size_completion else None
                 if recovered_state == PipelineState.ERROR and saved.state != PipelineState.ERROR:
                     self.state.error_message = (
                         "FIX idle timeout: recovered confirmed timeout"
@@ -1133,6 +1164,23 @@ class RecoveryMixin:
                     self.state.error_message = saved.error_message
                 self.state.state = recovered_state
                 await self._restore_current_run_record()
+                if pending_size_completion:
+                    record = self._current_run_record
+                    if (
+                        record is None or record.run_id != completion.invocation.run_id
+                        or record.task_id != queued.pr_id or not record.invocations
+                        or record.invocations[-1] != completion.invocation
+                        or record.fix_iterations != completion.invocation.fix_iteration
+                        or record.attempt_index != completion.invocation.attempt_index
+                        or record.task_spec_hash not in ("", completion.task_spec_hash)
+                    ):
+                        self.state.size_fix_completion = None
+                        self.state.state = PipelineState.ERROR
+                        self.state.error_message = (
+                            "Size FIX completion accounting unavailable; operator Retry or revised approval required."
+                        )
+                        self.log_event("[RECOVERY] Size FIX completion receipt lacks its bound run; parked ERROR.")
+                        return
                 self.log_event(
                     f"[RECOVERY] Restored bound FIX PR #{bound.number} for "
                     f"{queued.pr_id} in {recovered_state.value}."

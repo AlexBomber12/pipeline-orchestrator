@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.cancellation import CancellationCause
+from src.cancellation.storage import task_spec_content_hash
 from src.config import load_config
 from src.daemon import guardrails
 from src.daemon.approval_commands import bound_checkout_work_blocker_for_ref, checkout_process_blocker
@@ -23,6 +24,7 @@ from src.daemon.quarantine import (
     apply_quarantine_label_for_violation,
     blocking_quarantine_labels,
     complete_size_fix_marker,
+    continued_size_label,
     is_fixing_size_label,
 )
 from src.daemon.selector import CoderPurpose, resolve_active_coder, resolve_pause_coder
@@ -215,6 +217,7 @@ class WatchMixin:
         if pr_state in ("MERGED", "CLOSED"):
             await self._handle_external_pr_resolution(found, pr_state)
             return
+        live_quarantine_labels = set(found.quarantine_labels)
         found = self._approval_filtered_pr(found)
         await self._rehydrate_quarantine_from_pr_labels(found)
         await self._detect_external_quarantine_release(found)
@@ -257,15 +260,89 @@ class WatchMixin:
             }
         )
         self.state.current_pr = found
-        if any(is_fixing_size_label(label) for label in found.quarantine_labels):
+        completion = self.state.size_fix_completion
+        fixing_labels = {label for label in live_quarantine_labels if is_fixing_size_label(label)}
+        if completion is not None or fixing_labels:
+            def park_changed_completion(reason: str) -> None:
+                self.state.size_fix_completion = None
+                self.state.state = PipelineState.ERROR
+                self.state.error_message = (
+                    "Size FIX completion changed; operator Retry or revised approval required. " + reason
+                )
+                self.log_event(f"[WATCH] PR #{found.number} size FIX completion parked: {reason}")
+
             task = self.state.current_task
-            # FIX first commits ERROR before publishing size-fix, then TODO
-            # only after its coder has finished. Redis can retain a stale
-            # DOING snapshot across restart, so read the confirmed base.
-            remote_status = self._remote_frontmatter_error_status_for_current_task()[0]
-            if task is None or task.status != TaskStatus.DOING or remote_status != "todo":
+            remote_status, remote_reason, revision = (
+                self._remote_frontmatter_error_status_for_current_task()
+            )
+            if task is None or (completion is None and not fixing_labels):
                 self.log_event(f"[WATCH] PR #{found.number} size FIX outcome is unresolved; holding PR.")
                 return
+            if remote_status is not None and revision is None:
+                self.log_event(f"[WATCH] PR #{found.number} size FIX task revision unavailable; retrying.")
+                return
+            if completion is not None:
+                record = self._current_run_record
+                if (
+                    completion.task_id != task.pr_id or completion.branch != task.branch
+                    or completion.pr_number != found.number or completion.head_sha != found.head_sha
+                    or found.pr_id not in (None, task.pr_id)
+                    or self.state.active_invocation != completion.invocation
+                    or record is None or record.run_id != completion.invocation.run_id
+                    or record.task_id != task.pr_id or not record.invocations
+                    or record.invocations[-1] != completion.invocation
+                    or completion.invocation.fix_iteration != record.fix_iterations
+                    or completion.invocation.attempt_index != record.attempt_index
+                    or record.task_spec_hash not in ("", completion.task_spec_hash)
+                    or blocking_quarantine_labels(live_quarantine_labels) - {completion.fixing_label}
+                ):
+                    park_changed_completion("Task, PR, invocation, revision, or guardrail binding changed.")
+                    return
+                try:
+                    task_hash = task_spec_content_hash(
+                        (Path(self.repo_path) / (task.task_file or "")).read_text(encoding="utf-8")
+                    )
+                except (OSError, UnicodeError) as exc:
+                    self.log_event(f"[WATCH] PR #{found.number} size FIX task unavailable: {exc}")
+                    return
+                if task_hash != completion.task_spec_hash:
+                    park_changed_completion("Task generation changed.")
+                    return
+                try:
+                    suppression = await self._suppression_record_for_task(task.pr_id)
+                except Exception as exc:
+                    self.log_event(f"[WATCH] PR #{found.number} size FIX suppression unavailable: {exc}")
+                    return
+                if suppression is not None or (
+                    remote_status == "error" and (
+                        remote_reason != SuppressionReason.CRASH
+                        or revision != completion.error_revision
+                    )
+                ) or remote_status not in {"error", "todo"}:
+                    if remote_status is None and suppression is None:
+                        self.log_event(f"[WATCH] PR #{found.number} size FIX remote status unavailable; retrying.")
+                        return
+                    park_changed_completion("Task status or suppression changed.")
+                    return
+                if not fixing_labels and (
+                    remote_status != "todo"
+                    or continued_size_label(found.head_sha) not in live_quarantine_labels
+                ):
+                    park_changed_completion("Size FIX marker disappeared before completion.")
+                    return
+            elif task.status != TaskStatus.DOING or remote_status != "todo":
+                # A size label or stale DOING snapshot cannot prove success.
+                self.log_event(f"[WATCH] PR #{found.number} size FIX outcome is unresolved; holding PR.")
+                return
+            else:
+                try:
+                    suppression = await self._suppression_record_for_task(task.pr_id)
+                except Exception as exc:
+                    self.log_event(f"[WATCH] PR #{found.number} size FIX suppression unavailable: {exc}")
+                    return
+                if suppression is not None or blocking_quarantine_labels(live_quarantine_labels) - fixing_labels:
+                    self.log_event(f"[WATCH] PR #{found.number} newer guardrail prevents size FIX cleanup.")
+                    return
             try:
                 reason = checkout_process_blocker(self.repo_path)
                 if not reason:
@@ -277,12 +354,28 @@ class WatchMixin:
             if reason:
                 self.log_event(f"[WATCH] PR #{found.number} size FIX marker retained: {reason}")
                 return
-            committed = await self._commit_task_status_change(
-                task, "TODO", "Size FIX completed; continuing published PR",
-            )
+            if completion is not None and not fixing_labels:
+                self.state.current_task = task.model_copy(update={"status": TaskStatus.DOING})
+                self.state.size_fix_completion = None
+                self.log_event(f"[WATCH] PR #{found.number} size FIX completion already durable.")
+                return
+            try:
+                committed = await self._commit_task_status_change(
+                    task, "TODO", "Size FIX completed; continuing published PR",
+                    expected_task_sha256=revision,
+                )
+            except Exception as exc:
+                self.log_event(f"[WATCH] PR #{found.number} size FIX task status retry deferred: {exc}")
+                return
             if not committed or not complete_size_fix_marker(self, found):
                 self.log_event(f"[WATCH] PR #{found.number} size FIX marker retry deferred.")
                 return
+            self.state.current_task = task.model_copy(update={"status": TaskStatus.DOING})
+            self.state.current_queue = [
+                self.state.current_task if item.pr_id == task.pr_id else item
+                for item in (self.state.current_queue or [task])
+            ]
+            self.state.size_fix_completion = None
             self.log_event(f"[WATCH] PR #{found.number} size FIX marker completed; refreshing PR.")
             return
         # Retry rehydrate every cycle so a transient commit-time fetch
@@ -1339,16 +1432,11 @@ class WatchMixin:
             f"[WATCH] PR #{pr_number} externally resolved as {pr_state}; "
             f"releasing task and returning to IDLE ({legacy_fragment})."
         )
-        task_id = getattr(found, "pr_id", "") or ""
-        if task_id:
-            await self._clear_task_suppression(task_id)  # pragma: no cover
-        if isinstance(pr_number, int):
-            self.state.quarantined_prs.discard(pr_number)
         if pr_state == "MERGED":
             current_task = self.state.current_task
             if current_task is not None and current_task.task_file:
                 try:
-                    await self._commit_task_status_change(
+                    written = await self._commit_task_status_change(
                         current_task,
                         "DONE",
                         "PR merged externally during WATCH",
@@ -1358,10 +1446,22 @@ class WatchMixin:
                         f"[ERROR] Failed to write status:DONE to "
                         f"{current_task.task_file}: {exc}"
                     )
+                    return
+                if not written:
+                    self.log_event(
+                        f"[WATCH] Remote merge confirmed but status:DONE was not written to "
+                        f"{current_task.task_file}; retrying."
+                    )
+                    return
             self._mark_task_done_in_snapshot()
             await self._save_current_run_record("success_merged")
         elif pr_state == "CLOSED":
             await self._save_current_run_record("closed_unmerged")
+        task_id = getattr(found, "pr_id", "") or ""
+        if task_id:
+            await self._clear_task_suppression(task_id)  # pragma: no cover
+        if isinstance(pr_number, int):
+            self.state.quarantined_prs.discard(pr_number)
         self._current_run_record = None
         self.state.current_task = None
         self.state.current_pr = None

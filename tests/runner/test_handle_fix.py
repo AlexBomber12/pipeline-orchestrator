@@ -40,6 +40,7 @@ from src.models import (
     ReviewStatus,
     TaskStatus,
 )
+from src.subsource_registry import SuppressionReason
 from src.usage import UsageSnapshot
 
 from tests.runner import _helpers as h
@@ -117,7 +118,7 @@ def test_handle_fix_releases_reservation_for_invalid_size_head(
     assert any("published PR HEAD is required" in item["event"] for item in runner.state.history)
 
 
-def test_handle_fix_retains_marker_until_successful_completion(
+def test_handle_fix_retains_marker_without_remote_completion_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
@@ -145,16 +146,106 @@ def test_handle_fix_retains_marker_until_successful_completion(
     )
     monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     asyncio.run(runner.handle_fix())
-    assert runner.state.state == PipelineState.WATCH
-    assert runner.state.current_pr.quarantine_labels == {marker}
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr.quarantine_labels == {marker, fixing}
     assert ["pr", "edit", "77", "--add-label", fixing] in calls
-    assert ["pr", "edit", "77", "--remove-label", fixing] in calls
-    assert calls.index(["pr", "edit", "77", "--add-label", fixing]) < calls.index(
-        ["pr", "edit", "77", "--remove-label", fixing]
+    assert ["pr", "edit", "77", "--remove-label", fixing] not in calls
+
+
+@pytest.mark.parametrize("failure", ["false", "raise", "lost_ack", "label", "redis"])
+def test_successful_size_fix_retries_failed_todo_write_in_watch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, failure: str,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    coder = AsyncMock(return_value=(0, "", ""))
+    monkeypatch.setattr(claude_cli, "fix_review_async", coder)
+    marker = continued_size_label("a" * 40)
+    fixing = fixing_size_label("a" * 40)
+    task_path = tmp_path / "tasks" / "PR-019.md"
+    task_path.parent.mkdir()
+    task_path.write_text("task generation\n")
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.WATCH
+    pr = PRInfo(number=77, branch="pr-019", pr_id="PR-019", head_sha="a" * 40,
+                quarantine_labels={marker})
+    runner.state.current_pr = pr
+    runner.state.current_task = QueueTask(
+        pr_id="PR-019", title="t", status=TaskStatus.DOING,
+        branch="pr-019", task_file="tasks/PR-019.md",
     )
+    remote = {"status": "error", "revision": "e" * 64}
+    if failure == "redis":
+        publish = runner.publish_state
+        missed = {"once": False}
+
+        async def transient_publish() -> None:
+            if runner.state.size_fix_completion is not None and not missed["once"]:
+                missed["once"] = True
+                raise OSError("temporary Redis failure")
+            await publish()
+
+        monkeypatch.setattr(runner, "publish_state", transient_publish)
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task",
+        lambda: (remote["status"], SuppressionReason.CRASH if remote["status"] == "error" else None,
+                 remote["revision"]),
+    )
+    writes: list[str] = []
+
+    async def status_write(_task, status, _reason, **_kwargs):
+        writes.append(status)
+        if status == "TODO" and writes.count("TODO") == 1:
+            if failure == "false":
+                return False
+            if failure == "raise":
+                raise OSError("temporary status write failure")
+            if failure == "lost_ack":
+                remote.update(status="todo", revision="t" * 64)
+                return False
+        if status == "TODO":
+            remote.update(status="todo", revision="t" * 64)
+        return True
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", status_write)
+    monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker", lambda *_args: None)
+    monkeypatch.setattr("src.daemon.handlers.watch.bound_checkout_work_blocker_for_ref", lambda *a: None)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kwargs: [pr])
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *args, **kwargs: "OPEN")
+    label_attempts = {"count": 0}
+
+    def run_gh(args, **_kwargs):
+        if args[:3] == ["label", "create", marker]:
+            label_attempts["count"] += 1
+            if failure == "label" and label_attempts["count"] == 1:
+                raise OSError("temporary label failure")
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", run_gh)
+    original_git = git_ops_module._git
+
+    def fixed_head(repo_path: str, *args: str, **kwargs: Any):
+        if args[:2] == ("rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, "a" * 40 + "\n", "")
+        return original_git(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops_module, "_git", fixed_head)
+    asyncio.run(runner.handle_fix())
+    assert runner.state.size_fix_completion is not None
+    assert writes == ["ERROR"]
+    expected_writes = (
+        (["ERROR", "TODO"],) if failure == "redis"
+        else (["ERROR", "TODO"], ["ERROR", "TODO", "TODO"])
+    )
+    for expected in expected_writes:
+        asyncio.run(runner.handle_watch())
+        assert writes == expected
+    assert coder.await_count == 1
+    assert runner.state.size_fix_completion is None
+    assert fixing not in runner.state.current_pr.quarantine_labels
+    assert remote["status"] == "todo"
 
 
-@pytest.mark.parametrize("failure", ["prior_fix", "apply", "status", "complete_status", "complete"])
+@pytest.mark.parametrize("failure", ["prior_fix", "apply", "status"])
 def test_handle_fix_keeps_recovery_marker_when_fix_outcome_is_uncertain(
     monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
@@ -172,16 +263,11 @@ def test_handle_fix_keeps_recovery_marker_when_fix_outcome_is_uncertain(
     runner.state.current_task = QueueTask(
         pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019",
     )
-    status_write = (
-        AsyncMock(side_effect=[True, False]) if failure == "complete_status"
-        else AsyncMock(return_value=failure != "status")
-    )
+    status_write = AsyncMock(return_value=failure != "status")
     monkeypatch.setattr(runner, "_commit_task_status_change", status_write)
 
     def run_gh(args: list[str], **kwargs: Any) -> None:
         if failure == "apply" and args == ["pr", "edit", "77", "--add-label", fixing]:
-            raise OSError("label unavailable")
-        if failure == "complete" and args[:3] == ["label", "create", marker]:
             raise OSError("label unavailable")
 
     monkeypatch.setattr(fix_module.gh_runner, "run_gh", run_gh)
@@ -201,19 +287,12 @@ def test_handle_fix_keeps_recovery_marker_when_fix_outcome_is_uncertain(
     elif failure == "apply":
         assert runner.state.current_pr.quarantine_labels == {marker}
         assert any("marker application deferred" in item["event"] for item in runner.state.history)
-    elif failure == "complete":
-        assert runner.state.current_pr.quarantine_labels == {marker, fixing}
-        assert any("marker completion deferred" in item["event"] for item in runner.state.history)
-    elif failure == "complete_status":
-        assert runner.state.current_pr.quarantine_labels == {marker, fixing}
-        assert status_write.await_count == 2
-        assert any("retaining recovery marker" in item["event"] for item in runner.state.history)
     else:
         assert runner.state.current_pr.quarantine_labels == {marker}
         assert any("task status update deferred" in item["event"] for item in runner.state.history)
 
 
-def test_handle_fix_rotates_size_marker_after_published_push(
+def test_handle_fix_retains_size_marker_after_push_without_remote_evidence(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
@@ -243,11 +322,12 @@ def test_handle_fix_rotates_size_marker_after_published_push(
     )
     monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
     asyncio.run(runner.handle_fix())
-    assert runner.state.state == PipelineState.WATCH
-    assert runner.state.current_pr.quarantine_labels == {new_marker}
-    assert ["pr", "edit", "77", "--add-label", new_marker] in calls
-    assert ["pr", "edit", "77", "--remove-label", old_marker] in calls
-    assert ["pr", "edit", "77", "--remove-label", fixing] in calls
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr.quarantine_labels == {old_marker, fixing}
+    assert new_marker not in runner.state.current_pr.quarantine_labels
+    assert ["pr", "edit", "77", "--add-label", new_marker] not in calls
+    assert ["pr", "edit", "77", "--remove-label", old_marker] not in calls
+    assert ["pr", "edit", "77", "--remove-label", fixing] not in calls
 
 
 def test_handle_fix_defers_for_credential_login_without_counting_iteration(
