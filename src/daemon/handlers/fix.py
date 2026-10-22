@@ -5,21 +5,27 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.approval_commands import load_approval, matches_state
 from src.branch_context import BranchContext
 from src.cancellation import (
     CancellationCause,
     safe_record_cancellation_cause,
 )
-from src.cancellation.storage import task_spec_content_hash
+from src.cancellation.storage import cause_key, task_spec_content_hash
 from src.daemon import (
     fix_codex_trigger,
     fix_escalation,
     fix_push_verify,
     fix_supervision,
     git_ops,
+)
+from src.daemon.approval_commands import (
+    bound_checkout_work_blocker_for_ref,
+    checkout_process_blocker,
 )
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers.breach import BreachMixin
@@ -35,6 +41,7 @@ from src.daemon.selector import CoderSelectionUnavailable
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github.reviewer_policy import ReviewerPolicy
+from src.keyspace import control_stop
 from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus, SizeFixCompletion, TaskStatus
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
@@ -95,6 +102,47 @@ def _fetch_failed_ci_logs(repo: str, branch: str) -> str | None:
 
 class FixMixin(BreachMixin):
     """FIX FEEDBACK handler with idle timeout and breach monitoring."""
+
+    async def _approved_guardrail_fix_attempt(self, record, current_pr):
+        """Return the bound approval only for its finalized guardrail run."""
+        command = self._current_approval(current_pr)
+        task = self.state.current_task
+        invocation = self.state.active_invocation
+        if (
+            command is None or command.status != "applied" or not command.active
+            or task is None or not matches_state(command, self.state)
+            or task.branch != current_pr.branch
+            or current_pr.pr_id not in (None, task.pr_id)
+            or record.task_id != task.pr_id or record.repo_name != self.name
+            or record.ended_at is None or record.cause != "ESCALATE"
+            or record.cause_subsource != "guardrail"
+            or record.head_sha != current_pr.head_sha
+            or record.task_spec_hash not in ("", command.task_fingerprint)
+            or invocation is None or invocation.run_id != record.run_id
+            or invocation.attempt_index != record.attempt_index
+            or not record.invocations or record.invocations[-1] != invocation
+            or self.state.user_paused or not self.repo_config.active
+            or self._current_coder_process is not None
+        ):
+            return None
+        try:
+            persisted = await load_approval(self.redis, self.name, command.binding)
+            if (
+                persisted is None or persisted.status != "applied" or not persisted.active
+                or persisted.binding != command.binding
+                or persisted.failure != command.failure
+                or self._approval_scope(persisted) != self._approval_scope(command)
+                or await self.redis.get(cause_key(self.name, task.pr_id))
+                or await self.redis.get(control_stop(self.name))
+                or checkout_process_blocker(self.repo_path)
+                or bound_checkout_work_blocker_for_ref(
+                    self.repo_path, current_pr.branch, {current_pr.head_sha},
+                )
+            ):
+                return None
+        except (OSError, RuntimeError, ValueError):
+            return None
+        return command
 
     async def _monitor_fix_idle(
         self,
@@ -343,23 +391,51 @@ class FixMixin(BreachMixin):
                 record = self._current_run_record
                 assert record is not None
                 record.run_phase = "fix"
-            elif record.task_id != task.pr_id or (
-                record.ended_at is not None and record.exit_reason != "coding_complete"
-            ):
+            elif record.task_id != task.pr_id:
                 self.log_event("[FIX] Completed or unrelated run record; deferring dispatch.")
                 self.state.state = PipelineState.WATCH
                 return
             elif record.ended_at is not None:
+                approval = None
+                if record.exit_reason != "coding_complete":
+                    approval = await self._approved_guardrail_fix_attempt(record, current_pr)
+                    if approval is None:
+                        self.log_event("[FIX] Completed or unrelated run record; deferring dispatch.")
+                        self.state.state = PipelineState.WATCH
+                        return
                 if record.fix_iterations - record.fix_recovery_baseline >= fix_iteration_cap:
                     await self._escalate_fix_iteration_cap(current_pr)
                     return
                 previous_snapshot = self.state.active_invocation
-                self._current_run_record = self._new_fix_run_record(
-                    record, coder_name=coder_name,
-                    model=plugin.resolve_model(self.app_config.daemon),
+                admitted_run_id = (
+                    str(uuid.uuid5(uuid.NAMESPACE_URL, f"{self.name}:{approval.binding}:{record.run_id}:fix"))
+                    if approval is not None else None
                 )
                 try:
-                    await self._checkpoint_current_run_record()
+                    admitted = (
+                        await self._metrics_store.get(admitted_run_id)
+                        if admitted_run_id is not None else None
+                    )
+                    if admitted is None:
+                        admitted = self._new_fix_run_record(
+                            record, coder_name=coder_name,
+                            model=plugin.resolve_model(self.app_config.daemon),
+                            task_spec_hash=approval.task_fingerprint if approval is not None else None,
+                        )
+                        if admitted_run_id is not None:
+                            admitted.run_id = admitted_run_id
+                        self._current_run_record = admitted
+                        await self._checkpoint_current_run_record()
+                    elif (
+                        admitted.task_id != task.pr_id or admitted.repo_name != self.name
+                        or admitted.ended_at is not None or admitted.invocations
+                        or admitted.attempt_index != record.attempt_index + 1
+                        or admitted.fix_iterations != record.fix_iterations
+                        or admitted.fix_recovery_baseline != record.fix_recovery_baseline
+                        or approval is None or admitted.task_spec_hash != approval.task_fingerprint
+                    ):
+                        raise RuntimeError("admitted FIX accounting changed")
+                    self._current_run_record = admitted
                 except Exception as exc:
                     self._current_run_record = record
                     self.state.active_invocation = previous_snapshot

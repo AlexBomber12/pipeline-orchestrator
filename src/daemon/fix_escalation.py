@@ -349,9 +349,33 @@ async def escalate_fix_iteration_cap(
         )
         return
     current_pr.is_escalated = True
-    await runner._commit_and_park_in_error(
+    message = (
         f"FIX cap reached ({count}/{fix_iteration_cap}) on PR "
-        f"#{pr_number}: escalated, parking in ERROR",
+        f"#{pr_number}: escalated, parking in ERROR"
+    )
+    if record is not None and record.ended_at is not None:
+        # An approved guardrail can return to FIX with a finalized historical
+        # run. Exhaustion must park without rewriting that prior outcome.
+        await runner._transition_to_error(
+            message,
+            save_run_record_as=None,
+            log_prefix="[ESCALATE]",
+            cancellation_cause=CancellationCause(
+                category="ERROR",
+                payload={
+                    "subsource": "fix_iteration_cap",
+                    "reason_text": message,
+                    "previous_state": runner.state.state.value,
+                    "pr_number": pr_number,
+                    "iteration_count": count,
+                    "fix_iteration_cap": fix_iteration_cap,
+                },
+            ),
+            commit_task_status=True,
+        )
+        return
+    await runner._commit_and_park_in_error(
+        message,
         subsource="fix_iteration_cap",
         extra_payload={
             "pr_number": pr_number,

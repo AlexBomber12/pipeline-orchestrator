@@ -25,9 +25,10 @@ from src.cancellation.storage import CancellationCause, cause_key, index_key
 from src.daemon import approval_commands as daemon_approval
 from src.daemon import recovery as daemon_recovery
 from src.daemon.guardrails import GuardrailViolation
+from src.daemon.handlers import watch as daemon_watch
 from src.daemon.quarantine import OBSOLETE_SIZE_LABEL, continued_size_label, fixing_size_label
 from src.keyspace import control_stop, pipeline_state
-from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
+from src.models import CIStatus, PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.subsource_registry import SuppressionReason
 from src.task_status import MergedState
 
@@ -236,6 +237,205 @@ async def test_clean_approval_and_restart_resume_exact_pr_without_git_writes(app
     await runner._run_cycle_body()
     assert runner.state.current_pr.number == 42 and runner.state.state == PipelineState.WATCH
     assert snapshot(repo) == before and git(remote, "show-ref") == remote_before
+
+
+async def finalized_guardrail_approval(approval, monkeypatch, *, fix_iterations=1, apply=True):
+    runner, _, repo, _ = approval
+    runner.app_config.daemon.fix_iteration_cap = 3
+    runner.state.current_pr.ci_status = CIStatus.FAILURE
+    runner.state.current_pr.quarantine_labels = {"quarantine:workflow"}
+    cause = CancellationCause(
+        category="ERROR",
+        payload={"subsource": "guardrail", "category": "workflow_destruction", "excerpt": "workflow change"},
+    ).to_redis()
+    await runner.redis.set(cause_key(runner.name, "PR-42"), cause)
+    runner._start_current_run_record("claude", "opus")
+    old = runner._current_run_record
+    old.run_phase = "fix"
+    old.attempt_index = 2
+    old.fix_iterations = fix_iterations
+    runner._capture_invocation_snapshot("claude", {}, phase="fix", fix_iteration=fix_iterations)
+    await runner._save_current_run_record("error", cause="ESCALATE", cause_subsource="guardrail")
+    old = await runner._metrics_store.get(old.run_id)
+    runner.state.current_pr.head_sha = old.head_sha
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(runner.name, runner.state, cause, repo)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a, **k: [command.pr])
+    if apply:
+        await enqueue_approval(runner.redis, command)
+        await runner._run_cycle_body()
+        assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    return runner, command, old
+
+
+def real_watch_with_mock_coder(runner, monkeypatch):
+    monkeypatch.setattr(runner, "handle_watch", runner.__class__.handle_watch.__get__(runner))
+    monkeypatch.setattr(daemon_watch.gh_prs, "get_pr_state", lambda *a: "OPEN")
+    monkeypatch.setattr(runner, "_rehydrate_quarantine_from_pr_labels", AsyncMock())
+    monkeypatch.setattr(runner, "_detect_external_quarantine_release", AsyncMock())
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", AsyncMock())
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", AsyncMock())
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda *a: None)
+    dispatched = AsyncMock(return_value=(0, "", ""))
+    monkeypatch.setattr("src.coders.claude.claude_cli.fix_review_async", dispatched)
+    return dispatched
+
+
+@pytest.mark.asyncio
+async def test_finalized_guardrail_approval_dispatches_new_fix_attempt(approval, monkeypatch):
+    runner, command, old = await finalized_guardrail_approval(approval, monkeypatch)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    await runner._run_cycle_body()
+    assert dispatched.await_count == 1
+    assert runner._current_run_record.run_id != old.run_id
+    assert runner._current_run_record.attempt_index == 3
+    assert runner._current_run_record.fix_iterations == 2
+    assert runner._current_run_record.fix_recovery_baseline == 0
+    assert await runner._metrics_store.get(old.run_id) == old
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.active_invocation.run_id == runner._current_run_record.run_id
+    assert runner._current_run_record.invocations[-1] == runner.state.active_invocation
+    runner.state.current_pr.ci_status = CIStatus.PENDING
+    command.pr.ci_status = CIStatus.PENDING
+    await runner.publish_state()
+    await runner._run_cycle_body()
+    assert dispatched.await_count == 1
+    assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
+
+
+@pytest.mark.parametrize("failure", ["before_write", "lost_ack"])
+@pytest.mark.parametrize("restart", [False, True])
+async def test_approved_guardrail_fix_checkpoint_retry_reuses_attempt(
+    approval, monkeypatch, failure, restart,
+):
+    runner, command, old = await finalized_guardrail_approval(approval, monkeypatch)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    checkpoint = runner._checkpoint_current_run_record
+    failures = 0
+
+    async def flaky_checkpoint():
+        nonlocal failures
+        if (
+            failures == 0 and runner._current_run_record.run_id != old.run_id
+            and not runner._current_run_record.invocations
+        ):
+            failures += 1
+            if failure == "lost_ack":
+                await checkpoint()
+            raise OSError("FIX admission checkpoint unavailable")
+        await checkpoint()
+
+    monkeypatch.setattr(runner, "_checkpoint_current_run_record", flaky_checkpoint)
+    await runner._run_cycle_body()
+    assert failures == 1 and dispatched.await_count == 0
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == old.run_id
+    assert await runner._metrics_store.get(old.run_id) == old
+    if restart:
+        runner._recovered = False
+        runner._current_run_record = None
+        runner._approval_receipt = None
+        runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
+        await runner._run_cycle_body()
+        assert runner.state.state == PipelineState.WATCH
+        assert runner._current_run_record.run_id == old.run_id
+    await runner._run_cycle_body()
+    assert dispatched.await_count == 1
+    admitted = runner._current_run_record
+    assert admitted.attempt_index == 3
+    assert admitted.fix_iterations == 2 and admitted.fix_recovery_baseline == 0
+    assert admitted.invocations[-1] == runner.state.active_invocation
+    assert await runner._metrics_store.get(old.run_id) == old
+    assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
+
+
+async def test_approved_guardrail_fix_rejects_changed_admitted_accounting(approval, monkeypatch):
+    runner, _, old = await finalized_guardrail_approval(approval, monkeypatch)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    checkpoint = runner._checkpoint_current_run_record
+
+    async def lost_ack():
+        if runner._current_run_record.run_id != old.run_id:
+            await checkpoint()
+            raise OSError("lost checkpoint acknowledgement")
+        await checkpoint()
+
+    monkeypatch.setattr(runner, "_checkpoint_current_run_record", lost_ack)
+    await runner._run_cycle_body()
+    admitted = next(
+        record for record in await runner._metrics_store.list_task_runs(runner.name, "PR-42")
+        if record.run_id != old.run_id
+    )
+    admitted.fix_iterations += 1
+    await runner._metrics_store.save(admitted)
+    monkeypatch.setattr(runner, "_checkpoint_current_run_record", checkpoint)
+    await runner._run_cycle_body()
+    assert dispatched.await_count == 0
+    assert runner._current_run_record.run_id == old.run_id
+    assert await runner._metrics_store.get(old.run_id) == old
+
+
+async def test_approved_guardrail_fix_respects_exhausted_budget(approval, monkeypatch):
+    runner, _, old = await finalized_guardrail_approval(
+        approval, monkeypatch, fix_iterations=3,
+    )
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    monkeypatch.setattr("src.github.comments.post_comment", lambda *a: None)
+    await runner._run_cycle_body()
+    assert dispatched.await_count == 0
+    assert runner.state.state == PipelineState.ERROR
+    assert runner._current_run_record.run_id == old.run_id
+    assert await runner._metrics_store.get(old.run_id) == old
+    assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 1
+
+
+@pytest.mark.parametrize(
+    "blocker",
+    [
+        "missing_approval", "stale_receipt", "stale_head", "changed_pr",
+        "changed_task", "new_cause", "pause", "stop", "dirty", "process",
+        "verification_error",
+    ],
+)
+async def test_finalized_guardrail_fix_rejects_changed_approval_binding(
+    approval, monkeypatch, blocker,
+):
+    runner, command, old = await finalized_guardrail_approval(approval, monkeypatch)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    if blocker == "missing_approval":
+        runner._approval_receipt = None
+    elif blocker == "stale_receipt":
+        persisted = await load_approval(runner.redis, runner.name, command.binding)
+        persisted.active = False
+        await runner.redis.set(approval_key(runner.name, command.binding), persisted.model_dump_json())
+    elif blocker == "stale_head":
+        runner.state.current_pr.head_sha = "f" * 40
+    elif blocker == "changed_pr":
+        runner.state.current_pr.number = 99
+    elif blocker == "changed_task":
+        (Path(runner.repo_path) / command.task.task_file).write_text(
+            (Path(runner.repo_path) / command.task.task_file).read_text() + "Revised work.\n"
+        )
+    elif blocker == "new_cause":
+        await runner.redis.set(cause_key(runner.name, "PR-42"), "newer suppression")
+    elif blocker == "pause":
+        runner.state.user_paused = True
+    elif blocker == "stop":
+        await runner.redis.set(control_stop(runner.name), "1")
+    elif blocker == "dirty":
+        (Path(runner.repo_path) / "local-only.txt").write_text("unpublished work")
+    elif blocker == "process":
+        runner._current_coder_process = object()
+    elif blocker == "verification_error":
+        monkeypatch.setattr(
+            "src.daemon.handlers.fix.checkout_process_blocker",
+            lambda *a: (_ for _ in ()).throw(OSError("process ownership unavailable")),
+        )
+    await runner.handle_fix()
+    assert dispatched.await_count == 0
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == old.run_id
+    assert await runner._metrics_store.get(old.run_id) == old
 
 
 @pytest.mark.parametrize("single", [False, True])
