@@ -365,6 +365,7 @@ def test_handle_watch_unified_slowdown_skips_non_watch_cycles() -> None:
 def test_handle_watch_unified_budget_resets_slowdown_counter() -> None:
     runner = h._make_runner()
     _set_flag(runner, True)
+    _seed_github_budget(runner, remaining=5000)
     runner._github_api_slowdown_attempts = 2
     runner._github_api_slowdown_cycle = 1
 
