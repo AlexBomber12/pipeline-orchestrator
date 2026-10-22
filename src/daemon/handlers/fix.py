@@ -809,7 +809,7 @@ class FixMixin(BreachMixin):
             if size_fix_marker is None or current_pr is None or self.state.current_task is None:
                 return
             committed = await self._commit_task_status_change(
-                self.state.current_task, "DOING", "Size FIX completed; continuing published PR",
+                self.state.current_task, "TODO", "Size FIX completed; continuing published PR",
             )
             if not committed:
                 self.log_event("[FIX] Size FIX task status update deferred; retaining recovery marker.")

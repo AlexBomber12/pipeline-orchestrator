@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import logging
 import os
 import re
 import subprocess
@@ -245,6 +244,9 @@ class ApprovalCommandMixin:
                         await self._approval_result(command, "deferred", reason)
                         self.log_event(f"[RECOVERY] Approved PR waiting: {reason}")
                         return True
+                    if command.size_only or is_size_only_cause(command.failure):
+                        if not await self._finish_size_approval(command, pr.quarantine_labels):
+                            return True
                     # Keep preserved work out of scaffolding and destructive
                     # preflight on subsequent cycles. WATCH retains all gates.
                     if "continuation deferred:" in command.reason:
@@ -555,9 +557,9 @@ class ApprovalCommandMixin:
                 return True
             raw_state = await self.redis.get(pipeline_state(self.name))
             persisted = RepoState.model_validate_json(raw_state) if raw_state else None
-            await self._commit_approval_state(
-                command, pr.quarantine_labels, is_size_only_cause(command.failure, persisted)
-            )
+            await self._commit_approval_state(command)
+            if is_size_only_cause(command.failure, persisted):
+                await self._finish_size_approval(command, pr.quarantine_labels)
             return True
         except ApprovalChanged as exc:
             await self._approval_result(command, "failed", str(exc))
@@ -605,32 +607,12 @@ class ApprovalCommandMixin:
         self.state = await self.redis.transaction(transaction, state_key, cancellation, value_from_callable=True)
         self._approval_head_refresh_uncertain = False
 
-    async def _commit_approval_state(
-        self, command: ApprovalCommand, live_labels: set[str], size_only: bool,
-    ) -> None:
+    async def _commit_approval_state(self, command: ApprovalCommand) -> None:
         key = approval_key(self.name, command.binding)
         cancellation = cause_key(self.name, command.task.pr_id)
         state_key = pipeline_state(self.name)
         stop_key = control_stop(self.name)
         upload_key = upload_pending(self.name)
-        marker = continued_size_label(command.pr.head_sha) if size_only else None
-        # Keep a blocking size label through the Redis commit. A size-ok label
-        # before that commit would falsely authorize stateless recovery if it
-        # aborted or the daemon exited between the GitHub and Redis writes.
-        if marker is not None and OBSOLETE_SIZE_LABEL not in live_labels and marker not in live_labels:
-            try:
-                gh_runner.run_gh(
-                    ["label", "create", OBSOLETE_SIZE_LABEL, "--color", "B60205",
-                     "--description", "Legacy size decision pending approval"],
-                    repo=self.owner_repo,
-                )
-            except Exception as exc:
-                if not _is_label_already_exists_error(exc):
-                    raise RuntimeError(f"Size quarantine marker unavailable: {exc}") from exc
-            gh_runner.run_gh(
-                ["pr", "edit", str(command.pr.number), "--add-label", OBSOLETE_SIZE_LABEL],
-                repo=self.owner_repo,
-            )
 
         async def transaction(pipe: Any) -> RepoState:
             current = ApprovalCommand.model_validate_json(await pipe.get(key))
@@ -667,6 +649,7 @@ class ApprovalCommandMixin:
                 raise RuntimeError("Another quarantine finding appeared during application.")
             state.quarantined_prs.discard(command.pr.number)
             current.status = "applied"
+            current.size_only = is_size_only_cause(command.failure, persisted)
             current.reason = "Daemon applied approval; watching the existing PR. CI and review gates remain required."
             pipe.multi()
             pipe.set(key, current.model_dump_json())
@@ -691,7 +674,46 @@ class ApprovalCommandMixin:
         self._approval_commit_uncertain = False
         self._recovered = True
         self._approval_receipt = command.model_copy(update={"status": "applied"})
-        if marker is not None and (OBSOLETE_SIZE_LABEL in live_labels or marker not in live_labels):
+
+    async def _finish_size_approval(self, command: ApprovalCommand, live_labels: set[str]) -> bool:
+        """Use the confirmed base task header as durable continuation authority."""
+        key = approval_key(self.name, command.binding)
+        if not command.task_status_committed:
+            raw_state = await self.redis.get(pipeline_state(self.name))
+            if (
+                command.repo_slug != self.name or command.repo_url != self.repo_config.url
+                or not raw_state
+                or not matches_state(
+                    command, RepoState.model_validate_json(raw_state), check_head=False,
+                )
+                or await self.redis.get(cause_key(self.name, command.task.pr_id))
+            ):
+                self.log_event("[RECOVERY] Size approval binding changed before task status write.")
+                return False
+            if not await self._commit_task_status_change(
+                command.task, "TODO", "Size-only approval applied; continuing published PR",
+            ):
+                self.log_event("[RECOVERY] Size approval task status write deferred; retaining receipt.")
+                return False
+
+            async def transaction(pipe: Any) -> None:
+                current = ApprovalCommand.model_validate_json(await pipe.get(key))
+                state = RepoState.model_validate_json(await pipe.get(pipeline_state(self.name)))
+                if (
+                    current.status != "applied" or not current.active
+                    or not matches_state(command, state, check_head=False)
+                    or await pipe.get(cause_key(self.name, command.task.pr_id))
+                ):
+                    raise ApprovalChanged("Size approval changed before status confirmation.")
+                current.task_status_committed = True
+                pipe.multi()
+                pipe.set(key, current.model_dump_json())
+
+            await self.redis.transaction(
+                transaction, key, pipeline_state(self.name), cause_key(self.name, command.task.pr_id),
+            )
+        marker = continued_size_label(command.pr.head_sha)
+        if OBSOLETE_SIZE_LABEL in live_labels or marker not in live_labels:
             try:
                 gh_runner.run_gh(
                     [
@@ -703,19 +725,20 @@ class ApprovalCommandMixin:
             except Exception as exc:
                 if not _is_label_already_exists_error(exc):
                     self.log_event(f"[RECOVERY] Size label migration deferred: {exc}")
-                    return
+                    return True
             try:
                 gh_runner.run_gh(
                     ["pr", "edit", str(command.pr.number), "--add-label", marker],
                     repo=self.owner_repo,
                 )
-                gh_runner.run_gh(
-                    ["pr", "edit", str(command.pr.number), "--remove-label", OBSOLETE_SIZE_LABEL],
-                    repo=self.owner_repo,
-                )
+                if OBSOLETE_SIZE_LABEL in live_labels:
+                    gh_runner.run_gh(
+                        ["pr", "edit", str(command.pr.number), "--remove-label", OBSOLETE_SIZE_LABEL],
+                        repo=self.owner_repo,
+                    )
             except Exception as exc:
                 self.log_event(f"[RECOVERY] Obsolete size label removal deferred: {exc}")
-        logging.getLogger(__name__).info("Approval %s applied to existing PR #%s", command.binding, command.pr.number)
+        return True
 
     @staticmethod
     def _approved_finding(command: ApprovalCommand) -> tuple[str, str]:

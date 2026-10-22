@@ -25,17 +25,10 @@ from src.cancellation import (
     get_current_run_started_at,
     safe_record_cancellation_cause,
 )
-from src.cancellation.storage import task_spec_content_hash
 from src.daemon import git_ops
-from src.daemon.approval_commands import (
-    bound_checkout_work_blocker_for_ref,
-    checkout_process_blocker,
-)
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
 from src.daemon.quarantine import (
     blocking_quarantine_labels,
-    continued_size_label,
-    is_continued_size_label,
     is_fixing_size_label,
 )
 from src.github import prs as gh_prs
@@ -85,10 +78,6 @@ from src.task_status import (
 logger = logging.getLogger(__name__)
 
 _PR_NUMBER_RE = re.compile(r"^PR-(\d+)(.*)$")
-
-
-class LegacySizeRecoveryDeferred(RuntimeError):
-    """Keep startup recovery retryable while size-only evidence is uncertain."""
 
 
 def _task_pr_sort_key(pr_id: str) -> tuple[int, int | str, str]:
@@ -751,6 +740,7 @@ class RecoveryMixin:
                 log_message=f"recover_state failed: {exc}",
             )
             return False
+        base_refreshed = False
         if any(
             is_fixing_size_label(label)
             for pr in prs for label in pr.quarantine_labels
@@ -765,6 +755,7 @@ class RecoveryMixin:
                     self.repo_path, "fetch", "--no-tags", "origin",
                     f"refs/heads/{base}:refs/remotes/origin/{base}", timeout=120,
                 )
+                base_refreshed = True
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 self.log_event(f"[RECOVERY] Size FIX task header refresh deferred: {exc}")
                 return False
@@ -793,6 +784,28 @@ class RecoveryMixin:
         try:
             try:
                 tasks = self._parse_tasks_from_headers()
+                if (
+                    not base_refreshed and tasks and (Path(self.repo_path) / ".git").exists()
+                    and any(
+                        task.status == TaskStatus.ERROR
+                        and (header := self._recovery_task_headers.get(task.pr_id)) is not None
+                        and header.blocked_reason == SuppressionReason.GUARDRAIL.value
+                        and find_matching_open_pr(task.pr_id, task.branch, prs) is not None
+                        for task in tasks
+                    )
+                ):
+                    # The status writer uses an isolated checkout. Refresh the
+                    # base ref before treating a cached ERROR header as final.
+                    base = self.repo_config.branch
+                    if not base or base.startswith("-") or git_ops._git(
+                        self.repo_path, "check-ref-format", "--branch", base, check=False,
+                    ).returncode != 0:
+                        raise ValueError("invalid configured base branch")
+                    git_ops._git(
+                        self.repo_path, "fetch", "--no-tags", "origin",
+                        f"refs/heads/{base}:refs/remotes/origin/{base}", timeout=120,
+                    )
+                    tasks = self._parse_tasks_from_headers()
             except MergeStatusUnavailable as exc:
                 self.log_event(f"[INFRA] recover_state deferred: {exc}")
                 return False
@@ -834,11 +847,7 @@ class RecoveryMixin:
             tasks = []
         if not await self._recover_header_merge_attempt(tasks, prs):
             return False
-        try:
-            await self._apply_recovery_decisions(tasks, prs)
-        except LegacySizeRecoveryDeferred as exc:
-            self.log_event(f"[RECOVERY] Legacy size continuation waiting: {exc}.")
-            return False
+        await self._apply_recovery_decisions(tasks, prs)
         # PR-263: hydrate the in-memory queue snapshot so the dashboard's
         # /api/repo/{name}/queue endpoint reflects post-restart state
         # immediately, without waiting for the next IDLE cycle.
@@ -935,98 +944,31 @@ class RecoveryMixin:
                 "from GitHub labels."
             )
 
-    async def _recover_legacy_size_tasks(
+    async def _recover_guardrail_error_pr(
         self, tasks: list[QueueTask], prs: list[PRInfo],
-    ) -> None:
-        """Restore a size-only ERROR task from its task header and live PR."""
-        candidates = [
-            (index, task) for index, task in enumerate(tasks)
-            if task.status == TaskStatus.ERROR
-            and (header := getattr(self, "_recovery_task_headers", {}).get(task.pr_id)) is not None
-            and header.frontmatter_status == "error"
-            and header.blocked_reason == SuppressionReason.GUARDRAIL.value
-            and task.pr_id not in self._crashed_task_pr_ids
-        ]
-        if not candidates:
-            return
-        raw_state = await self.redis.get(pipeline_state(self.name))
-        try:
-            persisted = RepoState.model_validate_json(raw_state) if raw_state else None
-        except ValueError:
-            self.log_event("[RECOVERY] Legacy size task retained: saved state is malformed.")
-            return
-        for index, task in candidates:
-            pr = find_matching_open_pr(task.pr_id, task.branch, prs)
-            if pr is None or not pr.quarantine_labels:
-                continue
-            if any(is_fixing_size_label(label) for label in pr.quarantine_labels):
-                self.log_event(
-                    f"[RECOVERY] Size FIX for {task.pr_id} has no durable success; "
-                    "retaining ERROR for operator recovery."
-                )
-                continue
-            markers = {label for label in pr.quarantine_labels if is_continued_size_label(label)}
-            if blocking_quarantine_labels(pr.quarantine_labels):
-                continue
-            if re.fullmatch(r"[0-9a-fA-F]{40}", pr.head_sha) is None:
-                raise LegacySizeRecoveryDeferred("live PR HEAD is unavailable")
-            if markers and markers != {continued_size_label(pr.head_sha)}:
-                raise LegacySizeRecoveryDeferred("size continuation marker belongs to another PR HEAD")
-            if persisted is not None and not (
-                persisted.state == PipelineState.WATCH
-                and persisted.current_task is not None
-                and persisted.current_task.pr_id == task.pr_id
-                and persisted.current_pr is not None
-                and persisted.current_pr.number == pr.number
-                and persisted.current_pr.branch == pr.branch
+    ) -> tuple[QueueTask, PRInfo] | None:
+        """Park an ERROR guardrail PR; labels cannot authorize continuation.
+
+        A size-ok or legacy size label can outlive a later guardrail whose
+        GitHub label write failed. A confirmed TODO task header with a matching
+        open PR is durable evidence that this approval completed.
+        """
+        for task in tasks:
+            header = getattr(self, "_recovery_task_headers", {}).get(task.pr_id)
+            if (
+                task.status != TaskStatus.ERROR or header is None
+                or header.frontmatter_status != "error"
+                or header.blocked_reason != SuppressionReason.GUARDRAIL.value
             ):
                 continue
-            if await self._suppression_record_for_task(task.pr_id) is not None:
-                continue
-            try:
-                if not (Path(self.repo_path) / ".git").exists():
-                    raise LegacySizeRecoveryDeferred("checkout is unavailable for task verification")
-                reason = checkout_process_blocker(self.repo_path)
-                if not reason:
-                    reason = bound_checkout_work_blocker_for_ref(
-                        self.repo_path, task.branch, {pr.head_sha}
-                    )
-                if reason:
-                    raise LegacySizeRecoveryDeferred(reason)
-                base = git_ops._git(
-                    self.repo_path, "show",
-                    f"refs/remotes/origin/{self.repo_config.branch}:{task.task_file}",
-                    check=False,
+            pr = find_matching_open_pr(task.pr_id, task.branch, prs)
+            if pr is not None:
+                self.log_event(
+                    f"[RECOVERY] Guardrail ERROR task {task.pr_id} retains PR #{pr.number}; "
+                    "task header does not authorize continuation."
                 )
-                if base.returncode:
-                    raise LegacySizeRecoveryDeferred("base task generation is unavailable")
-                published = git_ops._git(
-                    self.repo_path, "show", f"{pr.head_sha}:{task.task_file}", check=False,
-                )
-                if published.returncode:
-                    fetched = subprocess.run(
-                        ["git", "-C", self.repo_path, "fetch", "--no-tags", "origin", pr.head_sha],
-                        capture_output=True, text=True, timeout=120, check=False,
-                    )
-                    if fetched.returncode:
-                        raise LegacySizeRecoveryDeferred("live PR HEAD fetch is unavailable")
-                    published = git_ops._git(
-                        self.repo_path, "show", f"{pr.head_sha}:{task.task_file}", check=False,
-                    )
-                    if published.returncode:
-                        raise LegacySizeRecoveryDeferred("published task generation is unavailable")
-                base_text, published_text = base.stdout, published.stdout
-                if task_spec_content_hash(base_text) != task_spec_content_hash(published_text):
-                    raise ValueError("published task generation differs from the ERROR task")
-            except LegacySizeRecoveryDeferred:
-                raise
-            except (OSError, subprocess.SubprocessError) as exc:
-                raise LegacySizeRecoveryDeferred(f"checkout verification is unavailable: {exc}") from exc
-            except ValueError as exc:
-                self.log_event(f"[RECOVERY] Legacy size PR #{pr.number} retained: {exc}.")
-                continue
-            tasks[index] = task.model_copy(update={"status": TaskStatus.DOING})
-            self.log_event(f"[RECOVERY] Legacy size-only task {task.pr_id} resumes WATCH PR #{pr.number}.")
+                return task, pr
+        return None
 
     async def _apply_recovery_decisions(
         self, tasks: list[QueueTask], prs: list[PRInfo]
@@ -1035,7 +977,7 @@ class RecoveryMixin:
 
         The body mirrors the original recover_state decision tree.
         """
-        await self._recover_legacy_size_tasks(tasks, prs)
+        unresolved_guardrail_pr = await self._recover_guardrail_error_pr(tasks, prs)
         self._set_queue_progress(
             sum(1 for t in tasks if t.status == TaskStatus.DONE),
             len(tasks),
@@ -1390,6 +1332,14 @@ class RecoveryMixin:
                 f"[INFRA] Recovered: {matched_task.status.value} task "
                 f"{matched_task.pr_id} -> WATCH PR #{matched_pr.number}."
             )
+            return
+
+        if unresolved_guardrail_pr is not None:
+            task, pr = unresolved_guardrail_pr
+            self.state.current_task = task
+            self.state.current_pr = pr
+            self.state.state = PipelineState.ERROR
+            self.state.error_message = "Guardrail decision unresolved; operator Retry or revised approval required."
             return
 
         self.state.state = PipelineState.IDLE

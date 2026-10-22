@@ -261,7 +261,7 @@ class WatchMixin:
                 self.log_event(f"[WATCH] PR #{found.number} size FIX outcome is unresolved; holding PR.")
                 return
             committed = await self._commit_task_status_change(
-                task, "DOING", "Size FIX completed; continuing published PR",
+                task, "TODO", "Size FIX completed; continuing published PR",
             )
             if not committed or not complete_size_fix_marker(self, found):
                 self.log_event(f"[WATCH] PR #{found.number} size FIX marker retry deferred.")

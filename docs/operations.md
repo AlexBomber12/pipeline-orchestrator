@@ -179,21 +179,25 @@ not need to remove their existing settings.
 After upgrading, a persisted `large_diff_threshold` cancellation for a bound
 open PR is reconciled through the same task, PR, HEAD, checkout, and process
 checks as an operator approval. A previously deferred approval resumes when
-those checks pass. Before removing the obsolete `quarantine:large_diff` label,
-the daemon adds an informational `size-ok:<PR HEAD SHA>` label as durable
-recovery evidence. The old size label or a continuation label bound to the
-current PR HEAD lets an ERROR task with a matching published PR and task
-generation return to WATCH after Redis loss. A marker for an older HEAD parks
-recovery. Neither label blocks CI or review; other quarantine labels still
-block. When the old label was never applied, the continuation marker must be
-published before the cancellation record is cleared. Before FIX dispatch, the
-daemon adds `size-fix:<PR HEAD SHA>` while retaining the continuation marker.
-After a successful FIX it records `status: DOING` in the task header, binds
+those checks pass. The Redis approval transaction validates the current
+cancellation and clears it before any GitHub label write. The daemon then
+commits `status: TODO` to the task header on the configured base branch. A
+matching open PR makes that durable header derive DOING during startup
+recovery. A failed status write stays retryable through the applied approval
+receipt; no continuation label is written until the status commit succeeds.
+Afterward, the daemon adds the informational `size-ok:<PR HEAD SHA>` label and
+removes the obsolete `quarantine:large_diff` label. Failed GitHub label writes
+are retried while the receipt is available. These labels are not authority to
+clear an ERROR task: they can survive a later, unrelated guardrail whose label
+write failed. An ERROR task with a matching open PR stays in ERROR for operator
+recovery after Redis loss, even if an old size label remains. Before FIX
+dispatch, the daemon adds `size-fix:<PR HEAD SHA>` while retaining the
+continuation marker. After a successful FIX it commits `status: TODO`, binds
 the continuation marker to the resulting HEAD, and removes `size-fix` last.
-WATCH retries failed label cleanup; startup can recover from the durable DOING
-header after fetching the latest base ref. An unresolved FIX with an ERROR
-header recovers into ERROR for operator Retry. CODING with an
-existing continuation PR returns to WATCH.
+WATCH retries failed label cleanup; startup refreshes the base ref and derives
+DOING from the TODO header and matching open PR. An unresolved FIX with an
+ERROR header recovers into ERROR for operator Retry. CODING with an existing
+continuation PR returns to WATCH.
 Startup recovery also checks the checkout for unpublished work and active
 processes. It fetches a missing verified PR HEAD without moving local refs;
 unavailable evidence leaves recovery pending for the next cycle.
