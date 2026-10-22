@@ -614,20 +614,21 @@ class ApprovalCommandMixin:
         stop_key = control_stop(self.name)
         upload_key = upload_pending(self.name)
         marker = continued_size_label(command.pr.head_sha) if size_only else None
-        # When the old GitHub label is absent, publish recovery evidence before
-        # the transaction clears the only remaining cancellation record.
+        # Keep a blocking size label through the Redis commit. A size-ok label
+        # before that commit would falsely authorize stateless recovery if it
+        # aborted or the daemon exited between the GitHub and Redis writes.
         if marker is not None and OBSOLETE_SIZE_LABEL not in live_labels and marker not in live_labels:
             try:
                 gh_runner.run_gh(
-                    ["label", "create", marker, "--color", "0E8A16",
-                     "--description", "Legacy size decision continued; CI and review still required"],
+                    ["label", "create", OBSOLETE_SIZE_LABEL, "--color", "B60205",
+                     "--description", "Legacy size decision pending approval"],
                     repo=self.owner_repo,
                 )
             except Exception as exc:
                 if not _is_label_already_exists_error(exc):
-                    raise RuntimeError(f"Size recovery marker unavailable: {exc}") from exc
+                    raise RuntimeError(f"Size quarantine marker unavailable: {exc}") from exc
             gh_runner.run_gh(
-                ["pr", "edit", str(command.pr.number), "--add-label", marker],
+                ["pr", "edit", str(command.pr.number), "--add-label", OBSOLETE_SIZE_LABEL],
                 repo=self.owner_repo,
             )
 
@@ -690,7 +691,7 @@ class ApprovalCommandMixin:
         self._approval_commit_uncertain = False
         self._recovered = True
         self._approval_receipt = command.model_copy(update={"status": "applied"})
-        if marker is not None and OBSOLETE_SIZE_LABEL in live_labels:
+        if marker is not None and (OBSOLETE_SIZE_LABEL in live_labels or marker not in live_labels):
             try:
                 gh_runner.run_gh(
                     [
@@ -708,11 +709,10 @@ class ApprovalCommandMixin:
                     ["pr", "edit", str(command.pr.number), "--add-label", marker],
                     repo=self.owner_repo,
                 )
-                if OBSOLETE_SIZE_LABEL in live_labels:
-                    gh_runner.run_gh(
-                        ["pr", "edit", str(command.pr.number), "--remove-label", OBSOLETE_SIZE_LABEL],
-                        repo=self.owner_repo,
-                    )
+                gh_runner.run_gh(
+                    ["pr", "edit", str(command.pr.number), "--remove-label", OBSOLETE_SIZE_LABEL],
+                    repo=self.owner_repo,
+                )
             except Exception as exc:
                 self.log_event(f"[RECOVERY] Obsolete size label removal deferred: {exc}")
         logging.getLogger(__name__).info("Approval %s applied to existing PR #%s", command.binding, command.pr.number)

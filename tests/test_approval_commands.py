@@ -551,9 +551,37 @@ async def test_size_recovery_creates_marker_without_obsolete_label(approval, mon
     marker = continued_size_label(command.pr.head_sha)
     assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
     assert [call[:4] for call in calls] == [
+        ["label", "create", OBSOLETE_SIZE_LABEL, "--color"],
+        ["pr", "edit", "42", "--add-label"],
         ["label", "create", marker, "--color"],
         ["pr", "edit", "42", "--add-label"],
+        ["pr", "edit", "42", "--remove-label"],
     ]
+
+
+async def test_aborted_size_approval_never_publishes_continuation_marker(approval, monkeypatch):
+    runner, command, _, _ = approval
+    command.pr.quarantine_labels.clear()
+    runner.state.current_pr.quarantine_labels.clear()
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    calls = []
+    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append(args))
+    original = runner.redis.transaction
+
+    async def abort_commit(fn, *keys, **kwargs):
+        if len(keys) == 5:
+            raise RuntimeError("approval transaction aborted")
+        return await original(fn, *keys, **kwargs)
+
+    monkeypatch.setattr(runner.redis, "transaction", abort_commit)
+    await runner._run_cycle_body()
+    assert [call[:4] for call in calls] == [
+        ["label", "create", OBSOLETE_SIZE_LABEL, "--color"],
+        ["pr", "edit", "42", "--add-label"],
+    ]
+    assert all(continued_size_label(command.pr.head_sha) not in call for call in calls)
+    assert runner.state.state == PipelineState.ERROR
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
 
 
 async def test_size_recovery_keeps_failure_when_first_marker_is_unavailable(approval, monkeypatch):
