@@ -27,6 +27,7 @@ from src.cancellation.storage import CancellationCause, cause_key, index_key
 from src.daemon import approval_commands as daemon_approval
 from src.daemon import recovery as daemon_recovery
 from src.daemon.guardrails import GuardrailViolation
+from src.daemon.handlers import fix as daemon_fix
 from src.daemon.handlers import watch as daemon_watch
 from src.daemon.quarantine import OBSOLETE_SIZE_LABEL, continued_size_label, fixing_size_label
 from src.keyspace import control_stop, pipeline_state
@@ -549,6 +550,70 @@ async def test_approved_guardrail_fix_credential_deferral_retries_from_watch(
     await runner._run_cycle_body()
     assert attempts == 2 and dispatched.await_count == 1
     assert runner._current_run_record.fix_iterations == old.fix_iterations + 1
+    assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
+
+
+@pytest.mark.parametrize("boundary", ["before_reset", "before_launch"])
+async def test_approved_guardrail_fix_preserves_work_arriving_after_admission(
+    approval, monkeypatch, boundary,
+):
+    runner, _, old = await finalized_guardrail_approval(approval, monkeypatch)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    work = Path(runner.repo_path) / "implementation.py"
+    if boundary == "before_reset":
+        fetch = daemon_fix.retry_transient
+
+        def edit_during_fetch(operation, **kwargs):
+            result = fetch(operation, **kwargs)
+            work.write_text("new editor work\n")
+            return result
+
+        monkeypatch.setattr(daemon_fix, "retry_transient", edit_during_fetch)
+        await runner.handle_fix()
+    else:
+        publish = runner.publish_state
+
+        async def edit_after_publish():
+            await publish()
+            if runner.state.state == PipelineState.FIX:
+                work.write_text("new editor work\n")
+
+        monkeypatch.setattr(runner, "publish_state", edit_after_publish)
+        with pytest.raises(RuntimeError, match="Approved checkout changed before FIX launch"):
+            await runner.handle_fix()
+    assert dispatched.await_count == 0
+    assert work.read_text() == "new editor work\n"
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == old.run_id
+    assert await runner._metrics_store.get(old.run_id) == old
+
+
+@pytest.mark.parametrize("restart", [False, True])
+async def test_persisted_fix_invocation_does_not_dispatch_twice(
+    approval, monkeypatch, restart,
+):
+    runner, old, admitted, snapshot, dispatched = await checkpointed_prelaunch_approval(
+        approval, monkeypatch,
+    )
+    runner._current_run_record = admitted
+    runner.state.active_invocation = snapshot
+    runner.state.state = PipelineState.FIX
+    await runner.publish_state()
+    if restart:
+        runner._recovered = False
+        runner._current_run_record = None
+        runner._approval_receipt = None
+        runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
+        for _ in range(3):
+            await runner._run_cycle_body()
+    else:
+        runner.state.state = PipelineState.WATCH
+        await runner.handle_fix()
+        assert runner.state.state == PipelineState.ERROR
+    assert dispatched.await_count == 0
+    assert (await runner._metrics_store.get(admitted.run_id)).fix_iterations == old.fix_iterations + 1
+    assert (await runner._metrics_store.get(admitted.run_id)).invocations == [snapshot]
+    assert await runner._metrics_store.get(old.run_id) == old
     assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
 
 

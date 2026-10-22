@@ -125,24 +125,34 @@ class FixMixin(BreachMixin):
             or self._current_coder_process is not None
         ):
             return None
+        return command if await self._approved_fix_checkout_safe(command, current_pr) else None
+
+    async def _approved_fix_checkout_safe(self, command, current_pr) -> bool:
+        """Recheck approval and checkout ownership at destructive/launch boundaries."""
+        task = self.state.current_task
+        if (
+            task is None or self._current_approval(current_pr) is None
+            or not matches_state(command, self.state)
+            or self.state.user_paused or not self.repo_config.active
+            or self._current_coder_process is not None
+        ):
+            return False
         try:
             persisted = await load_approval(self.redis, self.name, command.binding)
-            if (
-                persisted is None or persisted.status != "applied" or not persisted.active
-                or persisted.binding != command.binding
-                or persisted.failure != command.failure
-                or self._approval_scope(persisted) != self._approval_scope(command)
-                or await self.redis.get(cause_key(self.name, task.pr_id))
-                or await self.redis.get(control_stop(self.name))
-                or checkout_process_blocker(self.repo_path)
-                or bound_checkout_work_blocker_for_ref(
+            return bool(
+                persisted is not None and persisted.status == "applied" and persisted.active
+                and persisted.binding == command.binding
+                and persisted.failure == command.failure
+                and self._approval_scope(persisted) == self._approval_scope(command)
+                and not await self.redis.get(cause_key(self.name, task.pr_id))
+                and not await self.redis.get(control_stop(self.name))
+                and not checkout_process_blocker(self.repo_path)
+                and not bound_checkout_work_blocker_for_ref(
                     self.repo_path, current_pr.branch, {current_pr.head_sha},
                 )
-            ):
-                return None
+            )
         except (OSError, RuntimeError, ValueError):
-            return None
-        return command
+            return False
 
     async def _recover_fix_prelaunch(self, admitted, previous, approval) -> bool:
         """Reuse a saved invocation only when WATCH still owns the old run."""
@@ -393,6 +403,7 @@ class FixMixin(BreachMixin):
         fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
         task = self.state.current_task
         reused_prelaunch = False
+        approved_continuation = None
         pending_fix_record = None
         prelaunch_previous_record = None
         prelaunch_previous_invocation = None
@@ -418,6 +429,24 @@ class FixMixin(BreachMixin):
                     (item for item in recent if item.task_id == task.pr_id), None
                 )
             record = self._current_run_record
+            if (
+                record is not None and record.ended_at is None and record.invocations
+                and record.run_id != getattr(self, "_completed_fix_run_id", None)
+            ):
+                raw_state = await self.redis.get(pipeline_state(self.name))
+                if raw_state:
+                    persisted = RepoState.model_validate_json(raw_state)
+                    if (
+                        persisted.state == PipelineState.FIX
+                        and persisted.active_invocation is not None
+                        and persisted.active_invocation.run_id == record.run_id
+                    ):
+                        await self._transition_to_error(
+                            "Persisted FIX invocation ownership is uncertain; operator Retry required",
+                            save_run_record_as=None, log_prefix="[FIX]",
+                            commit_task_status=True,
+                        )
+                        return
             if record is None:
                 if (
                     self.state.active_invocation is not None
@@ -442,6 +471,7 @@ class FixMixin(BreachMixin):
                         self.log_event("[FIX] Completed or unrelated run record; deferring dispatch.")
                         self.state.state = PipelineState.WATCH
                         return
+                    approved_continuation = approval
                 if record.fix_iterations - record.fix_recovery_baseline >= fix_iteration_cap:
                     await self._escalate_fix_iteration_cap(current_pr)
                     return
@@ -560,7 +590,19 @@ class FixMixin(BreachMixin):
                     ),
                     operation_name=f"git fetch origin {branch}",
                 )
+                if approved_continuation is not None and not await self._approved_fix_checkout_safe(
+                    approved_continuation, current_pr,
+                ):
+                    self.log_event("[FIX] Approved checkout changed before refresh; deferring dispatch.")
+                    self.state.state = PipelineState.WATCH
+                    return
                 git_ops._git(self.repo_path, "checkout", branch)
+                if approved_continuation is not None and not await self._approved_fix_checkout_safe(
+                    approved_continuation, current_pr,
+                ):
+                    self.log_event("[FIX] Approved checkout changed before reset; deferring dispatch.")
+                    self.state.state = PipelineState.WATCH
+                    return
                 git_ops._git(self.repo_path, "reset", "--hard", f"origin/{branch}")
             except (
                 subprocess.CalledProcessError,
@@ -764,6 +806,10 @@ class FixMixin(BreachMixin):
                 if run_record is not None:
                     await self._checkpoint_current_run_record()
             await self.publish_state()
+            if approved_continuation is not None and not await self._approved_fix_checkout_safe(
+                approved_continuation, current_pr,
+            ):
+                raise RuntimeError("Approved checkout changed before FIX launch")
             heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
             self._coder_invocation_active = True
             claude_task: asyncio.Task[tuple[int, str, str]] = (
@@ -887,6 +933,10 @@ class FixMixin(BreachMixin):
             raise pending_cancellation
         if not cleanup_confirmed:
             return
+        if run_record is not None:
+            # A same-process completed no-push FIX may run another iteration
+            # before the cycle publishes WATCH. Restart has no such proof.
+            self._completed_fix_run_id = run_record.run_id
         if external_state_flag["state"] is not None and not stop_cancelled:
             await self._handle_external_terminal_pr_state(
                 external_state_flag["state"]  # type: ignore[arg-type]
