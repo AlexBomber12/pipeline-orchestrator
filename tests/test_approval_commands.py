@@ -406,6 +406,45 @@ async def test_approved_guardrail_fix_recovers_prelaunch_invocation(
     assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
 
 
+async def test_reused_prelaunch_failed_validation_restores_persisted_watch(
+    approval, monkeypatch,
+):
+    runner, old, admitted, snapshot, dispatched = await checkpointed_prelaunch_approval(
+        approval, monkeypatch,
+    )
+    work = Path(runner.repo_path) / "implementation.py"
+    publish = runner.publish_state
+
+    async def edit_after_fix_publication():
+        await publish()
+        if runner.state.state == PipelineState.FIX:
+            work.write_text("work arrived during admission\n")
+
+    monkeypatch.setattr(runner, "publish_state", edit_after_fix_publication)
+    with pytest.raises(RuntimeError, match="Approved checkout changed before FIX launch"):
+        await runner.handle_fix()
+    persisted = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert persisted.state == PipelineState.WATCH
+    assert persisted.active_invocation == old.invocations[-1]
+    assert runner._current_run_record.run_id == old.run_id
+    assert (await runner._metrics_store.get(admitted.run_id)).invocations == [snapshot]
+    assert await runner._metrics_store.get(old.run_id) == old
+    assert dispatched.await_count == 0
+
+    monkeypatch.setattr(runner, "publish_state", publish)
+    work.write_text("implementation\n")
+    runner._recovered = False
+    runner._current_run_record = None
+    runner._approval_receipt = None
+    runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
+    await runner._run_cycle_body()
+    await runner._run_cycle_body()
+    assert dispatched.await_count == 1
+    assert runner._current_run_record.run_id == admitted.run_id
+    assert runner._current_run_record.invocations == [snapshot]
+    assert await runner._metrics_store.get(old.run_id) == old
+
+
 @pytest.mark.parametrize(
     "damage", ["snapshot", "missing_state", "changed_ownership", "settings", "publish_failure"],
 )

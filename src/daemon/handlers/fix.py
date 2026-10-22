@@ -867,6 +867,7 @@ class FixMixin(BreachMixin):
                 self._current_run_record = prelaunch_previous_record
                 self.state.active_invocation = prelaunch_previous_invocation
                 self.state.state = PipelineState.WATCH
+                await self.publish_state()
             if heartbeat is not None:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
