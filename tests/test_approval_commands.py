@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import uuid
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -345,6 +346,53 @@ async def test_approved_guardrail_fix_checkpoint_retry_reuses_attempt(
     assert admitted.attempt_index == 3
     assert admitted.fix_iterations == 2 and admitted.fix_recovery_baseline == 0
     assert admitted.invocations[-1] == runner.state.active_invocation
+    assert await runner._metrics_store.get(old.run_id) == old
+    assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
+
+
+@pytest.mark.parametrize("restart", [False, True])
+async def test_approved_guardrail_fix_recovers_prelaunch_invocation(
+    approval, monkeypatch, restart,
+):
+    runner, command, old = await finalized_guardrail_approval(approval, monkeypatch)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    coder_name, plugin = runner._get_coder(allow_exploration=False)
+    breach_dir, breach_run_id = runner._breach_env()
+    run_kwargs = plugin.build_run_kwargs(
+        daemon_config=runner.app_config.daemon, breach_dir=breach_dir,
+        breach_run_id=breach_run_id,
+    )
+    admitted = runner._new_fix_run_record(
+        old, coder_name=coder_name, model=plugin.resolve_model(runner.app_config.daemon),
+        task_spec_hash=command.task_fingerprint,
+    )
+    admitted.run_id = str(uuid.uuid5(
+        uuid.NAMESPACE_URL, f"{runner.name}:{command.binding}:{old.run_id}:fix",
+    ))
+    runner._current_run_record = admitted
+    await runner._checkpoint_current_run_record()
+    admitted.fix_iterations += 1
+    prelaunch = runner._capture_invocation_snapshot(
+        coder_name, run_kwargs, phase="fix", fix_iteration=admitted.fix_iterations,
+    )
+    await runner._checkpoint_current_run_record()
+    # Simulate a crash before publishing FIX ownership: Redis still holds
+    # the approved WATCH state and the finalized run's invocation.
+    runner._current_run_record = old
+    runner.state.active_invocation = old.invocations[-1]
+    if restart:
+        runner._recovered = False
+        runner._current_run_record = None
+        runner._approval_receipt = None
+        runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
+        await runner._run_cycle_body()
+        assert runner._current_run_record.run_id == old.run_id
+    await runner._run_cycle_body()
+    assert dispatched.await_count == 1
+    assert runner._current_run_record.run_id == admitted.run_id
+    assert runner._current_run_record.fix_iterations == old.fix_iterations + 1
+    assert runner._current_run_record.invocations == [prelaunch]
+    assert runner.state.active_invocation == prelaunch
     assert await runner._metrics_store.get(old.run_id) == old
     assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
 

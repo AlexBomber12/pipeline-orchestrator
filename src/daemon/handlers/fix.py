@@ -41,8 +41,8 @@ from src.daemon.selector import CoderSelectionUnavailable
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github.reviewer_policy import ReviewerPolicy
-from src.keyspace import control_stop
-from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus, SizeFixCompletion, TaskStatus
+from src.keyspace import control_stop, pipeline_state
+from src.models import CIStatus, PipelineState, PRInfo, RepoState, ReviewStatus, SizeFixCompletion, TaskStatus
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
 
@@ -143,6 +143,28 @@ class FixMixin(BreachMixin):
         except (OSError, RuntimeError, ValueError):
             return None
         return command
+
+    async def _recover_approved_fix_prelaunch(self, admitted, previous, approval) -> bool:
+        """Reuse a saved invocation only when WATCH still owns the old run."""
+        if (
+            len(admitted.invocations) != 1
+            or admitted.fix_iterations != previous.fix_iterations + 1
+            or admitted.invocations[0].phase != "fix"
+            or admitted.invocations[0].run_id != admitted.run_id
+            or admitted.invocations[0].attempt_index != admitted.attempt_index
+            or admitted.invocations[0].fix_iteration != admitted.fix_iterations
+        ):
+            return False
+        raw = await self.redis.get(pipeline_state(self.name))
+        if not raw:
+            return False
+        persisted = RepoState.model_validate_json(raw)
+        return bool(
+            persisted.state == PipelineState.WATCH
+            and matches_state(approval, persisted)
+            and persisted.active_invocation == self.state.active_invocation
+            and persisted.active_invocation == previous.invocations[-1]
+        )
 
     async def _monitor_fix_idle(
         self,
@@ -357,6 +379,7 @@ class FixMixin(BreachMixin):
             return
         fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
         task = self.state.current_task
+        reused_prelaunch = False
         if task is not None and current_pr is not None:
             if (
                 (task.branch and current_pr.branch != task.branch)
@@ -428,12 +451,19 @@ class FixMixin(BreachMixin):
                         await self._checkpoint_current_run_record()
                     elif (
                         admitted.task_id != task.pr_id or admitted.repo_name != self.name
-                        or admitted.ended_at is not None or admitted.invocations
+                        or admitted.ended_at is not None
                         or admitted.attempt_index != record.attempt_index + 1
-                        or admitted.fix_iterations != record.fix_iterations
                         or admitted.fix_recovery_baseline != record.fix_recovery_baseline
                         or approval is None or admitted.task_spec_hash != approval.task_fingerprint
                     ):
+                        raise RuntimeError("admitted FIX accounting changed")
+                    elif admitted.invocations:
+                        reused_prelaunch = await self._recover_approved_fix_prelaunch(
+                            admitted, record, approval,
+                        )
+                        if not reused_prelaunch:
+                            raise RuntimeError("admitted FIX invocation ownership changed")
+                    elif admitted.fix_iterations != record.fix_iterations:
                         raise RuntimeError("admitted FIX accounting changed")
                     self._current_run_record = admitted
                 except Exception as exc:
@@ -442,7 +472,9 @@ class FixMixin(BreachMixin):
                     self.log_event(f"[FIX] Could not persist active FIX run: {exc}.")
                     self.state.state = PipelineState.WATCH
                     return
-                self.state.active_invocation = None
+                self.state.active_invocation = (
+                    admitted.invocations[-1] if reused_prelaunch else None
+                )
         record = self._current_run_record
         if (
             record is not None and current_pr is not None
@@ -594,6 +626,18 @@ class FixMixin(BreachMixin):
                     self.log_event("[FIX] PR HEAD changed before review dispatch; returning to WATCH.")
                     self.state.state = PipelineState.WATCH
                     return
+        if reused_prelaunch:
+            snapshot = self.state.active_invocation
+            if (
+                snapshot.plugin_id != coder_name
+                or snapshot.model_override != self._invocation_override(fix_kwargs.get("model"))
+                or snapshot.reasoning_effort_override != self._invocation_override(
+                    fix_kwargs.get("reasoning_effort")
+                )
+            ):
+                self.log_event("[FIX] Checkpointed invocation settings changed; deferring dispatch.")
+                self.state.state = PipelineState.WATCH
+                return
         if current_pr is not None and any(
             is_fixing_size_label(label) for label in current_pr.quarantine_labels
         ):
@@ -677,20 +721,23 @@ class FixMixin(BreachMixin):
                 tier="state",
                 kind="transition",
             )
-            fix_iteration: int | None = None
-            if self._current_run_record is not None:
-                self._current_run_record.fix_iterations += 1
-                fix_iteration = self._current_run_record.fix_iterations
-            elif self.state.current_pr is not None:
-                fix_iteration = self.state.current_pr.fix_iteration_count + 1
-            captured_snapshot = self._capture_invocation_snapshot(
-                coder_name,
-                fix_kwargs,
-                phase="fix",
-                fix_iteration=fix_iteration,
-            )
-            if run_record is not None:
-                await self._checkpoint_current_run_record()
+            if reused_prelaunch:
+                captured_snapshot = self.state.active_invocation
+            else:
+                fix_iteration: int | None = None
+                if self._current_run_record is not None:
+                    self._current_run_record.fix_iterations += 1
+                    fix_iteration = self._current_run_record.fix_iterations
+                elif self.state.current_pr is not None:
+                    fix_iteration = self.state.current_pr.fix_iteration_count + 1
+                captured_snapshot = self._capture_invocation_snapshot(
+                    coder_name,
+                    fix_kwargs,
+                    phase="fix",
+                    fix_iteration=fix_iteration,
+                )
+                if run_record is not None:
+                    await self._checkpoint_current_run_record()
             await self.publish_state()
             heartbeat = asyncio.create_task(self._publish_while_waiting("FIX"))
             self._coder_invocation_active = True
@@ -704,7 +751,7 @@ class FixMixin(BreachMixin):
             )
             idle_flag["started_at"] = fix_supervision.time.monotonic()
         except BaseException:
-            if captured_snapshot is not None:
+            if captured_snapshot is not None and not reused_prelaunch:
                 self.state.active_invocation = previous_active_invocation
                 if (
                     run_record is not None
@@ -719,6 +766,8 @@ class FixMixin(BreachMixin):
                 if run_record is not None:
                     rollback_writes.append(self._checkpoint_current_run_record())
                 await asyncio.gather(*rollback_writes, return_exceptions=True)
+            elif reused_prelaunch:
+                self.state.state = PipelineState.WATCH
             if heartbeat is not None:
                 heartbeat.cancel()
                 await asyncio.gather(heartbeat, return_exceptions=True)
