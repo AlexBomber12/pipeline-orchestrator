@@ -201,6 +201,7 @@ class ApprovalCommandMixin:
                             # gets no permission from this old receipt.
                             self.state = persisted
                             self._recovered = True
+                            await self._restore_current_run_record()
                             if not await self.redis.get(cause_key(self.name, command.task.pr_id)):
                                 return True
                 if not command.active:
@@ -372,7 +373,12 @@ class ApprovalCommandMixin:
                     command, "deferred", "Bound PR terminal state changed during verification."
                 )
                 return True
-            await self._handle_external_pr_resolution(self.state.current_pr, state)
+            completed = await self._handle_external_pr_resolution(self.state.current_pr, state)
+            if not completed:
+                await self._approval_result(
+                    command, "deferred", "Terminal task bookkeeping is pending; retrying."
+                )
+                return True
             await self._retire_completed_approval(command, state)
             self._approval_receipt = None
             return True

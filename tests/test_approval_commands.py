@@ -1117,6 +1117,283 @@ async def test_applied_approval_reconciles_confirmed_external_resolution(
     assert snapshot(repo) == before
 
 
+@pytest.mark.parametrize("failure", ["false", "raise", "lost_ack"])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("guardrail", ["size", "workflow"])
+async def test_terminal_approval_retries_done_bookkeeping(
+    approval, monkeypatch, failure, restart, guardrail,
+):
+    runner, command, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    if guardrail == "workflow":
+        cause = CancellationCause(
+            category="ERROR",
+            payload={
+                "subsource": "guardrail",
+                "category": "workflow_destruction",
+                "excerpt": "workflow change",
+            },
+        ).to_redis()
+        runner.state.current_pr.quarantine_labels = {"quarantine:workflow"}
+        await runner.redis.set(cause_key(runner.name, "PR-42"), cause)
+    else:
+        cause = await runner.redis.get(cause_key(runner.name, "PR-42"))
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(runner.name, runner.state, cause, repo)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+    assert ("status: ERROR" in git(remote, "show", "main:tasks/PR-42.md")) == (guardrail == "workflow")
+    before = snapshot(repo)
+
+    real_writer = runner.__class__._commit_task_status_change.__get__(runner)
+    done_attempts = 0
+
+    async def flaky_writer(task, status, reason, **kwargs):
+        nonlocal done_attempts
+        if status != "DONE":
+            return await real_writer(task, status, reason, **kwargs)
+        done_attempts += 1
+        if done_attempts == 1:
+            if failure == "raise":
+                raise OSError("temporary status-write failure")
+            if failure == "lost_ack":
+                assert await real_writer(task, status, reason, **kwargs)
+            return False
+        return await real_writer(task, status, reason, **kwargs)
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", flaky_writer)
+    save_record = AsyncMock()
+    monkeypatch.setattr(runner, "_save_current_run_record", save_record)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "MERGED")
+    await runner._run_cycle_body()
+    pending = await load_approval(runner.redis, runner.name, command.binding)
+    assert pending.active and pending.status == "applied"
+    assert "bookkeeping is pending" in pending.reason
+    assert runner._approval_receipt is not None
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task.pr_id == "PR-42"
+    assert runner.state.current_pr.number == 42
+    assert await list_approvals(runner.redis, runner.name)
+    save_record.assert_not_awaited()
+    assert ("status: DONE" in git(remote, "show", "main:tasks/PR-42.md")) == (failure == "lost_ack")
+    assert snapshot(repo) == before
+
+    if restart:
+        runner._recovered = False
+        runner._approval_receipt = None
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+        await runner._run_cycle_body()
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_task.pr_id == "PR-42"
+        assert runner.state.current_pr.number == 42
+        assert (await load_approval(runner.redis, runner.name, command.binding)).active
+
+    await runner._run_cycle_body()
+    completed = await load_approval(runner.redis, runner.name, command.binding)
+    assert not completed.active and completed.status == "applied"
+    assert not await list_approvals(runner.redis, runner.name)
+    assert runner._approval_receipt is None
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None and runner.state.current_pr is None
+    assert "status: DONE" in git(remote, "show", "main:tasks/PR-42.md")
+    assert done_attempts == 2
+    save_record.assert_awaited_once_with("success_merged")
+    runner.handle_coding.assert_not_awaited()
+    runner.preflight.assert_not_awaited()
+    assert snapshot(repo) == before
+
+
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+@pytest.mark.parametrize("lost_ack", [False, True])
+async def test_terminal_approval_retries_after_run_record_saved(
+    approval, monkeypatch, terminal, lost_ack,
+):
+    runner, _, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    cause = CancellationCause(
+        category="ERROR",
+        payload={
+            "subsource": "guardrail",
+            "category": "workflow_destruction",
+            "excerpt": "workflow change",
+        },
+    ).to_redis()
+    runner.state.current_pr.quarantine_labels = {"quarantine:workflow"}
+    await runner.redis.set(cause_key(runner.name, "PR-42"), cause)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(runner.name, runner.state, cause, repo)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    runner._start_current_run_record("claude", "test")
+    run_id = runner._current_run_record.run_id
+    before = snapshot(repo)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: terminal)
+
+    publish = runner.publish_state
+    failures = 0
+
+    async def flaky_publish():
+        nonlocal failures
+        if runner.state.state == PipelineState.IDLE and failures == 0:
+            failures += 1
+            if lost_ack:
+                await publish()
+            raise OSError("temporary state-write failure")
+        await publish()
+
+    monkeypatch.setattr(runner, "publish_state", flaky_publish)
+    await runner._run_cycle_body()
+    pending = await load_approval(runner.redis, runner.name, command.binding)
+    assert pending.active and pending.status == "applied"
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.number == 42
+    assert runner._current_run_record.run_id == run_id
+    assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 1
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.IDLE
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).active
+    runs = await runner._metrics_store.list_task_runs(runner.name, "PR-42")
+    assert len(runs) == 1 and runs[0].run_id == run_id
+    assert runs[0].exit_reason == ("success_merged" if terminal == "MERGED" else "closed_unmerged")
+    assert len(await runner._metrics_store.recent("PR-42", repo_name=runner.name)) == 1
+    assert ("status: DONE" in git(remote, "show", "main:tasks/PR-42.md")) == (terminal == "MERGED")
+    runner.handle_coding.assert_not_awaited()
+    assert snapshot(repo) == before
+
+
+async def test_terminal_approval_restart_restores_bound_run_accounting(approval, monkeypatch):
+    runner, _, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    cause = CancellationCause(
+        category="ERROR",
+        payload={
+            "subsource": "guardrail",
+            "category": "workflow_destruction",
+            "excerpt": "workflow change",
+        },
+    ).to_redis()
+    runner.state.current_pr.quarantine_labels = {"quarantine:workflow"}
+    await runner.redis.set(cause_key(runner.name, "PR-42"), cause)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(runner.name, runner.state, cause, repo)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    runner._start_current_run_record("claude", "test")
+    run_id = runner._current_run_record.run_id
+    await runner._metrics_store.save(runner._current_run_record)
+    real_writer = runner.__class__._commit_task_status_change.__get__(runner)
+    first_attempt = True
+
+    async def flaky_writer(task, status, reason, **kwargs):
+        nonlocal first_attempt
+        if status == "DONE" and first_attempt:
+            first_attempt = False
+            return False
+        return await real_writer(task, status, reason, **kwargs)
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", flaky_writer)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "MERGED")
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).active
+    assert "status: ERROR" in git(remote, "show", "main:tasks/PR-42.md")
+
+    runner._recovered = False
+    runner._approval_receipt = None
+    runner._current_run_record = None
+    runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == run_id
+    await runner._run_cycle_body()
+    assert "status: DONE" in git(remote, "show", "main:tasks/PR-42.md")
+    assert not (await load_approval(runner.redis, runner.name, command.binding)).active
+    runs = await runner._metrics_store.list_task_runs(runner.name, "PR-42")
+    assert len(runs) == 1 and runs[0].run_id == run_id
+    assert runs[0].exit_reason == "success_merged"
+    runner.handle_coding.assert_not_awaited()
+
+
+@pytest.mark.parametrize("changed", ["task", "pr", "generation", "suppression", "pause", "stop"])
+async def test_pending_terminal_approval_keeps_binding_and_operator_controls(
+    approval, monkeypatch, changed,
+):
+    runner, command, repo, remote = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "MERGED")
+    write_status = AsyncMock(return_value=False)
+    monkeypatch.setattr(runner, "_commit_task_status_change", write_status)
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, command.binding)).active
+
+    if changed == "task":
+        runner.state.current_task.pr_id = "PR-43"
+    elif changed == "pr":
+        runner.state.current_pr.number = 43
+    elif changed == "generation":
+        task_path = repo / "tasks/PR-42.md"
+        task_path.write_text(task_path.read_text() + "\nRevised requirements.\n")
+        git(repo, "add", "tasks/PR-42.md")
+        git(repo, "commit", "-m", "revise task generation")
+    elif changed == "suppression":
+        newer = CancellationCause(
+            category="ERROR", payload={"subsource": "operator_reject", "excerpt": "newer decision"},
+        )
+        await runner.redis.set(cause_key(runner.name, "PR-42"), newer.to_redis())
+    elif changed == "pause":
+        persisted = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+        persisted.user_paused = True
+        await runner.redis.set(pipeline_state(runner.name), persisted.model_dump_json())
+    else:
+        await runner.redis.set(control_stop(runner.name), "1")
+
+    await runner._consume_approval_command()
+    assert write_status.await_count == 1
+    assert runner.state.state == PipelineState.WATCH
+    assert "status: ERROR" in git(remote, "show", "main:tasks/PR-42.md")
+    runner.handle_coding.assert_not_awaited()
+
+
+async def test_new_suppression_during_done_write_survives_terminal_retry(approval, monkeypatch):
+    runner, _, repo, remote = approval
+    use_real_status_writer(runner, remote, monkeypatch)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(
+        runner.name, runner.state, await runner.redis.get(cause_key(runner.name, "PR-42")), repo,
+    )
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    real_writer = runner.__class__._commit_task_status_change.__get__(runner)
+    newer = CancellationCause(
+        category="ERROR", payload={"subsource": "guardrail", "category": "repo_delete"},
+    ).to_redis()
+
+    async def interrupted_writer(task, status, reason, **kwargs):
+        assert status == "DONE"
+        assert await real_writer(task, status, reason, **kwargs)
+        await runner.redis.set(cause_key(runner.name, "PR-42"), newer)
+        return True
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", interrupted_writer)
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [])
+    monkeypatch.setattr(daemon_approval.gh_prs, "get_pr_state", lambda *a: "MERGED")
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.WATCH
+    assert (await load_approval(runner.redis, runner.name, command.binding)).active
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) == newer
+    assert "status: DONE" in git(remote, "show", "main:tasks/PR-42.md")
+    runner.handle_coding.assert_not_awaited()
+
+
 @pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
 async def test_terminal_approval_clones_base_after_pr_branch_deletion(
     approval, monkeypatch, terminal,

@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from src.cancellation import CancellationCause
-from src.cancellation.storage import task_spec_content_hash
+from src.cancellation.storage import cause_key, task_spec_content_hash
 from src.config import load_config
 from src.daemon import guardrails
 from src.daemon.approval_commands import bound_checkout_work_blocker_for_ref, checkout_process_blocker
@@ -1416,18 +1416,16 @@ class WatchMixin:
         self,
         found: object,
         pr_state: str,
-    ) -> None:
-        """Release WATCH when the current PR is terminal on GitHub."""
+    ) -> bool:
+        """Return whether terminal bookkeeping released the bound task."""
         pr_number = getattr(found, "number", None)
         legacy_fragment = (
             "merged externally -> IDLE"
             if pr_state == "MERGED"
             else "closed without merge -> IDLE"
         )
-        self.log_event(
-            f"[WATCH] PR #{pr_number} externally resolved as {pr_state}; "
-            f"releasing task and returning to IDLE ({legacy_fragment})."
-        )
+        prior_state = self.state.model_copy(deep=True)
+        prior_run_record = self._current_run_record
         if pr_state == "MERGED":
             current_task = self.state.current_task
             if current_task is not None and current_task.task_file:
@@ -1442,28 +1440,48 @@ class WatchMixin:
                         f"[ERROR] Failed to write status:DONE to "
                         f"{current_task.task_file}: {exc}"
                     )
-                    return
+                    return False
                 if not written:
                     self.log_event(
                         f"[WATCH] Remote merge confirmed but status:DONE was not written to "
                         f"{current_task.task_file}; retrying."
                     )
-                    return
-            self._mark_task_done_in_snapshot()
-            await self._save_current_run_record("success_merged")
-        elif pr_state == "CLOSED":
-            await self._save_current_run_record("closed_unmerged")
-        task_id = getattr(found, "pr_id", "") or ""
-        if task_id:
-            await self._clear_task_suppression(task_id)  # pragma: no cover
-        if isinstance(pr_number, int):
-            self.state.quarantined_prs.discard(pr_number)
-        self._current_run_record = None
-        self.state.current_task = None
-        self.state.current_pr = None
+                    return False
+        try:
+            task_id = getattr(found, "pr_id", "") or ""
+            if task_id and self._approval_receipt is not None:
+                # Acceptance already removed its bound cause. A later cause
+                # belongs to a newer decision and must survive this retry.
+                if await self.redis.get(cause_key(self.name, task_id)):
+                    self.log_event(f"[WATCH] Newer task suppression defers PR #{pr_number} reconciliation.")
+                    return False
+            if pr_state == "MERGED":
+                self._mark_task_done_in_snapshot()
+                await self._save_current_run_record("success_merged")
+            elif pr_state == "CLOSED":
+                await self._save_current_run_record("closed_unmerged")
+            if task_id and self._approval_receipt is None:
+                await self._clear_task_suppression(task_id)  # pragma: no cover
+            if isinstance(pr_number, int):
+                self.state.quarantined_prs.discard(pr_number)
+            self._current_run_record = None
+            self.state.current_task = None
+            self.state.current_pr = None
+            self.state.state = PipelineState.IDLE
+            await self.publish_state()
+        except Exception as exc:
+            # A bookkeeping write may have succeeded despite a lost reply.
+            # Retain the bound state so the same terminal outcome can retry.
+            self.state = prior_state
+            self._current_run_record = prior_run_record
+            self.log_event(f"[WATCH] Terminal bookkeeping deferred for PR #{pr_number}: {exc}")
+            return False
         self._reset_runner_local_task_counters()
-        self.state.state = PipelineState.IDLE
-        await self.publish_state()
+        self.log_event(
+            f"[WATCH] PR #{pr_number} externally resolved as {pr_state}; "
+            f"releasing task and returning to IDLE ({legacy_fragment})."
+        )
+        return True
 
     async def _mark_infra_retry_attempted(
         self, pr_number: int, head_sha: str
