@@ -154,7 +154,7 @@ def test_handle_fix_retains_marker_until_successful_completion(
     )
 
 
-@pytest.mark.parametrize("failure", ["prior_fix", "apply", "status", "complete"])
+@pytest.mark.parametrize("failure", ["prior_fix", "apply", "status", "complete_status", "complete"])
 def test_handle_fix_keeps_recovery_marker_when_fix_outcome_is_uncertain(
     monkeypatch: pytest.MonkeyPatch, failure: str,
 ) -> None:
@@ -172,9 +172,11 @@ def test_handle_fix_keeps_recovery_marker_when_fix_outcome_is_uncertain(
     runner.state.current_task = QueueTask(
         pr_id="PR-019", title="t", status=TaskStatus.DOING, branch="pr-019",
     )
-    monkeypatch.setattr(
-        runner, "_commit_task_status_change", AsyncMock(return_value=failure != "status"),
+    status_write = (
+        AsyncMock(side_effect=[True, False]) if failure == "complete_status"
+        else AsyncMock(return_value=failure != "status")
     )
+    monkeypatch.setattr(runner, "_commit_task_status_change", status_write)
 
     def run_gh(args: list[str], **kwargs: Any) -> None:
         if failure == "apply" and args == ["pr", "edit", "77", "--add-label", fixing]:
@@ -202,6 +204,10 @@ def test_handle_fix_keeps_recovery_marker_when_fix_outcome_is_uncertain(
     elif failure == "complete":
         assert runner.state.current_pr.quarantine_labels == {marker, fixing}
         assert any("marker completion deferred" in item["event"] for item in runner.state.history)
+    elif failure == "complete_status":
+        assert runner.state.current_pr.quarantine_labels == {marker, fixing}
+        assert status_write.await_count == 2
+        assert any("retaining recovery marker" in item["event"] for item in runner.state.history)
     else:
         assert runner.state.current_pr.quarantine_labels == {marker}
         assert any("task status update deferred" in item["event"] for item in runner.state.history)

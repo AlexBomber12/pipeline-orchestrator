@@ -772,7 +772,10 @@ def test_watch_does_not_clear_in_progress_size_fix_after_restart(monkeypatch: py
     assert any("outcome is unresolved" in entry["event"] for entry in runner.state.history)
 
 
-def test_watch_keeps_size_fix_marker_while_coder_owns_checkout(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("blocker", ["active", "unavailable"])
+def test_watch_keeps_size_fix_marker_while_coder_owns_checkout(
+    monkeypatch: pytest.MonkeyPatch, blocker: str,
+) -> None:
     h._patch_subprocess(monkeypatch)
     marker = fixing_size_label("a" * 40)
     pr = PRInfo(number=5, branch="pr-001", head_sha="a" * 40, quarantine_labels={marker})
@@ -785,9 +788,12 @@ def test_watch_keeps_size_fix_marker_while_coder_owns_checkout(monkeypatch: pyte
     monkeypatch.setattr(
         runner, "_remote_frontmatter_error_status_for_current_task", lambda: ("todo", None, "revision"),
     )
-    monkeypatch.setattr(
-        "src.daemon.handlers.watch.checkout_process_blocker", lambda *_args: "Coder still uses checkout",
-    )
+    def process_blocker(*_args):
+        if blocker == "unavailable":
+            raise OSError("process inspection unavailable")
+        return "Coder still uses checkout"
+
+    monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker", process_blocker)
     status_write = AsyncMock()
     monkeypatch.setattr(runner, "_commit_task_status_change", status_write)
     calls: list[list[str]] = []
