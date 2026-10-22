@@ -718,8 +718,21 @@ async def test_persisted_fix_invocation_does_not_dispatch_twice(
         runner._current_run_record = None
         runner._approval_receipt = None
         runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
-        for _ in range(3):
+        await runner._run_cycle_body()
+        assert runner.ensure_repo_cloned.await_count == 0
+        monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+        monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+        for _ in range(2):
             await runner._run_cycle_body()
+        assert runner.state.state == PipelineState.ERROR
+        assert RepoState.model_validate_json(
+            await runner.redis.get(pipeline_state(runner.name))
+        ).state == PipelineState.ERROR
+        assert runner._recovered is True
+        assert runner._current_run_record.run_id == admitted.run_id
+        assert runner.state.active_invocation == snapshot
+        assert "operator Retry required" in runner.state.error_message
+        assert not await runner._consume_approval_command()
     else:
         runner.state.state = PipelineState.WATCH
         await runner.handle_fix()
@@ -729,6 +742,98 @@ async def test_persisted_fix_invocation_does_not_dispatch_twice(
     assert (await runner._metrics_store.get(admitted.run_id)).invocations == [snapshot]
     assert await runner._metrics_store.get(old.run_id) == old
     assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
+
+
+@pytest.mark.parametrize("blocker", ["process", "accounting"])
+async def test_persisted_fix_approval_waits_for_uncertain_ownership(
+    approval, monkeypatch, blocker,
+):
+    runner, _, admitted, snapshot, dispatched = await checkpointed_prelaunch_approval(
+        approval, monkeypatch,
+    )
+    runner._current_run_record = admitted
+    runner.state.active_invocation = snapshot
+    runner.state.state = PipelineState.FIX
+    await runner.publish_state()
+    if blocker == "process":
+        monkeypatch.setattr(daemon_approval, "checkout_process_blocker", lambda *a: "coder owns checkout")
+    else:
+        monkeypatch.setattr(runner._metrics_store, "get", AsyncMock(return_value=None))
+    runner._recovered = False
+    runner._current_run_record = None
+    runner._approval_receipt = None
+    runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
+    await runner._run_cycle_body()
+    persisted = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert persisted.state == PipelineState.FIX
+    assert persisted.active_invocation == snapshot
+    assert runner.state.state == PipelineState.IDLE
+    assert runner._recovered is False
+    assert runner.ensure_repo_cloned.await_count == 0
+    assert dispatched.await_count == 0
+
+
+async def test_persisted_fix_park_preserves_newer_suppression(approval, monkeypatch):
+    runner, _, admitted, snapshot, dispatched = await checkpointed_prelaunch_approval(
+        approval, monkeypatch,
+    )
+    runner._current_run_record = admitted
+    runner.state.active_invocation = snapshot
+    runner.state.state = PipelineState.FIX
+    await runner.publish_state()
+    newer = CancellationCause(
+        category="ERROR", payload={"subsource": "guardrail", "category": "new_finding"},
+    ).to_redis()
+    await runner.redis.set(cause_key(runner.name, "PR-42"), newer)
+    runner._recovered = False
+    runner._current_run_record = None
+    runner._approval_receipt = None
+    runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.ERROR
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) == newer
+    assert runner._commit_task_status_change.await_args.kwargs["blocked_reason"] == SuppressionReason.GUARDRAIL
+    assert dispatched.await_count == 0
+
+
+async def test_persisted_fix_park_retries_lost_publication(approval, monkeypatch):
+    runner, old, admitted, snapshot, dispatched = await checkpointed_prelaunch_approval(
+        approval, monkeypatch,
+    )
+    runner._current_run_record = admitted
+    runner.state.active_invocation = snapshot
+    runner.state.state = PipelineState.FIX
+    await runner.publish_state()
+    publish = runner.publish_state
+    failed = False
+
+    async def fail_once():
+        nonlocal failed
+        if runner.state.state == PipelineState.ERROR and not failed:
+            failed = True
+            raise OSError("state publication unavailable")
+        await publish()
+
+    monkeypatch.setattr(runner, "publish_state", fail_once)
+    runner._recovered = False
+    runner._current_run_record = None
+    runner._approval_receipt = None
+    runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
+    await runner._run_cycle_body()
+    assert runner._recovered is False
+    assert RepoState.model_validate_json(
+        await runner.redis.get(pipeline_state(runner.name))
+    ).state == PipelineState.FIX
+    await runner._run_cycle_body()
+    assert runner._recovered is True
+    assert runner.state.state == PipelineState.ERROR
+    assert runner._current_run_record.run_id == admitted.run_id
+    assert RepoState.model_validate_json(
+        await runner.redis.get(pipeline_state(runner.name))
+    ).state == PipelineState.ERROR
+    assert await runner._metrics_store.get(old.run_id) == old
+    assert (await runner._metrics_store.get(admitted.run_id)).invocations == [snapshot]
+    assert dispatched.await_count == 0
 
 
 async def test_coding_complete_admission_reused_across_prelaunch_deferrals(

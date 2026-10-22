@@ -156,6 +156,10 @@ class ErrorMixin:
             self.log_event("[RECOVERY] Size FIX remains parked for operator Retry.")
             return
 
+        if context.startswith("Persisted FIX invocation ownership is uncertain; operator Retry required"):
+            self.log_event("[RECOVERY] Uncertain FIX invocation remains parked for operator Retry.")
+            return
+
         if "status:ERROR write failed; operator Retry required" in context:
             reason_text = context.partition(":")[0]
             try:
