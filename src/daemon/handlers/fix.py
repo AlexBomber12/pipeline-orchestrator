@@ -144,7 +144,7 @@ class FixMixin(BreachMixin):
             return None
         return command
 
-    async def _recover_approved_fix_prelaunch(self, admitted, previous, approval) -> bool:
+    async def _recover_fix_prelaunch(self, admitted, previous, approval) -> bool:
         """Reuse a saved invocation only when WATCH still owns the old run."""
         if (
             len(admitted.invocations) != 1
@@ -159,9 +159,22 @@ class FixMixin(BreachMixin):
         if not raw:
             return False
         persisted = RepoState.model_validate_json(raw)
+        if approval is not None:
+            bound = matches_state(approval, persisted)
+        else:
+            task, pr = self.state.current_task, self.state.current_pr
+            prior_task, prior_pr = persisted.current_task, persisted.current_pr
+            bound = bool(
+                task is not None and pr is not None
+                and prior_task is not None and prior_pr is not None
+                and task.pr_id == prior_task.pr_id and task.branch == prior_task.branch
+                and task.task_file == prior_task.task_file
+                and pr.number == prior_pr.number and pr.branch == prior_pr.branch
+                and pr.head_sha == prior_pr.head_sha
+            )
         return bool(
             persisted.state == PipelineState.WATCH
-            and matches_state(approval, persisted)
+            and bound
             and persisted.active_invocation == self.state.active_invocation
             and persisted.active_invocation == previous.invocations[-1]
         )
@@ -433,23 +446,23 @@ class FixMixin(BreachMixin):
                     await self._escalate_fix_iteration_cap(current_pr)
                     return
                 previous_snapshot = self.state.active_invocation
-                admitted_run_id = (
-                    str(uuid.uuid5(uuid.NAMESPACE_URL, f"{self.name}:{approval.binding}:{record.run_id}:fix"))
-                    if approval is not None else None
+                admitted_run_id = str(uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"{self.name}:{approval.binding if approval is not None else 'coding_complete'}:"
+                    f"{record.run_id}:fix",
+                ))
+                expected_task_hash = (
+                    approval.task_fingerprint if approval is not None else record.task_spec_hash
                 )
                 try:
-                    admitted = (
-                        await self._metrics_store.get(admitted_run_id)
-                        if admitted_run_id is not None else None
-                    )
+                    admitted = await self._metrics_store.get(admitted_run_id)
                     if admitted is None:
                         admitted = self._new_fix_run_record(
                             record, coder_name=coder_name,
                             model=plugin.resolve_model(self.app_config.daemon),
-                            task_spec_hash=approval.task_fingerprint if approval is not None else None,
+                            task_spec_hash=expected_task_hash,
                         )
-                        if admitted_run_id is not None:
-                            admitted.run_id = admitted_run_id
+                        admitted.run_id = admitted_run_id
                         self._current_run_record = admitted
                         await self._checkpoint_current_run_record()
                     elif (
@@ -457,11 +470,11 @@ class FixMixin(BreachMixin):
                         or admitted.ended_at is not None
                         or admitted.attempt_index != record.attempt_index + 1
                         or admitted.fix_recovery_baseline != record.fix_recovery_baseline
-                        or approval is None or admitted.task_spec_hash != approval.task_fingerprint
+                        or admitted.task_spec_hash != expected_task_hash
                     ):
                         raise RuntimeError("admitted FIX accounting changed")
                     elif admitted.invocations:
-                        reused_prelaunch = await self._recover_approved_fix_prelaunch(
+                        reused_prelaunch = await self._recover_fix_prelaunch(
                             admitted, record, approval,
                         )
                         if not reused_prelaunch:
@@ -668,6 +681,7 @@ class FixMixin(BreachMixin):
                 "[FIX] Coder invocation deferred while credential login owns "
                 "its credential location."
             )
+            self.state.state = PipelineState.WATCH
             return
         size_fix_marker: str | None = None
 

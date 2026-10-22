@@ -518,6 +518,70 @@ async def test_approved_guardrail_fix_new_invocation_publish_failure_rolls_back(
     assert await runner._metrics_store.get(old.run_id) == old
 
 
+@pytest.mark.parametrize("restart", [False, True])
+async def test_approved_guardrail_fix_credential_deferral_retries_from_watch(
+    approval, monkeypatch, restart,
+):
+    runner, _, old = await finalized_guardrail_approval(approval, monkeypatch)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    reserve = runner._reserve_coder_credentials
+    attempts = 0
+
+    def reserve_after_login(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return False
+        return reserve(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "_reserve_coder_credentials", reserve_after_login)
+    await runner._run_cycle_body()
+    assert dispatched.await_count == 0
+    assert runner.state.state == PipelineState.WATCH
+    assert runner._current_run_record.run_id == old.run_id
+    if restart:
+        runner._recovered = False
+        runner._current_run_record = None
+        runner._approval_receipt = None
+        runner.state = RepoState(url=runner.repo_config.url, name=runner.name)
+        await runner._run_cycle_body()
+        assert runner.state.state == PipelineState.WATCH
+    await runner._run_cycle_body()
+    assert attempts == 2 and dispatched.await_count == 1
+    assert runner._current_run_record.fix_iterations == old.fix_iterations + 1
+    assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
+
+
+async def test_coding_complete_admission_reused_across_prelaunch_deferrals(
+    approval, monkeypatch,
+):
+    runner, _, _, _ = approval
+    await runner.redis.delete(cause_key(runner.name, "PR-42"))
+    runner._approval_receipt = None
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_task.status = TaskStatus.DOING
+    runner.state.current_pr.quarantine_labels = set()
+    runner._start_current_run_record("claude", "opus")
+    old = runner._current_run_record
+    runner._capture_invocation_snapshot("claude", {}, phase="coding")
+    await runner._save_current_run_record("coding_complete")
+    old = await runner._metrics_store.get(old.run_id)
+    marker = fixing_size_label(runner.state.current_pr.head_sha)
+    runner.state.current_pr.quarantine_labels.add(marker)
+    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
+    for _ in range(3):
+        await runner.handle_fix()
+        assert runner.state.state == PipelineState.WATCH
+        assert runner._current_run_record.run_id == old.run_id
+        assert dispatched.await_count == 0
+        assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
+    runner.state.current_pr.quarantine_labels.remove(marker)
+    await runner.handle_fix()
+    assert dispatched.await_count == 1
+    assert runner._current_run_record.fix_iterations == old.fix_iterations + 1
+    assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
+
+
 @pytest.mark.parametrize("damage", ["counter", "attempt_index"])
 async def test_approved_guardrail_fix_rejects_changed_admitted_accounting(
     approval, monkeypatch, damage,
