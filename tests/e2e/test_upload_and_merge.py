@@ -1,6 +1,6 @@
 import time
 
-from tests.e2e.lib.coder_shim import coder_shim
+from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
 
 
 def test_full_happy_path_via_shim_succeeds(
@@ -68,7 +68,7 @@ def test_legacy_size_label_pr_merges_and_task_is_done(
     make_task_zip,
     reset_testbed,
 ):
-    """A published PR carrying an obsolete size label uses ordinary WATCH/MERGE."""
+    """An obsolete size label does not prevent ordinary FIX and merge."""
     import base64
     import json
     import subprocess
@@ -88,9 +88,9 @@ def test_legacy_size_label_pr_merges_and_task_is_done(
         number = pr["number"]
         head = pr["head_sha"]
         assert len(head) == 40
-        label = f"size-ok:{head}"
+        label = "quarantine:large_diff"
         created = subprocess.run(
-            ["gh", "label", "create", label, "-R", repo, "--color", "0E8A16"],
+            ["gh", "label", "create", label, "-R", repo, "--color", "B60205"],
             capture_output=True, text=True, timeout=30,
         )
         assert created.returncode == 0 or "already exists" in created.stderr.lower(), created.stderr
@@ -98,13 +98,30 @@ def test_legacy_size_label_pr_merges_and_task_is_done(
             ["gh", "pr", "edit", str(number), "-R", repo, "--add-label", label],
             capture_output=True, text=True, check=True, timeout=30,
         )
-        subprocess.run(
+        # The pending status prevents a merge race while the legacy label is
+        # attached. Failure then drives the ordinary FIX path. The successful
+        # FIX shim publishes a fresh HEAD without this engineered gate.
+        SHIM_SCENARIO_PATH.write_text("success\n")
+        status = subprocess.run(
             ["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{head}",
-             "-f", "state=success", "-f", "context=e2e/watch-merge-gate"],
+             "-f", "state=failure", "-f", "context=e2e/watch-merge-gate"],
             capture_output=True, text=True, check=True, timeout=30,
         )
-        wait_for_state(["IDLE"], timeout_sec=240)
+        assert json.loads(status.stdout)["state"] == "failure"
+        try:
+            wait_for_state(["IDLE"], timeout_sec=240)
+        except TimeoutError as exc:
+            state = get_state()
+            raise AssertionError(
+                f"legacy PR did not finish ordinary FIX/MERGE; "
+                f"state={state.get('state') if state else None!r}, "
+                f"current_pr={(state or {}).get('current_pr')!r}"
+            ) from exc
 
+    state = get_state()
+    assert state is not None and any(
+        item.get("state") == "FIX" for item in (state.get("history") or [])
+    ), "legacy PR did not enter ordinary FIX"
     result = subprocess.run(
         ["gh", "pr", "view", str(number), "-R", repo,
          "--json", "state,headRefName,mergedAt"],
@@ -119,5 +136,4 @@ def test_legacy_size_label_pr_merges_and_task_is_done(
     )
     content = base64.b64decode(json.loads(task.stdout)["content"]).decode()
     assert content.startswith("---\nstatus: DONE\n"), content[:300]
-    state = get_state()
-    assert state is not None and state["state"] == "IDLE"
+    assert state["state"] == "IDLE"
