@@ -21,7 +21,6 @@ from enum import Enum
 from urllib.parse import quote
 
 from src.config import load_config
-from src.daemon.quarantine import is_continued_size_label, is_fixing_size_label
 from src.github import cache, checks, gh_runner, reviews
 from src.github.gh_runner import (
     _extract_commit_date,
@@ -42,6 +41,7 @@ _last_known_sha: dict[str, str] = {}
 _merged_prs_cache: dict[tuple[str, str], tuple[float, list["PRInfo"]]] = {}
 _MERGED_PRS_CACHE_TTL_SECONDS = 60.0
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_OBSOLETE_SIZE_LABEL_RE = re.compile(r"^(?:size-ok|size-fix):[0-9a-fA-F]{40}$")
 
 
 @dataclass(frozen=True)
@@ -443,8 +443,7 @@ def get_open_prs(
             if isinstance(label, dict)
             and (
                 (label.get("name") or "").startswith("quarantine:")
-                or is_continued_size_label(label.get("name") or "")
-                or is_fixing_size_label(label.get("name") or "")
+                or _OBSOLETE_SIZE_LABEL_RE.fullmatch(label.get("name") or "") is not None
             )
         }
         prs.append(
@@ -522,8 +521,7 @@ def _get_open_prs_rest(
             if isinstance(label, dict)
             and (
                 (label.get("name") or "").startswith("quarantine:")
-                or is_continued_size_label(label.get("name") or "")
-                or is_fixing_size_label(label.get("name") or "")
+                or _OBSOLETE_SIZE_LABEL_RE.fullmatch(label.get("name") or "") is not None
             )
         }
         prs.append(
