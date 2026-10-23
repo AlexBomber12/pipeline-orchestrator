@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -237,7 +238,9 @@ class CodingMixin:
         await self._resolve_published_attempt(resolve_terminal=False)
         await self.publish_state()
 
-    def _publication_matches_attempt(self, item: gh_prs.BranchPublication) -> bool:
+    def _publication_matches_attempt(
+        self, item: gh_prs.BranchPublication, *, allow_headless: bool = False,
+    ) -> bool:
         attempt = self.state.publication_attempt
         return bool(
             attempt is not None and attempt.baseline_numbers is not None
@@ -245,7 +248,10 @@ class CodingMixin:
             and item.number not in attempt.baseline_numbers
             and item.created_at is not None and item.created_at >= attempt.started_at
             and item.base_branch == attempt.base and item.head_branch == attempt.branch
-            and item.head_sha == attempt.head_sha and not item.is_cross_repository
+            and (item.head_sha == attempt.head_sha or (
+                allow_headless and attempt.head_sha is None
+                and re.fullmatch(r"[0-9a-fA-F]{40}", item.head_sha) is not None
+            )) and not item.is_cross_repository
             and gh_prs.extract_queue_pr_id(item.title) == attempt.task_id
         )
 
@@ -266,21 +272,31 @@ class CodingMixin:
     async def _resolve_published_attempt(self, *, resolve_terminal: bool = True) -> bool:
         """Reconcile exact evidence; absence never authorizes another create."""
         attempt = self.state.publication_attempt
-        if not self._publication_attempt_matches_dispatch() or not attempt.head_sha:
+        if not self._publication_attempt_matches_dispatch():
             return False
         try:
-            if attempt.pr_number is None:
+            if attempt.head_sha is None:
+                # A restart can precede capture even after the coder published.
+                # Prefer the exact local task ref; if it is gone, use only one
+                # fresh, non-baseline publication for this dispatch's identity.
+                attempt.head_sha = await asyncio.to_thread(
+                    _local_branch_head_sha, self.repo_path, attempt.branch,
+                )
+            if attempt.pr_number is None or attempt.head_sha is None:
                 if attempt.baseline_numbers is None:
                     return False
                 publications = await asyncio.to_thread(
                     gh_prs.get_branch_publications,
                     attempt.repo, attempt.base, attempt.branch,
                 )
-                matches = [item for item in publications if self._publication_matches_attempt(item)]
+                matches = [item for item in publications if self._publication_matches_attempt(
+                    item, allow_headless=True,
+                )]
                 if len(matches) != 1:
                     return False
                 candidate = matches[0].to_pr_info()
                 # Keep positive identity even if the exact read is unavailable.
+                attempt.head_sha = candidate.head_sha
                 attempt.pr_number = candidate.number
                 attempt.candidate = candidate
             current = attempt.candidate

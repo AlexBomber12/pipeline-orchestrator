@@ -2414,3 +2414,104 @@ def test_deleted_branch_without_publication_baseline_keeps_hold(monkeypatch):
     monkeypatch.setattr(coding_module, "_remote_branch_exists", lambda *a: False)
     asyncio.run(runner._release_unpublished_attempt(attempt.branch))
     assert attempt.pending
+
+
+@pytest.mark.parametrize("local_head", [None, "a" * 40])
+@pytest.mark.parametrize("terminal", [None, "MERGED", "CLOSED"])
+def test_restart_recovers_publication_before_head_capture(monkeypatch, local_head, terminal):
+    from src.keyspace import pipeline_state
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    # The coder publishes before the monitor gets a chance to observe its PR.
+    remote["omit"] = True
+
+    async def crash_before_capture(*args):
+        raise asyncio.CancelledError("daemon stopped before capture")
+
+    monkeypatch.setattr(runner, "_capture_published_attempt", crash_before_capture)
+    with pytest.raises(asyncio.CancelledError, match="before capture"):
+        asyncio.run(runner.handle_coding())
+    saved = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    assert type(runner.state).model_validate_json(saved).publication_attempt.head_sha is None
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: local_head)
+    remote["omit"] = False
+    remote["terminal"] = terminal
+    if terminal is None:
+        retry_runner = h._make_runner()
+        retry_runner.state = type(runner.state).model_validate_json(saved)
+        command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                           task_id="PR-001", branch="pr-001")
+        continuation, pr = asyncio.run(retry_runner._select_retry_continuation(command))
+        assert continuation == "watch"
+        assert pr.number == 402
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    assert asyncio.run(restarted.recover_state())
+    attempt = restarted.state.publication_attempt
+    assert attempt.head_sha == "a" * 40
+    assert attempt.pr_number == 402
+    assert attempt.verified
+    if terminal:
+        assert restarted.state.state == PipelineState.IDLE
+        assert restarted.state.current_task is None
+        assert not attempt.pending
+    else:
+        assert restarted.state.state == PipelineState.WATCH
+        assert restarted.state.current_pr.number == 402
+    assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("evidence", [
+    "ambiguous", "missing", "unavailable", "bad_sha", "old", "baseline",
+    "no_baseline", "base", "branch", "task", "cross_repo", "local_mismatch", "exact_unknown",
+])
+def test_headless_attempt_requires_bounded_unambiguous_exact_evidence(monkeypatch, evidence):
+    from dataclasses import replace
+    from datetime import timedelta
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    attempt.head_sha = attempt.pr_number = attempt.candidate = None
+    runner.state.current_pr = None
+    item = _REAL_PUBLICATIONS(attempt.repo, attempt.base, attempt.branch)[0]
+    updates = {
+        "bad_sha": {"head_sha": "invalid"},
+        "old": {"created_at": attempt.started_at - timedelta(seconds=1)},
+        "base": {"base_branch": "other"}, "branch": {"head_branch": "other"},
+        "task": {"title": "PR-002: unrelated"}, "cross_repo": {"is_cross_repository": True},
+    }
+    items = [replace(item, **updates.get(evidence, {}))]
+    if evidence == "ambiguous":
+        items.append(replace(item, number=403))
+    if evidence == "missing":
+        items = []
+    if evidence in {"baseline", "no_baseline"}:
+        attempt.baseline_numbers = {402} if evidence == "baseline" else None
+    remote["exact_unknown"] = evidence == "exact_unknown"
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha",
+                        lambda *a: "b" * 40 if evidence == "local_mismatch" else None)
+
+    def publications(*args):
+        if evidence == "unavailable":
+            raise OSError("discovery unavailable")
+        return items
+
+    monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", publications)
+    assert not asyncio.run(runner._resolve_published_attempt())
+    assert attempt.pending
+    assert runner.state.current_pr is None
+    # Exact-read outages retain the discovered identity for later reconciliation.
+    remote["exact_unknown"] = False
+    monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", _REAL_PUBLICATIONS)
+    attempt.baseline_numbers = set()
+    if evidence == "local_mismatch":
+        attempt.head_sha = None
+        monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: None)
+    assert asyncio.run(runner._resolve_published_attempt())
+    assert runner.state.current_pr.number == 402
+    assert remote["calls"] == 1
