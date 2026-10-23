@@ -1050,13 +1050,16 @@ class FixMixin(BreachMixin):
                 no_push_policy.increment(self.state.current_pr)
             if await pause_for_stop_after_bookkeeping():
                 return
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.pending = False
+                # Escalation can discard the dispatch binding. Checkpoint the
+                # completed attempt first so recovery cannot resurrect its hold.
+                await self.publish_state()
             if (
                 self.state.current_pr is not None
                 and await no_push_policy.maybe_escalate(self.state.current_pr)
             ):
                 return
-            if self.state.publication_attempt is not None:
-                self.state.publication_attempt.pending = False
             self.state.state = PipelineState.WATCH
             await self.publish_state()
             return

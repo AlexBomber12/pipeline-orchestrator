@@ -248,6 +248,7 @@ class CodingMixin:
             and item.number not in attempt.baseline_numbers
             and item.created_at is not None and item.created_at >= attempt.started_at
             and item.base_branch == attempt.base and item.head_branch == attempt.branch
+            and (item.state in {"MERGED", "CLOSED"} or item.is_verified_ready)
             and (item.head_sha == attempt.head_sha or (
                 allow_headless and attempt.head_sha is None
                 and re.fullmatch(r"[0-9a-fA-F]{40}", item.head_sha) is not None
@@ -690,6 +691,12 @@ class CodingMixin:
                 f"[CODING] Publication baseline unavailable for "
                 f"{target_branch!r}: {exc}; deferring coder invocation."
             )
+            # No coder has launched. Persist queue eligibility rather than a
+            # CODING task that recovery would classify as an interrupted run.
+            self.state.current_task = None
+            self._reset_runner_local_task_counters()
+            self.state.state = PipelineState.IDLE
+            await self.publish_state()
             return None
         else:
             publication_baseline = {item.number for item in baseline}

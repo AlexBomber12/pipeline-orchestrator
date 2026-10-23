@@ -1904,7 +1904,21 @@ def test_fix_head_probe_failure_preserves_known_remote_head(monkeypatch, probe, 
         assert runner.state.publication_attempt.pending
 
 
-def test_baseline_outage_defers_until_publication_can_be_reconciled(monkeypatch):
+def test_baseline_outage_defers_until_publication_can_be_reconciled(monkeypatch, tmp_path):
+    from src.keyspace import pipeline_state
+    from src.task_status import MergedState
+
+    from tests.runner.test_retry_commands import _task_text
+
+    (tmp_path / "tasks").mkdir()
+    (tmp_path / "tasks/PR-001.md").write_text(
+        _task_text(task_id="PR-001", branch="pr-001").replace("status: ERROR", "status: TODO")
+        .replace("blocked_reason: daemon\n", "").replace("- Coder: codex", "- Coder: claude")
+    )
+    for module in ("src.daemon.recovery", "src.daemon.handlers.idle"):
+        monkeypatch.setattr(f"{module}._resolve_merged_state",
+                            lambda *a, **kw: MergedState(set(), set(), True))
+
     runner = _runner(monkeypatch)
     runner.state.state = PipelineState.CODING
     remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
@@ -1914,16 +1928,31 @@ def test_baseline_outage_defers_until_publication_can_be_reconciled(monkeypatch)
 
     monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", unavailable)
     asyncio.run(runner.handle_coding())
-    assert runner.state.state == PipelineState.CODING
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
     assert runner.state.active_invocation is None
     assert runner.state.publication_attempt is None
     assert remote["calls"] == 0
 
+    saved = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    assert type(runner.state).model_validate_json(saved).state == PipelineState.IDLE
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    restarted.repo_path = str(tmp_path)
+    monkeypatch.setattr(coding_module.gh_prs, "get_merged_prs", lambda *a, **kw: [])
+    monkeypatch.setattr(coding_module.gh_prs, "get_merged_prs_discovery",
+                        lambda *a: SimpleNamespace(complete=True, prs=[]))
+    assert asyncio.run(restarted.recover_state())
+    assert restarted.state.state == PipelineState.IDLE
+    assert restarted.state.current_task is None
+    assert [(task.pr_id, task.status) for task in restarted.state.current_queue] == [
+        ("PR-001", TaskStatus.TODO)
+    ]
     monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", _REAL_PUBLICATIONS)
-    asyncio.run(runner.handle_coding())
+    asyncio.run(restarted.handle_idle())
     assert remote["calls"] == 1
-    assert runner.state.state == PipelineState.WATCH
-    assert runner.state.current_pr.number == 402
+    assert restarted.state.state == PipelineState.WATCH
+    assert restarted.state.current_pr.number == 402
 
 
 @pytest.mark.parametrize("remote_exists", [False, True, None])
@@ -2515,3 +2544,60 @@ def test_headless_attempt_requires_bounded_unambiguous_exact_evidence(monkeypatc
     assert asyncio.run(runner._resolve_published_attempt())
     assert runner.state.current_pr.number == 402
     assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("local_head", [None, "a" * 40])
+@pytest.mark.parametrize("terminal", [None, "MERGED", "CLOSED"])
+def test_fallback_discovery_rejects_open_draft_but_reconciles_terminal(
+    monkeypatch, local_head, terminal,
+):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    remote["update"] = {"isDraft": True, "state": terminal or "OPEN"}
+    remote["terminal"] = terminal
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: local_head)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    if terminal:
+        assert runner.state.state == PipelineState.IDLE
+        assert not attempt.pending
+        assert attempt.pr_number == 402
+    else:
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.current_pr is None
+        assert attempt.pr_number is None
+        assert attempt.pending
+        remote["update"] = {}
+        assert asyncio.run(runner._resolve_published_attempt())
+        assert runner.state.current_pr.number == 402
+    assert remote["calls"] == 1
+
+
+def test_no_push_escalation_checkpoints_completed_attempt_before_clearing_task(monkeypatch):
+    from src.keyspace import pipeline_state
+
+    runner = _runner(monkeypatch)
+    _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+    runner._app_config = h._app_cfg(fix_no_push_cap=1)
+    h._patch_no_push_fix(monkeypatch, head_seq=lambda: "a" * 40)
+    original_escalate = runner._escalate_fix_no_push_deadlock
+
+    async def check_checkpoint(pr):
+        saved = await runner.redis.get(pipeline_state(runner.name))
+        checkpoint = type(runner.state).model_validate_json(saved)
+        assert checkpoint.current_task is not None
+        assert not checkpoint.publication_attempt.pending
+        await original_escalate(pr)
+
+    monkeypatch.setattr(runner, "_escalate_fix_no_push_deadlock", check_checkpoint)
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert not runner.state.publication_attempt.pending
+    assert not asyncio.run(runner._hold_unresolved_publication())
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    assert asyncio.run(restarted.recover_state())
+    assert restarted.state.state == PipelineState.IDLE
+    assert not asyncio.run(restarted._hold_unresolved_publication())
