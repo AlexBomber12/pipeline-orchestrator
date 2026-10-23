@@ -2997,7 +2997,7 @@ def test_guardrail_suppression_precedes_delayed_pr_discovery(monkeypatch, stoppe
 @pytest.mark.parametrize("blocker", [
     None, "cleanup", "suppression", "absent", "unknown", "publication", "outage",
     "create", "unclassified", "active", "mismatch", "no_baseline", "no_head",
-    "remote_drift", "malformed_remote",
+    "remote_drift", "malformed_remote", "baseline_closed", "baseline_draft",
 ])
 def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
     from src.subsource_registry import SuppressionReason
@@ -3050,6 +3050,8 @@ def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
         attempt.head_sha = None
         monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: None)
     real_transport = gh_runner.run_gh
+    if blocker in {"baseline_closed", "baseline_draft"}:
+        attempt.baseline_numbers = {401}
 
     def transport(args, **kwargs):
         if args[:2] == ["pr", "create"]:
@@ -3064,13 +3066,23 @@ def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
             if blocker == "outage":
                 raise OSError("all-state unavailable")
             remote["omit"] = False
-        return real_transport(args, **kwargs)
+        publications = real_transport(args, **kwargs)
+        if blocker in {"baseline_closed", "baseline_draft"}:
+            publications.append({
+                "number": 401, "title": "PR-001: historical", "baseRefName": "main",
+                "headRefName": "pr-001", "headRefOid": "a" * 40,
+                "state": "CLOSED" if blocker == "baseline_closed" else "OPEN",
+                "isDraft": blocker == "baseline_draft", "isCrossRepository": False,
+                "createdAt": "2020-01-01T00:00:00Z",
+                "url": "https://github.com/octo/demo/pull/401",
+            })
+        return publications
 
     monkeypatch.setattr(gh_runner, "run_gh", transport)
     command = _command(_task_text(task_id="PR-001", branch="pr-001"),
                        task_id="PR-001", branch="pr-001")
     result = asyncio.run(runner._select_retry_continuation(command))
-    if blocker is None:
+    if blocker in {None, "baseline_closed", "baseline_draft"}:
         assert result[0] == "watch"
         assert result[1].head_sha == "a" * 40
         assert attempt.verified
@@ -3177,4 +3189,38 @@ def test_error_retries_status_write_before_retained_publication(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_task is task
     assert attempt.pending
+    assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("code", [0, 1])
+def test_published_escalation_remains_retryable_after_restart(monkeypatch, code):
+    from src.keyspace import pipeline_state
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(
+        monkeypatch, runner, code=code, stdout="ESCALATE: operator recovery needed",
+    )
+    asyncio.run(runner.handle_coding())
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message == "operator recovery needed"
+    saved = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    checkpoint = type(runner.state).model_validate_json(saved)
+    assert checkpoint.publication_attempt.exit_classification == "failure"
+    assert checkpoint.publication_attempt.pending
+    assert checkpoint.publication_attempt.pr_number == 402
+
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    assert asyncio.run(restarted.recover_state())
+    # An escalation stays parked until the operator explicitly retries.
+    assert restarted.state.state == PipelineState.ERROR
+    assert restarted.state.publication_attempt.pending
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001")
+    result = asyncio.run(restarted._select_retry_continuation(command))
+    assert result[0] == "watch"
+    assert result[1].number == 402
+    assert result[1].head_sha == "a" * 40
     assert remote["calls"] == 1

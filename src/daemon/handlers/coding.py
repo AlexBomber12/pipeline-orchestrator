@@ -456,7 +456,7 @@ class CodingMixin:
             publications = await asyncio.to_thread(
                 gh_prs.get_branch_publications, attempt.repo, attempt.base, attempt.branch,
             )
-            if publications:
+            if any(item.number not in attempt.baseline_numbers for item in publications):
                 return False
             if await asyncio.to_thread(
                 _remote_branch_exists, self.repo_path, attempt.branch, attempt.head_sha,
@@ -1486,6 +1486,9 @@ class CodingMixin:
             return
         escalate_reason = fix_escalation.parse_escalate_marker(stdout)
         if escalate_reason is not None:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
+                await self.publish_state()
             await self._release_unpublished_attempt(target_branch)
             await self._transition_to_error(
                 escalate_reason, publish=False, log_prefix="[CODING]",
