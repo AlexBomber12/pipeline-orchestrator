@@ -47,6 +47,37 @@ from tests.runner import _helpers as h
 claude_cli = claude_plugin_module.claude_cli
 
 
+def test_ordinary_fix_prelaunch_recovers_without_approval() -> None:
+    from src.models import InvocationSnapshot
+
+    runner = h._make_runner()
+    task = QueueTask(pr_id="PR-019", title="t", status=TaskStatus.DOING,
+                     branch="pr-019", task_file="tasks/PR-019.md")
+    pr = PRInfo(number=77, branch="pr-019", head_sha="a" * 40)
+    prior = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="old-run", attempt_index=1, phase="coding",
+    )
+    pending = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="new-run", attempt_index=1, phase="fix", fix_iteration=2,
+    )
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_task = task
+    runner.state.current_pr = pr
+    runner.state.active_invocation = prior
+    asyncio.run(runner.redis.set(
+        runner_module.pipeline_state(runner.name), runner.state.model_dump_json()
+    ))
+    previous = types.SimpleNamespace(fix_iterations=1, invocations=[prior])
+    admitted = types.SimpleNamespace(
+        run_id="new-run", attempt_index=1, fix_iterations=2, invocations=[pending],
+    )
+    assert asyncio.run(runner._recover_fix_prelaunch(admitted, previous, None))
+    runner.state.current_pr.head_sha = "b" * 40
+    assert not asyncio.run(runner._recover_fix_prelaunch(admitted, previous, None))
+
+
 def test_legacy_size_label_uses_ordinary_fix_without_status_or_marker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

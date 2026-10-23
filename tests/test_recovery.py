@@ -270,6 +270,36 @@ def test_legacy_size_label_does_not_require_base_refresh(
     assert not any(call[0] == "fetch" for call in calls)
 
 
+@pytest.mark.parametrize("outcome", ["ok", "unavailable", "invalid_base"])
+def test_legacy_completion_refreshes_base_before_header_read(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str,
+) -> None:
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    (tmp_path / ".git").mkdir()
+    runner._persisted_fix_recovery = SimpleNamespace(size_fix_completion=object())
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_a, **_k: [])
+    if outcome == "invalid_base":
+        runner.repo_config.branch = "-invalid"
+    calls: list[tuple[str, ...]] = []
+    def git(_repo: str, *args: str, **_kwargs: Any):
+        calls.append(args)
+        if outcome == "unavailable" and args[0] == "fetch":
+            raise OSError("offline")
+        return subprocess.CompletedProcess(args, 0, "", "")
+    monkeypatch.setattr(recovery_module.git_ops, "_git", git)
+    monkeypatch.setattr(runner, "_hydrate_current_task_from_persisted_state",
+                        AsyncMock(return_value=False))
+    assert asyncio.run(runner._recover_state_headers()) is False
+    if outcome == "ok":
+        assert [call[0] for call in calls] == ["check-ref-format", "fetch"]
+    elif outcome == "unavailable":
+        assert [call[0] for call in calls] == ["check-ref-format", "fetch"]
+        assert any("task header refresh deferred" in e["event"] for e in runner.state.history)
+    else:
+        assert calls == []
+
+
 def test_recover_projects_quarantine_when_guardrail_suppression_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

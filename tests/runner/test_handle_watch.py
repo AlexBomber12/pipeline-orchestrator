@@ -689,7 +689,11 @@ def test_handle_watch_rehydrates_quarantine_before_merge(
 
 
 @pytest.mark.parametrize("labels", [set(), {"size-fix:" + "a" * 40}])
-@pytest.mark.parametrize("change", ["none", "generation", "head", "invocation", "guardrail", "cause", "process", "missing_revision"])
+@pytest.mark.parametrize("change", [
+    "none", "generation", "head", "invocation", "guardrail", "cause",
+    "process", "process_unavailable", "task_unavailable", "status_raise",
+    "status_false", "todo", "missing_revision",
+])
 def test_watch_reconciles_legacy_receipt_without_label_dependency(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, labels: set[str], change: str,
 ) -> None:
@@ -724,6 +728,11 @@ def test_watch_reconciles_legacy_receipt_without_label_dependency(
     )
     if change == "generation":
         task_path.write_text("revised generation\n")
+    elif change == "task_unavailable":
+        monkeypatch.setattr(
+            watch_module, "task_spec_content_hash",
+            lambda *_args: (_ for _ in ()).throw(OSError("task unavailable")),
+        )
     elif change == "head":
         pr.head_sha = "b" * 40
     elif change == "invocation":
@@ -741,22 +750,36 @@ def test_watch_reconciles_legacy_receipt_without_label_dependency(
     monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_a, **_k: "OPEN")
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *_a, **_k: None)
     monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
-                        lambda: ("error", SuppressionReason.CRASH,
-                                 None if change == "missing_revision" else "e" * 64))
-    monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker",
-                        lambda *_a: "active coder" if change == "process" else None)
+                        lambda: (("todo", None, "t" * 64) if change == "todo" else
+                                 ("error", SuppressionReason.CRASH,
+                                  None if change == "missing_revision" else "e" * 64)))
+    def process_blocker(*_args):
+        if change == "process_unavailable":
+            raise OSError("inspection unavailable")
+        return "active coder" if change == "process" else None
+    monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker", process_blocker)
     monkeypatch.setattr("src.daemon.handlers.watch.bound_checkout_work_blocker_for_ref", lambda *_a: None)
-    write = AsyncMock(return_value=True)
+    write = AsyncMock(return_value=change != "status_false")
+    if change == "status_raise":
+        write.side_effect = OSError("status unavailable")
     monkeypatch.setattr(runner, "_commit_task_status_change", write)
     asyncio.run(runner.handle_watch())
-    if change == "none":
-        assert write.await_count == 1
-        assert write.await_args.args[1] == "TODO"
+    if change in {"none", "todo"}:
+        assert write.await_count == (0 if change == "todo" else 1)
+        if change != "todo":
+            assert write.await_args.args[1] == "TODO"
         assert runner.state.size_fix_completion is None
         assert runner.state.current_task.status == TaskStatus.DOING
     else:
-        write.assert_not_awaited()
-        assert runner.state.state == (PipelineState.WATCH if change in {"process", "missing_revision"} else PipelineState.ERROR)
+        if change not in {"status_raise", "status_false"}:
+            write.assert_not_awaited()
+        deferred = {
+            "process", "process_unavailable", "task_unavailable",
+            "status_raise", "status_false", "missing_revision",
+        }
+        assert runner.state.state == (
+            PipelineState.WATCH if change in deferred else PipelineState.ERROR
+        ), runner.state.error_message
 
 
 
