@@ -2996,7 +2996,8 @@ def test_guardrail_suppression_precedes_delayed_pr_discovery(monkeypatch, stoppe
 
 @pytest.mark.parametrize("blocker", [
     None, "cleanup", "suppression", "absent", "unknown", "publication", "outage",
-    "create", "unclassified", "active", "mismatch", "no_baseline",
+    "create", "unclassified", "active", "mismatch", "no_baseline", "no_head",
+    "remote_drift", "malformed_remote",
 ])
 def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
     from src.subsource_registry import SuppressionReason
@@ -3019,8 +3020,22 @@ def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
         return blocker != "cleanup"
 
     monkeypatch.setattr(runner, "_confirm_current_coder_cleanup", cleanup)
-    monkeypatch.setattr(coding_module, "_remote_branch_exists",
-                        lambda *a: {"absent": False, "unknown": None}.get(blocker, True))
+    real_git = git_ops._git
+
+    def git_transport(repo_path, *args, **kwargs):
+        if args[:1] != ("ls-remote",):
+            return real_git(repo_path, *args, **kwargs)
+        if blocker == "unknown":
+            raise OSError("remote unavailable")
+        sha = "b" * 40 if blocker == "remote_drift" else "a" * 40
+        output = f"{sha}\trefs/heads/pr-001\n"
+        if blocker == "malformed_remote":
+            output = f"{sha}\trefs/heads/unrelated\n"
+        return subprocess.CompletedProcess(
+            args, 2 if blocker == "absent" else 0, stdout=output, stderr="",
+        )
+
+    monkeypatch.setattr(git_ops, "_git", git_transport)
     if blocker == "suppression":
         asyncio.run(runner._suppress_task("PR-001", SuppressionReason.GUARDRAIL))
     if blocker == "unclassified":
@@ -3031,6 +3046,9 @@ def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
         attempt.run_id = "wrong-run"
     if blocker == "no_baseline":
         attempt.baseline_numbers = None
+    if blocker == "no_head":
+        attempt.head_sha = None
+        monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: None)
     real_transport = gh_runner.run_gh
 
     def transport(args, **kwargs):
@@ -3092,4 +3110,56 @@ def test_restart_after_successful_exit_classification_resumes_watch(monkeypatch)
     assert restarted.state.current_pr.number == 402
     assert not restarted.state.publication_attempt.pending
     assert reviews == [402]
+    assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("phase", ["coding", "fix"])
+@pytest.mark.parametrize("visible", [False, True])
+@pytest.mark.parametrize("status_context", [False, True])
+def test_error_retries_status_write_before_retained_publication(
+    monkeypatch, tmp_path, phase, visible, status_context,
+):
+    from dataclasses import replace
+
+    from src.subsource_registry import SuppressionReason
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    runner.state.active_invocation = replace(runner.state.active_invocation, phase=phase)
+    remote["omit"] = remote["exact_unknown"] = not visible
+    task = runner.state.current_task
+    task_path = tmp_path / "task.md"
+    task_path.write_text("status: DOING\n")
+    if status_context:
+        runner.state.error_message = "crash: status:ERROR write failed; operator Retry required"
+    asyncio.run(runner._mark_status_write_failed_task(
+        task, blocked_reason=SuppressionReason.CRASH,
+    ))
+    writes = []
+
+    async def commit(current_task, status, context, *, blocked_reason):
+        assert current_task is task
+        assert status == "ERROR"
+        assert blocked_reason == SuppressionReason.CRASH
+        writes.append(status)
+        if len(writes) == 1:
+            return False
+        task_path.write_text(f"status: {status}\n")
+        return True
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit)
+    asyncio.run(runner.handle_error())
+    assert task.pr_id in runner._status_write_failed_task_pr_ids
+    assert task_path.read_text() == "status: DOING\n"
+    asyncio.run(runner.handle_error())
+    assert task_path.read_text() == "status: ERROR\n"
+    assert task.pr_id not in runner._status_write_failed_task_pr_ids
+    assert f"status_write_failed_tasks:{runner.name}" not in runner.redis.store
+    asyncio.run(runner.handle_error())
+    assert writes == ["ERROR", "ERROR"]
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task is task
+    assert attempt.pending
     assert remote["calls"] == 1

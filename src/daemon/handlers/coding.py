@@ -103,8 +103,10 @@ def _local_branch_exists(repo_path: str, branch: str) -> bool:
     return probe.returncode == 0
 
 
-def _remote_branch_exists(repo_path: str, branch: str) -> bool | None:
-    """Return presence, proven absence (rc=2), or unknown on probe failure."""
+def _remote_branch_exists(
+    repo_path: str, branch: str, expected_head_sha: str | None = None,
+) -> bool | None:
+    """Return presence (optionally at an exact SHA), absence, or probe failure."""
     try:
         probe = git_ops._git(
             repo_path,
@@ -121,7 +123,9 @@ def _remote_branch_exists(repo_path: str, branch: str) -> bool | None:
     if probe.returncode == 2:
         return False
     if probe.returncode == 0 and probe.stdout.strip():
-        return True
+        return expected_head_sha is None or probe.stdout.split() == [
+            expected_head_sha, f"refs/heads/{branch}",
+        ]
     return None
 
 
@@ -440,7 +444,8 @@ class CodingMixin:
         attempt = self.state.publication_attempt
         if (not self._publication_attempt_matches_dispatch()
             or attempt.pr_number is not None or attempt.baseline_numbers is None
-            or attempt.exit_classification is None or self._coder_invocation_active):
+            or attempt.exit_classification is None or not attempt.head_sha
+            or self._coder_invocation_active):
             return False
         if not await self._confirm_current_coder_cleanup("Retry PR creation"):
             return False
@@ -448,12 +453,14 @@ class CodingMixin:
         if suppression is not None and suppression.reason == SuppressionReason.GUARDRAIL:
             return False
         try:
-            if await asyncio.to_thread(_remote_branch_exists, self.repo_path, attempt.branch) is not True:
-                return False
             publications = await asyncio.to_thread(
                 gh_prs.get_branch_publications, attempt.repo, attempt.base, attempt.branch,
             )
             if publications:
+                return False
+            if await asyncio.to_thread(
+                _remote_branch_exists, self.repo_path, attempt.branch, attempt.head_sha,
+            ) is not True:
                 return False
             await asyncio.to_thread(
                 gh_runner.run_gh,

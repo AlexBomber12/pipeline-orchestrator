@@ -152,11 +152,6 @@ class ErrorMixin:
             await self._admit_fix_idle_timeout()
             return
 
-        attempt = self.state.publication_attempt
-        if attempt is not None and attempt.pending:
-            await self._hold_unresolved_publication()
-            return
-
         if "status:ERROR write failed; operator Retry required" in context:
             reason_text = context.partition(":")[0]
             try:
@@ -199,6 +194,13 @@ class ErrorMixin:
                 return
             self._status_write_failed_task_pr_ids.discard(retry_task_id)
             await self._persist_status_write_failed_task_pr_ids()
+
+        # Repair durable task status before reconciliation can retain the
+        # publication and return to ERROR again.
+        attempt = self.state.publication_attempt
+        if attempt is not None and attempt.pending:
+            await self._hold_unresolved_publication()
+            return
 
         async def _clear_cause_for_retry() -> None:
             if retry_task_id is not None:
