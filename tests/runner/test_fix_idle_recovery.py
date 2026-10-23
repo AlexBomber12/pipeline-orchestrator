@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import subprocess
 from dataclasses import replace
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 from src import codex_cli
@@ -734,6 +736,95 @@ async def test_legacy_error_dispatch_invokes_timeout_admission(
     monkeypatch.setattr(runner, "_consume_retry_command", no_retry)
     await runner._run_cycle_body()
     assert runner.state.state == PipelineState.WATCH
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entrypoint", ["cycle", "handler"])
+@pytest.mark.parametrize("outcome", ["OPEN", "MERGED", "CLOSED"])
+async def test_timeout_admission_reconciles_and_consumes_publication_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entrypoint: str, outcome: str,
+) -> None:
+    runner, task, pr, task_path = await _timeout_runner(tmp_path, monkeypatch)
+    runner._begin_publication_attempt(started_at=datetime.now(timezone.utc))
+    attempt = runner.state.publication_attempt
+    attempt.unverified_head_sha = "b" * 40
+    attempt.failure = runner.state.error_message
+    original_error = runner.state.error_message
+    run_id = runner._current_run_record.run_id
+    remote_state = None
+    remote_head = None
+
+    def exact(repo, base, number, sha):
+        return gh_prs.ExactPROutcome(
+            repo, base, number, sha,
+            gh_prs.ExactPRState(remote_state) if sha == remote_head
+            else gh_prs.ExactPRState.UNKNOWN,
+            remote_state is not None,
+        )
+
+    monkeypatch.setattr(gh_prs, "get_exact_pr_outcome", exact)
+    runner._recovered = True
+    monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner, "_refresh_user_paused_from_redis", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner, "_consume_approval_command", AsyncMock(return_value=False))
+    monkeypatch.setattr(runner, "_consume_retry_command", AsyncMock(return_value=RetryDispatch.NONE))
+    monkeypatch.setattr(runner, "_check_github_api_budget", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+    dispatch = runner._run_cycle_body if entrypoint == "cycle" else runner.handle_error
+
+    # An outage and then a stale exact head must both retain the timeout and
+    # ownership rather than returning to WATCH on branch/list evidence alone.
+    for remote_state, remote_head in [(None, None), ("OPEN", "a" * 40)]:
+        await dispatch()
+        assert runner.state.state == PipelineState.ERROR
+        assert attempt.pending
+        assert attempt.unverified_head_sha == "b" * 40
+        assert runner.state.error_message == original_error
+        assert "status: ERROR" in task_path.read_text()
+        assert await runner.redis.get(cause_key(runner.name, task.pr_id))
+
+    remote_state, remote_head = outcome, "b" * 40
+    monkeypatch.setattr(
+        gh_prs, "get_open_prs",
+        lambda *_a, **_k: [pr.model_copy(update={"head_sha": remote_head})],
+    )
+    invocation = runner.state.active_invocation
+    runner.state.active_invocation = replace(invocation, run_id="unrelated")
+    await dispatch()
+    assert runner.state.state == PipelineState.ERROR
+    assert attempt.pending
+    runner.state.active_invocation = invocation
+
+    checkpoints = []
+    publish = runner.publish_state
+
+    async def checkpoint():
+        checkpoints.append((runner.state.state, attempt.pending, runner.state.current_task))
+        await publish()
+
+    monkeypatch.setattr(runner, "publish_state", checkpoint)
+    await dispatch()
+    assert not attempt.pending, runner.state.history
+    assert attempt.head_sha == "b" * 40
+    assert attempt.unverified_head_sha is None
+    # The hold is durably consumed while the original dispatch is still bound.
+    assert checkpoints[0][:2] == (PipelineState.ERROR, False)
+    assert checkpoints[0][2].pr_id == task.pr_id
+    persisted = await runner.redis.get(pipeline_state(runner.name))
+    assert not runner.state.model_validate_json(persisted).publication_attempt.pending
+    if outcome == "OPEN":
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_pr.head_sha == "b" * 40
+        assert "status: TODO" in task_path.read_text()
+        assert await runner.redis.get(cause_key(runner.name, task.pr_id)) is None
+    else:
+        assert runner.state.state == PipelineState.IDLE
+        assert runner.state.current_task is None
+        assert runner.state.current_pr is None
+        record = await runner._metrics_store.get(run_id)
+        assert record.exit_reason == (
+            "success_merged" if outcome == "MERGED" else "closed_unmerged"
+        )
 
 
 @pytest.mark.asyncio

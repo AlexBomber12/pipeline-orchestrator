@@ -111,6 +111,13 @@ class RetryCommandMixin:
 
     async def _admit_fix_idle_timeout(self) -> None:
         """Resume only the interrupted, bound FIX run after durable admission."""
+        attempt = self.state.publication_attempt
+        if attempt is not None and attempt.pending:
+            if not await self._resolve_published_attempt():
+                await self._hold_unresolved_publication()
+                return
+            if self.state.current_task is None:
+                return
         task, bound = self.state.current_task, self.state.current_pr
         if task is None or bound is None or not task.branch:
             self.log_event("[RECOVERY] FIX timeout has no bound task/PR; operator Retry required.")
@@ -225,6 +232,11 @@ class RetryCommandMixin:
         self._crashed_task_pr_ids.discard(task.pr_id)
         self._last_error_park_log_key = None
         self.state.current_pr = self._preserve_fix_iteration_count(found)
+        if attempt is not None and attempt.pending:
+            # Exact reconciliation above proved this dispatch's publication.
+            # Checkpoint consumption before WATCH/MERGE can clear the binding.
+            attempt.pending = False
+            await self.publish_state()
         self.state.state = PipelineState.WATCH
         await self._clear_error_message_on_recovery(
             log_prefix="[RECOVERY]", reason="confirmed FIX timeout admitted to WATCH"
