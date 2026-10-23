@@ -31,9 +31,10 @@ from src.daemon.guardrails import GuardrailViolation, scan_stdout
 from src.daemon.handlers import CoderUnavailable
 from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.daemon.selector import CoderSelectionUnavailable
+from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.models import PipelineState, PRInfo, PublicationAttempt
+from src.models import CIStatus, PipelineState, PRInfo, PublicationAttempt
 from src.process_supervisor import (
     ProcessSupervisionError,
     SupervisedProcess,
@@ -386,6 +387,22 @@ class CodingMixin:
                 )
             if outcome.discovery_complete and outcome.state == gh_prs.ExactPRState.OPEN:
                 current.head_sha = attempt.head_sha
+                # Publication discovery proves identity only. Hydrate CI from
+                # the canonical reader without weakening source completeness
+                # or the repository's required-context policy.
+                try:
+                    retrieval = await asyncio.to_thread(
+                        gh_checks._retrieve_ci_status_evidence,
+                        attempt.repo, attempt.head_sha,
+                    )
+                    current.ci_status = gh_checks._classify_ci_retrieval(
+                        retrieval,
+                        required_contexts=self.repo_config.required_checks,
+                        empty_is_success=self.repo_config.allow_merge_without_checks,
+                    )
+                except Exception as exc:
+                    current.ci_status = CIStatus.PENDING
+                    self.log_event(f"[INFRA] CODING CI hydration deferred: {exc}")
                 attempt.verified = True
                 self.state.current_pr = current
                 # The old remote head proves ownership, but cannot release a

@@ -3844,3 +3844,82 @@ def test_watch_terminal_keeps_unverified_publication(monkeypatch):
     assert attempt.pending
     assert runner.state.current_task is not None
     assert runner.state.state == PipelineState.ERROR
+
+
+@pytest.mark.parametrize("scenario", ["missing", "incomplete", "incomplete_status", "complete", "empty", "testbed", "required_exempt"])
+def test_coding_hydrates_ci_with_repository_policy(monkeypatch, scenario):
+    from src.github import cache, checks
+    from src.models import CIStatus
+
+    runner = _runner(monkeypatch)
+    _publication_transport(monkeypatch, runner, code=0, stderr="")
+    runner.repo_config.required_checks = ["unit", "integration"]
+    if scenario in {"empty", "testbed"}:
+        runner.repo_config.required_checks = None
+    assert runner.repo_config.allow_merge_without_checks is False
+    if scenario in {"testbed", "required_exempt"}:
+        runner.repo_config.allow_merge_without_checks = True
+    clock = [100.0]
+    source = {"complete": scenario != "incomplete", "status_complete": scenario != "incomplete_status",
+              "names": ["unit", "integration"]}
+    if scenario in {"missing", "required_exempt"}:
+        source["names"] = ["unit"]
+    if scenario in {"empty", "testbed"}:
+        source["names"] = []
+    calls = []
+
+    def check_pages(path):
+        assert path == "repos/octo/demo/commits/" + "a" * 40 + "/check-runs?per_page=100"
+        calls.append(path)
+        runs = [{"id": i, "name": name, "head_sha": "a" * 40,
+                 "status": "completed", "conclusion": "success", "app": {"id": 1}}
+                for i, name in enumerate(source["names"], 1)]
+        return cache.PaginatedEvidence([{"check_runs": runs}], source["complete"], not runs)
+
+    def status_pages(path, key):
+        assert path == "repos/octo/demo/commits/" + "a" * 40 + "/status?per_page=100"
+        assert key == "statuses"
+        return cache.PaginatedEvidence(
+            [{"sha": "a" * 40, "state": "pending", "total_count": 0, "statuses": []}], source["status_complete"], True,
+        )
+
+    checks.clear_ci_status_cache()
+    monkeypatch.setattr(checks.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cache, "_gh_api_paginated_evidence", check_pages)
+    monkeypatch.setattr(cache, "_etag_get_object_pages_evidence", status_pages)
+    try:
+        asyncio.run(runner.handle_coding())
+        assert runner.state.state == PipelineState.WATCH
+        assert (runner.state.current_pr.number, runner.state.current_pr.head_sha) == (402, "a" * 40)
+        expected = CIStatus.SUCCESS if scenario in {"complete", "testbed"} else CIStatus.PENDING
+        assert runner.state.current_pr.ci_status == expected
+        source.update(complete=True, status_complete=True, names=["unit", "integration"])
+        assert asyncio.run(runner._resolve_published_attempt())
+        assert runner.state.current_pr.ci_status == expected
+        assert len(calls) == 1  # Cached partial evidence must retain its policy.
+        clock[0] += checks._CI_STATUS_CACHE_TTL_SECONDS
+        assert asyncio.run(runner._resolve_published_attempt())
+        assert runner.state.current_pr.ci_status == CIStatus.SUCCESS
+        assert len(calls) == 2
+    finally:
+        checks.clear_ci_status_cache()
+
+
+def test_coding_ci_reader_error_clears_previous_success_without_losing_identity(monkeypatch):
+    from src.github import checks
+    from src.models import CIStatus
+
+    runner = _runner(monkeypatch)
+    _publication_transport(monkeypatch, runner, code=0, stderr="")
+
+    def unavailable(*args):
+        raise RuntimeError("CI transport unavailable")
+
+    monkeypatch.setattr(checks, "_retrieve_ci_status_evidence", unavailable)
+    asyncio.run(runner.handle_coding())
+    runner.state.current_pr.ci_status = CIStatus.SUCCESS
+    assert asyncio.run(runner._resolve_published_attempt())
+    assert runner.state.current_pr.number == 402
+    assert runner.state.current_pr.head_sha == "a" * 40
+    assert runner.state.current_pr.ci_status == CIStatus.PENDING
+    assert any("CI hydration deferred: CI transport unavailable" in e["event"] for e in runner.state.history)

@@ -4467,3 +4467,78 @@ def test_agents_scan_method_re_emits_when_drift_changes(
         "PR-088.md" in event and "no_verify_commit" in event
         for event in scan_events
     ), scan_events
+
+
+@pytest.mark.parametrize("scenario", ["missing", "incomplete", "incomplete_status", "complete", "empty", "testbed", "required_exempt"])
+def test_idle_attachment_retains_canonical_ci_policy(monkeypatch, scenario):
+    from types import SimpleNamespace
+
+    from src.github import cache, checks, gh_runner, prs, reviews
+
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    runner.repo_config.required_checks = ["unit", "integration"]
+    if scenario in {"empty", "testbed"}:
+        runner.repo_config.required_checks = None
+    assert runner.repo_config.allow_merge_without_checks is False
+    if scenario in {"testbed", "required_exempt"}:
+        runner.repo_config.allow_merge_without_checks = True
+    task = QueueTask(pr_id="PR-042", title="Sample", status=TaskStatus.TODO, branch="pr-042-sample")
+    h._stub_dag_select(monkeypatch, task=task)
+    monkeypatch.setattr(prs, "get_merged_prs", lambda *a, **kw: [])
+    monkeypatch.setattr(prs, "get_pr_head_publication", lambda *a, **kw: SimpleNamespace(
+        published_at=None, unknown_reason=None, head_repo="octo/demo", ref="refs/heads/pr-042-sample", repo="octo/demo",
+        head_sha="a" * 40, provenance="test",
+    ))
+    monkeypatch.setattr(reviews, "get_pr_review_status", lambda *a, **kw: ReviewStatus.PENDING)
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: None)
+
+    def transport(args, **kwargs):
+        assert kwargs["repo"] == "octo/demo"
+        assert args[:2] == ["pr", "list"]
+        return [{"number": 99, "title": "PR-042: Sample", "headRefName": task.branch,
+                 "headRefOid": "a" * 40}]
+
+    monkeypatch.setattr(gh_runner, "run_gh", transport)
+    clock = [100.0]
+    source = {"complete": scenario != "incomplete", "status_complete": scenario != "incomplete_status",
+              "names": ["unit", "integration"]}
+    if scenario in {"missing", "required_exempt"}:
+        source["names"] = ["unit"]
+    if scenario in {"empty", "testbed"}:
+        source["names"] = []
+    calls = []
+
+    def check_pages(path):
+        assert path == "repos/octo/demo/commits/" + "a" * 40 + "/check-runs?per_page=100"
+        calls.append(path)
+        runs = [{"id": i, "name": name, "head_sha": "a" * 40,
+                 "status": "completed", "conclusion": "success", "app": {"id": 1}}
+                for i, name in enumerate(source["names"], 1)]
+        return cache.PaginatedEvidence([{"check_runs": runs}], source["complete"], not runs)
+
+    def status_pages(path, key):
+        assert path == "repos/octo/demo/commits/" + "a" * 40 + "/status?per_page=100"
+        assert key == "statuses"
+        return cache.PaginatedEvidence(
+            [{"sha": "a" * 40, "state": "pending", "total_count": 0, "statuses": []}], source["status_complete"], True,
+        )
+
+    checks.clear_ci_status_cache()
+    monkeypatch.setattr(checks.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(cache, "_gh_api_paginated_evidence", check_pages)
+    monkeypatch.setattr(cache, "_etag_get_object_pages_evidence", status_pages)
+    try:
+        expected = CIStatus.SUCCESS if scenario in {"complete", "testbed"} else CIStatus.PENDING
+        for expired in (False, False, True):
+            if expired:
+                clock[0] += checks._CI_STATUS_CACHE_TTL_SECONDS
+            runner.state.state = PipelineState.IDLE
+            asyncio.run(runner.handle_idle())
+            assert runner.state.state == PipelineState.WATCH, runner.state.history
+            assert (runner.state.current_pr.number, runner.state.current_pr.head_sha) == (99, "a" * 40)
+            assert runner.state.current_pr.ci_status == (CIStatus.SUCCESS if expired else expected)
+            assert len(calls) == (2 if expired else 1)
+            source.update(complete=True, status_complete=True, names=["unit", "integration"])
+    finally:
+        checks.clear_ci_status_cache()
