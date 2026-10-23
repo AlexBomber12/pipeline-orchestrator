@@ -104,7 +104,11 @@ class FixMixin(BreachMixin):
     """FIX FEEDBACK handler with idle timeout and breach monitoring."""
 
     async def _approved_guardrail_fix_attempt(self, record, current_pr):
-        """Return the bound approval only for its finalized guardrail run."""
+        """Return the bound approval only for its finalized guardrail run.
+
+        The run's head_sha is checkout telemetry and can predate the published
+        PR head. Approval and the live remote check bind the executable head.
+        """
         command = self._current_approval(current_pr)
         task = self.state.current_task
         invocation = self.state.active_invocation
@@ -116,7 +120,6 @@ class FixMixin(BreachMixin):
             or record.task_id != task.pr_id or record.repo_name != self.name
             or record.ended_at is None or record.cause != "ESCALATE"
             or record.cause_subsource != "guardrail"
-            or record.head_sha != current_pr.head_sha
             or record.task_spec_hash not in ("", command.task_fingerprint)
             or invocation is None or invocation.run_id != record.run_id
             or invocation.attempt_index != record.attempt_index
