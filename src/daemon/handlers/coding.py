@@ -354,6 +354,9 @@ class CodingMixin:
                     return
                 if not any(item.number not in attempt.baseline_numbers for item in publications):
                     attempt.pending = False
+                    # Checkpoint before callers await terminal bookkeeping:
+                    # a headless attempt cannot repeat reconciliation on restart.
+                    await self.publish_state()
 
     async def _hold_unresolved_publication(self) -> bool:
         """Prevent IDLE/CODING from losing an unfinished publication attempt."""

@@ -2249,6 +2249,48 @@ def test_deleted_branch_requires_fresh_all_state_publication_lookup(monkeypatch,
         assert remote["calls"] == 1
 
 
+@pytest.mark.parametrize("stderr", ["coder failed", "rate limit exceeded",
+                                   "ESCALATE: operator recovery needed"])
+def test_unpublished_release_survives_crash_before_terminal_bookkeeping(monkeypatch, stderr):
+    from src.keyspace import pipeline_state
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+
+    async def unpublished_coder(*args, **kwargs):
+        remote["calls"] += 1
+        return 1, stderr if stderr.startswith("ESCALATE:") else "", stderr
+
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", unpublished_coder)
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: None)
+    monkeypatch.setattr(coding_module, "_remote_branch_exists", lambda *a: False)
+    release = runner._release_unpublished_attempt
+
+    async def crash_after_release(branch):
+        await release(branch)
+        assert not runner.state.publication_attempt.pending
+        raise asyncio.CancelledError("daemon stopped before terminal bookkeeping")
+
+    monkeypatch.setattr(runner, "_release_unpublished_attempt", crash_after_release)
+    with pytest.raises(asyncio.CancelledError, match="daemon stopped"):
+        asyncio.run(runner.handle_coding())
+
+    saved = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    restarted = _runner(monkeypatch)
+    restarted.state = type(runner.state).model_validate_json(saved)
+    assert restarted.state.publication_attempt.head_sha is None
+    assert not restarted.state.publication_attempt.pending
+    assert not asyncio.run(restarted._hold_unresolved_publication())
+    monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
+    monkeypatch.setattr(coding_module.gh_prs, "get_merged_prs", lambda *a, **kw: [])
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001")
+    assert asyncio.run(restarted._select_retry_continuation(command)) == ("coding", None)
+    assert remote["calls"] == 1
+
+
 def test_deleted_branch_without_publication_baseline_keeps_hold(monkeypatch):
     runner = _runner(monkeypatch)
     remote = _publication_transport(monkeypatch, runner)
