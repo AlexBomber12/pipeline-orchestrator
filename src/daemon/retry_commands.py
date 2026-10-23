@@ -537,10 +537,6 @@ class RetryCommandMixin:
                 return await self._defer_retry_command(
                     command, "Coder exit is unclassified; operator recovery required.",
                 )
-            # Consume while the validated invocation still binds this attempt.
-            # Retry accounting below may replace it with a fresh FIX run record.
-            attempt.pending = False
-            await self.publish_state()
             return "watch", pr
         try:
             open_prs = await asyncio.to_thread(
@@ -768,6 +764,34 @@ class RetryCommandMixin:
         if isinstance(continuation, RetryDispatch):
             return continuation
         continuation_name, pr = continuation
+
+        if continuation_name == "watch":
+            assert pr is not None
+
+            def bind_publication(current: RetryCommand) -> None:
+                current.bound_pr_number = pr.number
+                current.bound_pr_branch = pr.branch
+                current.bound_pr_head_sha = pr.head_sha
+
+            try:
+                bound = await update_retry_command(
+                    self.redis, self.name, command.command_id, bind_publication,
+                    keep_pending=True,
+                    transition_reason="Bound Retry to the retained publication.",
+                )
+                if bound is None:
+                    raise RuntimeError("retry command disappeared before publication binding")
+                command = bound
+            except Exception as exc:
+                return await self._defer_retry_command(
+                    command, f"Could not bind Retry publication: {exc}.",
+                )
+            # The command now durably owns the exact PR even if later admission
+            # defers or accounting replaces the original invocation.
+            attempt = self.state.publication_attempt
+            if attempt is not None and attempt.pending:
+                attempt.pending = False
+                await self.publish_state()
 
         if continuation_name == "coding":
             coder = await self._ensure_retry_coder_available(command, header, task)

@@ -2318,6 +2318,15 @@ def test_escalation_and_breach_release_only_proven_unpublished_attempts(
         assert runner.state.error_message == "operator recovery needed"
     else:
         assert runner.state.state == PipelineState.PAUSED
+        if evidence == "published":
+            assert attempt.exit_classification is None
+            expired = datetime.now(timezone.utc) - timedelta(seconds=1)
+            runner.state.rate_limited_until = expired
+            runner.state.rate_limited_coder_until = {"claude": expired}
+            asyncio.run(runner.handle_paused())
+            assert runner.state.state == PipelineState.ERROR
+            assert attempt.pending
+            assert runner.state.current_pr.number == 402
         if released:
             expired = datetime.now(timezone.utc) - timedelta(seconds=1)
             runner.state.rate_limited_until = expired
@@ -3096,7 +3105,7 @@ def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
     else:
         assert result != ("coding", None)
         assert len(creates) == (1 if blocker == "create" else 0)
-    assert attempt.pending is (blocker not in {None, "baseline_closed", "baseline_draft", "changed_head", "absent"})
+    assert attempt.pending is (blocker != "absent")
     assert remote["calls"] == 1
 
 
@@ -3280,3 +3289,105 @@ def test_watch_admission_consumes_retained_verified_publication(monkeypatch):
     runner._admit_observed_pr(runner.state.current_pr.model_copy())
     assert not attempt.pending
     assert attempt.failure == "coder failed"
+
+
+@pytest.mark.parametrize("stop_path", ["cancelled", "exited"])
+@pytest.mark.parametrize("delayed", [False, True])
+def test_stopped_published_coding_requires_retry_before_watch(monkeypatch, stop_path, delayed):
+    from src.daemon.retry_commands import RetryDispatch
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    remote["omit"] = delayed
+
+    async def stopped(*args, **kwargs):
+        remote["created"] = True
+        runner._stop_requested = True
+        runner.state.user_paused = True
+        if stop_path == "cancelled":
+            raise asyncio.CancelledError
+        return 0, "", ""
+
+    monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", stopped)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    assert runner.state.state == PipelineState.PAUSED
+    assert attempt.pending and attempt.exit_classification == "failure"
+    remote["omit"] = False
+    runner._stop_requested = False
+    runner.state.user_paused = False
+    asyncio.run(runner.handle_paused())
+    assert runner.state.state == PipelineState.ERROR
+    assert attempt.pending
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001")
+    result = asyncio.run(runner._select_retry_continuation(command))
+    assert not isinstance(result, RetryDispatch)
+    assert result[0] == "watch" and result[1].number == 402
+
+
+@pytest.mark.parametrize("failure", ["binding", "binding_missing", "reservation", "status", "cleanup", "ack"])
+def test_retained_retry_durably_binds_before_admission_can_defer(monkeypatch, failure):
+    from src.daemon import retry_commands as retry_module
+    from src.daemon.retry_commands import RetryDispatch
+    from src.retry_commands import enqueue_retry_command, load_retry_command
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001")
+    # Use the actual daemon namespace for the durable command.
+    command.repo_slug = runner.name
+    asyncio.run(enqueue_retry_command(runner.redis, command))
+    task = runner.state.current_task
+
+    async def validate(*args):
+        return object(), task
+
+    async def no_blocker(*args):
+        return None
+
+    async def fail(*args, **kwargs):
+        raise RuntimeError("transient failure")
+
+    async def commit(*args):
+        return failure != "status"
+
+    monkeypatch.setattr(runner, "_validate_retry_command", validate)
+    monkeypatch.setattr(runner, "_retry_blocker", no_blocker)
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit)
+    if failure in {"binding", "binding_missing"}:
+        real_update = retry_module.update_retry_command
+
+        async def fail_binding(*args, **kwargs):
+            if kwargs.get("transition_reason") == "Bound Retry to the retained publication.":
+                if failure == "binding_missing":
+                    return None
+                raise RuntimeError("transient binding failure")
+            return await real_update(*args, **kwargs)
+
+        monkeypatch.setattr(retry_module, "update_retry_command", fail_binding)
+    elif failure == "reservation":
+        monkeypatch.setattr(retry_module, "reserve_retry_attempt", fail)
+    elif failure == "cleanup":
+        monkeypatch.setattr(runner, "_clear_retry_failure_evidence", fail)
+    elif failure == "ack":
+        monkeypatch.setattr(runner, "_mark_retry_applied", fail)
+    assert asyncio.run(runner._apply_retry_command(command)) == RetryDispatch.HANDLED
+    stored = asyncio.run(load_retry_command(runner.redis, runner.name, command.command_id))
+    if failure in {"binding", "binding_missing"}:
+        assert runner.state.publication_attempt.pending
+        assert stored.bound_pr_number is None
+    else:
+        assert stored.bound_pr_number == 402
+        assert stored.bound_pr_branch == "pr-001"
+        assert stored.bound_pr_head_sha == "a" * 40
+        # List omission on a later attempt must never authorize CODING.
+        monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
+        monkeypatch.setattr(coding_module.gh_prs, "get_pr_state", lambda *a: "OPEN")
+        assert asyncio.run(runner._select_retry_continuation(stored)) == RetryDispatch.HANDLED

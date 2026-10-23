@@ -1123,6 +1123,9 @@ class CodingMixin:
             return None
 
         if interruption == "stop":
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
+                await self.publish_state()
             await self._release_unpublished_attempt(target_branch)
             self.state.user_paused = True
             if current_pr_id is not None:
@@ -1434,6 +1437,9 @@ class CodingMixin:
                     )
             if not requested:
                 return False
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
+                await self.publish_state()
             await self._release_unpublished_attempt(target_branch)
             self.state.user_paused = True
             if current_pr_id is not None:

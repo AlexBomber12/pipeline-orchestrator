@@ -950,6 +950,16 @@ class IdleMixin:
 
     async def handle_paused(self) -> None:
         """Wait for rate limit window to expire, then resume previous flow."""
+        attempt = self.state.publication_attempt
+        invocation = self.state.active_invocation
+        if (not self.state.user_paused and attempt is not None and attempt.pending
+            and invocation is not None and invocation.phase == "coding"
+            and attempt.exit_classification != "success"):
+            await self._transition_to_error(
+                attempt.failure or "Interrupted coder publication requires operator Retry recovery",
+                save_run_record_as=None, publish=True, log_prefix="[INFRA]",
+            )
+            return
         # PR-330b: per-repo feature flag selects the unified inhibitor
         # exit check over the legacy ``user_paused``/``rate_limited_until``
         # branches. PAUSED is a global state for repo-wide inhibitors,
