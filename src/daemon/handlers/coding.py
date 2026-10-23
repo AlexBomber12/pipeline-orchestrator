@@ -364,6 +364,9 @@ class CodingMixin:
         if resolved and self.state.current_task is None:
             return True
         if self.state.user_paused or self.state.state == PipelineState.PAUSED:
+            if self.state.user_paused and not self._user_pause_logged:
+                self.log_event("[INFRA] Paused. Press Play to resume.")
+                self._user_pause_logged = True
             await self.publish_state()
             return True
         if resolved and not attempt.failure and not self.state.error_message:
@@ -1302,6 +1305,10 @@ class CodingMixin:
             if await pause_for_stop_if_requested():
                 return
             protected_pr = self.state.current_pr
+            if protected_pr is None and self._publication_attempt_matches_dispatch():
+                # Discovery already bounded this candidate to the dispatch.
+                # An unavailable exact read must not bypass quarantine.
+                protected_pr = self.state.publication_attempt.candidate
             if protected_pr is not None:
                 pr_number = protected_pr.number
                 self.state.quarantined_prs.add(pr_number)

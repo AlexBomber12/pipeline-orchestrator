@@ -1650,6 +1650,102 @@ def test_run_coder_breach_cleanup_failure_wins_over_pause(
 # ---------- _post_coder_resolution ----------
 
 
+@pytest.mark.parametrize("exact_failure", ["exception", "unknown"])
+def test_guardrail_quarantines_retained_candidate_without_exact_lookup(
+    monkeypatch: pytest.MonkeyPatch, exact_failure: str,
+) -> None:
+    from src.subsource_registry import SuppressionReason
+    from src.suppression.redis_store import RedisSuppressionStore
+
+    runner = _runner_with_task(monkeypatch)
+    runner.state.state = PipelineState.CODING
+    runner._start_current_run_record("claude", "opus")
+    runner._capture_invocation_snapshot("claude", {}, phase="coding")
+    runner._begin_publication_attempt(
+        started_at=datetime.now(timezone.utc), baseline_numbers=set(),
+    )
+    attempt = runner.state.publication_attempt
+    attempt.head_sha = "a" * 40
+    monkeypatch.setattr(
+        coding_module.gh_prs, "get_branch_publications", lambda *_: [_publication(42)],
+    )
+
+    def exact(*args):
+        if exact_failure == "exception":
+            raise RuntimeError("GitHub unavailable")
+        return coding_module.gh_prs.ExactPROutcome(
+            *args, coding_module.gh_prs.ExactPRState.UNKNOWN, False,
+        )
+
+    monkeypatch.setattr(coding_module.gh_prs, "get_exact_pr_outcome", exact)
+    assert not asyncio.run(runner._resolve_published_attempt())
+    assert attempt.candidate.number == 42
+    assert runner.state.current_pr is None
+    assert not attempt.verified
+    labelled = []
+    monkeypatch.setattr(
+        coding_module, "apply_quarantine_label_for_violation",
+        lambda _runner, number, violation: labelled.append((number, violation.category)),
+    )
+    asyncio.run(runner._post_coder_resolution(
+        "claude", 0, "gh repo create octo/demo\n", "",
+        target_branch="pr-001", current_pr_id="PR-001",
+    ))
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr is None
+    assert runner.state.quarantined_prs == {42}
+    assert labelled == [(42, "repo_create")]
+    suppression = asyncio.run(
+        RedisSuppressionStore(runner.redis).is_suppressed(runner.name, "PR-001")
+    )
+    assert suppression.reason == SuppressionReason.GUARDRAIL
+    assert suppression.detail["pr_number"] == 42
+    assert attempt.failure.startswith("GUARDRAIL: repo_create:")
+
+    # A later successful read can bind identity without dropping protection.
+    monkeypatch.setattr(
+        coding_module.gh_prs, "get_exact_pr_outcome",
+        lambda *args: coding_module.gh_prs.ExactPROutcome(
+            *args, coding_module.gh_prs.ExactPRState.OPEN, True,
+        ),
+    )
+    assert asyncio.run(runner._hold_unresolved_publication())
+    assert runner.state.current_pr.number == 42
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.quarantined_prs == {42}
+    assert asyncio.run(
+        RedisSuppressionStore(runner.redis).is_suppressed(runner.name, "PR-001")
+    ).reason == SuppressionReason.GUARDRAIL
+
+
+@pytest.mark.parametrize("user_paused", [True, False])
+def test_retained_publication_pause_acknowledges_once_without_releasing_hold(
+    monkeypatch: pytest.MonkeyPatch, user_paused: bool,
+) -> None:
+    runner = _runner_with_task(monkeypatch)
+    runner._start_current_run_record("claude", "opus")
+    runner._capture_invocation_snapshot("claude", {}, phase="coding")
+    runner._begin_publication_attempt(
+        started_at=datetime.now(timezone.utc), baseline_numbers=set(),
+    )
+    attempt = runner.state.publication_attempt
+    attempt.failure = "FIX coder ESCALATE; retaining publication"
+    runner.state.state = PipelineState.ERROR if user_paused else PipelineState.PAUSED
+    runner.state.user_paused = user_paused
+    for _ in range(2):
+        assert asyncio.run(runner._hold_unresolved_publication())
+    acknowledgements = [
+        event for event in runner.state.history
+        if event["event"] == "[INFRA] Paused. Press Play to resume."
+    ]
+    assert len(acknowledgements) == int(user_paused)
+    assert runner.state.state == (PipelineState.ERROR if user_paused else PipelineState.PAUSED)
+    assert runner.state.publication_attempt is attempt
+    assert attempt.pending
+    assert attempt.failure == "FIX coder ESCALATE; retaining publication"
+
+
 def test_post_coder_resolution_transitions_to_watch_when_pr_found(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
