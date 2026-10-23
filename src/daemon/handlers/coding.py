@@ -325,7 +325,9 @@ class CodingMixin:
                 current.head_sha = attempt.head_sha
                 attempt.verified = True
                 self.state.current_pr = current
-                return True
+                # The old remote head proves ownership, but cannot release a
+                # FIX hold while its newer local commit remains unverified.
+                return attempt.unverified_head_sha is None
             return False
         except Exception as exc:
             self.log_event(f"[INFRA] Reconciliation deferred: {exc}")

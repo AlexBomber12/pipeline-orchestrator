@@ -3893,7 +3893,7 @@ def test_fix_iterations_survive_recovery_until_merge(
         if args[:2] == ("rev-parse", "HEAD"):
             return h._FakeCompletedProcess(
                 args=["git", "rev-parse", "HEAD"],
-                stdout="abc123\n",
+                stdout="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
                 returncode=0,
             )
         if args[0] == "merge" and len(args) > 1 and args[1].startswith("origin/"):
@@ -3913,7 +3913,7 @@ def test_fix_iterations_survive_recovery_until_merge(
     monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
-        lambda repo, **kw: [PRInfo(number=77, branch="pr-001")],
+        lambda repo, **kw: [PRInfo(number=77, branch="pr-001", head_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_metadata",
@@ -3947,7 +3947,7 @@ def test_fix_iterations_survive_recovery_until_merge(
         branch="pr-001",
         task_file="tasks/PR-001.md",
     )
-    runner.state.current_pr = PRInfo(number=77, branch="pr-001")
+    runner.state.current_pr = PRInfo(number=77, branch="pr-001", head_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     runner.state.state = PipelineState.WATCH
     runner._start_current_run_record("claude", "opus")
     asyncio.run(runner._save_current_run_record("coding_complete"))

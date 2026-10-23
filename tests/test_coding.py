@@ -1848,10 +1848,14 @@ def test_failed_fix_only_records_new_head_after_remote_verification(monkeypatch,
     assert attempt.failure == "fix failed"
     command = _command(_task_text(task_id="PR-001", branch="pr-001"),
                        task_id="PR-001", branch="pr-001", bound_pr=runner.state.current_pr)
-    continuation, pr = asyncio.run(runner._select_retry_continuation(command))
-    assert continuation == "watch"
-    assert pr.number == 402
-    assert pr.head_sha == remote["head"]
+    if pushed:
+        continuation, pr = asyncio.run(runner._select_retry_continuation(command))
+        assert continuation == "watch"
+        assert pr.number == 402
+        assert pr.head_sha == remote["head"]
+    else:
+        assert not asyncio.run(runner._resolve_published_attempt())
+        assert runner.state.publication_attempt.pending
 
 
 @pytest.mark.parametrize("probe", ["stale", "unknown", "raises"])
@@ -1882,7 +1886,7 @@ def test_fix_head_probe_failure_preserves_known_remote_head(monkeypatch, probe, 
         remote["head"] = "b" * 40
     remote["exact_unknown"] = False
     monkeypatch.setattr(coding_module.gh_prs, "get_exact_pr_outcome", _REAL_EXACT_OUTCOME)
-    assert asyncio.run(runner._resolve_published_attempt())
+    assert asyncio.run(runner._resolve_published_attempt()) is pushed
     assert runner.state.publication_attempt.head_sha == remote["head"]
     assert runner.state.current_pr.head_sha == remote["head"]
     assert runner.state.publication_attempt.unverified_head_sha == (None if pushed else "b" * 40)
@@ -1892,9 +1896,12 @@ def test_fix_head_probe_failure_preserves_known_remote_head(monkeypatch, probe, 
 
     command = _command(_task_text(task_id="PR-001", branch="pr-001"),
                        task_id="PR-001", branch="pr-001", bound_pr=runner.state.current_pr)
-    continuation, pr = asyncio.run(runner._select_retry_continuation(command))
-    assert continuation == "watch"
-    assert pr.head_sha == remote["head"]
+    if pushed:
+        continuation, pr = asyncio.run(runner._select_retry_continuation(command))
+        assert continuation == "watch"
+        assert pr.head_sha == remote["head"]
+    else:
+        assert runner.state.publication_attempt.pending
 
 
 def test_baseline_outage_defers_until_publication_can_be_reconciled(monkeypatch):
@@ -2289,6 +2296,112 @@ def test_unpublished_release_survives_crash_before_terminal_bookkeeping(monkeypa
                        task_id="PR-001", branch="pr-001")
     assert asyncio.run(restarted._select_retry_continuation(command)) == ("coding", None)
     assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("git_verification", [None, True])
+def test_successful_fix_releases_hold_after_exact_new_head_verification(monkeypatch, git_verification):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+    posted = []
+    monkeypatch.setattr(runner, "_post_codex_review", lambda number: posted.append(number) or True)
+    monkeypatch.setattr(runner, "_verify_pushes_since", lambda *a, **kw: git_verification)
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: remote["head"])
+    original_git = git_ops._git
+
+    def git(repo_path, *args, **kwargs):
+        if args == ("rev-parse", "HEAD"):
+            return subprocess.CompletedProcess([], 0, remote["head"] + "\n", "")
+        return original_git(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops, "_git", git)
+
+    async def successful_fix(*args, **kwargs):
+        remote["head"] = "b" * 40
+        return 0, "", ""
+
+    monkeypatch.setattr(h.claude_cli, "fix_review_async", successful_fix)
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert not runner.state.publication_attempt.pending
+    assert runner.state.publication_attempt.unverified_head_sha is None
+    assert runner.state.publication_attempt.head_sha == runner.state.current_pr.head_sha == "b" * 40
+    assert runner.state.current_pr.fix_iteration_count == 1
+    assert posted == [402]
+
+
+@pytest.mark.parametrize("probe", ["stale", "unknown", "raises"])
+@pytest.mark.parametrize("pushed", [False, True])
+@pytest.mark.parametrize("paused", [False, True])
+def test_successful_fix_holds_unverified_head_until_exact_reconciliation(
+    monkeypatch, probe, pushed, paused,
+):
+    from unittest.mock import AsyncMock
+
+    from src.daemon.retry_commands import RetryDispatch
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+    posted = []
+    fixes = []
+    pushes_before = runner.state.current_pr.push_count
+    monkeypatch.setattr(runner, "_post_codex_review", lambda number: posted.append(number) or True)
+    monkeypatch.setattr(runner, "_verify_pushes_since", lambda *a, **kw: None)
+
+    async def successful_fix(*args, **kwargs):
+        fixes.append(True)
+        monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: "b" * 40)
+        remote["exact_unknown"] = probe == "unknown"
+        if probe == "raises":
+            def unavailable(*args, **kwargs):
+                raise OSError("exact probe unavailable")
+            monkeypatch.setattr(coding_module.gh_prs, "get_exact_pr_outcome", unavailable)
+        if paused:
+            runner._stop_requested = True
+            runner.state.user_paused = True
+        return 0, "", ""
+
+    monkeypatch.setattr(h.claude_cli, "fix_review_async", successful_fix)
+    asyncio.run(runner.handle_fix())
+    attempt = runner.state.publication_attempt
+    assert attempt.pending
+    assert attempt.unverified_head_sha == "b" * 40
+    assert attempt.head_sha == runner.state.current_pr.head_sha == "a" * 40
+    assert runner.state.current_pr.fix_iteration_count == 0
+    assert runner.state.current_pr.push_count == pushes_before
+    assert runner.state.state == (PipelineState.PAUSED if paused else PipelineState.ERROR)
+    assert posted == []
+
+    # Restart with the old remote head available: neither hold reconciliation
+    # nor another FIX may release ownership or invoke a second coder.
+    runner.state = type(runner.state).model_validate_json(runner.state.model_dump_json())
+    remote["exact_unknown"] = False
+    monkeypatch.setattr(coding_module.gh_prs, "get_exact_pr_outcome", _REAL_EXACT_OUTCOME)
+    assert not asyncio.run(runner._resolve_published_attempt())
+    asyncio.run(runner.handle_fix())
+    assert fixes == [True]
+    assert posted == []
+    assert runner.state.publication_attempt.pending
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001", bound_pr=runner.state.current_pr)
+    deferred = AsyncMock(return_value=RetryDispatch.ACTIVE_TASK_DEFERRED)
+    monkeypatch.setattr(runner, "_defer_retry_command", deferred)
+    assert asyncio.run(runner._select_retry_continuation(command)) == RetryDispatch.ACTIVE_TASK_DEFERRED
+    deferred.assert_awaited_once()
+
+    if pushed:
+        remote["head"] = "b" * 40
+    assert asyncio.run(runner._resolve_published_attempt()) is pushed
+    assert runner.state.current_pr.head_sha == remote["head"]
+    assert runner.state.publication_attempt.unverified_head_sha == (None if pushed else "b" * 40)
+    if pushed:
+        command.bound_pr_head_sha = "b" * 40
+        continuation, pr = asyncio.run(runner._select_retry_continuation(command))
+        assert continuation == "watch"
+        assert pr.head_sha == "b" * 40
 
 
 def test_deleted_branch_without_publication_baseline_keeps_hold(monkeypatch):

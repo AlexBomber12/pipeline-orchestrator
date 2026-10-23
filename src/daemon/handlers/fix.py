@@ -992,6 +992,17 @@ class FixMixin(BreachMixin):
         if head_after is None:
             return
 
+        attempt = self.state.publication_attempt
+        if attempt is not None and attempt.unverified_head_sha is not None:
+            # Capture retained the candidate commit without exact remote proof.
+            # Do not advertise it or clear the hold through optimistic git
+            # verification (or through the no-push WATCH path).
+            await capture_stop_requested_after_exit()
+            if await pause_for_stop_after_bookkeeping():
+                return
+            await self._hold_unresolved_publication()
+            return
+
         local_no_push = bool(head_before) and head_before == head_after
         remote_no_push = False
         if not local_no_push:

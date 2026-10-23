@@ -386,6 +386,7 @@ def test_configured_plugin_reaches_normal_coding_and_fix_dispatch(
     runner.state.current_pr = PRInfo(
         number=42,
         branch="pr-901",
+        head_sha=runner.state.current_pr.head_sha,
         ci_status=CIStatus.FAILURE,
         review_status=ReviewStatus.PENDING,
     )
