@@ -58,3 +58,66 @@ def test_full_happy_path_via_shim_succeeds(
     assert current_pr is None or current_pr.get("state") == "MERGED", (
         f"unexpected current_pr after merge: {current_pr!r}"
     )
+
+
+def test_legacy_size_label_pr_merges_and_task_is_done(
+    testbed_slug,
+    wait_for_state,
+    get_state,
+    upload_zip,
+    make_task_zip,
+    reset_testbed,
+):
+    """A published PR carrying an obsolete size label uses ordinary WATCH/MERGE."""
+    import base64
+    import json
+    import subprocess
+
+    repo = testbed_slug.replace("__", "/", 1)
+    wait_for_state(["IDLE"], timeout_sec=30)
+    pr_id_int = time.time_ns() // 1_000_000
+    task_id = f"PR-{pr_id_int}"
+    branch = f"pr-{pr_id_int}-e2e-legacy-size-label"
+    with coder_shim("success_pending_ci"):
+        assert upload_zip(make_task_zip(pr_id_int, "e2e-legacy-size-label")) in (200, 201)
+        coding = wait_for_state(["CODING"], timeout_sec=150)
+        assert (coding.get("current_task") or {}).get("pr_id") == task_id
+        watch = wait_for_state(["WATCH"], timeout_sec=120)
+        pr = watch.get("current_pr") or {}
+        assert pr.get("branch") == branch, pr
+        number = pr["number"]
+        head = pr["head_sha"]
+        assert len(head) == 40
+        label = f"size-ok:{head}"
+        created = subprocess.run(
+            ["gh", "label", "create", label, "-R", repo, "--color", "0E8A16"],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert created.returncode == 0 or "already exists" in created.stderr.lower(), created.stderr
+        subprocess.run(
+            ["gh", "pr", "edit", str(number), "-R", repo, "--add-label", label],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        subprocess.run(
+            ["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{head}",
+             "-f", "state=success", "-f", "context=e2e/watch-merge-gate"],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        wait_for_state(["IDLE"], timeout_sec=240)
+
+    result = subprocess.run(
+        ["gh", "pr", "view", str(number), "-R", repo,
+         "--json", "state,headRefName,mergedAt"],
+        capture_output=True, text=True, check=True, timeout=30,
+    )
+    merged = json.loads(result.stdout)
+    assert merged["headRefName"] == branch
+    assert merged["state"] == "MERGED" and merged["mergedAt"], merged
+    task = subprocess.run(
+        ["gh", "api", f"repos/{repo}/contents/tasks/{task_id}.md?ref=main"],
+        capture_output=True, text=True, check=True, timeout=30,
+    )
+    content = base64.b64decode(json.loads(task.stdout)["content"]).decode()
+    assert content.startswith("---\nstatus: DONE\n"), content[:300]
+    state = get_state()
+    assert state is not None and state["state"] == "IDLE"

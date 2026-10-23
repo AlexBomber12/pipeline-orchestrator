@@ -21,6 +21,7 @@ from enum import Enum
 from urllib.parse import quote
 
 from src.config import load_config
+from src.daemon.quarantine import is_continued_size_label, is_fixing_size_label
 from src.github import cache, checks, gh_runner, reviews
 from src.github.gh_runner import (
     _extract_commit_date,
@@ -440,7 +441,11 @@ def get_open_prs(
             label.get("name", "")
             for label in labels
             if isinstance(label, dict)
-            and (label.get("name") or "").startswith(("quarantine:", "size-ok:", "size-fix:"))
+            and (
+                (label.get("name") or "").startswith("quarantine:")
+                or is_continued_size_label(label.get("name") or "")
+                or is_fixing_size_label(label.get("name") or "")
+            )
         }
         prs.append(
             PRInfo(
@@ -515,7 +520,11 @@ def _get_open_prs_rest(
             label.get("name", "")
             for label in labels
             if isinstance(label, dict)
-            and (label.get("name") or "").startswith(("quarantine:", "size-ok:", "size-fix:"))
+            and (
+                (label.get("name") or "").startswith("quarantine:")
+                or is_continued_size_label(label.get("name") or "")
+                or is_fixing_size_label(label.get("name") or "")
+            )
         }
         prs.append(
             PRInfo(

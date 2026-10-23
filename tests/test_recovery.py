@@ -17,9 +17,6 @@ from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
 from src.daemon.quarantine import (
     OBSOLETE_SIZE_LABEL,
-    complete_size_fix_marker,
-    continued_size_label,
-    fixing_size_label,
 )
 from src.daemon.runner import PipelineRunner
 from src.keyspace import pipeline_state
@@ -39,25 +36,7 @@ from src.subsource_registry import SuppressionReason
 from src.suppression import SuppressionRecord
 from src.task_status import MergedState
 
-
-def test_size_continuation_label_requires_published_head() -> None:
-    with pytest.raises(ValueError, match="published PR HEAD"):
-        continued_size_label("invalid")
-
-
-def test_size_fix_completion_is_idempotent_without_marker() -> None:
-    pr = PRInfo(number=17, branch="pr-042-inflight", head_sha="a" * 40)
-    assert complete_size_fix_marker(_make_runner(), pr)
-    assert pr.quarantine_labels == set()
-
-
-def test_size_fix_completion_waits_for_published_head() -> None:
-    pr = PRInfo(
-        number=17, branch="pr-042-inflight", head_sha="",
-        quarantine_labels={fixing_size_label("a" * 40)},
-    )
-    assert complete_size_fix_marker(_make_runner(), pr) is False
-    assert fixing_size_label("a" * 40) in pr.quarantine_labels
+from tests.legacy_size_labels import continued_size_label, fixing_size_label
 
 
 class _FakeRedis:
@@ -270,40 +249,25 @@ def test_recover_rehydrates_quarantine_from_pr_labels(
     )
 
 
-@pytest.mark.parametrize("refresh", ["ok", "unavailable", "invalid_base"])
-def test_recover_completed_size_fix_from_doing_header(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, refresh: str,
+def test_legacy_size_label_does_not_require_base_refresh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     task = _doing_task()
-    pr = PRInfo(
-        number=17, branch="pr-042-inflight", head_sha="a" * 40,
-        quarantine_labels={fixing_size_label("a" * 40)},
-    )
+    pr = PRInfo(number=17, branch="pr-042-inflight", head_sha="a" * 40,
+                quarantine_labels={fixing_size_label("a" * 40)})
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
     runner = _make_runner()
     (tmp_path / ".git").mkdir()
     runner.repo_path = str(tmp_path)
     calls: list[tuple[str, ...]] = []
-
     def git(_repo: str, *args: str, **kwargs: Any):
         calls.append(args)
-        if args[0] == "check-ref-format":
-            return subprocess.CompletedProcess(args, int(refresh == "invalid_base"), "", "")
-        if args[0] == "fetch" and refresh == "unavailable":
-            raise OSError("offline")
         return subprocess.CompletedProcess(args, 0, "", "")
-
     monkeypatch.setattr(recovery_module.git_ops, "_git", git)
     runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
-    completed = asyncio.run(runner.recover_state())
-    if refresh == "ok":
-        assert completed is True
-        assert runner.state.state == PipelineState.WATCH
-        assert fixing_size_label("a" * 40) in runner.state.current_pr.quarantine_labels
-        assert any(call[0] == "fetch" for call in calls)
-    else:
-        assert completed is False
-        assert runner._recovered is False
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.state == PipelineState.WATCH
+    assert not any(call[0] == "fetch" for call in calls)
 
 
 def test_recover_projects_quarantine_when_guardrail_suppression_exists(
@@ -731,8 +695,10 @@ def test_unresolved_size_fix_recovery_completes_in_error(
 
 
 @pytest.mark.parametrize("feature_flag,run_match", [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("label_present", [False, True])
 def test_retained_successful_size_fix_retries_error_header_after_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, feature_flag: bool, run_match: bool,
+    label_present: bool,
 ) -> None:
     task_file = tmp_path / "tasks" / "PR-100.md"
     task_file.parent.mkdir()
@@ -740,7 +706,7 @@ def test_retained_successful_size_fix_retries_error_header_after_restart(
     task_hash = task_spec_content_hash(task_file.read_text())
     marker = fixing_size_label("a" * 40)
     pr = PRInfo(number=100, branch="pr-100-size", pr_id="PR-100", head_sha="a" * 40,
-                quarantine_labels={marker})
+                quarantine_labels={marker} if label_present else set())
     queued = QueueTask(pr_id="PR-100", title="size", status=TaskStatus.ERROR,
                        branch=pr.branch, task_file="tasks/PR-100.md")
     invocation = InvocationSnapshot(

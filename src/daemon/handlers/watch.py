@@ -23,9 +23,7 @@ from src.daemon.approval_commands import bound_checkout_work_blocker_for_ref, ch
 from src.daemon.quarantine import (
     apply_quarantine_label_for_violation,
     blocking_quarantine_labels,
-    complete_size_fix_marker,
-    continued_size_label,
-    is_fixing_size_label,
+    cleanup_obsolete_size_labels,
 )
 from src.daemon.selector import CoderPurpose, resolve_active_coder, resolve_pause_coder
 from src.github import cache as gh_cache
@@ -218,6 +216,7 @@ class WatchMixin:
             await self._handle_external_pr_resolution(found, pr_state)
             return
         live_quarantine_labels = set(found.quarantine_labels)
+        cleanup_obsolete_size_labels(self, found)
         found = self._approval_filtered_pr(found)
         await self._rehydrate_quarantine_from_pr_labels(found)
         await self._detect_external_quarantine_release(found)
@@ -260,85 +259,60 @@ class WatchMixin:
             }
         )
         self.state.current_pr = found
+        # Older daemons could finish a FIX while leaving an artificial ERROR
+        # header. Reconcile only their persisted, invocation-bound receipt.
         completion = self.state.size_fix_completion
-        fixing_labels = {label for label in live_quarantine_labels if is_fixing_size_label(label)}
-        if completion is not None or fixing_labels:
-            async def park_changed_completion(reason: str) -> None:
-                self.state.size_fix_completion = None
-                await self._transition_to_error(
-                    "Size FIX completion changed; operator Retry or revised approval required. " + reason,
-                    save_run_record_as=None, publish=False, log_prefix="[WATCH]",
-                )
-
+        if completion is not None:
             task = self.state.current_task
+            record = self._current_run_record
             remote_status, remote_reason, revision = (
                 self._remote_frontmatter_error_status_for_current_task()
             )
-            if remote_status is not None and revision is None:
-                self.log_event(f"[WATCH] PR #{found.number} size FIX task revision unavailable; retrying.")
+            if remote_status is None or revision is None:
+                self.log_event(f"[WATCH] PR #{found.number} legacy completion header unavailable; retrying.")
                 return
-            if completion is not None:
-                record = self._current_run_record
-                if (
-                    completion.task_id != task.pr_id or completion.branch != task.branch
-                    or completion.pr_number != found.number or completion.head_sha != found.head_sha
-                    or found.pr_id not in (None, task.pr_id)
-                    or self.state.active_invocation != completion.invocation
-                    or record is None or record.run_id != completion.invocation.run_id
-                    or record.task_id != task.pr_id or not record.invocations
-                    or record.invocations[-1] != completion.invocation
-                    or completion.invocation.fix_iteration != record.fix_iterations
-                    or completion.invocation.attempt_index != record.attempt_index
-                    or record.task_spec_hash not in ("", completion.task_spec_hash)
-                    or blocking_quarantine_labels(live_quarantine_labels) - {completion.fixing_label}
-                ):
-                    await park_changed_completion("Task, PR, invocation, revision, or guardrail binding changed.")
-                    return
-                try:
-                    task_hash = task_spec_content_hash(
-                        (Path(self.repo_path) / (task.task_file or "")).read_text(encoding="utf-8")
-                    )
-                except (OSError, UnicodeError) as exc:
-                    self.log_event(f"[WATCH] PR #{found.number} size FIX task unavailable: {exc}")
-                    return
-                if task_hash != completion.task_spec_hash:
-                    await park_changed_completion("Task generation changed.")
-                    return
-                try:
-                    suppression = await self._suppression_record_for_task(task.pr_id)
-                except Exception as exc:
-                    self.log_event(f"[WATCH] PR #{found.number} size FIX suppression unavailable: {exc}")
-                    return
-                if suppression is not None or (
-                    remote_status == "error" and (
-                        remote_reason != SuppressionReason.CRASH
-                        or revision != completion.error_revision
-                    )
-                ) or remote_status not in {"error", "todo"}:
-                    if remote_status is None and suppression is None:
-                        self.log_event(f"[WATCH] PR #{found.number} size FIX remote status unavailable; retrying.")
-                        return
-                    await park_changed_completion("Task status or suppression changed.")
-                    return
-                if not fixing_labels and (
-                    remote_status != "todo"
-                    or continued_size_label(found.head_sha) not in live_quarantine_labels
-                ):
-                    await park_changed_completion("Size FIX marker disappeared before completion.")
-                    return
-            elif task.status != TaskStatus.DOING or remote_status != "todo":
-                # A size label or stale DOING snapshot cannot prove success.
-                self.log_event(f"[WATCH] PR #{found.number} size FIX outcome is unresolved; holding PR.")
+            if (
+                task is None or completion.task_id != task.pr_id
+                or completion.branch != task.branch or completion.pr_number != found.number
+                or completion.head_sha != found.head_sha
+                or found.pr_id not in (None, task.pr_id)
+                or self.state.active_invocation != completion.invocation
+                or completion.invocation.phase != "fix" or completion.invocation.run_id is None
+                or record is None or record.run_id != completion.invocation.run_id
+                or record.task_id != task.pr_id or not record.invocations
+                or record.invocations[-1] != completion.invocation
+                or record.fix_iterations != completion.invocation.fix_iteration
+                or record.attempt_index != completion.invocation.attempt_index
+                or record.task_spec_hash not in ("", completion.task_spec_hash)
+            ):
+                await self._transition_to_error(
+                    "Legacy FIX completion binding changed; operator Retry required.",
+                    save_run_record_as=None, publish=False, log_prefix="[WATCH]",
+                )
                 return
-            else:
-                try:
-                    suppression = await self._suppression_record_for_task(task.pr_id)
-                except Exception as exc:
-                    self.log_event(f"[WATCH] PR #{found.number} size FIX suppression unavailable: {exc}")
-                    return
-                if suppression is not None or blocking_quarantine_labels(live_quarantine_labels) - fixing_labels:
-                    self.log_event(f"[WATCH] PR #{found.number} newer guardrail prevents size FIX cleanup.")
-                    return
+            try:
+                task_hash = task_spec_content_hash(
+                    (Path(self.repo_path) / (task.task_file or "")).read_text(encoding="utf-8")
+                )
+                suppression = await self._suppression_record_for_task(task.pr_id)
+                cause = await self.redis.get(cause_key(self.name, task.pr_id))
+            except (OSError, UnicodeError) as exc:
+                self.log_event(f"[WATCH] PR #{found.number} legacy completion validation deferred: {exc}")
+                return
+            if (
+                task_hash != completion.task_spec_hash or suppression is not None or cause
+                or blocking_quarantine_labels(live_quarantine_labels)
+                or (remote_status == "error" and (
+                    remote_reason != SuppressionReason.CRASH
+                    or revision != completion.error_revision
+                ))
+                or remote_status not in {"error", "todo"}
+            ):
+                await self._transition_to_error(
+                    "Legacy FIX completion was superseded; operator Retry required.",
+                    save_run_record_as=None, publish=False, log_prefix="[WATCH]",
+                )
+                return
             try:
                 reason = checkout_process_blocker(self.repo_path)
                 if not reason:
@@ -348,31 +322,26 @@ class WatchMixin:
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 reason = f"Checkout verification unavailable: {exc}"
             if reason:
-                self.log_event(f"[WATCH] PR #{found.number} size FIX marker retained: {reason}")
+                self.log_event(f"[WATCH] PR #{found.number} legacy completion waiting: {reason}")
                 return
-            if completion is not None and not fixing_labels:
-                self.state.current_task = task.model_copy(update={"status": TaskStatus.DOING})
-                self.state.size_fix_completion = None
-                self.log_event(f"[WATCH] PR #{found.number} size FIX completion already durable.")
-                return
-            try:
-                committed = await self._commit_task_status_change(
-                    task, "TODO", "Size FIX completed; continuing published PR",
-                    expected_task_sha256=revision,
-                )
-            except Exception as exc:
-                self.log_event(f"[WATCH] PR #{found.number} size FIX task status retry deferred: {exc}")
-                return
-            if not committed or not complete_size_fix_marker(self, found):
-                self.log_event(f"[WATCH] PR #{found.number} size FIX marker retry deferred.")
-                return
+            if remote_status == "error":
+                try:
+                    committed = await self._commit_task_status_change(
+                        task, "TODO", "Legacy FIX completed; continuing published PR",
+                        expected_task_sha256=revision,
+                    )
+                except Exception as exc:
+                    self.log_event(f"[WATCH] PR #{found.number} legacy status retry deferred: {exc}")
+                    return
+                if not committed:
+                    return
             self.state.current_task = task.model_copy(update={"status": TaskStatus.DOING})
             self.state.current_queue = [
                 self.state.current_task if item.pr_id == task.pr_id else item
                 for item in (self.state.current_queue or [task])
             ]
             self.state.size_fix_completion = None
-            self.log_event(f"[WATCH] PR #{found.number} size FIX marker completed; refreshing PR.")
+            self.log_event(f"[WATCH] PR #{found.number} legacy completion reconciled.")
             return
         # Retry rehydrate every cycle so a transient commit-time fetch
         # failure during ``recover_state`` doesn't permanently leave

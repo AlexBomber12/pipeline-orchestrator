@@ -176,39 +176,42 @@ and `daemon.large_diff_files_threshold` configuration values remain accepted;
 they now control only when that informational event appears. Deployments do
 not need to remove their existing settings.
 
-After upgrading, a persisted `large_diff_threshold` cancellation for a bound
-open PR is reconciled through the same task, PR, HEAD, checkout, and process
-checks as an operator approval. A previously deferred approval resumes when
-those checks pass. The Redis approval transaction validates the current
-cancellation and clears it before any GitHub label write. The daemon then
-commits `status: TODO` to the task header on the configured base branch. A
-matching open PR makes that durable header derive DOING during startup
-recovery. A failed status write stays retryable through the applied approval
-receipt; no continuation label is written until the status commit succeeds.
-Afterward, the daemon adds the informational `size-ok:<PR HEAD SHA>` label and
-removes the obsolete `quarantine:large_diff` label. Failed GitHub label writes
-are retried while the receipt is available. These labels are not authority to
-clear an ERROR task: they can survive a later, unrelated guardrail whose label
-write failed. An ERROR task with a matching open PR stays in ERROR for operator
-recovery after Redis loss, even if an old size label remains. Before FIX
-dispatch, the daemon first commits `status: ERROR` with a crash reason, then
-adds `size-fix:<PR HEAD SHA>` while retaining the continuation marker. After
-the coder exits successfully and cleanup is confirmed, the daemon saves a
-completion receipt bound to its invocation, task generation, PR, and resulting
-HEAD. WATCH verifies the live PR and quiescent checkout before writing
-`status: TODO`; a transient status-write failure is retried on later WATCH
-cycles without rerunning the coder. It then binds the continuation marker to
-the resulting HEAD and removes `size-fix` last. Failed label cleanup is also
-retried. A retained Redis receipt allows restart recovery while the remote
-header is still ERROR. If that receipt is lost before TODO is durable, the
-ERROR header remains parked for operator Retry; labels and stale DOING state
-do not reconstruct successful coder completion. Marker setup failures after
-the ERROR write also park the task. If Redis is lost between the ERROR write and attaching
-`size-fix`, the existing `size-ok` label helps recovery retain the matching PR
-in ERROR; it never authorizes WATCH. Startup refreshes the base ref and
-derives DOING from the TODO header and matching open PR. An unresolved FIX with an ERROR header
-recovers into ERROR for operator Retry. CODING with an existing
-continuation PR returns to WATCH.
+A legacy `large_diff_threshold` cancellation on a bound, open PR is
+reconciled through the existing validated approval transaction. The daemon
+checks the task generation, live PR identity and HEAD, checkout work, process
+ownership, and any newer failure before clearing only that obsolete decision.
+A pending artificial `status: ERROR` header is restored to `TODO`; the matching
+published PR then derives DOING on restart. A failed status write remains
+retryable through the approval receipt. The historical run HEAD is telemetry:
+it may differ from the live published PR HEAD after a later push.
+
+New CODING and FIX attempts use the ordinary lifecycle regardless of actual
+diff size or differences from planned estimates. They do not write size labels,
+artificial ERROR/TODO pairs, or size completion receipts. The daemon recognizes
+only the former exact `size-ok:<40-hex-SHA>`, `size-fix:<40-hex-SHA>`, and
+`quarantine:large_diff` labels. It removes them from the bound PR when it can;
+GitHub label cleanup failure cannot hold FIX, WATCH, or MERGE. Malformed and
+unrelated labels are left alone. A label alone never proves coder completion
+or authorizes clearing an ERROR.
+
+An old persisted size FIX completion receipt can reconcile a pending artificial
+ERROR header after restart. The receipt must match the task generation,
+invocation and run accounting, live PR identity and HEAD, exact old header
+revision, and a quiescent checkout, with no newer cancellation or suppression.
+The label may already have been removed. Missing or corrupt evidence leaves the
+published PR and real failure parked for operator recovery; no coder is
+redispatched on the strength of a label. These compatibility readers can be
+removed after all deployments have crossed a quiescent upgrade boundary and
+no retained task or Redis state contains these legacy artifacts.
+
+Before upgrading a deployment with an active legacy FIX, pause new dispatch
+and let the old invocation finish and its pending completion reconcile. Confirm
+that no coder or child process owns the checkout and that the task header and
+published PR agree. Upgrade at that quiescent boundary, then resume. If the
+invocation outcome cannot be established, preserve the checkout, task, and PR
+for the existing uncertainty/Retry procedure; an arbitrary restart during an
+active invocation is not a safe migration step.
+
 An externally merged PR remains in WATCH until its DONE task-status write is
 confirmed; a transient write failure is retried on the next WATCH cycle.
 Startup recovery also checks the checkout for unpublished work and active

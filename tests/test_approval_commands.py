@@ -29,12 +29,13 @@ from src.daemon import recovery as daemon_recovery
 from src.daemon.guardrails import GuardrailViolation
 from src.daemon.handlers import fix as daemon_fix
 from src.daemon.handlers import watch as daemon_watch
-from src.daemon.quarantine import OBSOLETE_SIZE_LABEL, continued_size_label, fixing_size_label
+from src.daemon.quarantine import OBSOLETE_SIZE_LABEL
 from src.keyspace import control_stop, pipeline_state
 from src.models import CIStatus, PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.subsource_registry import SuppressionReason
 from src.task_status import MergedState
 
+from tests.legacy_size_labels import continued_size_label, fixing_size_label
 from tests.runner import _helpers as h
 
 
@@ -611,27 +612,6 @@ async def test_approved_guardrail_fix_prelaunch_requires_exact_ownership(
         assert runner._current_run_record.invocations == [snapshot]
 
 
-async def test_approved_guardrail_fix_later_deferral_preserves_watch_ownership(
-    approval, monkeypatch,
-):
-    runner, old, admitted, snapshot, dispatched = await checkpointed_prelaunch_approval(
-        approval, monkeypatch,
-    )
-    marker = fixing_size_label(runner.state.current_pr.head_sha)
-    runner.state.current_pr.quarantine_labels.add(marker)
-    await runner.handle_fix()
-    assert dispatched.await_count == 0
-    assert runner.state.state == PipelineState.WATCH
-    assert runner._current_run_record.run_id == old.run_id
-    assert runner.state.active_invocation == old.invocations[-1]
-    runner.state.current_pr.quarantine_labels.remove(marker)
-    await runner.handle_fix()
-    assert dispatched.await_count == 1
-    assert runner._current_run_record.run_id == admitted.run_id
-    assert runner._current_run_record.invocations == [snapshot]
-    assert runner._current_run_record.fix_iterations == old.fix_iterations + 1
-
-
 async def test_approved_guardrail_fix_new_invocation_publish_failure_rolls_back(
     approval, monkeypatch,
 ):
@@ -1056,56 +1036,6 @@ async def test_persisted_fix_park_retries_failed_status_write(approval, monkeypa
     assert dispatched.await_count == 0
 
 
-async def test_coding_complete_admission_reused_across_prelaunch_deferrals(
-    approval, monkeypatch,
-):
-    runner, _, _, _ = approval
-    await runner.redis.delete(cause_key(runner.name, "PR-42"))
-    runner._approval_receipt = None
-    runner.state.state = PipelineState.WATCH
-    runner.state.current_task.status = TaskStatus.DOING
-    runner.state.current_pr.quarantine_labels = set()
-    runner._start_current_run_record("claude", "opus")
-    old = runner._current_run_record
-    runner._capture_invocation_snapshot("claude", {}, phase="coding")
-    await runner._save_current_run_record("coding_complete")
-    old = await runner._metrics_store.get(old.run_id)
-    marker = fixing_size_label(runner.state.current_pr.head_sha)
-    runner.state.current_pr.quarantine_labels.add(marker)
-    dispatched = real_watch_with_mock_coder(runner, monkeypatch)
-    for _ in range(3):
-        await runner.handle_fix()
-        assert runner.state.state == PipelineState.WATCH
-        assert runner._current_run_record.run_id == old.run_id
-        assert dispatched.await_count == 0
-        assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
-    admitted = next(
-        record for record in await runner._metrics_store.list_task_runs(runner.name, "PR-42")
-        if record.run_id != old.run_id
-    )
-    coder_name, plugin = runner._get_coder(allow_exploration=False)
-    breach_dir, breach_run_id = runner._breach_env()
-    run_kwargs = plugin.build_run_kwargs(
-        daemon_config=runner.app_config.daemon, breach_dir=breach_dir,
-        breach_run_id=breach_run_id,
-    )
-    runner._current_run_record = admitted
-    admitted.fix_iterations += 1
-    prelaunch = runner._capture_invocation_snapshot(
-        coder_name, run_kwargs, phase="fix", fix_iteration=admitted.fix_iterations,
-    )
-    await runner._checkpoint_current_run_record()
-    runner._current_run_record = old
-    runner.state.active_invocation = old.invocations[-1]
-    await runner.publish_state()
-    runner.state.current_pr.quarantine_labels.remove(marker)
-    await runner.handle_fix()
-    assert dispatched.await_count == 1
-    assert runner._current_run_record.invocations == [prelaunch]
-    assert runner._current_run_record.fix_iterations == old.fix_iterations + 1
-    assert len(await runner._metrics_store.list_task_runs(runner.name, "PR-42")) == 2
-
-
 @pytest.mark.parametrize("damage", ["counter", "attempt_index"])
 async def test_approved_guardrail_fix_rejects_changed_admitted_accounting(
     approval, monkeypatch, damage,
@@ -1528,33 +1458,13 @@ async def test_size_only_store_recovers_without_operator_approval(approval):
 
 async def test_size_recovery_removes_only_obsolete_github_label(approval, monkeypatch):
     runner, command, _, _ = approval
-    marker = continued_size_label(command.pr.head_sha)
     calls = []
     monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append((args, kwargs)))
     await runner._run_cycle_body()
     assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
     assert calls == [
-        (["label", "create", marker, "--color", "0E8A16",
-          "--description", "Legacy size decision continued; CI and review still required"],
+        (["pr", "edit", "42", "--remove-label", OBSOLETE_SIZE_LABEL],
          {"repo": runner.owner_repo}),
-        (["pr", "edit", "42", "--add-label", marker], {"repo": runner.owner_repo}),
-        (["pr", "edit", "42", "--remove-label", OBSOLETE_SIZE_LABEL], {"repo": runner.owner_repo}),
-    ]
-
-
-async def test_size_recovery_creates_marker_without_obsolete_label(approval, monkeypatch):
-    runner, command, _, _ = approval
-    command.pr.quarantine_labels.clear()
-    runner.state.current_pr.quarantine_labels.clear()
-    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
-    calls = []
-    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", lambda args, **kwargs: calls.append(args))
-    await runner._run_cycle_body()
-    marker = continued_size_label(command.pr.head_sha)
-    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
-    assert [call[:4] for call in calls] == [
-        ["label", "create", marker, "--color"],
-        ["pr", "edit", "42", "--add-label"],
     ]
 
 
@@ -1666,7 +1576,7 @@ async def test_committed_size_migration_recovers_after_redis_loss(
     saved = await load_approval(runner.redis, runner.name, command.binding)
     assert saved.status == "applied" and saved.task_status_committed, runner.state.history[-5:]
     assert git(remote, "show", "main:tasks/PR-42.md").startswith("---\nstatus: TODO")
-    assert labels == {continued_size_label(command.pr.head_sha)}
+    assert labels == set()
     fresh = await recover_without_redis(repo, remote, live, monkeypatch, suffix=f"fresh-{obsolete_label}")
     assert fresh.state.state == PipelineState.WATCH
     assert fresh.state.current_task.status == TaskStatus.DOING
@@ -1752,7 +1662,7 @@ async def test_size_marker_write_failure_retries_after_durable_clearance(approva
     assert fresh.state.state == PipelineState.WATCH
     fail = False
     await runner._run_cycle_body()
-    assert labels == {continued_size_label(command.pr.head_sha)}
+    assert labels == set()
 
 
 async def test_size_status_confirmation_rechecks_binding_and_new_cause(approval, monkeypatch):
@@ -1806,7 +1716,7 @@ async def test_new_guardrail_after_success_overrides_stale_size_marker(approval,
 
     monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", update_labels)
     await runner._run_cycle_body()
-    assert labels == {continued_size_label(command.pr.head_sha)}
+    assert labels == set()
     assert await runner._commit_task_status_change(
         command.task, "ERROR", "new repository deletion guardrail", blocked_reason="guardrail",
     )
@@ -1882,7 +1792,7 @@ async def test_in_progress_size_fix_recovers_as_error_with_empty_redis(
     assert fresh.state.state == PipelineState.ERROR
     assert fresh.state.current_pr.number == command.pr.number
     assert fresh.state.current_task.status == TaskStatus.ERROR
-    assert "Size FIX outcome unresolved" in fresh.state.error_message
+    assert "Published task failure unresolved" in fresh.state.error_message
     assert (fixing_size_label(command.pr.head_sha) in fresh.state.current_pr.quarantine_labels) == marker_attached
 
 
@@ -1904,7 +1814,6 @@ async def test_size_recovery_keeps_committed_status_when_marker_is_unavailable(a
 
 async def test_size_recovery_removes_label_missing_from_error_snapshot(approval, monkeypatch):
     runner, command, _, _ = approval
-    marker = continued_size_label(command.pr.head_sha)
     runner.state.current_pr.quarantine_labels.clear()
     await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
     calls = []
@@ -1912,8 +1821,6 @@ async def test_size_recovery_removes_label_missing_from_error_snapshot(approval,
     await runner._run_cycle_body()
     assert runner.state.state == PipelineState.WATCH
     assert [call[:4] for call in calls] == [
-        ["label", "create", marker, "--color"],
-        ["pr", "edit", "42", "--add-label"],
         ["pr", "edit", "42", "--remove-label"],
     ]
     assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
@@ -1925,40 +1832,7 @@ async def test_size_label_cleanup_failure_does_not_reblock_watch(approval, monke
     await runner._run_cycle_body()
     assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
     assert runner.state.state == PipelineState.WATCH
-    assert any("Size label migration deferred" in event["event"] for event in runner.state.history)
-
-
-async def test_size_label_is_retained_if_continuation_marker_cannot_be_added(approval, monkeypatch):
-    runner, command, _, _ = approval
-    calls = []
-
-    def run_gh(args, **kwargs):
-        calls.append(args)
-        if "--add-label" in args:
-            raise OSError("GitHub label update unavailable")
-
-    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", run_gh)
-    await runner._run_cycle_body()
-    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
-    assert runner.state.state == PipelineState.WATCH
-    assert len(calls) == 2
-    assert "--add-label" in calls[-1]
-    assert all("--remove-label" not in args for args in calls)
-
-
-async def test_existing_continuation_label_still_allows_size_label_cleanup(approval, monkeypatch):
-    runner, command, _, _ = approval
-    calls = []
-
-    def run_gh(args, **kwargs):
-        calls.append(args)
-        if args[:2] == ["label", "create"]:
-            raise RuntimeError("label already exists")
-
-    monkeypatch.setattr(daemon_approval.gh_runner, "run_gh", run_gh)
-    await runner._run_cycle_body()
-    assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
-    assert [args[3] for args in calls[1:]] == ["--add-label", "--remove-label"]
+    assert any("Obsolete size label cleanup deferred" in event["event"] for event in runner.state.history)
 
 
 @pytest.mark.parametrize("restart", [False, True])
@@ -2804,8 +2678,6 @@ async def test_legacy_label_suppression_recovers_only_matching_size_error(approv
     assert await runner.redis.get(cause_key(runner.name, "PR-42")) is None
     assert (await load_approval(runner.redis, runner.name, command.binding)) is None
     assert [call[:4] for call in calls] == [
-        ["label", "create", continued_size_label(command.pr.head_sha), "--color"],
-        ["pr", "edit", "42", "--add-label"],
         ["pr", "edit", "42", "--remove-label"],
     ]
 
