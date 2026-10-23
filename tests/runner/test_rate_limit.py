@@ -2567,7 +2567,10 @@ def test_handle_coding_records_pr_before_breach_cancel_pause(
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.current_pr == pr
+    assert runner.state.current_pr.number == pr.number
+    assert runner.state.current_pr.branch == pr.branch
+    assert runner.state.current_pr.head_sha == "a" * 40
+    assert runner.state.publication_attempt.verified
     assert any("Recorded PR #42 before breach-cancel pause" in entry["event"] for entry in runner.state.history)
 
 
@@ -2631,7 +2634,10 @@ def test_handle_coding_records_pr_before_late_breach_pause(
     asyncio.run(runner.handle_coding())
 
     assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.current_pr == pr
+    assert runner.state.current_pr.number == pr.number
+    assert runner.state.current_pr.branch == pr.branch
+    assert runner.state.current_pr.head_sha == "a" * 40
+    assert runner.state.publication_attempt.verified
     assert any("Recorded PR #42 before late-breach pause" in entry["event"] for entry in runner.state.history)
 
 

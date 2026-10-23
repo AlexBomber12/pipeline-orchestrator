@@ -199,6 +199,13 @@ class ErrorMixin:
             self._status_write_failed_task_pr_ids.discard(retry_task_id)
             await self._persist_status_write_failed_task_pr_ids()
 
+        # Repair durable task status before reconciliation can retain the
+        # publication and return to ERROR again.
+        attempt = self.state.publication_attempt
+        if attempt is not None and attempt.pending:
+            await self._hold_unresolved_publication()
+            await self._process_upload_while_publication_held()
+            return
         if context.startswith("Persisted FIX invocation ownership is uncertain; operator Retry required"):
             self.log_event("[RECOVERY] Uncertain FIX invocation remains parked for operator Retry.")
             return

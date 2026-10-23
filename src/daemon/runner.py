@@ -2032,6 +2032,11 @@ class PipelineRunner(
         prior_state = self.state.state
         self.state.state = PipelineState.ERROR
         self.state.error_message = message
+        attempt = self.state.publication_attempt
+        if attempt is not None and attempt.pending:
+            attempt.failure = attempt.failure or message
+            # Save ownership and the original failure before terminal side effects.
+            await self.publish_state()
         log_body = message if log_message is None else log_message
         self.log_event(f"{log_prefix} {log_body}.")
         if save_run_record_as:

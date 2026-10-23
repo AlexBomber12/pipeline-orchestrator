@@ -501,6 +501,32 @@ class RecoveryMixin:
         except Exception:
             self._publication_snapshot_damaged = True
             return True
+        if (
+            persisted.name == self.name and persisted.url == self.repo_config.url
+            and persisted.publication_attempt is not None
+            and persisted.publication_attempt.pending
+        ):
+            self.state.current_task = persisted.current_task
+            self.state.current_pr = persisted.current_pr
+            self.state.active_invocation = persisted.active_invocation
+            self.state.publication_attempt = persisted.publication_attempt
+            self.state.error_message = persisted.error_message
+            if not self._publication_attempt_matches_dispatch():
+                self.state.current_pr = None
+            self.state.user_paused = persisted.user_paused
+            self.state.rate_limited_until = persisted.rate_limited_until
+            if persisted.state == PipelineState.PAUSED:
+                self.state.state = PipelineState.PAUSED
+            if (self._publication_attempt_matches_dispatch()
+                and persisted.active_invocation.phase == "fix"
+                and persisted.current_pr is not None):
+                self._persisted_fix_recovery = persisted
+            if self._publication_attempt_matches_dispatch():
+                self.state.publication_migration = persisted.publication_migration
+                self._restore_publication_watermark(persisted)
+            await self._restore_current_run_record()
+            # Do not let list omissions or task status re-derivation replace it.
+            return True
         self._publication_snapshot_pr_unbound = (
             persisted.current_pr is None
             and persisted.publication_watermark is None
@@ -772,9 +798,11 @@ class RecoveryMixin:
         # decisions`` only runs the PR-186 crash path on a DOING entry,
         # so the task would be silently re-dispatched into a crash loop
         # instead of being marked ERROR pending manual re-upload.
-        # Hydration remains after the ``get_open_prs`` probe so a transient
-        # GitHub outage still surfaces as ERROR with no current_task.
+        # Publication recovery can complete early in ERROR. Restore failed
+        # status writes first so subsequent ERROR cycles can repair the header.
         await self._hydrate_status_write_failed_task_pr_ids()
+        if await self._hold_unresolved_publication():
+            return True
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery
         # fetch and reset on exit so ``handle_idle`` does not later read
@@ -1907,6 +1935,24 @@ class RecoveryMixin:
 
     def _admit_observed_pr(self, pr: PRInfo) -> None:
         """Initialize trust context using the PR list's own observation."""
+        attempt = self.state.publication_attempt
+        task = self.state.current_task
+        if (
+            attempt is not None and attempt.pending and attempt.verified
+            and attempt.exit_classification == "success"
+            and attempt.unverified_head_sha is None
+            and task is not None
+            and (attempt.repo, attempt.base, attempt.task_id, attempt.branch,
+                 attempt.pr_number, attempt.head_sha) == (
+                     self.owner_repo, self.repo_config.branch or "main",
+                     task.pr_id, pr.branch, pr.number, pr.head_sha,
+                 )
+            and task.branch == pr.branch and pr.pr_id in {None, task.pr_id}
+            and not pr.is_cross_repository
+        ):
+            # An admitted WATCH continuation acknowledges this proven publication.
+            # Retain its original failure in metadata without blocking the new run.
+            attempt.pending = False
         evidence = None
         if pr.publication_observed:
             evidence = gh_prs.HeadPublicationEvidence(

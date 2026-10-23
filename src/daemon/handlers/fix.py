@@ -346,6 +346,13 @@ class FixMixin(BreachMixin):
 
     async def handle_fix(self) -> None:
         """Run ``FIX FEEDBACK`` via the active coder CLI and return to WATCH."""
+        if self.state.publication_attempt is not None and self.state.publication_attempt.pending:
+            resolved = await self._resolve_published_attempt()
+            if resolved and self.state.current_task is None:
+                return
+            if not resolved or self.state.current_pr is None:
+                await self._hold_unresolved_publication()
+                return
         self._stop_requested = False
         fix_feedback_reviewer_policy = self._fix_feedback_reviewer_policy
         self._fix_feedback_reviewer_policy = None
@@ -735,6 +742,7 @@ class FixMixin(BreachMixin):
         run_record = self._current_run_record
         previous_profile_id = run_record.profile_id if run_record is not None else None
         previous_active_invocation = self.state.active_invocation
+        previous_publication_attempt = self.state.publication_attempt
         previous_fix_iterations = (
             run_record.fix_iterations if run_record is not None else None
         )
@@ -766,6 +774,8 @@ class FixMixin(BreachMixin):
                 )
                 if run_record is not None:
                     await self._checkpoint_current_run_record()
+            if not self._publication_attempt_matches_dispatch():
+                self._begin_publication_attempt(started_at=datetime.now(timezone.utc))
             await self.publish_state()
             if approved_continuation is not None and not await self._approved_fix_checkout_safe(
                 approved_continuation, current_pr, require_fetched_head=True,
@@ -786,6 +796,7 @@ class FixMixin(BreachMixin):
             try:
                 if captured_snapshot is not None and not reused_prelaunch:
                     self.state.active_invocation = previous_active_invocation
+                    self.state.publication_attempt = previous_publication_attempt
                     if (
                         run_record is not None
                         and run_record.invocations
@@ -809,6 +820,7 @@ class FixMixin(BreachMixin):
                 elif reused_prelaunch:
                     self._current_run_record = prelaunch_previous_record
                     self.state.active_invocation = prelaunch_previous_invocation
+                    self.state.publication_attempt = previous_publication_attempt
                     self.state.state = PipelineState.WATCH
                     await self.publish_state()
             finally:
@@ -890,9 +902,12 @@ class FixMixin(BreachMixin):
                     breach_flag,
                 )
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
-            cleanup_confirmed = await self._confirm_current_coder_cleanup(
-                "FIX completion"
-            )
+            try:
+                await self._capture_published_attempt()
+            finally:
+                cleanup_confirmed = await self._confirm_current_coder_cleanup(
+                    "FIX completion"
+                )
         if pending_cancellation is not None:
             raise pending_cancellation
         if not cleanup_confirmed:
@@ -902,11 +917,24 @@ class FixMixin(BreachMixin):
             # before the cycle publishes WATCH. Restart has no such proof.
             self._completed_fix_run_id = run_record.run_id
         if external_state_flag["state"] is not None and not stop_cancelled:
+            attempt = self.state.publication_attempt
+            if attempt is not None:
+                attempt.exit_classification = "failure"
+            if attempt is not None and (
+                not self._publication_attempt_matches_dispatch()
+                or not attempt.verified or attempt.unverified_head_sha is not None
+            ):
+                await self._hold_unresolved_publication()
+                return
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.pending = False
             await self._handle_external_terminal_pr_state(
                 external_state_flag["state"]  # type: ignore[arg-type]
             )
             return
         if breach_flag["breached"]:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
             if self.state.current_pr is not None:
                 # Late-breach pause is not a no-push success; reset the
                 # streak (Codex P2 on PR #222) — same rationale as the
@@ -1046,6 +1074,8 @@ class FixMixin(BreachMixin):
 
         await capture_stop_requested_after_exit()
         if idle_flag["timed_out"]:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
             # Idle timeout breaks the no-push streak: the coder didn't
             # produce a push and the daemon killed it. Reset the counter
             # so a later "no-push success" cycle starts fresh rather
@@ -1079,6 +1109,8 @@ class FixMixin(BreachMixin):
         await self._save_cli_log(stdout, stderr, f"FIX FEEDBACK output [{coder_name}]")
         violations = scan_stdout(f"{stdout}\n{stderr}")
         if violations:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
             first = violations[0]
             cause = f"GUARDRAIL: {first.category}: {first.excerpt}"
             for violation in violations:
@@ -1119,6 +1151,8 @@ class FixMixin(BreachMixin):
         await capture_stop_requested_after_exit()
         escalate_reason = fix_escalation.parse_escalate_marker(stdout)
         if escalate_reason is not None and self.state.current_pr is not None:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
             # Coder semantic circuit breaker (PR-166): an explicit
             # self-report wins over the regular push/return-code flow.
             # ``no_push_fix_count`` is reset because an explicit
@@ -1151,6 +1185,8 @@ class FixMixin(BreachMixin):
                 return
             return
         if stop_cancelled:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
             head_after = await read_head_after_fix()
             if head_after is None:
                 return
@@ -1182,6 +1218,8 @@ class FixMixin(BreachMixin):
             )
             return  # pragma: no cover - defensive fallback
         if code != 0:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
             # FIX failure breaks the consecutive no-push streak (Codex P2
             # on PR #222): a sequence like no-push success → failed FIX
             # → no-push success would otherwise still trip the deadlock
@@ -1212,6 +1250,21 @@ class FixMixin(BreachMixin):
 
         head_after = await read_head_after_fix()
         if head_after is None:
+            return
+
+        if self.state.publication_attempt is not None:
+            self.state.publication_attempt.exit_classification = "success"
+            await self.publish_state()
+
+        attempt = self.state.publication_attempt
+        if attempt is not None and attempt.unverified_head_sha is not None:
+            # Capture retained the candidate commit without exact remote proof.
+            # Do not advertise it or clear the hold through optimistic git
+            # verification (or through the no-push WATCH path).
+            await capture_stop_requested_after_exit()
+            if await pause_for_stop_after_bookkeeping():
+                return
+            await self._hold_unresolved_publication()
             return
 
         local_no_push = bool(head_before) and head_before == head_after
@@ -1261,12 +1314,18 @@ class FixMixin(BreachMixin):
                 no_push_policy.increment(self.state.current_pr)
             if await pause_for_stop_after_bookkeeping():
                 return
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.pending = False
+                # Escalation can discard the dispatch binding. Checkpoint the
+                # completed attempt first so recovery cannot resurrect its hold.
+                await self.publish_state()
             if (
                 self.state.current_pr is not None
                 and await no_push_policy.maybe_escalate(self.state.current_pr)
             ):
                 return
             self.state.state = PipelineState.WATCH
+            await self.publish_state()
             return
 
         if not await record_fix_push(
@@ -1277,4 +1336,7 @@ class FixMixin(BreachMixin):
             return
         if await pause_for_stop_after_bookkeeping():
             return
+        if self.state.publication_attempt is not None:
+            self.state.publication_attempt.pending = False
         self.state.state = PipelineState.WATCH
+        await self.publish_state()

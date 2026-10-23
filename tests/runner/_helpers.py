@@ -487,12 +487,31 @@ def _patch_subprocess(
         return _FakeCompletedProcess(args=cmd, stdout=stdout, returncode=returncode)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
-    # CODING now takes a targeted publication baseline before CLI launch.
-    # Keep legacy handler tests hermetic; publication tests replace this stub.
+    # Legacy handler fixtures expose publication through the targeted API too.
+    publication_calls = 0
+    published_identities = set()
+    exact_outcome = coding_module.gh_prs.get_exact_pr_outcome
+
+    def publications(repo, base, branch):
+        nonlocal publication_calls
+        publication_calls += 1
+        if publication_calls == 1:
+            return []
+        prs = coding_module.gh_prs.get_open_prs(repo, allow_merge_without_checks=False)
+        published_identities.update((repo, pr.number, pr.head_sha or "a" * 40) for pr in prs if pr.branch == branch)
+        return [coding_module.gh_prs.BranchPublication(
+            number=pr.number, title=pr.title or f"{pr.pr_id or "-".join(branch.upper().split("-")[:2])}: task",
+            base_branch=base, head_branch=pr.branch, head_sha=pr.head_sha or "a" * 40,
+            state="OPEN", is_draft=False, is_cross_repository=False,
+            created_at=datetime.now(timezone.utc), url=pr.url,
+        ) for pr in prs if pr.branch == branch]
+
+    monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", publications)
     monkeypatch.setattr(
-        coding_module.gh_prs,
-        "get_branch_publications",
-        lambda *args, **kwargs: [],
+        coding_module.gh_prs, "get_exact_pr_outcome",
+        lambda repo, base, number, sha: coding_module.gh_prs.ExactPROutcome(
+            repo, base, number, sha, coding_module.gh_prs.ExactPRState.OPEN, True,
+        ) if (repo, number, sha) in published_identities else exact_outcome(repo, base, number, sha),
     )
     monkeypatch.setattr(
         coding_module,

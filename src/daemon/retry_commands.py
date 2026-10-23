@@ -111,6 +111,13 @@ class RetryCommandMixin:
 
     async def _admit_fix_idle_timeout(self) -> None:
         """Resume only the interrupted, bound FIX run after durable admission."""
+        attempt = self.state.publication_attempt
+        if attempt is not None and attempt.pending:
+            if not await self._resolve_published_attempt():
+                await self._hold_unresolved_publication()
+                return
+            if self.state.current_task is None:
+                return
         task, bound = self.state.current_task, self.state.current_pr
         if task is None or bound is None or not task.branch:
             self.log_event("[RECOVERY] FIX timeout has no bound task/PR; operator Retry required.")
@@ -225,6 +232,11 @@ class RetryCommandMixin:
         self._crashed_task_pr_ids.discard(task.pr_id)
         self._last_error_park_log_key = None
         self.state.current_pr = self._preserve_fix_iteration_count(found)
+        if attempt is not None and attempt.pending:
+            # Exact reconciliation above proved this dispatch's publication.
+            # Checkpoint consumption before WATCH/MERGE can clear the binding.
+            attempt.pending = False
+            await self.publish_state()
         self.state.state = PipelineState.WATCH
         await self._clear_error_message_on_recovery(
             log_prefix="[RECOVERY]", reason="confirmed FIX timeout admitted to WATCH"
@@ -493,6 +505,40 @@ class RetryCommandMixin:
     async def _select_retry_continuation(
         self, command: RetryCommand
     ) -> tuple[str, PRInfo | None] | RetryDispatch:
+        attempt = self.state.publication_attempt
+        resolved = False
+        if attempt is not None and attempt.pending:
+            resolved = await self._resolve_published_attempt()
+            attempt = self.state.publication_attempt
+            if (not resolved and command.task_id == attempt.task_id
+                and command.task_branch == attempt.branch
+                and command.bound_pr_number is None):
+                resolved = await self._recover_branch_without_pr()
+            if not resolved:
+                await self._release_abandoned_publication_attempt()
+                attempt = self.state.publication_attempt
+                if attempt.pending:
+                    return await self._defer_retry_command(
+                        command, "Publication ownership is unresolved; prior invocation retained.",
+                    )
+        if resolved:
+            pr = self.state.current_pr
+            if pr is None:
+                return await self._fail_retry_command(
+                    command, "Retained pull request is terminal; implementation will not be rerun.",
+                )
+            if (
+                command.task_id != attempt.task_id or command.task_branch != attempt.branch
+                or command.bound_pr_number not in {None, pr.number}
+                or command.bound_pr_branch not in {None, pr.branch}
+                or (command.bound_pr_head_sha and command.bound_pr_head_sha != pr.head_sha)
+            ):
+                return await self._fail_retry_command(command, "Retained publication identity changed.")
+            if attempt.exit_classification is None:
+                return await self._defer_retry_command(
+                    command, "Coder exit is unclassified; operator recovery required.",
+                )
+            return "watch", pr
         try:
             open_prs = await asyncio.to_thread(
                 gh_prs.get_open_prs,
@@ -720,6 +766,27 @@ class RetryCommandMixin:
             return continuation
         continuation_name, pr = continuation
 
+        if continuation_name == "watch":
+            assert pr is not None
+
+            def bind_publication(current: RetryCommand) -> None:
+                current.bound_pr_number = pr.number
+                current.bound_pr_branch = pr.branch
+                current.bound_pr_head_sha = pr.head_sha
+
+            try:
+                bound = await update_retry_command(
+                    self.redis, self.name, command.command_id, bind_publication,
+                    keep_pending=True,
+                    transition_reason="Bound Retry to the retained publication.",
+                )
+                if bound is None:
+                    raise RuntimeError("retry command disappeared before publication binding")
+                command = bound
+            except Exception as exc:
+                return await self._defer_retry_command(
+                    command, f"Could not bind Retry publication: {exc}.",
+                )
         if continuation_name == "coding":
             coder = await self._ensure_retry_coder_available(command, header, task)
             if isinstance(coder, RetryDispatch):
@@ -740,6 +807,15 @@ class RetryCommandMixin:
             return await self._defer_retry_command(
                 command, f"Could not reserve retry allowance: {exc}."
             )
+
+        if continuation_name == "watch":
+            # Only transfer ownership after reservation succeeds: a cap failure
+            # removes the command from the queue, so the attempt must still hold
+            # the publication against normal ERROR diagnosis in that case.
+            attempt = self.state.publication_attempt
+            if attempt is not None and attempt.pending:
+                attempt.pending = False
+                await self.publish_state()
 
         if command.effect_stage == RetryEffectStage.RETRY_RESERVED:
             committed = await self._commit_task_status_change(

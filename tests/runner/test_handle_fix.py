@@ -979,6 +979,123 @@ def test_handle_fix_external_terminal_waits_for_confirmed_cleanup(
     assert runner.state.current_pr is not None
 
 
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+def test_handle_fix_inflight_terminal_records_verified_pushed_head(
+    monkeypatch: pytest.MonkeyPatch, terminal: str,
+) -> None:
+    from src.daemon.handlers import coding as coding_module
+
+    from tests.test_coding import _publication_transport, _runner
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+    assert runner.state.current_pr.head_sha == "a" * 40
+    runner._start_current_run_record("claude", "opus")
+    terminal_flag: dict[str, str | None] = {}
+
+    def monitor(pr_number, target, flag):
+        nonlocal terminal_flag
+        terminal_flag = flag
+        return None
+
+    async def fix(*args, **kwargs):
+        remote["head"] = "b" * 40
+        remote["terminal"] = terminal
+        terminal_flag["state"] = terminal
+        return 0, "", ""
+
+    monkeypatch.setattr(runner, "_run_coder_with_polling", monitor)
+    monkeypatch.setattr(h.claude_cli, "fix_review_async", fix)
+    monkeypatch.setattr(
+        coding_module, "_local_branch_head_sha", lambda *args: remote["head"],
+    )
+    observed = []
+    original_save = runner._save_current_run_record
+
+    async def save_outcome(outcome):
+        attempt = runner.state.publication_attempt
+        observed.append((outcome, runner.state.current_pr.head_sha))
+        assert attempt.candidate.head_sha == attempt.head_sha == "b" * 40
+        assert attempt.unverified_head_sha is None
+        assert not attempt.pending
+        await original_save(outcome)
+
+    monkeypatch.setattr(runner, "_save_current_run_record", save_outcome)
+    asyncio.run(runner.handle_fix())
+
+    outcome = "success_merged" if terminal == "MERGED" else "closed_unmerged"
+    assert observed == [(outcome, "b" * 40)]
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    recent = asyncio.run(runner._metrics_store.recent(
+        task_id="PR-001", limit=1, repo_name=runner.name,
+    ))
+    assert recent[0].exit_reason == outcome
+    if terminal == "MERGED":
+        assert recent[0].head_sha == "b" * 40
+
+
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+@pytest.mark.parametrize("probe", ["unknown", "stale", "raises", "after_candidate"])
+def test_fix_terminal_poll_retains_candidate_until_exact_head_verified(monkeypatch, terminal, probe):
+    from src.daemon.handlers import coding as coding_module
+
+    from tests.test_coding import _REAL_EXACT_OUTCOME, _publication_transport, _runner
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+    runner._start_current_run_record("claude", "opus")
+    terminal_flag = {}
+
+    def monitor(pr_number, target, flag):
+        nonlocal terminal_flag
+        terminal_flag = flag
+        return None
+
+    async def fix(*args, **kwargs):
+        remote["head"] = "a" * 40 if probe == "stale" else "b" * 40
+        remote["terminal"] = terminal
+        remote["exact_unknown"] = probe == "unknown"
+        if probe == "raises":
+            def unavailable(*args):
+                raise OSError("exact read unavailable")
+            monkeypatch.setattr(coding_module.gh_prs, "get_exact_pr_outcome", unavailable)
+        if probe == "after_candidate":
+            def unavailable_after_candidate(*args):
+                outcome = _REAL_EXACT_OUTCOME(*args)
+                remote["exact_unknown"] = True
+                return outcome
+            monkeypatch.setattr(coding_module.gh_prs, "get_exact_pr_outcome", unavailable_after_candidate)
+        terminal_flag["state"] = terminal
+        return 0, "", ""
+
+    monkeypatch.setattr(runner, "_run_coder_with_polling", monitor)
+    monkeypatch.setattr(h.claude_cli, "fix_review_async", fix)
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: "b" * 40)
+    asyncio.run(runner.handle_fix())
+    assert runner.state.publication_attempt.pending
+    assert runner.state.publication_attempt.unverified_head_sha == (None if probe == "after_candidate" else "b" * 40)
+    assert runner.state.current_task is not None
+    assert runner.state.current_pr.head_sha == "a" * 40
+    assert runner._current_run_record.exit_reason != "success_merged"
+    # Persist/reload the only candidate evidence, then let exact reads recover.
+    runner.state = type(runner.state).model_validate_json(runner.state.model_dump_json())
+    remote["head"] = "b" * 40
+    remote["exact_unknown"] = False
+    monkeypatch.setattr(coding_module.gh_prs, "get_exact_pr_outcome", _REAL_EXACT_OUTCOME)
+    assert asyncio.run(runner._resolve_published_attempt())
+    assert not runner.state.publication_attempt.pending
+    assert runner.state.current_task is None
+    recent = asyncio.run(runner._metrics_store.recent(
+        task_id="PR-001", limit=1, repo_name=runner.name,
+    ))
+    assert recent[0].exit_reason == ("success_merged" if terminal == "MERGED" else "closed_unmerged")
+    if terminal == "MERGED":
+        assert recent[0].head_sha == "b" * 40
+
+
 def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2674,7 +2791,15 @@ def test_handle_fix_external_close_during_coder_skips_with_crash_cause(
     runner = h._make_runner()
     runner._app_config = h._app_cfg(fix_poll_interval_sec=1)
     runner.state.state = PipelineState.WATCH
-    runner.state.current_pr = PRInfo(number=78, branch="pr-078")
+    runner.state.current_pr = PRInfo(number=78, branch="pr-078", head_sha="a" * 40)
+    from src.github.prs import ExactPROutcome, ExactPRState
+
+    monkeypatch.setattr(
+        "src.github.prs.get_exact_pr_outcome",
+        lambda repo, base, number, sha: ExactPROutcome(
+            repo, base, number, sha, ExactPRState.CLOSED, True,
+        ),
+    )
     runner.state.current_task = QueueTask(
         pr_id="PR-078",
         title="t",
@@ -3953,7 +4078,7 @@ def test_fix_iterations_survive_recovery_until_merge(
         if args[:2] == ("rev-parse", "HEAD"):
             return h._FakeCompletedProcess(
                 args=["git", "rev-parse", "HEAD"],
-                stdout="abc123\n",
+                stdout="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
                 returncode=0,
             )
         if args[0] == "merge" and len(args) > 1 and args[1].startswith("origin/"):
@@ -3973,7 +4098,7 @@ def test_fix_iterations_survive_recovery_until_merge(
     monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
-        lambda repo, **kw: [PRInfo(number=77, branch="pr-001")],
+        lambda repo, **kw: [PRInfo(number=77, branch="pr-001", head_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_metadata",
@@ -4007,7 +4132,7 @@ def test_fix_iterations_survive_recovery_until_merge(
         branch="pr-001",
         task_file="tasks/PR-001.md",
     )
-    runner.state.current_pr = PRInfo(number=77, branch="pr-001")
+    runner.state.current_pr = PRInfo(number=77, branch="pr-001", head_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
     runner.state.state = PipelineState.WATCH
     runner._start_current_run_record("claude", "opus")
     asyncio.run(runner._save_current_run_record("coding_complete"))

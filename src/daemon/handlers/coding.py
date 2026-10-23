@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -25,15 +26,14 @@ from src.cancellation import (
     task_spec_content_hash,
 )
 from src.coder_registry import CoderPlugin
-from src.daemon import git_ops
-from src.daemon.guardrails import scan_stdout
+from src.daemon import fix_escalation, git_ops
+from src.daemon.guardrails import GuardrailViolation, scan_stdout
 from src.daemon.handlers import CoderUnavailable
 from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.daemon.selector import CoderSelectionUnavailable
-from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.models import PipelineState, PRInfo
+from src.models import PipelineState, PRInfo, PublicationAttempt
 from src.process_supervisor import (
     ProcessSupervisionError,
     SupervisedProcess,
@@ -103,15 +103,10 @@ def _local_branch_exists(repo_path: str, branch: str) -> bool:
     return probe.returncode == 0
 
 
-def _remote_branch_exists(repo_path: str, branch: str) -> bool:
-    """Return ``True`` if ``origin`` reports ``refs/heads/{branch}`` exists.
-
-    Uses ``git ls-remote --exit-code`` so a missing ref returns rc=2 and a
-    transient transport failure returns rc>=128 — both interpreted as "not
-    visible upstream" by the caller, which routes A/B through escalation and
-    back to IDLE without risking a false-positive PR-creation attempt against
-    a non-existent upstream branch.
-    """
+def _remote_branch_exists(
+    repo_path: str, branch: str, expected_head_sha: str | None = None,
+) -> bool | None:
+    """Return presence (optionally at an exact SHA), absence, or probe failure."""
     try:
         probe = git_ops._git(
             repo_path,
@@ -124,8 +119,31 @@ def _remote_branch_exists(repo_path: str, branch: str) -> bool:
             check=False,
         )
     except (subprocess.SubprocessError, OSError):
+        return None
+    if probe.returncode == 2:
         return False
-    return probe.returncode == 0 and bool(probe.stdout.strip())
+    if probe.returncode == 0 and probe.stdout.strip():
+        return expected_head_sha is None or probe.stdout.split() == [
+            expected_head_sha, f"refs/heads/{branch}",
+        ]
+    return None
+
+
+def _initial_branch_head_sha(repo_path: str, branch: str) -> str | None:
+    """Snapshot the pre-launch ref; distinguish absence from a failed probe."""
+    try:
+        probe = git_ops._git(
+            repo_path, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}",
+            timeout=10, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if probe.returncode == 1:
+        return ""
+    sha = probe.stdout.strip()
+    if probe.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+        return sha
+    return None
 
 
 def _local_branch_head_sha(repo_path: str, branch: str) -> str | None:
@@ -151,8 +169,8 @@ def _local_branch_head_sha(repo_path: str, branch: str) -> str | None:
 class _PublicationResolution:
     """Final targeted publication state after coder cleanup."""
 
-    candidate: PRInfo | None = None
     failure: Exception | str | None = None
+    cancelled_by_publication: bool = False
 
 
 def _fresh_ready_publication(
@@ -183,15 +201,358 @@ def _fresh_ready_publication(
 class CodingMixin:
     """Run ``PLANNED PR`` via the active coder CLI and hand off to WATCH."""
 
+    def _begin_publication_attempt(
+        self, *, started_at: datetime, baseline_numbers: set[int] | None = None,
+    ) -> None:
+        task = self.state.current_task
+        invocation = self.state.active_invocation
+        if task is None or not task.branch or invocation is None:
+            return
+        self.state.publication_attempt = PublicationAttempt(
+            repo=self.owner_repo, base=self.repo_config.branch or "main",
+            task_id=task.pr_id, branch=task.branch,
+            run_id=invocation.run_id, attempt_index=invocation.attempt_index,
+            started_at=started_at, baseline_numbers=baseline_numbers,
+            pr_number=self.state.current_pr.number if invocation.phase == "fix"
+            and self.state.current_pr is not None
+            and self.state.current_pr.branch == task.branch
+            and self.state.current_pr.pr_id in {None, task.pr_id} else None,
+        )
+        if self.state.publication_attempt.pr_number is not None:
+            self.state.publication_attempt.candidate = self.state.current_pr.model_copy(deep=True)
+            self.state.publication_attempt.head_sha = self.state.current_pr.head_sha
+
+    async def _retain_observed_publication(self, observed: gh_prs.BranchPublication) -> None:
+        """Checkpoint a fresh monitor proof before a later read can omit it."""
+        attempt = self.state.publication_attempt
+        if attempt is None:
+            return
+        if attempt.head_sha != observed.head_sha:
+            attempt.verified = False
+        attempt.head_sha = observed.head_sha
+        if self._publication_matches_attempt(observed):
+            attempt.pr_number = observed.number
+            attempt.candidate = observed.to_pr_info()
+            await self._resolve_published_attempt(resolve_terminal=False)
+            await self.publish_state()
+
+    async def _capture_published_attempt(
+        self, observed: gh_prs.BranchPublication | None = None,
+    ) -> None:
+        """Persist positive identity before any failure/cleanup handoff."""
+        attempt = self.state.publication_attempt
+        if attempt is None:
+            return
+        local_head = await asyncio.to_thread(
+            _local_branch_head_sha, self.repo_path, attempt.branch,
+        )
+        if local_head is not None and local_head != attempt.head_sha:
+            # Keep the known remote head and persist the local candidate so
+            # reconciliation can retry after GitHub catches up with a push.
+            if attempt.pr_number is not None:
+                attempt.unverified_head_sha = local_head
+            else:
+                attempt.verified = False
+                attempt.head_sha = local_head
+        if (observed is not None and self._publication_matches_attempt(observed)):
+            attempt.pr_number = observed.number
+            attempt.candidate = observed.to_pr_info()
+        await self._resolve_published_attempt(resolve_terminal=False)
+        await self.publish_state()
+
+    def _publication_matches_attempt(
+        self, item: gh_prs.BranchPublication, *, allow_headless: bool = False,
+    ) -> bool:
+        attempt = self.state.publication_attempt
+        return bool(
+            attempt is not None and attempt.baseline_numbers is not None
+            and attempt.pr_number in {None, item.number}
+            and item.number not in attempt.baseline_numbers
+            and item.created_at is not None and item.created_at >= attempt.started_at
+            and item.base_branch == attempt.base and item.head_branch == attempt.branch
+            and (item.state in {"MERGED", "CLOSED"} or item.is_verified_ready)
+            and (item.head_sha == attempt.head_sha or (
+                allow_headless and attempt.head_sha is None
+                and re.fullmatch(r"[0-9a-fA-F]{40}", item.head_sha) is not None
+            )) and not item.is_cross_repository
+            and gh_prs.extract_queue_pr_id(item.title) == attempt.task_id
+        )
+
+    def _publication_attempt_matches_dispatch(self) -> bool:
+        attempt = self.state.publication_attempt
+        task = self.state.current_task
+        invocation = self.state.active_invocation
+        return bool(
+            attempt is not None and task is not None and invocation is not None
+            and attempt.run_id
+            and (attempt.repo, attempt.base, attempt.task_id, attempt.branch,
+                 attempt.run_id, attempt.attempt_index) == (
+                     self.owner_repo, self.repo_config.branch or "main",
+                     task.pr_id, task.branch, invocation.run_id, invocation.attempt_index,
+                 )
+        )
+
+    async def _resolve_published_attempt(self, *, resolve_terminal: bool = True) -> bool:
+        """Reconcile exact evidence; absence never authorizes another create."""
+        attempt = self.state.publication_attempt
+        if not self._publication_attempt_matches_dispatch():
+            return False
+        try:
+            if self.state.active_invocation.phase == "fix":
+                local_head = await asyncio.to_thread(
+                    _local_branch_head_sha, self.repo_path, attempt.branch,
+                )
+                if local_head is not None and local_head != attempt.head_sha:
+                    attempt.unverified_head_sha = local_head
+                    await self.publish_state()
+            if attempt.head_sha is None:
+                # A restart can precede capture even after the coder published.
+                # Prefer the exact local task ref; if it is gone, use only one
+                # fresh, non-baseline publication for this dispatch's identity.
+                attempt.head_sha = await asyncio.to_thread(
+                    _local_branch_head_sha, self.repo_path, attempt.branch,
+                )
+            if attempt.pr_number is None or attempt.head_sha is None:
+                if attempt.baseline_numbers is None:
+                    return False
+                publications = await asyncio.to_thread(
+                    gh_prs.get_branch_publications,
+                    attempt.repo, attempt.base, attempt.branch,
+                )
+                matches = [item for item in publications if self._publication_matches_attempt(
+                    item, allow_headless=True,
+                )]
+                if len(matches) != 1:
+                    return False
+                candidate = matches[0].to_pr_info()
+                # Keep positive identity even if the exact read is unavailable.
+                attempt.head_sha = candidate.head_sha
+                attempt.pr_number = candidate.number
+                attempt.candidate = candidate
+            suppression = await self._suppression_record_for_task(attempt.task_id)
+            if (suppression is not None and suppression.reason == SuppressionReason.GUARDRAIL
+                and attempt.pr_number not in self.state.quarantined_prs):
+                self.state.quarantined_prs.add(attempt.pr_number)
+                violation = suppression.detail.get("violation")
+                if violation:
+                    apply_quarantine_label_for_violation(
+                        self, attempt.pr_number, GuardrailViolation(**violation),
+                    )
+                await self.publish_state()
+            current = attempt.candidate
+            if (current is None or current.number != attempt.pr_number
+                or current.branch != attempt.branch or current.is_cross_repository
+                or current.pr_id not in {None, attempt.task_id}):
+                return False
+            if attempt.unverified_head_sha is not None:
+                try:
+                    candidate_outcome = await asyncio.to_thread(
+                        gh_prs.get_exact_pr_outcome,
+                        attempt.repo, attempt.base, attempt.pr_number,
+                        attempt.unverified_head_sha,
+                    )
+                except Exception as exc:
+                    self.log_event(f"[INFRA] FIX head verification deferred: {exc}")
+                else:
+                    if (candidate_outcome.discovery_complete
+                        and candidate_outcome.state in {
+                            gh_prs.ExactPRState.OPEN, gh_prs.ExactPRState.MERGED,
+                            gh_prs.ExactPRState.CLOSED,
+                        }):
+                        attempt.head_sha = attempt.unverified_head_sha
+                        attempt.unverified_head_sha = None
+                        attempt.verified = False
+            outcome = await asyncio.to_thread(
+                gh_prs.get_exact_pr_outcome,
+                attempt.repo, attempt.base, attempt.pr_number, attempt.head_sha,
+            )
+            if (outcome.discovery_complete and outcome.state in {
+                gh_prs.ExactPRState.MERGED, gh_prs.ExactPRState.CLOSED,
+            }):
+                if attempt.unverified_head_sha is not None:
+                    return False
+                current.head_sha = attempt.head_sha
+                self.state.current_pr = current
+                attempt.verified = True
+                # Capture may run before process cleanup. Only consuming paths
+                # may finalize the task and release its publication hold, but
+                # deferred terminal bookkeeping still needs the verified head.
+                if (not resolve_terminal or (
+                    attempt.exit_classification is None
+                )):
+                    return False
+                return await self._handle_external_pr_resolution(
+                    current, outcome.state.value,
+                )
+            if outcome.discovery_complete and outcome.state == gh_prs.ExactPRState.OPEN:
+                current.head_sha = attempt.head_sha
+                attempt.verified = True
+                self.state.current_pr = current
+                # The old remote head proves ownership, but cannot release a
+                # FIX hold while its newer local commit remains unverified.
+                return attempt.unverified_head_sha is None
+            return False
+        except Exception as exc:
+            self.log_event(f"[INFRA] Reconciliation deferred: {exc}")
+            return False
+
+    async def _release_unpublished_attempt(self, target_branch: str) -> None:
+        """Prove remote absence and clean the local branch before releasing Retry."""
+        attempt = self.state.publication_attempt
+        if (attempt is not None and attempt.branch == target_branch
+            and attempt.pr_number is None and attempt.candidate is None):
+            remote_exists = await asyncio.to_thread(
+                _remote_branch_exists, self.repo_path, target_branch,
+            )
+            if remote_exists is False and attempt.baseline_numbers is not None:
+                # A closed PR survives deletion of its head branch. Recheck all
+                # states after the ref probe; failed/earlier discovery cannot
+                # authorize another create. Retain even candidates whose HEAD
+                # or metadata cannot yet be matched to this dispatch.
+                try:
+                    publications = await asyncio.to_thread(
+                        gh_prs.get_branch_publications,
+                        attempt.repo, attempt.base, attempt.branch,
+                    )
+                except Exception as exc:
+                    self.log_event(f"[INFRA] Unpublished attempt release deferred: {exc}")
+                    return
+                if not any(item.number not in attempt.baseline_numbers for item in publications):
+                    # Remote absence does not establish ownership of a local
+                    # ref. Preserve a branch that predates this invocation,
+                    # and defer when the pre-launch probe was unavailable.
+                    if attempt.initial_branch_head_sha != "":
+                        self.log_event(
+                            "[INFRA] Unpublished local branch cleanup deferred: "
+                            "pre-launch branch ownership is unproven"
+                        )
+                        return
+                    # Retry dispatches CODING directly, so AUTO PR must be able
+                    # to create its branch without an intervening IDLE sync.
+                    try:
+                        if target_branch == self.repo_config.branch:
+                            raise ValueError("task branch is the configured base")
+                        if git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip():
+                            raise ValueError("worktree is dirty")
+                        local_head = _initial_branch_head_sha(self.repo_path, target_branch)
+                        if local_head is None:
+                            raise ValueError("local branch probe unavailable")
+                        if local_head:
+                            if attempt.head_sha is None or local_head != attempt.head_sha:
+                                raise ValueError("local branch HEAD changed or was not captured")
+                            git_ops._git(
+                                self.repo_path, "checkout", "--detach",
+                                f"origin/{self.repo_config.branch}",
+                            )
+                            git_ops._git(self.repo_path, "branch", "-D", "--", target_branch)
+                    except Exception as exc:
+                        self.log_event(f"[INFRA] Unpublished local branch cleanup deferred: {exc}")
+                        return
+                    attempt.pending = False
+                    # Checkpoint before callers await terminal bookkeeping:
+                    # a headless attempt cannot repeat reconciliation on restart.
+                    await self.publish_state()
+
+    async def _release_abandoned_publication_attempt(self) -> None:
+        """Prove absence after quiescence, including a pre-launch crash."""
+        attempt = self.state.publication_attempt
+        if (not self._publication_attempt_matches_dispatch()
+            or attempt.pr_number is not None or attempt.candidate is not None
+            or self._coder_invocation_active):
+            return
+        if await self._confirm_current_coder_cleanup("publication recovery"):
+            await self._release_unpublished_attempt(attempt.branch)
+
+    async def _recover_branch_without_pr(self) -> bool:
+        """Operator Retry may publish an abandoned pushed branch after fresh discovery."""
+        attempt = self.state.publication_attempt
+        if (not self._publication_attempt_matches_dispatch()
+            or attempt.pr_number is not None or attempt.baseline_numbers is None
+            or attempt.exit_classification is None or not attempt.head_sha
+            or attempt.initial_branch_head_sha is None
+            or attempt.head_sha == attempt.initial_branch_head_sha
+            or self._coder_invocation_active):
+            return False
+        if not await self._confirm_current_coder_cleanup("Retry PR creation"):
+            return False
+        suppression = await self._suppression_record_for_task(attempt.task_id)
+        if suppression is not None and suppression.reason == SuppressionReason.GUARDRAIL:
+            return False
+        try:
+            publications = await asyncio.to_thread(
+                gh_prs.get_branch_publications, attempt.repo, attempt.base, attempt.branch,
+            )
+            if any(item.number not in attempt.baseline_numbers for item in publications):
+                return False
+            if await asyncio.to_thread(
+                _remote_branch_exists, self.repo_path, attempt.branch, attempt.head_sha,
+            ) is not True:
+                return False
+            await asyncio.to_thread(
+                gh_runner.run_gh,
+                ["pr", "create", "--base", attempt.base, "--head", attempt.branch,
+                 "--title", f"{attempt.task_id}: {self.state.current_task.title}",
+                 "--body", "Recovered pushed task branch on operator Retry; normal CI and review gates apply."],
+                repo=attempt.repo,
+            )
+            return await self._resolve_published_attempt()
+        except Exception as exc:
+            self.log_event(f"[INFRA] Retry PR creation deferred: {exc}")
+            return False
+
+    async def _hold_unresolved_publication(self) -> bool:
+        """Prevent IDLE/CODING from losing an unfinished publication attempt."""
+        attempt = self.state.publication_attempt
+        if attempt is None or not attempt.pending:
+            return False
+        resolved = await self._resolve_published_attempt()
+        if resolved and self.state.current_task is None:
+            return True
+        # Terminal bookkeeping may roll state back from a deep copy after a
+        # failed write. The pre-reconciliation attempt then points at an
+        # abandoned object and cannot authorize release of the live hold.
+        attempt = self.state.publication_attempt
+        if not resolved:
+            await self._release_abandoned_publication_attempt()
+            attempt = self.state.publication_attempt
+            if not attempt.pending:
+                return False
+        if self.state.user_paused or self.state.state == PipelineState.PAUSED:
+            if self.state.user_paused and not self._user_pause_logged:
+                self.log_event("[INFRA] Paused. Press Play to resume.")
+                self._user_pause_logged = True
+            await self.publish_state()
+            return True
+        classified_success = attempt.exit_classification == "success"
+        if resolved and classified_success and not attempt.failure and not self.state.error_message:
+            if self.state.active_invocation.phase == "fix":
+                # Play resumes the retained FIX; it is not CODING completion
+                # and an unchanged head must not request another review.
+                attempt.pending = False
+                self.state.state = PipelineState.WATCH
+                self._rehydrate_last_push_at(self.state.current_pr)
+                self.log_event("[FIX] Recovered retained PR -> WATCH.")
+                await self.publish_state()
+                return True
+            await self._handoff_coding_pr_to_watch(
+                self.state.current_pr, "Recovered published PR -> WATCH.",
+            )
+            return True
+        await self._transition_to_error(
+            attempt.failure or self.state.error_message
+            or "Publication ownership unresolved; retaining coder attempt",
+            save_run_record_as=None, publish=True, log_prefix="[INFRA]",
+        )
+        return True
+
     async def handle_coding(self) -> None:
         """Run ``PLANNED PR`` via the active coder CLI and hand off to WATCH.
 
         The coder owns the full git workflow per AGENTS.md: branch creation,
         commit, push, and PR creation. The daemon must not pre-create the
         task branch — doing so conflicts with AGENTS.md step 4 ("create
-        branch from origin/main"). After the CLI returns 0 we poll GitHub
-        for the PR; because the list API is eventually consistent, we
-        retry a few times before surfacing an ERROR.
+        branch from origin/main"). After the CLI exits, targeted publication
+        and exact identity reads retain the owned PR. Incomplete discovery holds the attempt.
 
         Reads top-down as a state-machine flow with three phases:
 
@@ -206,8 +567,10 @@ class CodingMixin:
         2. ``_run_coder_with_supervision`` — subprocess plus stop and
            breach monitors; resolves user-stop and breach pauses.
         3. ``_post_coder_resolution`` — CLI log save, exit classification,
-           PR lookup or daemon-side PR creation, run record save.
+           publication reconciliation and run record save.
         """
+        if await self._hold_unresolved_publication():
+            return
         self._stop_requested = False
         current_pr_id = (
             self.state.current_task.pr_id
@@ -466,12 +829,17 @@ class CodingMixin:
                 target_branch,
             )
         except Exception as exc:
-            publication_baseline = None
             self.log_event(
                 f"[CODING] Publication baseline unavailable for "
-                f"{target_branch!r}: {exc}; this run will use ordinary "
-                "completion handling."
+                f"{target_branch!r}: {exc}; deferring coder invocation."
             )
+            # No coder has launched. Persist queue eligibility rather than a
+            # CODING task that recovery would classify as an interrupted run.
+            self.state.current_task = None
+            self._reset_runner_local_task_counters()
+            self.state.state = PipelineState.IDLE
+            await self.publish_state()
+            return None
         else:
             publication_baseline = {item.number for item in baseline}
 
@@ -498,6 +866,7 @@ class CodingMixin:
 
         run_record = self._current_run_record
         previous_active_invocation = self.state.active_invocation
+        previous_publication_attempt = self.state.publication_attempt
         captured_snapshot = None
         try:
             captured_snapshot = self._capture_invocation_snapshot(
@@ -510,6 +879,13 @@ class CodingMixin:
             # finalize that exact record after a crash; the reverse order
             # leaves an unidentifiable checkpoint if the daemon dies between
             # these writes.
+            self._begin_publication_attempt(
+                started_at=publication_not_before,
+                baseline_numbers=publication_baseline,
+            )
+            self.state.publication_attempt.initial_branch_head_sha = await asyncio.to_thread(
+                _initial_branch_head_sha, self.repo_path, self.state.current_task.branch,
+            )
             await self.publish_state()
             await self._checkpoint_current_run_record()
             heartbeat = asyncio.create_task(
@@ -531,6 +907,7 @@ class CodingMixin:
         except BaseException:
             if captured_snapshot is not None:
                 self.state.active_invocation = previous_active_invocation
+                self.state.publication_attempt = previous_publication_attempt
                 if (
                     run_record is not None
                     and run_record.invocations
@@ -589,11 +966,7 @@ class CodingMixin:
 
         async def refresh_as_coder_completes() -> None:
             nonlocal publication_observed
-            if (
-                publication_baseline is None
-                or self._stop_requested
-                or breach_flag["breached"]
-            ):
+            if self._stop_requested or breach_flag["breached"]:
                 return
             try:
                 publication_observed = await refresh_publication()
@@ -605,6 +978,7 @@ class CodingMixin:
                 )
             else:
                 if publication_observed is not None:
+                    await self._retain_observed_publication(publication_observed)
                     self.log_event(
                         "[CODING] Verified publication as coder completed "
                         "under publication observation."
@@ -643,6 +1017,7 @@ class CodingMixin:
                 publication_observed = publication_monitor.result()
                 if publication_observed is None:
                     break
+                await self._retain_observed_publication(publication_observed)
                 self.log_event(
                     f"[CODING] Verified publication of PR "
                     f"#{publication_observed.number}; allowing coder "
@@ -744,9 +1119,12 @@ class CodingMixin:
                     breach_flag,
                 )
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
-            cleanup_confirmed = await self._confirm_current_coder_cleanup(
-                "CODING completion"
-            )
+            try:
+                await self._capture_published_attempt(publication_observed)
+            finally:
+                cleanup_confirmed = await self._confirm_current_coder_cleanup(
+                    "CODING completion"
+                )
 
         if cancellation is not None:
             raise cancellation
@@ -754,6 +1132,11 @@ class CodingMixin:
             return None
 
         if interruption == "stop":
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
+                await self.publish_state()
+            await self._release_unpublished_attempt(target_branch)
+            self.state.user_paused = True
             if current_pr_id is not None:
                 self._user_stopped_task_pr_ids.add(current_pr_id)
                 await self._suppress_task(
@@ -770,7 +1153,13 @@ class CodingMixin:
             self.log_event("[CODING] CODING aborted: user stop requested.")
             return None
 
+        if interruption == "breach" or breach_flag["breached"]:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
+                await self.publish_state()
+
         if interruption == "breach":
+            await self._release_unpublished_attempt(target_branch)
             await self._record_pre_pause_pr(
                 target_branch, "before breach-cancel pause"
             )
@@ -787,6 +1176,7 @@ class CodingMixin:
             return None
 
         if breach_flag["breached"]:
+            await self._release_unpublished_attempt(target_branch)
             await self._record_pre_pause_pr(
                 target_branch, "before late-breach pause"
             )
@@ -819,7 +1209,8 @@ class CodingMixin:
                 *result,
                 _PublicationResolution(
                     failure=f"Process supervision failed: "
-                    f"{publication_process_failure}"
+                    f"{publication_process_failure}",
+                    cancelled_by_publication=True,
                 ),
             )
 
@@ -836,7 +1227,9 @@ class CodingMixin:
                 target_branch,
             )
         except Exception as exc:
-            publication = _PublicationResolution(failure=exc)
+            publication = _PublicationResolution(
+                failure=exc, cancelled_by_publication=publication_cancel_requested,
+            )
         else:
             final_evidence = _fresh_ready_publication(
                 refreshed,
@@ -850,11 +1243,11 @@ class CodingMixin:
                         "Verified publication changed or disappeared after "
                         "coder cleanup, or its head does not match the local "
                         "task branch"
-                    )
+                    ), cancelled_by_publication=publication_cancel_requested,
                 )
             else:
                 publication = _PublicationResolution(
-                    candidate=final_evidence.to_pr_info()
+                    cancelled_by_publication=publication_cancel_requested,
                 )
         return (*result, publication)
 
@@ -906,33 +1299,14 @@ class CodingMixin:
         target_branch: str,
         log_suffix: str,
     ) -> None:
-        """Best-effort: record a PR opened before a breach-induced pause.
-
-        PR list visibility is eventually consistent, so retry up to 3
-        times. Failures are silently ignored — the pause is still correct
-        without the PR record, and the runner picks up the PR on the next
-        cycle once the rate-limit window clears.
-        """
-        for attempt in range(3):
-            try:
-                prs = gh_prs.get_open_prs(
-                    self.owner_repo,
-                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
-                )
-                match = next(
-                    (pr for pr in prs if pr.branch == target_branch),
-                    None,
-                )
-                if match:
-                    self.state.current_pr = match
-                    self.log_event(
-                        f"[CODING] Recorded PR #{match.number} {log_suffix}."
-                    )
-                    return
-            except Exception:
-                pass  # best-effort; the pause is still correct
-            if attempt < 2:
-                await asyncio.sleep(5)
+        """Retain only dispatch-bound publication evidence before pausing."""
+        attempt = self.state.publication_attempt
+        if attempt is None or attempt.branch != target_branch:
+            return
+        if await self._resolve_published_attempt() and self.state.current_pr is not None:
+            self.log_event(
+                f"[CODING] Recorded PR #{self.state.current_pr.number} {log_suffix}."
+            )
 
     def _expected_branch_path(self) -> Path:
         """Return the path of the daemon's ``expected-branch`` marker file.
@@ -1077,13 +1451,20 @@ class CodingMixin:
                     )
             if not requested:
                 return False
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
+                await self.publish_state()
+            await self._release_unpublished_attempt(target_branch)
+            self.state.user_paused = True
             if current_pr_id is not None:
                 self._user_stopped_task_pr_ids.add(current_pr_id)
-                await self._suppress_task(
-                    current_pr_id,
-                    SuppressionReason.OPERATOR_STOPPED,
-                    {"source": "stop_requested_after_coder_exit"},
-                )
+                suppression = await self._suppression_record_for_task(current_pr_id)
+                if suppression is None or suppression.reason != SuppressionReason.GUARDRAIL:
+                    await self._suppress_task(
+                        current_pr_id,
+                        SuppressionReason.OPERATOR_STOPPED,
+                        {"source": "stop_requested_after_coder_exit"},
+                    )
             self.state.state = PipelineState.PAUSED
             await self._clear_error_message_on_recovery(
                 log_prefix="[CODING]",
@@ -1107,24 +1488,24 @@ class CodingMixin:
                     tier="guardrail",
                     kind=violation.category,
                 )
-            if await pause_for_stop_if_requested():
-                return
-            protected_pr = self.state.current_pr or (
-                publication.candidate if publication is not None else None
+            protected_pr = self.state.current_pr
+            if protected_pr is None and self._publication_attempt_matches_dispatch():
+                protected_pr = self.state.publication_attempt.candidate
+            task_id = self.state.current_task.pr_id if self.state.current_task else current_pr_id
+            await self._suppress_task(
+                task_id or "",
+                SuppressionReason.GUARDRAIL,
+                {"pr_number": protected_pr.number if protected_pr else None,
+                 "reason_text": cause, "violation": {
+                     "tier": first.tier, "category": first.category,
+                     "excerpt": first.excerpt, "rule": first.rule,
+                 }},
             )
             if protected_pr is not None:
-                pr_number = protected_pr.number
-                self.state.quarantined_prs.add(pr_number)
-                task_id = (
-                    protected_pr.pr_id
-                    or (self.state.current_task.pr_id if self.state.current_task else "")
-                )
-                await self._suppress_task(
-                    task_id,
-                    SuppressionReason.GUARDRAIL,
-                    {"pr_number": pr_number, "reason_text": cause},
-                )
-                apply_quarantine_label_for_violation(self, pr_number, first)
+                self.state.quarantined_prs.add(protected_pr.number)
+                apply_quarantine_label_for_violation(self, protected_pr.number, first)
+            if await pause_for_stop_if_requested():
+                return
             await self._transition_to_error(
                 cause,
                 publish=False,
@@ -1145,7 +1526,29 @@ class CodingMixin:
                 )
         if await pause_for_stop_if_requested():
             return
-        if code != 0:
+        escalate_reason = fix_escalation.parse_escalate_marker(stdout)
+        if escalate_reason is not None:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
+                await self.publish_state()
+            await self._release_unpublished_attempt(target_branch)
+            await self._transition_to_error(
+                escalate_reason, publish=False, log_prefix="[CODING]",
+                cancellation_cause=CancellationCause(
+                    category="ERROR", payload={"subsource": "coder_escalate",
+                                               "reason_text": escalate_reason},
+                ), commit_task_status=True,
+            )
+            return
+
+        if self.state.publication_attempt is not None:
+            self.state.publication_attempt.exit_classification = "failure"
+            await self.publish_state()
+        if code != 0 and not (publication and publication.cancelled_by_publication):
+            resolved = await self._resolve_published_attempt()
+            if resolved and self.state.current_pr is None:
+                return
+            await self._release_unpublished_attempt(target_branch)
             self._detect_rate_limit(stderr, coder_name=coder_name)
             if self.state.rate_limited_until is not None:
                 self.state.state = PipelineState.PAUSED
@@ -1159,13 +1562,12 @@ class CodingMixin:
                     f"{self.state.rate_limited_until.isoformat()}."
                 )
                 return
-            if publication is None:
-                await self._transition_to_error(
-                    stderr.strip() or f"{coder_name} exit {code}",
-                    publish=False,
-                    log_prefix=f"[CODING] [{coder_name}] CLI failed:",
-                )
-                return
+            await self._transition_to_error(
+                stderr.strip() or f"{coder_name} exit {code}",
+                publish=False,
+                log_prefix=f"[CODING] [{coder_name}] CLI failed:",
+            )
+            return
 
         if publication is not None:
             if publication.failure is not None:
@@ -1181,68 +1583,27 @@ class CodingMixin:
                     ),
                 )
                 return
-            assert publication.candidate is not None
-            await self._handoff_coding_pr_to_watch(
-                publication.candidate,
-                f"Published PR #{publication.candidate.number} -> WATCH.",
-            )
-            return
-
-        # The coder just exited; if it ran ``gh pr create`` from its own
-        # subprocess the daemon's ETag cache for ``repos/{repo}/pulls``
-        # still reflects the pre-create state. Invalidate before polling
-        # so the first ``get_open_prs`` REST fallback returns a fresh 200
-        # instead of a 304-cached page that omits the new PR.
-        gh_cache._invalidate_etag_cache(f"repos/{self.owner_repo}/pulls")
-        candidate = None
-        for attempt in range(3):
-            if await pause_for_stop_if_requested():
+        if self.state.publication_attempt is not None:
+            self.state.publication_attempt.exit_classification = "success"
+            await self.publish_state()
+        # A bounded positive identity can be retained despite list omissions.
+        if self.state.publication_attempt is not None:
+            resolved = await self._resolve_published_attempt()
+            if resolved and self.state.current_pr is None:
                 return
-            try:
-                prs = gh_prs.get_open_prs(
-                    self.owner_repo,
-                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
-                )
-            except Exception as exc:
-                await self._transition_to_error(
-                    f"get_open_prs failed: {exc}",
-                    publish=False,
-                    log_prefix="[CODING]",
-                    cancellation_cause=classify_infra_exception(exc),
+            if resolved and self.state.current_pr is not None:
+                if await pause_for_stop_if_requested():
+                    return
+                await self._handoff_coding_pr_to_watch(
+                    self.state.current_pr, "Retained published PR -> WATCH.",
                 )
                 return
-            candidate = next(
-                (pr for pr in prs if pr.branch == target_branch), None
-            )
-            if candidate is not None:
-                break
-            if attempt < 2:
-                self.log_event(
-                    f"[CODING] PR not found for {target_branch!r}, "
-                    f"retrying in 5s ({attempt + 1}/3)."
-                )
-                await asyncio.sleep(5)
-
-        if await pause_for_stop_if_requested():
-            return
-        if candidate is None:
-            # The branch-mismatch check is layered into
-            # ``_diagnose_exit_zero_no_pr`` (only on the case-A/B path
-            # where no upstream branch exists) instead of firing here
-            # unconditionally: a recoverable case-C run that pushed
-            # ``task_branch`` but exited on a different local branch
-            # (e.g. switched back to ``main`` before exit) must still
-            # reach the daemon ``gh pr create`` recovery, since
-            # ``--head task_branch`` operates on the upstream ref
-            # regardless of the local checkout.
             await self._diagnose_exit_zero_no_pr(
-                target_branch, coder_name, pause_for_stop_if_requested
+                target_branch, coder_name, pause_for_stop_if_requested,
             )
             return
-
-        await self._handoff_coding_pr_to_watch(
-            candidate,
-            f"Opened PR #{candidate.number} -> WATCH.",
+        await self._transition_to_error(
+            "Missing publication attempt identity", publish=False, log_prefix="[CODING]",
         )
 
     async def _handoff_coding_pr_to_watch(
@@ -1252,6 +1613,9 @@ class CodingMixin:
     ) -> None:
         """Apply the shared CODING-to-WATCH bookkeeping for a verified PR."""
         self.state.current_pr = candidate
+        if self.state.publication_attempt is not None:
+            self.state.publication_attempt.pr_number = candidate.number
+            self.state.publication_attempt.pending = False
         self.state.state = PipelineState.WATCH
         self._rehydrate_last_push_at(candidate)
         await self._save_current_run_record("coding_complete")
@@ -1270,34 +1634,22 @@ class CodingMixin:
         coder_name: str,
         pause_for_stop_if_requested: Callable[[], Awaitable[bool]],
     ) -> None:
-        """Resolve the "coder exited 0 but no PR" outcome by branch state.
+        """Diagnose no-push failures and hold ambiguous publication.
 
-        Distinguishes three cases the runner used to collapse into a single
-        escalation transition: (A) coder did nothing — neither a local branch
-        nor an upstream ref exists; (B) coder created the branch locally but
-        never pushed; (C) coder pushed a branch but failed to open the PR.
-        Cases A and B skip back to IDLE because we cannot trust the local tree
-        or push outcome without inspection. Case C is auto-recoverable —
-        the daemon issues ``gh pr create`` itself and hands off to WATCH on
-        success, falling back to IDLE when PR creation fails.
-
-        ``pause_for_stop_if_requested`` is rechecked before any state-changing
-        side effect (PR creation, sleep between visibility retries, final
-        WATCH transition) so a user stop pressed after coder exit but before
-        the daemon's own PR creation is honored — otherwise the daemon would
-        open an unwanted PR after an explicit stop.
+        A pushed branch with an omitted PR is not permission to create again.
+        Stop remains authoritative before diagnosing or retaining the attempt.
         """
         local_exists = _local_branch_exists(self.repo_path, target_branch)
         remote_exists = _remote_branch_exists(self.repo_path, target_branch)
 
         # ``_remote_branch_exists`` can block up to its 30s timeout; a stop
         # pressed during that window must still be honored before either A/B
-        # skips to IDLE or C proceeds to PR creation, otherwise the user's
-        # stop is silently overridden by an unwanted state transition.
+        # parks the attempt, so the user stop remains authoritative.
         if await pause_for_stop_if_requested():
             return
 
-        if not remote_exists:
+        if remote_exists is False:
+            await self._release_unpublished_attempt(target_branch)
             ctx = BranchContext.from_runner(self)
             if ctx.mismatch_reason is not None:
                 # Daemon recovery is unavailable (no upstream
@@ -1335,184 +1687,8 @@ class CodingMixin:
             )
             return
 
-        self.log_event(
-            f"[CODING] [{coder_name}] Coder exited 0 with branch but no "
-            f"PR — daemon creating PR."
+        await self._transition_to_error(
+            f"[{coder_name}] Publication ownership unresolved for {target_branch!r}; "
+            "retaining attempt without repeating PR creation",
+            publish=False, log_prefix="[CODING]",
         )
-        if not await self._daemon_create_pr_for_branch(
-            target_branch, coder_name
-        ):
-            return
-
-        # GitHub's PR list endpoints are eventually consistent, so a PR
-        # that gh pr create just opened may be temporarily absent. Retry
-        # the same bounded 3x/5s schedule used earlier in handle_coding
-        # before declaring the PR missing. Each iteration honors a pending
-        # stop request so a user pressing stop during the visibility window
-        # is not overridden by a WATCH handoff. A transient exception from
-        # ``get_open_prs`` (network blip, rate-limit fallback) is folded
-        # into the same loop so a single failure cannot park the runner as
-        # HUNG when the PR has already been created and only the read path
-        # is briefly unhealthy.
-        candidate = None
-        last_list_exc: Exception | None = None
-        for attempt in range(3):
-            if await pause_for_stop_if_requested():
-                return
-            try:
-                prs = gh_prs.get_open_prs(
-                    self.owner_repo,
-                    allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
-                )
-            except Exception as exc:
-                last_list_exc = exc
-                self.log_event(
-                    f"[CODING] [{coder_name}] Daemon-created PR list "
-                    f"failed for {target_branch!r}: {exc} "
-                    f"({attempt + 1}/3)."
-                )
-                if attempt < 2:
-                    await asyncio.sleep(5)
-                continue
-            last_list_exc = None
-            candidate = next(
-                (pr for pr in prs if pr.branch == target_branch), None
-            )
-            if candidate is not None:
-                break
-            if attempt < 2:
-                self.log_event(
-                    f"[CODING] [{coder_name}] Daemon-created PR not "
-                    f"visible yet for {target_branch!r}, retrying in 5s "
-                    f"({attempt + 1}/3)."
-                )
-                await asyncio.sleep(5)
-
-        if await pause_for_stop_if_requested():
-            return
-        if candidate is None:
-            if last_list_exc is not None:
-                # Every list attempt raised — the PR was created but we
-                # cannot confirm its visibility. Degrade to ERROR (which
-                # the daemon retries) rather than HUNG (manual park) so a
-                # transient read outage does not strand the task.
-                infra_cause = classify_infra_exception(last_list_exc)
-                if infra_cause is None:
-                    infra_cause = CancellationCause(
-                        category="ERROR",
-                        payload={
-                            "subsource": "infra_failure",
-                            "subsystem": "gh_api",
-                            "retry_count": 3,
-                            "last_attempt_iso": datetime.now(
-                                timezone.utc
-                            ).isoformat(),
-                            "error_class": type(last_list_exc).__name__,
-                            "error_message": str(last_list_exc)[:500],
-                        },
-                    )
-                await self._transition_to_error(
-                    (
-                        f"[{coder_name}] Daemon-created PR list failed after "
-                        f"3 attempts: {last_list_exc}"
-                    ),
-                    publish=False,
-                    log_prefix="[CODING]",
-                    cancellation_cause=infra_cause,
-                )
-            else:
-                message = (
-                    f"[{coder_name}] Daemon-created PR not found for branch "
-                    f"{target_branch!r}"
-                )
-                await self._commit_and_park_in_error(
-                    message,
-                    subsource="infra_failure",
-                )
-            return
-
-        await self._handoff_coding_pr_to_watch(
-            candidate,
-            f"[CODING] Daemon opened PR #{candidate.number} for "
-            f"{target_branch!r} -> WATCH.",
-        )
-
-    async def _daemon_create_pr_for_branch(
-        self,
-        target_branch: str,
-        coder_name: str,
-    ) -> bool:
-        """Run ``gh pr create`` against an already-pushed branch.
-
-        Returns ``True`` on success. ``gh pr create`` exits non-zero with an
-        "already exists" message when a PR for the same head branch is
-        already open (often because the earlier list lagged GitHub PR
-        visibility); that case is treated as success so the caller's
-        post-create visibility loop can pick up the existing PR rather than
-        skipping the task. On any other failure the runner is
-        transitioned to IDLE with the gh error and the run record saved,
-        matching the ESCALATE-style handling the diagnostic uses for cases
-        A and B — a failed creation is not silently retried.
-        """
-        task = self.state.current_task
-        # The diagnostic only runs after handle_coding's target_branch guard,
-        # so current_task is always populated when we reach this method.
-        assert task is not None
-        pr_title = f"{task.pr_id}: {task.title}" if task.title else task.pr_id
-        if task.task_file:
-            body = (
-                f"Auto-created by pipeline-orchestrator after coder exit=0 "
-                f"with no PR. See `{task.task_file}` for the planned scope."
-            )
-        else:
-            body = (
-                "Auto-created by pipeline-orchestrator after coder exit=0 "
-                "with no PR."
-            )
-
-        base_branch = self.repo_config.branch
-        try:
-            gh_runner.run_gh(
-                [
-                    "pr",
-                    "create",
-                    "--base",
-                    base_branch,
-                    "--head",
-                    target_branch,
-                    "--title",
-                    pr_title,
-                    "--body",
-                    body,
-                ],
-                repo=self.owner_repo,
-            )
-        except (RuntimeError, subprocess.SubprocessError, OSError) as exc:
-            if "already exists" in str(exc).lower():
-                self.log_event(
-                    f"[CODING] [{coder_name}] gh pr create reports PR "
-                    f"already exists for {target_branch!r}; reusing "
-                    f"existing PR."
-                )
-                # The daemon's last list view did not include this PR yet
-                # but the upstream "already exists" reply confirms it does;
-                # drop any cached pages so the post-create visibility loop
-                # fetches a fresh 200 instead of looping on a 304-cached
-                # page that still misses it.
-                gh_cache._invalidate_etag_cache(
-                    f"repos/{self.owner_repo}/pulls"
-                )
-                return True
-            message = (
-                f"[{coder_name}] Daemon PR creation failed for "
-                f"{target_branch!r}: {exc}"
-            )
-            await self._commit_and_park_in_error(
-                message,
-                subsource="infra_failure",
-            )
-            return False
-        gh_cache._invalidate_etag_cache(
-            f"repos/{self.owner_repo}/pulls"
-        )
-        return True

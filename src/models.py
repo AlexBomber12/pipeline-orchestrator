@@ -195,6 +195,28 @@ class InvocationSnapshot:
     fix_iteration: int | None = None
 
 
+class PublicationAttempt(BaseModel):
+    """Bound dispatch evidence retained while publication is unresolved."""
+
+    repo: str
+    base: str
+    task_id: str
+    branch: str
+    run_id: str | None
+    attempt_index: int | None
+    started_at: datetime
+    baseline_numbers: set[int] | None = None
+    # None is unknown (including older snapshots); empty means proven absent.
+    initial_branch_head_sha: str | None = None
+    head_sha: str | None = None
+    unverified_head_sha: str | None = None
+    pr_number: int | None = None
+    candidate: PRInfo | None = None
+    pending: bool = True
+    verified: bool = False
+    failure: str | None = None
+    exit_classification: Literal["success", "failure"] | None = None
+
 class SizeFixCompletion(BaseModel):
     """Confirmed FIX exit awaiting a status write or marker cleanup."""
 
@@ -319,6 +341,7 @@ class RepoState(BaseModel):
     merge_phase: str | None = None
     # Retain failed-command evidence across restart until admission is known.
     merge_command_failed: bool = False
+    publication_attempt: PublicationAttempt | None = None
     upload_pending_count: int = 0
 
     @field_validator("state", mode="before")

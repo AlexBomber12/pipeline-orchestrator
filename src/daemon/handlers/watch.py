@@ -136,6 +136,8 @@ class WatchMixin:
 
     async def handle_watch(self) -> None:
         """Poll PR status and decide whether to merge, fix, hang, or wait."""
+        if await self._hold_unresolved_publication():
+            return
         if self.state.current_pr is None:
             self.state.state = PipelineState.IDLE
             self.log_event("[WATCH] WATCH without current_pr -> IDLE.")
@@ -1390,6 +1392,23 @@ class WatchMixin:
     ) -> bool:
         """Return whether terminal bookkeeping released the bound task."""
         pr_number = getattr(found, "number", None)
+        attempt = self.state.publication_attempt
+        owns_attempt = bool(
+            self._publication_attempt_matches_dispatch()
+            and attempt.pr_number == pr_number
+            and attempt.branch == getattr(found, "branch", None)
+        )
+        if owns_attempt:
+            if attempt.pending and (
+                attempt.exit_classification is None or not attempt.verified
+                or attempt.unverified_head_sha is not None
+                or attempt.head_sha != getattr(found, "head_sha", None)
+            ):
+                await self._transition_to_error(
+                    "Terminal PR publication is unverified; operator Retry recovery required",
+                    save_run_record_as=None, publish=True, log_prefix="[WATCH]",
+                )
+                return False
         legacy_fragment = (
             "merged externally -> IDLE"
             if pr_state == "MERGED"
@@ -1435,6 +1454,9 @@ class WatchMixin:
                 await self._clear_task_suppression(task_id)  # pragma: no cover
             if isinstance(pr_number, int):
                 self.state.quarantined_prs.discard(pr_number)
+            if owns_attempt:
+                # Keep the ownership hold until all terminal writes succeeded.
+                attempt.pending = False
             self._current_run_record = None
             self.state.current_task = None
             self.state.current_pr = None
