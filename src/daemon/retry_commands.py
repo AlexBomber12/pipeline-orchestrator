@@ -509,12 +509,14 @@ class RetryCommandMixin:
         resolved = False
         if attempt is not None and attempt.pending:
             resolved = await self._resolve_published_attempt()
+            attempt = self.state.publication_attempt
             if (not resolved and command.task_id == attempt.task_id
                 and command.task_branch == attempt.branch
                 and command.bound_pr_number is None):
                 resolved = await self._recover_branch_without_pr()
             if not resolved:
                 await self._release_abandoned_publication_attempt()
+                attempt = self.state.publication_attempt
                 if attempt.pending:
                     return await self._defer_retry_command(
                         command, "Publication ownership is unresolved; prior invocation retained.",

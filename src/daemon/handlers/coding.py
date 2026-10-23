@@ -508,8 +508,13 @@ class CodingMixin:
         resolved = await self._resolve_published_attempt()
         if resolved and self.state.current_task is None:
             return True
+        # Terminal bookkeeping may roll state back from a deep copy after a
+        # failed write. The pre-reconciliation attempt then points at an
+        # abandoned object and cannot authorize release of the live hold.
+        attempt = self.state.publication_attempt
         if not resolved:
             await self._release_abandoned_publication_attempt()
+            attempt = self.state.publication_attempt
             if not attempt.pending:
                 return False
         if self.state.user_paused or self.state.state == PipelineState.PAUSED:

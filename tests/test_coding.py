@@ -3388,6 +3388,44 @@ def test_retained_terminal_publication_survives_failed_status_write(monkeypatch)
     assert runner.state.current_task is None
 
 
+def test_terminal_publish_rollback_keeps_live_publication_hold(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    from src.daemon.retry_commands import RetryDispatch
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    remote["terminal"] = "CLOSED"
+    original_publish = runner.publish_state
+    failures = []
+
+    async def fail_terminal_publish():
+        if runner.state.current_task is None and len(failures) < 2:
+            failures.append(True)
+            raise OSError("state checkpoint unavailable")
+        await original_publish()
+
+    monkeypatch.setattr(runner, "publish_state", fail_terminal_publish)
+    assert asyncio.run(runner._hold_unresolved_publication())
+    assert failures
+    assert runner.state.current_task is not None
+    assert runner.state.publication_attempt.pending
+    assert runner.state.state == PipelineState.ERROR
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001")
+    defer = AsyncMock(return_value=RetryDispatch.HANDLED)
+    monkeypatch.setattr(runner, "_defer_retry_command", defer)
+    assert asyncio.run(runner._select_retry_continuation(command)) == RetryDispatch.HANDLED
+    assert runner.state.publication_attempt.pending
+    defer.assert_awaited_once()
+    assert asyncio.run(runner._hold_unresolved_publication())
+    assert runner.state.current_task is None
+    assert not runner.state.publication_attempt.pending
+
+
 def test_crash_after_fix_capture_keeps_unclassified_publication_held(monkeypatch):
     from src.keyspace import pipeline_state
 
