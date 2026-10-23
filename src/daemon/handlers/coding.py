@@ -330,6 +330,8 @@ class CodingMixin:
             if (outcome.discovery_complete and outcome.state in {
                 gh_prs.ExactPRState.MERGED, gh_prs.ExactPRState.CLOSED,
             }):
+                if attempt.unverified_head_sha is not None:
+                    return False
                 current.head_sha = attempt.head_sha
                 self.state.current_pr = current
                 attempt.verified = True
@@ -380,6 +382,16 @@ class CodingMixin:
                     # a headless attempt cannot repeat reconciliation on restart.
                     await self.publish_state()
 
+    async def _release_abandoned_publication_attempt(self) -> None:
+        """Prove absence after quiescence, including a pre-launch crash."""
+        attempt = self.state.publication_attempt
+        if (not self._publication_attempt_matches_dispatch()
+            or attempt.pr_number is not None or attempt.candidate is not None
+            or self._coder_invocation_active):
+            return
+        if await self._confirm_current_coder_cleanup("publication recovery"):
+            await self._release_unpublished_attempt(attempt.branch)
+
     async def _hold_unresolved_publication(self) -> bool:
         """Prevent IDLE/CODING from losing an unfinished publication attempt."""
         attempt = self.state.publication_attempt
@@ -388,6 +400,10 @@ class CodingMixin:
         resolved = await self._resolve_published_attempt()
         if resolved and self.state.current_task is None:
             return True
+        if not resolved:
+            await self._release_abandoned_publication_attempt()
+            if not attempt.pending:
+                return False
         if self.state.user_paused or self.state.state == PipelineState.PAUSED:
             if self.state.user_paused and not self._user_pause_logged:
                 self.log_event("[INFRA] Paused. Press Play to resume.")
@@ -395,6 +411,15 @@ class CodingMixin:
             await self.publish_state()
             return True
         if resolved and not attempt.failure and not self.state.error_message:
+            if self.state.active_invocation.phase == "fix":
+                # Play resumes the retained FIX; it is not CODING completion
+                # and an unchanged head must not request another review.
+                attempt.pending = False
+                self.state.state = PipelineState.WATCH
+                self._rehydrate_last_push_at(self.state.current_pr)
+                self.log_event("[FIX] Recovered retained PR -> WATCH.")
+                await self.publish_state()
+                return True
             await self._handoff_coding_pr_to_watch(
                 self.state.current_pr, "Recovered published PR -> WATCH.",
             )

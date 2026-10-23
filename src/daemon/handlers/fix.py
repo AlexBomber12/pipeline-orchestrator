@@ -678,6 +678,13 @@ class FixMixin(BreachMixin):
         if not cleanup_confirmed:
             return
         if external_state_flag["state"] is not None and not stop_cancelled:
+            attempt = self.state.publication_attempt
+            if attempt is not None and (
+                not self._publication_attempt_matches_dispatch()
+                or not attempt.verified or attempt.unverified_head_sha is not None
+            ):
+                await self._hold_unresolved_publication()
+                return
             if self.state.publication_attempt is not None:
                 self.state.publication_attempt.pending = False
             await self._handle_external_terminal_pr_state(

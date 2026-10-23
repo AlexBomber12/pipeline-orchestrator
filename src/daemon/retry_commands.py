@@ -506,11 +506,16 @@ class RetryCommandMixin:
         self, command: RetryCommand
     ) -> tuple[str, PRInfo | None] | RetryDispatch:
         attempt = self.state.publication_attempt
+        resolved = False
         if attempt is not None and attempt.pending:
-            if not await self._resolve_published_attempt():
-                return await self._defer_retry_command(
-                    command, "Publication ownership is unresolved; prior invocation retained.",
-                )
+            resolved = await self._resolve_published_attempt()
+            if not resolved:
+                await self._release_abandoned_publication_attempt()
+                if attempt.pending:
+                    return await self._defer_retry_command(
+                        command, "Publication ownership is unresolved; prior invocation retained.",
+                    )
+        if resolved:
             pr = self.state.current_pr
             if pr is None:
                 return await self._fail_retry_command(
