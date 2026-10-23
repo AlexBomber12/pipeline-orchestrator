@@ -786,13 +786,6 @@ class RetryCommandMixin:
                 return await self._defer_retry_command(
                     command, f"Could not bind Retry publication: {exc}.",
                 )
-            # The command now durably owns the exact PR even if later admission
-            # defers or accounting replaces the original invocation.
-            attempt = self.state.publication_attempt
-            if attempt is not None and attempt.pending:
-                attempt.pending = False
-                await self.publish_state()
-
         if continuation_name == "coding":
             coder = await self._ensure_retry_coder_available(command, header, task)
             if isinstance(coder, RetryDispatch):
@@ -813,6 +806,15 @@ class RetryCommandMixin:
             return await self._defer_retry_command(
                 command, f"Could not reserve retry allowance: {exc}."
             )
+
+        if continuation_name == "watch":
+            # Only transfer ownership after reservation succeeds: a cap failure
+            # removes the command from the queue, so the attempt must still hold
+            # the publication against normal ERROR diagnosis in that case.
+            attempt = self.state.publication_attempt
+            if attempt is not None and attempt.pending:
+                attempt.pending = False
+                await self.publish_state()
 
         if command.effect_stage == RetryEffectStage.RETRY_RESERVED:
             committed = await self._commit_task_status_change(

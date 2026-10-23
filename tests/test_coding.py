@@ -3390,4 +3390,76 @@ def test_retained_retry_durably_binds_before_admission_can_defer(monkeypatch, fa
         # List omission on a later attempt must never authorize CODING.
         monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
         monkeypatch.setattr(coding_module.gh_prs, "get_pr_state", lambda *a: "OPEN")
-        assert asyncio.run(runner._select_retry_continuation(stored)) == RetryDispatch.HANDLED
+        selected = asyncio.run(runner._select_retry_continuation(stored))
+        if failure == "reservation":
+            assert runner.state.publication_attempt.pending
+            assert selected[0] == "watch" and selected[1].number == 402
+        else:
+            assert selected == RetryDispatch.HANDLED
+
+
+@pytest.mark.parametrize("discovery_available", [False, True])
+def test_retained_publication_survives_retry_cap_and_next_error_cycle(
+    monkeypatch, discovery_available,
+):
+    from src.daemon.retry_commands import RetryDispatch
+    from src.keyspace import pipeline_state
+    from src.models import RepoState
+    from src.retry_commands import (
+        RetryCommandStatus,
+        enqueue_retry_command,
+        list_pending_retry_commands,
+        load_retry_command,
+    )
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    invocation = runner.state.active_invocation
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001")
+    command.repo_slug = runner.name
+    asyncio.run(enqueue_retry_command(runner.redis, command))
+    runner.redis.store[f"metrics:retry_count:{runner.name}:{command.task_id}"] = "3"
+    task = runner.state.current_task
+
+    async def validate(*args):
+        return object(), task
+
+    async def no_blocker(*args):
+        return None
+
+    def unexpected_diagnosis(*args, **kwargs):
+        pytest.fail("exhausted Retry must not enter normal AI diagnosis")
+
+    monkeypatch.setattr(runner, "_validate_retry_command", validate)
+    monkeypatch.setattr(runner, "_retry_blocker", no_blocker)
+    monkeypatch.setattr(runner, "_get_auxiliary_coder", unexpected_diagnosis)
+    assert asyncio.run(runner._apply_retry_command(command)) == RetryDispatch.HANDLED
+    stored = asyncio.run(load_retry_command(runner.redis, runner.name, command.command_id))
+    assert stored.status == RetryCommandStatus.FAILED
+    assert "Retry cap reached (3/3)" in stored.outcome_reason
+    assert stored.bound_pr_number == 402
+    assert asyncio.run(list_pending_retry_commands(runner.redis, runner.name)) == []
+    assert attempt.pending
+    assert runner.state.active_invocation == invocation
+
+    # With the failed command removed, the publication alone must retain ERROR,
+    # including when fresh GitHub discovery cannot confirm the retained PR.
+    remote["omit"] = remote["exact_unknown"] = not discovery_available
+    assert asyncio.run(runner._consume_retry_command()) == RetryDispatch.NONE
+    asyncio.run(runner.handle_error())
+    assert runner.state.state == PipelineState.ERROR
+    assert attempt.pending
+    assert runner.state.active_invocation == invocation
+    assert runner.state.current_pr.number == 402
+    assert remote["calls"] == 1
+    saved = RepoState.model_validate_json(
+        asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    )
+    assert saved.publication_attempt.pending
+    assert saved.publication_attempt.pr_number == 402
+    assert saved.active_invocation == invocation
