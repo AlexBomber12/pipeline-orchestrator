@@ -152,6 +152,7 @@ def test_remote_listener_registers_diagnostics_and_transport_allowlist() -> None
         "get_task_schema",
         "get_agents_md_template",
         "get_repo_task_status",
+        "get_latest_cli_log",
         "get_orchestrator_status",
     }
     assert result["security"]["enable_dns_rebinding_protection"] is True
@@ -219,6 +220,7 @@ def test_restricted_mcp_instance_does_not_register_runtime_diagnostics() -> None
 
     assert "healthcheck" in names
     assert "get_task_schema" in names
+    assert "get_latest_cli_log" not in names
     assert "get_orchestrator_status" not in names
 
 
@@ -239,6 +241,7 @@ def test_opted_in_mcp_instance_registers_runtime_diagnostics() -> None:
     )
     names = json.loads(completed.stdout.strip().splitlines()[-1])
 
+    assert "get_latest_cli_log" in names
     assert "get_orchestrator_status" in names
     assert "list_orchestrator_logs" not in names
     assert "read_orchestrator_log" not in names

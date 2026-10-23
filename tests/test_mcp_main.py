@@ -17,6 +17,7 @@ def test_all_mcp_tools_registered_on_canonical_instance() -> None:
         "get_task_schema",
         "get_agents_md_template",
         "get_repo_task_status",
+        "get_latest_cli_log",
         "get_orchestrator_status",
     }
 
