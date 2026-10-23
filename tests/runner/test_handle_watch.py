@@ -50,6 +50,8 @@ from src.publication_migration import (
 from src.publication_migration import enqueue as enqueue_migration
 from src.subsource_registry import SuppressionReason
 
+from tests.legacy_recovery_git import git as real_git
+from tests.legacy_recovery_git import legacy_repo
 from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
@@ -787,9 +789,8 @@ def test_watch_reconciles_legacy_receipt_without_label_dependency(
     monkeypatch.setattr(runner, "_commit_task_status_change", write)
     asyncio.run(runner.handle_watch())
     if change in {"none", "todo"}:
-        assert write.await_count == (0 if change == "todo" else 1)
-        if change != "todo":
-            assert write.await_args.args[1] == "TODO"
+        assert write.await_count == 1
+        assert write.await_args.args[1] == "TODO"
         assert runner.state.size_fix_completion is None
         assert runner.state.current_task.status == TaskStatus.DOING
     else:
@@ -809,6 +810,88 @@ def test_watch_reconciles_legacy_receipt_without_label_dependency(
                 "legacy completion validation deferred" in item["event"]
                 for item in runner.state.history
             )
+
+
+@pytest.mark.parametrize("remote_case", [
+    "todo_same", "todo_revised", "error_valid", "error_guardrail", "pr_mismatch",
+])
+def test_watch_legacy_receipt_validates_real_remote_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote_case: str,
+) -> None:
+    case = legacy_repo(tmp_path, remote_error=remote_case in {"error_valid", "error_guardrail"})
+    if remote_case == "todo_revised":
+        case.remote_task.write_text(
+            case.remote_task.read_text().replace("Original generation", "Revised generation"),
+            encoding="utf-8",
+        )
+    elif remote_case == "error_guardrail":
+        case.remote_task.write_text(
+            case.remote_task.read_text().replace("blocked_reason: crash", "blocked_reason: guardrail"),
+            encoding="utf-8",
+        )
+    if remote_case in {"todo_revised", "error_guardrail"}:
+        real_git(case.writer, "add", "tasks/PR-100.md")
+        real_git(case.writer, "commit", "-m", "newer task decision")
+        real_git(case.writer, "push", "origin", "main")
+    base_before = real_git(case.writer, "rev-parse", "HEAD")
+    local_before = real_git(case.repo, "rev-parse", "HEAD")
+    task_hash = task_spec_content_hash(case.task.read_text())
+    invocation = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="run-100", attempt_index=2, phase="fix", fix_iteration=1,
+    )
+    pr = PRInfo(
+        number=100, branch="pr-100-size", pr_id="PR-OTHER" if remote_case == "pr_mismatch" else "PR-100",
+        head_sha=case.head, fix_iteration_count=1, no_push_fix_count=2,
+    )
+    runner = h._make_runner()
+    runner.repo_path = str(case.repo)
+    runner.repo_config.url = str(case.remote)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = pr
+    runner.state.current_task = QueueTask(
+        pr_id="PR-100", title="Original generation", status=TaskStatus.ERROR,
+        branch="pr-100-size", task_file="tasks/PR-100.md",
+    )
+    runner.state.active_invocation = invocation
+    runner.state.size_fix_completion = SizeFixCompletion(
+        task_id="PR-100", branch="pr-100-size", pr_number=100,
+        head_sha=case.head, fixing_label="size-fix:" + case.head,
+        error_revision=case.revision, task_spec_hash=task_hash, invocation=invocation,
+    )
+    record = types.SimpleNamespace(
+        run_id="run-100", task_id="PR-100", invocations=[invocation],
+        fix_iterations=1, attempt_index=2, task_spec_hash=task_hash,
+    )
+    runner._current_run_record = record
+    coder = AsyncMock(side_effect=AssertionError("legacy completion must not rerun coder"))
+    monkeypatch.setattr(runner, "handle_coding", coder)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_a, **_k: [pr])
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_a, **_k: "OPEN")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *_a, **_k: None)
+    monkeypatch.setattr(watch_module, "checkout_process_blocker", lambda *_a: None)
+    asyncio.run(runner.handle_watch())
+    coder.assert_not_awaited()
+    assert real_git(case.repo, "rev-parse", "HEAD") == local_before
+    assert real_git(case.repo, "rev-parse", "origin/pr-100-size") == case.head
+    assert runner._current_run_record is record
+    assert runner.state.current_pr.fix_iteration_count == 1
+    assert runner.state.current_pr.no_push_fix_count == 2
+    if remote_case in {"todo_same", "error_valid"}:
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_task.status == TaskStatus.DOING
+        assert runner.state.size_fix_completion is None
+        remote_head = real_git(case.writer, "ls-remote", "origin", "refs/heads/main").split()[0]
+        assert (remote_head == base_before) == (remote_case == "todo_same")
+        real_git(case.writer, "fetch", "origin", "main")
+        assert "status: TODO" in real_git(case.writer, "show", "FETCH_HEAD:tasks/PR-100.md")
+    else:
+        if remote_case == "todo_revised":
+            assert runner.state.state == PipelineState.WATCH
+            assert runner.state.size_fix_completion is not None
+        else:
+            assert runner.state.state == PipelineState.ERROR
+        assert real_git(case.writer, "ls-remote", "origin", "refs/heads/main").split()[0] == base_before
 
 
 

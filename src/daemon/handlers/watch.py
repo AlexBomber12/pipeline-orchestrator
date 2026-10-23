@@ -324,17 +324,19 @@ class WatchMixin:
             if reason:
                 self.log_event(f"[WATCH] PR #{found.number} legacy completion waiting: {reason}")
                 return
-            if remote_status == "error":
-                try:
-                    committed = await self._commit_task_status_change(
-                        task, "TODO", "Legacy FIX completed; continuing published PR",
-                        expected_task_sha256=revision,
-                    )
-                except Exception as exc:
-                    self.log_event(f"[WATCH] PR #{found.number} legacy status retry deferred: {exc}")
-                    return
-                if not committed:
-                    return
+            # The writer checks the admitted task generation and exact remote
+            # revision even when TODO is already present. Its no-diff path is
+            # idempotent and leaves main untouched for a matching TODO.
+            try:
+                committed = await self._commit_task_status_change(
+                    task, "TODO", "Legacy FIX completed; continuing published PR",
+                    expected_task_sha256=revision,
+                )
+            except Exception as exc:
+                self.log_event(f"[WATCH] PR #{found.number} legacy status retry deferred: {exc}")
+                return
+            if not committed:
+                return
             self.state.current_task = task.model_copy(update={"status": TaskStatus.DOING})
             self.state.current_queue = [
                 self.state.current_task if item.pr_id == task.pr_id else item

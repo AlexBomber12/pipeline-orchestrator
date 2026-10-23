@@ -739,6 +739,11 @@ class RecoveryMixin:
                 log_message=f"recover_state failed: {exc}",
             )
             return False
+        # Load the retained receipt before deciding whether the configured
+        # base ref needs refreshing. A fresh runner has no in-memory
+        # _persisted_fix_recovery until this snapshot read completes.
+        if not await self._hydrate_current_task_from_persisted_state():
+            return False
         base_refreshed = False
         saved_fix = getattr(self, "_persisted_fix_recovery", None)
         if (
@@ -767,11 +772,8 @@ class RecoveryMixin:
         # decisions`` only runs the PR-186 crash path on a DOING entry,
         # so the task would be silently re-dispatched into a crash loop
         # instead of being marked ERROR pending manual re-upload.
-        # Run after the ``get_open_prs`` probe so a transient GitHub
-        # outage during recovery still surfaces as ERROR with no
-        # current_task.
-        if not await self._hydrate_current_task_from_persisted_state():
-            return False
+        # Hydration remains after the ``get_open_prs`` probe so a transient
+        # GitHub outage still surfaces as ERROR with no current_task.
         await self._hydrate_status_write_failed_task_pr_ids()
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery
