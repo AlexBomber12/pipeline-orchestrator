@@ -1400,7 +1400,8 @@ class WatchMixin:
         )
         if owns_attempt:
             if attempt.pending and (
-                not attempt.verified or attempt.unverified_head_sha is not None
+                attempt.exit_classification is None or not attempt.verified
+                or attempt.unverified_head_sha is not None
                 or attempt.head_sha != getattr(found, "head_sha", None)
             ):
                 await self._transition_to_error(

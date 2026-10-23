@@ -2834,13 +2834,13 @@ def test_play_after_stopped_unchanged_fix_resumes_without_coding_bookkeeping(mon
     runner.state.state = PipelineState.IDLE
     asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
     asyncio.run(runner.handle_idle())
-    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_pr.head_sha == remote["head"] == "a" * 40
-    assert not runner.state.publication_attempt.pending
+    assert runner.state.publication_attempt.pending
     assert runner._current_run_record is original_record
     assert recorded == []
     checkpoint = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
-    assert not type(runner.state).model_validate_json(checkpoint).publication_attempt.pending
+    assert type(runner.state).model_validate_json(checkpoint).publication_attempt.pending
 
 
 @pytest.mark.parametrize("local_state", ["absent", "branch", "commit"])
@@ -3388,16 +3388,58 @@ def test_retained_terminal_publication_survives_failed_status_write(monkeypatch)
     assert runner.state.current_task is None
 
 
-def test_watch_admission_consumes_retained_verified_publication(monkeypatch):
+def test_crash_after_fix_capture_keeps_unclassified_publication_held(monkeypatch):
+    from src.keyspace import pipeline_state
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+
+    async def failed_fix(*args, **kwargs):
+        remote["head"] = "b" * 40
+        monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: "b" * 40)
+        return 1, "gh repo create unsafe", "coder failed"
+
+    capture = runner._capture_published_attempt
+
+    async def crash_after_capture(*args, **kwargs):
+        await capture(*args, **kwargs)
+        raise asyncio.CancelledError("daemon stopped after FIX capture")
+
+    monkeypatch.setattr(h.claude_cli, "fix_review_async", failed_fix)
+    monkeypatch.setattr(runner, "_capture_published_attempt", crash_after_capture)
+    with pytest.raises(asyncio.CancelledError, match="after FIX capture"):
+        asyncio.run(runner.handle_fix())
+    saved = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    checkpoint = type(runner.state).model_validate_json(saved)
+    assert checkpoint.publication_attempt.pending
+    assert checkpoint.publication_attempt.exit_classification is None
+
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    assert asyncio.run(restarted.recover_state())
+    assert restarted.state.state == PipelineState.ERROR
+    assert restarted.state.publication_attempt.pending
+    assert restarted.state.publication_attempt.exit_classification is None
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001", bound_pr=restarted.state.current_pr)
+    result = asyncio.run(restarted._select_retry_continuation(command))
+    assert result != ("watch", restarted.state.current_pr)
+    assert restarted.state.publication_attempt.pending
+
+
+def test_watch_admission_keeps_failed_publication_until_retry(monkeypatch):
     runner = _runner(monkeypatch)
     _publication_transport(monkeypatch, runner)
     asyncio.run(runner.handle_coding())
     attempt = runner.state.publication_attempt
     assert attempt.pending and attempt.verified
-    # Play can resume WATCH directly, without going through operator Retry.
-    # Its exact observed PR admission must still consume the validated hold.
+    # A failed invocation requires operator Retry even when a later WATCH
+    # observation matches the retained PR exactly.
     runner._admit_observed_pr(runner.state.current_pr.model_copy())
-    assert not attempt.pending
+    assert attempt.pending
     assert attempt.failure == "coder failed"
 
 
@@ -3642,8 +3684,12 @@ def test_interrupted_fix_cannot_release_unpublished_head(
     if entry == "paused" and terminal is None:
         assert attempt.pending
         asyncio.run(runner.handle_idle())
-    assert runner.state.state == (PipelineState.IDLE if terminal else PipelineState.WATCH)
-    assert not attempt.pending
+    if interruption == "breach" and terminal is None:
+        assert runner.state.state == PipelineState.ERROR
+        assert attempt.pending
+    else:
+        assert runner.state.state == (PipelineState.IDLE if terminal else PipelineState.WATCH)
+        assert not attempt.pending
 
 
 def test_watch_terminal_keeps_unverified_publication(monkeypatch):

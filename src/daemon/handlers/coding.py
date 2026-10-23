@@ -378,8 +378,7 @@ class CodingMixin:
                 # may finalize the task and release its publication hold, but
                 # deferred terminal bookkeeping still needs the verified head.
                 if (not resolve_terminal or (
-                    self.state.active_invocation.phase == "coding"
-                    and attempt.exit_classification is None
+                    attempt.exit_classification is None
                 )):
                     return False
                 return await self._handle_external_pr_resolution(
@@ -519,10 +518,7 @@ class CodingMixin:
                 self._user_pause_logged = True
             await self.publish_state()
             return True
-        classified_success = (
-            self.state.active_invocation.phase == "fix"
-            or attempt.exit_classification == "success"
-        )
+        classified_success = attempt.exit_classification == "success"
         if resolved and classified_success and not attempt.failure and not self.state.error_message:
             if self.state.active_invocation.phase == "fix":
                 # Play resumes the retained FIX; it is not CODING completion

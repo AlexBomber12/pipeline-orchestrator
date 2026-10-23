@@ -747,6 +747,7 @@ async def test_timeout_admission_reconciles_and_consumes_publication_hold(
     runner, task, pr, task_path = await _timeout_runner(tmp_path, monkeypatch)
     runner._begin_publication_attempt(started_at=datetime.now(timezone.utc))
     attempt = runner.state.publication_attempt
+    attempt.exit_classification = "failure"
     attempt.unverified_head_sha = "b" * 40
     attempt.failure = runner.state.error_message
     original_error = runner.state.error_message

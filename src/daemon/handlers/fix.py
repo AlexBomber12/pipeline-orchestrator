@@ -918,6 +918,8 @@ class FixMixin(BreachMixin):
             self._completed_fix_run_id = run_record.run_id
         if external_state_flag["state"] is not None and not stop_cancelled:
             attempt = self.state.publication_attempt
+            if attempt is not None:
+                attempt.exit_classification = "failure"
             if attempt is not None and (
                 not self._publication_attempt_matches_dispatch()
                 or not attempt.verified or attempt.unverified_head_sha is not None
@@ -931,6 +933,8 @@ class FixMixin(BreachMixin):
             )
             return
         if breach_flag["breached"]:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
             if self.state.current_pr is not None:
                 # Late-breach pause is not a no-push success; reset the
                 # streak (Codex P2 on PR #222) — same rationale as the
@@ -1070,6 +1074,8 @@ class FixMixin(BreachMixin):
 
         await capture_stop_requested_after_exit()
         if idle_flag["timed_out"]:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
             # Idle timeout breaks the no-push streak: the coder didn't
             # produce a push and the daemon killed it. Reset the counter
             # so a later "no-push success" cycle starts fresh rather
@@ -1103,6 +1109,8 @@ class FixMixin(BreachMixin):
         await self._save_cli_log(stdout, stderr, f"FIX FEEDBACK output [{coder_name}]")
         violations = scan_stdout(f"{stdout}\n{stderr}")
         if violations:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
             first = violations[0]
             cause = f"GUARDRAIL: {first.category}: {first.excerpt}"
             for violation in violations:
@@ -1143,6 +1151,8 @@ class FixMixin(BreachMixin):
         await capture_stop_requested_after_exit()
         escalate_reason = fix_escalation.parse_escalate_marker(stdout)
         if escalate_reason is not None and self.state.current_pr is not None:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
             # Coder semantic circuit breaker (PR-166): an explicit
             # self-report wins over the regular push/return-code flow.
             # ``no_push_fix_count`` is reset because an explicit
@@ -1175,6 +1185,8 @@ class FixMixin(BreachMixin):
                 return
             return
         if stop_cancelled:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
             head_after = await read_head_after_fix()
             if head_after is None:
                 return
@@ -1206,6 +1218,8 @@ class FixMixin(BreachMixin):
             )
             return  # pragma: no cover - defensive fallback
         if code != 0:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
             # FIX failure breaks the consecutive no-push streak (Codex P2
             # on PR #222): a sequence like no-push success → failed FIX
             # → no-push success would otherwise still trip the deadlock
@@ -1237,6 +1251,10 @@ class FixMixin(BreachMixin):
         head_after = await read_head_after_fix()
         if head_after is None:
             return
+
+        if self.state.publication_attempt is not None:
+            self.state.publication_attempt.exit_classification = "success"
+            await self.publish_state()
 
         attempt = self.state.publication_attempt
         if attempt is not None and attempt.unverified_head_sha is not None:

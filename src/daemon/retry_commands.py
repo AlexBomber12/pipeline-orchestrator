@@ -532,8 +532,7 @@ class RetryCommandMixin:
                 or (command.bound_pr_head_sha and command.bound_pr_head_sha != pr.head_sha)
             ):
                 return await self._fail_retry_command(command, "Retained publication identity changed.")
-            if (self.state.active_invocation.phase == "coding"
-                and attempt.exit_classification is None):
+            if attempt.exit_classification is None:
                 return await self._defer_retry_command(
                     command, "Coder exit is unclassified; operator recovery required.",
                 )
