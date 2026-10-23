@@ -775,9 +775,11 @@ class RecoveryMixin:
         # current_task.
         if not await self._hydrate_current_task_from_persisted_state():
             return False
+        # Publication recovery can complete early in ERROR. Restore failed
+        # status writes first so subsequent ERROR cycles can repair the header.
+        await self._hydrate_status_write_failed_task_pr_ids()
         if await self._hold_unresolved_publication():
             return True
-        await self._hydrate_status_write_failed_task_pr_ids()
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery
         # fetch and reset on exit so ``handle_idle`` does not later read

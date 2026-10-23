@@ -3116,8 +3116,9 @@ def test_restart_after_successful_exit_classification_resumes_watch(monkeypatch)
 @pytest.mark.parametrize("phase", ["coding", "fix"])
 @pytest.mark.parametrize("visible", [False, True])
 @pytest.mark.parametrize("status_context", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
 def test_error_retries_status_write_before_retained_publication(
-    monkeypatch, tmp_path, phase, visible, status_context,
+    monkeypatch, tmp_path, phase, visible, status_context, restart,
 ):
     from dataclasses import replace
 
@@ -3137,6 +3138,20 @@ def test_error_retries_status_write_before_retained_publication(
     asyncio.run(runner._mark_status_write_failed_task(
         task, blocked_reason=SuppressionReason.CRASH,
     ))
+    if restart:
+        asyncio.run(runner.publish_state())
+        restarted = h._make_runner()
+        restarted.redis = runner.redis
+        assert not restarted._status_write_failed_task_pr_ids
+        monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
+        assert asyncio.run(restarted.recover_state())
+        runner = restarted
+        task = runner.state.current_task
+        attempt = runner.state.publication_attempt
+        assert task.pr_id in runner._status_write_failed_task_pr_ids
+        assert task_path.read_text() == "status: DOING\n"
+        assert runner.state.state == PipelineState.ERROR
+        assert attempt.pending
     writes = []
 
     async def commit(current_task, status, context, *, blocked_reason):
