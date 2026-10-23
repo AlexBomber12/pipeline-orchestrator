@@ -1737,6 +1737,7 @@ def test_run_cycle_transient_discovery_failure_stays_retryable(
     runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.preflight = clean_preflight  # type: ignore[method-assign]
+    runner._check_github_api_budget = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
     # First cycle: discovery fails, cycle bails with ERROR.
     asyncio.run(runner.run_cycle())
@@ -1812,6 +1813,7 @@ def test_run_cycle_subsequent_cycle_still_runs_preflight(
     runner.recover_state = noop_recover  # type: ignore[method-assign]
     runner.preflight = ok_preflight  # type: ignore[method-assign]
     runner.handle_idle = noop_idle  # type: ignore[method-assign]
+    runner._check_github_api_budget = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
     asyncio.run(runner.run_cycle())  # recovery cycle: skips preflight
     asyncio.run(runner.run_cycle())  # normal cycle: runs preflight

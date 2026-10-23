@@ -193,6 +193,50 @@ class ApprovalCommandMixin:
                     if raw:
                         persisted = RepoState.model_validate_json(raw)
                         if (
+                            persisted.state == PipelineState.FIX
+                            and persisted.name == self.name
+                            and command.repo_slug == self.name
+                            and matches_state(command, persisted)
+                        ):
+                            invocation = persisted.active_invocation
+                            blocker = checkout_process_blocker(self.repo_path)
+                            if blocker:
+                                self.log_event(f"[FIX] Persisted invocation ownership pending: {blocker}")
+                                return True
+                            record = (
+                                await self._metrics_store.get(invocation.run_id)
+                                if invocation is not None and invocation.run_id is not None else None
+                            )
+                            invalid_record = bool(
+                                record is None or invocation is None
+                                or invocation.phase != "fix"
+                                or record.run_id != invocation.run_id
+                                or record.task_id != command.task.pr_id
+                                or record.repo_name != self.name
+                                or record.task_spec_hash != command.task_fingerprint
+                                or record.attempt_index != invocation.attempt_index
+                                or record.ended_at is not None
+                                or not record.invocations
+                                or record.invocations[-1] != invocation
+                            )
+                            if invalid_record:
+                                self.log_event(
+                                    "[FIX] Persisted invocation accounting changed; "
+                                    "parking for operator Retry."
+                                )
+                            self.state = persisted
+                            self._current_run_record = None if invalid_record else record
+                            active_cause = await self.redis.get(cause_key(self.name, command.task.pr_id))
+                            await self._transition_to_error(
+                                "Persisted FIX invocation ownership is uncertain; operator Retry required",
+                                save_run_record_as=None, log_prefix="[FIX]", commit_task_status=True,
+                                cancellation_cause=(
+                                    CancellationCause.from_redis(active_cause) if active_cause else None
+                                ),
+                            )
+                            self._recovered = True
+                            return True
+                        if (
                             persisted.state == PipelineState.WATCH
                             and matches_state(command, persisted, check_head=False)
                         ):

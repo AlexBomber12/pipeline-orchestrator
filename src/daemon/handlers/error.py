@@ -199,6 +199,10 @@ class ErrorMixin:
             self._status_write_failed_task_pr_ids.discard(retry_task_id)
             await self._persist_status_write_failed_task_pr_ids()
 
+        if context.startswith("Persisted FIX invocation ownership is uncertain; operator Retry required"):
+            self.log_event("[RECOVERY] Uncertain FIX invocation remains parked for operator Retry.")
+            return
+
         async def _clear_cause_for_retry() -> None:
             if retry_task_id is not None:
                 await safe_delete_cancellation_cause(
