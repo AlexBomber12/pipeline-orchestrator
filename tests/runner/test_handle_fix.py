@@ -919,6 +919,63 @@ def test_handle_fix_external_terminal_waits_for_confirmed_cleanup(
     assert runner.state.current_pr is not None
 
 
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+def test_handle_fix_inflight_terminal_records_verified_pushed_head(
+    monkeypatch: pytest.MonkeyPatch, terminal: str,
+) -> None:
+    from src.daemon.handlers import coding as coding_module
+
+    from tests.test_coding import _publication_transport, _runner
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+    assert runner.state.current_pr.head_sha == "a" * 40
+    runner._start_current_run_record("claude", "opus")
+    terminal_flag: dict[str, str | None] = {}
+
+    def monitor(pr_number, target, flag):
+        nonlocal terminal_flag
+        terminal_flag = flag
+        return None
+
+    async def fix(*args, **kwargs):
+        remote["head"] = "b" * 40
+        remote["terminal"] = terminal
+        terminal_flag["state"] = terminal
+        return 0, "", ""
+
+    monkeypatch.setattr(runner, "_run_coder_with_polling", monitor)
+    monkeypatch.setattr(h.claude_cli, "fix_review_async", fix)
+    monkeypatch.setattr(
+        coding_module, "_local_branch_head_sha", lambda *args: remote["head"],
+    )
+    observed = []
+    original_save = runner._save_current_run_record
+
+    async def save_outcome(outcome):
+        attempt = runner.state.publication_attempt
+        observed.append((outcome, runner.state.current_pr.head_sha))
+        assert attempt.candidate.head_sha == attempt.head_sha == "b" * 40
+        assert attempt.unverified_head_sha is None
+        assert not attempt.pending
+        await original_save(outcome)
+
+    monkeypatch.setattr(runner, "_save_current_run_record", save_outcome)
+    asyncio.run(runner.handle_fix())
+
+    outcome = "success_merged" if terminal == "MERGED" else "closed_unmerged"
+    assert observed == [(outcome, "b" * 40)]
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    recent = asyncio.run(runner._metrics_store.recent(
+        task_id="PR-001", limit=1, repo_name=runner.name,
+    ))
+    assert recent[0].exit_reason == outcome
+    if terminal == "MERGED":
+        assert recent[0].head_sha == "b" * 40
+
+
 def test_handle_fix_escalates_at_iteration_cap_before_next_spawn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

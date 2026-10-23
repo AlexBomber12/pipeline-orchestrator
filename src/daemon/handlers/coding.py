@@ -330,13 +330,14 @@ class CodingMixin:
             if (outcome.discovery_complete and outcome.state in {
                 gh_prs.ExactPRState.MERGED, gh_prs.ExactPRState.CLOSED,
             }):
-                # Capture may run before process cleanup. Only consuming paths
-                # may finalize the task and release its publication hold.
-                if not resolve_terminal:
-                    return False
                 current.head_sha = attempt.head_sha
                 self.state.current_pr = current
                 attempt.verified = True
+                # Capture may run before process cleanup. Only consuming paths
+                # may finalize the task and release its publication hold, but
+                # deferred terminal bookkeeping still needs the verified head.
+                if not resolve_terminal:
+                    return False
                 attempt.pending = False
                 await self._handle_external_pr_resolution(current, outcome.state.value)
                 return True
