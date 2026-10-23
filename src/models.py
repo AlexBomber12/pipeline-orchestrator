@@ -213,6 +213,7 @@ class PublicationAttempt(BaseModel):
     pending: bool = True
     verified: bool = False
     failure: str | None = None
+    exit_classification: Literal["success", "failure"] | None = None
 
 
 class PublicationWatermark(BaseModel):

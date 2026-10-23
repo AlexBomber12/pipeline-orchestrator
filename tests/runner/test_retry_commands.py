@@ -1731,6 +1731,7 @@ async def test_retry_reconciles_retained_publication_before_replacing_invocation
     attempt = runner.state.publication_attempt
     attempt.pr_number, attempt.candidate, attempt.head_sha = pr.number, pr, pr.head_sha
     attempt.failure = "prior failure"
+    attempt.exit_classification = "failure"
 
     monkeypatch.setattr(cache, "_etag_get", lambda path: {
         "number": 42, "state": "open", "merged": False,

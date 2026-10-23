@@ -1605,7 +1605,7 @@ def test_failed_fix_retains_exact_pr_and_failure_on_restart(monkeypatch):
 
 
 @pytest.mark.parametrize("paused", [False, True])
-def test_restart_after_publication_checkpoint_preserves_pause_or_resumes_owned_pr(monkeypatch, paused):
+def test_restart_after_publication_checkpoint_preserves_pause_or_holds_unclassified_pr(monkeypatch, paused):
     runner = _runner(monkeypatch)
     remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
 
@@ -1628,7 +1628,7 @@ def test_restart_after_publication_checkpoint_preserves_pause_or_resumes_owned_p
     monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
     assert asyncio.run(restarted.recover_state())
     assert restarted.state.current_pr.number == 402
-    assert restarted.state.state == (PipelineState.PAUSED if paused else PipelineState.WATCH)
+    assert restarted.state.state == (PipelineState.PAUSED if paused else PipelineState.ERROR)
     assert restarted.state.user_paused is paused
     assert remote["calls"] == 1
 
@@ -2591,9 +2591,9 @@ def test_restart_recovers_publication_before_head_capture(monkeypatch, local_hea
         retry_runner.state = type(runner.state).model_validate_json(saved)
         command = _command(_task_text(task_id="PR-001", branch="pr-001"),
                            task_id="PR-001", branch="pr-001")
-        continuation, pr = asyncio.run(retry_runner._select_retry_continuation(command))
-        assert continuation == "watch"
-        assert pr.number == 402
+        from src.daemon.retry_commands import RetryDispatch
+        assert asyncio.run(retry_runner._select_retry_continuation(command)) == RetryDispatch.HANDLED
+        assert retry_runner.state.publication_attempt.pending
     restarted = h._make_runner()
     restarted.redis = runner.redis
     assert asyncio.run(restarted.recover_state())
@@ -2601,13 +2601,10 @@ def test_restart_recovers_publication_before_head_capture(monkeypatch, local_hea
     assert attempt.head_sha == "a" * 40
     assert attempt.pr_number == 402
     assert attempt.verified
-    if terminal:
-        assert restarted.state.state == PipelineState.IDLE
-        assert restarted.state.current_task is None
-        assert not attempt.pending
-    else:
-        assert restarted.state.state == PipelineState.WATCH
-        assert restarted.state.current_pr.number == 402
+    assert restarted.state.state == PipelineState.ERROR
+    assert restarted.state.current_task is not None
+    assert attempt.pending
+    assert attempt.exit_classification is None
     assert remote["calls"] == 1
 
 
@@ -2897,3 +2894,202 @@ def test_retry_cleans_unpublished_local_branch_before_release(monkeypatch, tmp_p
     # abandoned branch had a clean unpublished commit or was checked out.
     git("checkout", "-b", "pr-001", "origin/main")
     assert git("rev-parse", "HEAD") == base_sha
+
+
+@pytest.mark.parametrize("pushed", [False, True])
+def test_restart_retains_fix_commit_created_before_capture(monkeypatch, pushed):
+    from src.keyspace import pipeline_state
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+
+    async def fix(*args, **kwargs):
+        monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: "b" * 40)
+        return 0, "", ""
+
+    async def crash(*args):
+        raise asyncio.CancelledError("crash before FIX capture")
+
+    monkeypatch.setattr(h.claude_cli, "fix_review_async", fix)
+    monkeypatch.setattr(runner, "_capture_published_attempt", crash)
+    with pytest.raises(asyncio.CancelledError, match="before FIX capture"):
+        asyncio.run(runner.handle_fix())
+    saved = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    assert type(runner.state).model_validate_json(saved).publication_attempt.head_sha == "a" * 40
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    assert asyncio.run(restarted.recover_state())
+    attempt = restarted.state.publication_attempt
+    assert restarted.state.state == PipelineState.ERROR
+    assert attempt.pending
+    assert attempt.head_sha == "a" * 40
+    assert attempt.unverified_head_sha == "b" * 40
+    checkpoint = asyncio.run(restarted.redis.get(pipeline_state(restarted.name)))
+    assert type(runner.state).model_validate_json(checkpoint).publication_attempt.unverified_head_sha == "b" * 40
+    if pushed:
+        remote["head"] = "b" * 40
+    assert asyncio.run(restarted._resolve_published_attempt()) is pushed
+    assert attempt.pending
+    assert attempt.unverified_head_sha == (None if pushed else "b" * 40)
+    assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("code,stdout", [(0, "ok"), (1, "failed"), (0, "gh repo create unsafe")])
+def test_unclassified_coding_exit_cannot_resume_after_capture_crash(monkeypatch, code, stdout):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=code, stdout=stdout)
+
+    async def crash(*args, **kwargs):
+        raise RuntimeError("before classification")
+
+    monkeypatch.setattr(runner, "_post_coder_resolution", crash)
+    with pytest.raises(RuntimeError, match="before classification"):
+        asyncio.run(runner.handle_coding())
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    assert asyncio.run(restarted.recover_state())
+    assert restarted.state.current_pr.number == 402
+    assert restarted.state.state == PipelineState.ERROR
+    assert restarted.state.publication_attempt.pending
+    assert restarted.state.publication_attempt.exit_classification is None
+    assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("stopped", [False, True])
+@pytest.mark.parametrize("legacy_suppression", [False, True])
+def test_guardrail_suppression_precedes_delayed_pr_discovery(monkeypatch, stopped, legacy_suppression):
+    from src.subsource_registry import SuppressionReason
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, stdout="gh repo create unsafe")
+    remote["omit"] = True
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+    applied = []
+    monkeypatch.setattr(coding_module, "apply_quarantine_label_for_violation",
+                        lambda runner, number, violation: applied.append((number, violation.category)))
+    if stopped:
+        original = runner._post_coder_resolution
+
+        async def stop_then_classify(*args, **kwargs):
+            runner._stop_requested = True
+            await original(*args, **kwargs)
+
+        monkeypatch.setattr(runner, "_post_coder_resolution", stop_then_classify)
+    asyncio.run(runner.handle_coding())
+    suppression = asyncio.run(runner._suppression_record_for_task("PR-001"))
+    assert suppression.reason == SuppressionReason.GUARDRAIL
+    assert runner.state.publication_attempt.pr_number is None
+    if legacy_suppression:
+        asyncio.run(runner._suppress_task("PR-001", SuppressionReason.GUARDRAIL))
+    remote["omit"] = False
+    assert asyncio.run(runner._resolve_published_attempt())
+    assert runner.state.quarantined_prs == {402}
+    assert applied == ([] if legacy_suppression else [(402, "repo_create")])
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001")
+    assert asyncio.run(runner._retry_blocker(command)) is not None
+    assert runner.state.publication_attempt.pending
+
+
+@pytest.mark.parametrize("blocker", [
+    None, "cleanup", "suppression", "absent", "unknown", "publication", "outage",
+    "create", "unclassified", "active", "mismatch", "no_baseline",
+])
+def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
+    from src.subsource_registry import SuppressionReason
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    remote["omit"] = True
+    _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    assert attempt.exit_classification == "failure"
+    # Repeated normal reconciliation cannot release or rerun the coder.
+    assert not asyncio.run(runner._resolve_published_attempt())
+    assert not asyncio.run(runner._resolve_published_attempt())
+    creates = []
+    discovery = []
+    async def cleanup(*args):
+        return blocker != "cleanup"
+
+    monkeypatch.setattr(runner, "_confirm_current_coder_cleanup", cleanup)
+    monkeypatch.setattr(coding_module, "_remote_branch_exists",
+                        lambda *a: {"absent": False, "unknown": None}.get(blocker, True))
+    if blocker == "suppression":
+        asyncio.run(runner._suppress_task("PR-001", SuppressionReason.GUARDRAIL))
+    if blocker == "unclassified":
+        attempt.exit_classification = None
+    if blocker == "active":
+        runner._coder_invocation_active = True
+    if blocker == "mismatch":
+        attempt.run_id = "wrong-run"
+    if blocker == "no_baseline":
+        attempt.baseline_numbers = None
+    real_transport = gh_runner.run_gh
+
+    def transport(args, **kwargs):
+        if args[:2] == ["pr", "create"]:
+            creates.append(args)
+            if blocker == "create":
+                raise RuntimeError("create unavailable")
+            remote["omit"] = False
+            return "https://github.com/octo/demo/pull/402"
+        discovery.append(args)
+        # First lookup is reconciliation, second is fresh pre-create discovery.
+        if len(discovery) == 2 and blocker in {"outage", "publication"}:
+            if blocker == "outage":
+                raise OSError("all-state unavailable")
+            remote["omit"] = False
+        return real_transport(args, **kwargs)
+
+    monkeypatch.setattr(gh_runner, "run_gh", transport)
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001")
+    result = asyncio.run(runner._select_retry_continuation(command))
+    if blocker is None:
+        assert result[0] == "watch"
+        assert result[1].head_sha == "a" * 40
+        assert attempt.verified
+        assert creates[0][:2] == ["pr", "create"]
+        assert creates[0][creates[0].index("--head") + 1] == "pr-001"
+        assert creates[0][creates[0].index("--base") + 1] == "main"
+    else:
+        assert result != ("coding", None)
+        assert len(creates) == (1 if blocker == "create" else 0)
+    assert attempt.pending is (blocker != "absent")
+    assert remote["calls"] == 1
+
+
+def test_restart_after_successful_exit_classification_resumes_watch(monkeypatch):
+    from src.keyspace import pipeline_state
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+
+    async def crash_before_handoff(*args, **kwargs):
+        raise RuntimeError("crash after successful classification")
+
+    monkeypatch.setattr(runner, "_handoff_coding_pr_to_watch", crash_before_handoff)
+    with pytest.raises(RuntimeError, match="after successful classification"):
+        asyncio.run(runner.handle_coding())
+    saved = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    checkpoint = type(runner.state).model_validate_json(saved)
+    assert checkpoint.publication_attempt.exit_classification == "success"
+    assert checkpoint.publication_attempt.pending
+    remote["omit"] = True
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    reviews = []
+    restarted._post_codex_review = lambda number: reviews.append(number) or True
+    assert asyncio.run(restarted.recover_state())
+    assert restarted.state.state == PipelineState.WATCH
+    assert restarted.state.current_pr.number == 402
+    assert not restarted.state.publication_attempt.pending
+    assert reviews == [402]
+    assert remote["calls"] == 1

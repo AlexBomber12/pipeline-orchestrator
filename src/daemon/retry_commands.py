@@ -509,6 +509,10 @@ class RetryCommandMixin:
         resolved = False
         if attempt is not None and attempt.pending:
             resolved = await self._resolve_published_attempt()
+            if (not resolved and command.task_id == attempt.task_id
+                and command.task_branch == attempt.branch
+                and command.bound_pr_number is None):
+                resolved = await self._recover_branch_without_pr()
             if not resolved:
                 await self._release_abandoned_publication_attempt()
                 if attempt.pending:
@@ -528,6 +532,11 @@ class RetryCommandMixin:
                 or (command.bound_pr_head_sha and command.bound_pr_head_sha != pr.head_sha)
             ):
                 return await self._fail_retry_command(command, "Retained publication identity changed.")
+            if (self.state.active_invocation.phase == "coding"
+                and attempt.exit_classification is None):
+                return await self._defer_retry_command(
+                    command, "Coder exit is unclassified; operator recovery required.",
+                )
             return "watch", pr
         try:
             open_prs = await asyncio.to_thread(

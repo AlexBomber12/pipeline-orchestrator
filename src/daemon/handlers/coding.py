@@ -27,10 +27,11 @@ from src.cancellation import (
 )
 from src.coder_registry import CoderPlugin
 from src.daemon import fix_escalation, git_ops
-from src.daemon.guardrails import scan_stdout
+from src.daemon.guardrails import GuardrailViolation, scan_stdout
 from src.daemon.handlers import CoderUnavailable
 from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.daemon.selector import CoderSelectionUnavailable
+from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.models import PipelineState, PRInfo, PublicationAttempt
 from src.process_supervisor import (
@@ -276,6 +277,13 @@ class CodingMixin:
         if not self._publication_attempt_matches_dispatch():
             return False
         try:
+            if self.state.active_invocation.phase == "fix":
+                local_head = await asyncio.to_thread(
+                    _local_branch_head_sha, self.repo_path, attempt.branch,
+                )
+                if local_head is not None and local_head != attempt.head_sha:
+                    attempt.unverified_head_sha = local_head
+                    await self.publish_state()
             if attempt.head_sha is None:
                 # A restart can precede capture even after the coder published.
                 # Prefer the exact local task ref; if it is gone, use only one
@@ -300,6 +308,16 @@ class CodingMixin:
                 attempt.head_sha = candidate.head_sha
                 attempt.pr_number = candidate.number
                 attempt.candidate = candidate
+            suppression = await self._suppression_record_for_task(attempt.task_id)
+            if (suppression is not None and suppression.reason == SuppressionReason.GUARDRAIL
+                and attempt.pr_number not in self.state.quarantined_prs):
+                self.state.quarantined_prs.add(attempt.pr_number)
+                violation = suppression.detail.get("violation")
+                if violation:
+                    apply_quarantine_label_for_violation(
+                        self, attempt.pr_number, GuardrailViolation(**violation),
+                    )
+                await self.publish_state()
             current = attempt.candidate
             if (current is None or current.number != attempt.pr_number
                 or current.branch != attempt.branch or current.is_cross_repository
@@ -338,7 +356,10 @@ class CodingMixin:
                 # Capture may run before process cleanup. Only consuming paths
                 # may finalize the task and release its publication hold, but
                 # deferred terminal bookkeeping still needs the verified head.
-                if not resolve_terminal:
+                if (not resolve_terminal or (
+                    self.state.active_invocation.phase == "coding"
+                    and attempt.exit_classification is None
+                )):
                     return False
                 attempt.pending = False
                 await self._handle_external_pr_resolution(current, outcome.state.value)
@@ -414,6 +435,38 @@ class CodingMixin:
         if await self._confirm_current_coder_cleanup("publication recovery"):
             await self._release_unpublished_attempt(attempt.branch)
 
+    async def _recover_branch_without_pr(self) -> bool:
+        """Operator Retry may publish an abandoned pushed branch after fresh discovery."""
+        attempt = self.state.publication_attempt
+        if (not self._publication_attempt_matches_dispatch()
+            or attempt.pr_number is not None or attempt.baseline_numbers is None
+            or attempt.exit_classification is None or self._coder_invocation_active):
+            return False
+        if not await self._confirm_current_coder_cleanup("Retry PR creation"):
+            return False
+        suppression = await self._suppression_record_for_task(attempt.task_id)
+        if suppression is not None and suppression.reason == SuppressionReason.GUARDRAIL:
+            return False
+        try:
+            if await asyncio.to_thread(_remote_branch_exists, self.repo_path, attempt.branch) is not True:
+                return False
+            publications = await asyncio.to_thread(
+                gh_prs.get_branch_publications, attempt.repo, attempt.base, attempt.branch,
+            )
+            if publications:
+                return False
+            await asyncio.to_thread(
+                gh_runner.run_gh,
+                ["pr", "create", "--base", attempt.base, "--head", attempt.branch,
+                 "--title", f"{attempt.task_id}: {self.state.current_task.title}",
+                 "--body", "Recovered pushed task branch on operator Retry; normal CI and review gates apply."],
+                repo=attempt.repo,
+            )
+            return await self._resolve_published_attempt()
+        except Exception as exc:
+            self.log_event(f"[INFRA] Retry PR creation deferred: {exc}")
+            return False
+
     async def _hold_unresolved_publication(self) -> bool:
         """Prevent IDLE/CODING from losing an unfinished publication attempt."""
         attempt = self.state.publication_attempt
@@ -432,7 +485,11 @@ class CodingMixin:
                 self._user_pause_logged = True
             await self.publish_state()
             return True
-        if resolved and not attempt.failure and not self.state.error_message:
+        classified_success = (
+            self.state.active_invocation.phase == "fix"
+            or attempt.exit_classification == "success"
+        )
+        if resolved and classified_success and not attempt.failure and not self.state.error_message:
             if self.state.active_invocation.phase == "fix":
                 # Play resumes the retained FIX; it is not CODING completion
                 # and an unchanged head must not request another review.
@@ -1352,11 +1409,13 @@ class CodingMixin:
             self.state.user_paused = True
             if current_pr_id is not None:
                 self._user_stopped_task_pr_ids.add(current_pr_id)
-                await self._suppress_task(
-                    current_pr_id,
-                    SuppressionReason.OPERATOR_STOPPED,
-                    {"source": "stop_requested_after_coder_exit"},
-                )
+                suppression = await self._suppression_record_for_task(current_pr_id)
+                if suppression is None or suppression.reason != SuppressionReason.GUARDRAIL:
+                    await self._suppress_task(
+                        current_pr_id,
+                        SuppressionReason.OPERATOR_STOPPED,
+                        {"source": "stop_requested_after_coder_exit"},
+                    )
             self.state.state = PipelineState.PAUSED
             await self._clear_error_message_on_recovery(
                 log_prefix="[CODING]",
@@ -1380,26 +1439,24 @@ class CodingMixin:
                     tier="guardrail",
                     kind=violation.category,
                 )
-            if await pause_for_stop_if_requested():
-                return
             protected_pr = self.state.current_pr
             if protected_pr is None and self._publication_attempt_matches_dispatch():
-                # Discovery already bounded this candidate to the dispatch.
-                # An unavailable exact read must not bypass quarantine.
                 protected_pr = self.state.publication_attempt.candidate
+            task_id = self.state.current_task.pr_id if self.state.current_task else current_pr_id
+            await self._suppress_task(
+                task_id or "",
+                SuppressionReason.GUARDRAIL,
+                {"pr_number": protected_pr.number if protected_pr else None,
+                 "reason_text": cause, "violation": {
+                     "tier": first.tier, "category": first.category,
+                     "excerpt": first.excerpt, "rule": first.rule,
+                 }},
+            )
             if protected_pr is not None:
-                pr_number = protected_pr.number
-                self.state.quarantined_prs.add(pr_number)
-                task_id = (
-                    protected_pr.pr_id
-                    or (self.state.current_task.pr_id if self.state.current_task else "")
-                )
-                await self._suppress_task(
-                    task_id,
-                    SuppressionReason.GUARDRAIL,
-                    {"pr_number": pr_number, "reason_text": cause},
-                )
-                apply_quarantine_label_for_violation(self, pr_number, first)
+                self.state.quarantined_prs.add(protected_pr.number)
+                apply_quarantine_label_for_violation(self, protected_pr.number, first)
+            if await pause_for_stop_if_requested():
+                return
             await self._transition_to_error(
                 cause,
                 publish=False,
@@ -1432,6 +1489,9 @@ class CodingMixin:
             )
             return
 
+        if self.state.publication_attempt is not None:
+            self.state.publication_attempt.exit_classification = "failure"
+            await self.publish_state()
         if code != 0 and not (publication and publication.cancelled_by_publication):
             resolved = await self._resolve_published_attempt()
             if resolved and self.state.current_pr is None:
@@ -1471,6 +1531,9 @@ class CodingMixin:
                     ),
                 )
                 return
+        if self.state.publication_attempt is not None:
+            self.state.publication_attempt.exit_classification = "success"
+            await self.publish_state()
         # A bounded positive identity can be retained despite list omissions.
         if self.state.publication_attempt is not None:
             resolved = await self._resolve_published_attempt()
