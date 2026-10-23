@@ -28,7 +28,7 @@ from src.coder_registry import CoderPlugin
 from src.daemon import git_ops
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers import CoderUnavailable
-from src.daemon.quarantine import apply_quarantine_label_for_violation, is_continued_size_label
+from src.daemon.quarantine import apply_quarantine_label_for_violation
 from src.daemon.selector import CoderSelectionUnavailable
 from src.github import cache as gh_cache
 from src.github import gh_runner
@@ -257,16 +257,6 @@ class CodingMixin:
                 log_prefix="[CODING]",
             )
             return
-
-        if self.state.current_pr is not None:
-            markers = {
-                label for label in self.state.current_pr.quarantine_labels
-                if is_continued_size_label(label)
-            }
-            if markers:
-                self.log_event("[CODING] Existing size-continuation PR belongs in WATCH; deferring dispatch.")
-                self.state.state = PipelineState.WATCH
-                return
 
         # AUTO PR dispatch: read the task spec inline before invoking the
         # coder so the daemon supplies the canonical pr_id, task_file, and

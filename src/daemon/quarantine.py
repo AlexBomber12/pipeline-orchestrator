@@ -6,10 +6,7 @@ import re
 from typing import TYPE_CHECKING
 
 from src.audit.operator_actions import write_operator_action_audit
-from src.daemon.fix_escalation import (
-    _exception_text,
-    _is_label_already_exists_error,
-)
+from src.daemon.fix_escalation import _exception_text, _is_label_already_exists_error
 from src.daemon.guardrails import GuardrailViolation
 from src.github import gh_runner
 
@@ -32,70 +29,40 @@ CONTINUED_SIZE_PREFIX = "size-ok:"
 FIXING_SIZE_PREFIX = "size-fix:"
 
 
-def continued_size_label(head_sha: str) -> str:
-    """Identify the exact PR revision whose size decision was continued."""
-    if re.fullmatch(r"[0-9a-fA-F]{40}", head_sha) is None:
-        raise ValueError("A published PR HEAD is required for size continuation")
-    return f"{CONTINUED_SIZE_PREFIX}{head_sha.lower()}"
-
-
 def is_continued_size_label(label: str) -> bool:
     return re.fullmatch(rf"{CONTINUED_SIZE_PREFIX}[0-9a-fA-F]{{40}}", label) is not None
-
-
-def fixing_size_label(head_sha: str) -> str:
-    return continued_size_label(head_sha).replace(CONTINUED_SIZE_PREFIX, FIXING_SIZE_PREFIX, 1)
 
 
 def is_fixing_size_label(label: str) -> bool:
     return re.fullmatch(rf"{FIXING_SIZE_PREFIX}[0-9a-fA-F]{{40}}", label) is not None
 
 
-def complete_size_fix_marker(runner: "PipelineRunner", pr: "PRInfo") -> bool:
-    """Retryable GitHub cleanup after the task header records FIX success."""
-    fixing = {label for label in pr.quarantine_labels if is_fixing_size_label(label)}
-    if not fixing:
-        return True
-    try:
-        marker = continued_size_label(pr.head_sha)
+def obsolete_size_labels(labels: set[str]) -> set[str]:
+    """Only labels emitted by the former size protocol are eligible for cleanup."""
+    return {
+        label for label in labels
+        if label == OBSOLETE_SIZE_LABEL or is_continued_size_label(label)
+        or is_fixing_size_label(label)
+    }
+
+
+def cleanup_obsolete_size_labels(runner: "PipelineRunner", pr: "PRInfo") -> None:
+    """Best-effort, bounded housekeeping; GitHub availability never gates work."""
+    for label in sorted(obsolete_size_labels(pr.quarantine_labels)):
         try:
             gh_runner.run_gh(
-                ["label", "create", marker, "--color", "0E8A16",
-                 "--description", "Legacy size decision continued; CI and review still required"],
+                ["pr", "edit", str(pr.number), "--remove-label", label],
                 repo=runner.owner_repo,
             )
         except Exception as exc:
-            if not _is_label_already_exists_error(exc):
-                raise
-        gh_runner.run_gh(
-            ["pr", "edit", str(pr.number), "--add-label", marker],
-            repo=runner.owner_repo,
-        )
-        old = {
-            label for label in pr.quarantine_labels
-            if is_continued_size_label(label) and label != marker
-        }
-        for label in sorted(old):
-            gh_runner.run_gh(
-                ["pr", "edit", str(pr.number), "--remove-label", label],
-                repo=runner.owner_repo,
-            )
-        for label in sorted(fixing):
-            gh_runner.run_gh(
-                ["pr", "edit", str(pr.number), "--remove-label", label],
-                repo=runner.owner_repo,
-            )
-    except Exception as exc:
-        runner.log_event(f"[RECOVERY] Size FIX marker completion deferred: {exc}")
-        return False
-    pr.quarantine_labels.difference_update(old | fixing)
-    pr.quarantine_labels.add(marker)
-    return True
+            runner.log_event(f"[RECOVERY] Obsolete size label cleanup deferred: {exc}")
+            continue
+        pr.quarantine_labels.discard(label)
 
 
 def blocking_quarantine_labels(labels: set[str]) -> set[str]:
     """Ignore only the former size decision; retain every other quarantine."""
-    return {label for label in labels if label != OBSOLETE_SIZE_LABEL and not is_continued_size_label(label)}
+    return labels - obsolete_size_labels(labels)
 
 
 def quarantine_label_for_category(category: str) -> str:
@@ -113,6 +80,9 @@ def apply_quarantine_label_for_violation(
     GitHub-side writes are best effort. The durable daemon protection is the
     guardrail suppression record plus the MERGE gate.
     """
+    if violation.category == "large_diff_threshold":
+        runner.log_event(f"[GUARDRAIL] Informational diff size: {violation.excerpt}")
+        return True
     label = quarantine_label_for_category(violation.category)
     try:
         gh_runner.run_gh(

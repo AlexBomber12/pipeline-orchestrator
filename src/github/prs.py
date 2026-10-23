@@ -41,6 +41,7 @@ _last_known_sha: dict[str, str] = {}
 _merged_prs_cache: dict[tuple[str, str], tuple[float, list["PRInfo"]]] = {}
 _MERGED_PRS_CACHE_TTL_SECONDS = 60.0
 _FULL_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_OBSOLETE_SIZE_LABEL_RE = re.compile(r"^(?:size-ok|size-fix):[0-9a-fA-F]{40}$")
 
 
 @dataclass(frozen=True)
@@ -440,7 +441,10 @@ def get_open_prs(
             label.get("name", "")
             for label in labels
             if isinstance(label, dict)
-            and (label.get("name") or "").startswith(("quarantine:", "size-ok:", "size-fix:"))
+            and (
+                (label.get("name") or "").startswith("quarantine:")
+                or _OBSOLETE_SIZE_LABEL_RE.fullmatch(label.get("name") or "") is not None
+            )
         }
         prs.append(
             PRInfo(
@@ -515,7 +519,10 @@ def _get_open_prs_rest(
             label.get("name", "")
             for label in labels
             if isinstance(label, dict)
-            and (label.get("name") or "").startswith(("quarantine:", "size-ok:", "size-fix:"))
+            and (
+                (label.get("name") or "").startswith("quarantine:")
+                or _OBSOLETE_SIZE_LABEL_RE.fullmatch(label.get("name") or "") is not None
+            )
         }
         prs.append(
             PRInfo(

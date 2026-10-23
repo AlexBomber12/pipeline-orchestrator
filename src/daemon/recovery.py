@@ -29,8 +29,6 @@ from src.daemon import git_ops
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
 from src.daemon.quarantine import (
     blocking_quarantine_labels,
-    is_continued_size_label,
-    is_fixing_size_label,
 )
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
@@ -741,11 +739,17 @@ class RecoveryMixin:
                 log_message=f"recover_state failed: {exc}",
             )
             return False
+        # Load the retained receipt before deciding whether the configured
+        # base ref needs refreshing. A fresh runner has no in-memory
+        # _persisted_fix_recovery until this snapshot read completes.
+        if not await self._hydrate_current_task_from_persisted_state():
+            return False
         base_refreshed = False
-        if any(
-            is_fixing_size_label(label)
-            for pr in prs for label in pr.quarantine_labels
-        ) and (Path(self.repo_path) / ".git").exists():
+        saved_fix = getattr(self, "_persisted_fix_recovery", None)
+        if (
+            saved_fix is not None and saved_fix.size_fix_completion is not None
+            and (Path(self.repo_path) / ".git").exists()
+        ):
             try:
                 base = self.repo_config.branch
                 if not base or base.startswith("-") or git_ops._git(
@@ -758,7 +762,7 @@ class RecoveryMixin:
                 )
                 base_refreshed = True
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                self.log_event(f"[RECOVERY] Size FIX task header refresh deferred: {exc}")
+                self.log_event(f"[RECOVERY] Legacy FIX task header refresh deferred: {exc}")
                 return False
         # PR-266b crash-no-PR fix: the headers helper derives ``DOING``
         # via ``current_task_pr_id`` when no matching open PR exists.
@@ -768,11 +772,8 @@ class RecoveryMixin:
         # decisions`` only runs the PR-186 crash path on a DOING entry,
         # so the task would be silently re-dispatched into a crash loop
         # instead of being marked ERROR pending manual re-upload.
-        # Run after the ``get_open_prs`` probe so a transient GitHub
-        # outage during recovery still surfaces as ERROR with no
-        # current_task.
-        if not await self._hydrate_current_task_from_persisted_state():
-            return False
+        # Hydration remains after the ``get_open_prs`` probe so a transient
+        # GitHub outage still surfaces as ERROR with no current_task.
         await self._hydrate_status_write_failed_task_pr_ids()
         # The helper consults ``_idle_open_prs`` to derive each task's
         # status from the live PR set. Populate it from the recovery
@@ -945,12 +946,10 @@ class RecoveryMixin:
     async def _recover_unresolved_error_pr(
         self, tasks: list[QueueTask], prs: list[PRInfo],
     ) -> tuple[QueueTask, PRInfo] | None:
-        """Park an ERROR guardrail or unfinished size FIX with its bound PR.
+        """Preserve a bound ERROR PR until its real cause is reconciled.
 
-        A size-ok or legacy size label can outlive a later guardrail whose
-        GitHub label write failed. A confirmed TODO task header with a matching
-        open PR is durable evidence that this approval completed. Size labels
-        only help retain an ERROR PR here; they never promote it to WATCH.
+        A legacy size label is neither completion evidence nor required for
+        preserving a published PR with a crash or guardrail header.
         """
         for task in tasks:
             header = getattr(self, "_recovery_task_headers", {}).get(task.pr_id)
@@ -961,12 +960,10 @@ class RecoveryMixin:
                 continue
             pr = find_matching_open_pr(task.pr_id, task.branch, prs)
             if pr is not None and (
-                header.blocked_reason == SuppressionReason.GUARDRAIL.value
-                or any(is_fixing_size_label(label) for label in pr.quarantine_labels)
-                or (
-                    header.blocked_reason == SuppressionReason.CRASH.value
-                    and any(is_continued_size_label(label) for label in pr.quarantine_labels)
-                )
+                header.blocked_reason in {
+                    SuppressionReason.GUARDRAIL.value,
+                    SuppressionReason.CRASH.value,
+                }
             ):
                 self.log_event(
                     f"[RECOVERY] ERROR task {task.pr_id} retains PR #{pr.number}; "
@@ -1080,7 +1077,6 @@ class RecoveryMixin:
                 and completion.invocation.run_id is not None
                 and live_completion_pr is not None
                 and live_completion_pr.head_sha == completion.head_sha
-                and completion.fixing_label in live_completion_pr.quarantine_labels
                 and (header := self._recovery_task_headers.get(queued.pr_id)) is not None
                 and header.frontmatter_status == "error"
                 and header.blocked_reason == SuppressionReason.CRASH.value
@@ -1389,18 +1385,11 @@ class RecoveryMixin:
         if unresolved_error_pr is not None:
             task, pr = unresolved_error_pr
             header = self._recovery_task_headers.get(task.pr_id)
-            fixing = any(is_fixing_size_label(label) for label in pr.quarantine_labels) or (
-                header is not None and header.blocked_reason == SuppressionReason.CRASH.value
-                and any(is_continued_size_label(label) for label in pr.quarantine_labels)
-            )
             self.state = self.state.model_copy(update={
                 "current_task": task,
                 "current_pr": pr,
                 "state": PipelineState.ERROR,
-                "error_message": (
-                    "Size FIX outcome unresolved; operator Retry or revised approval required."
-                    if fixing else "Guardrail decision unresolved; operator Retry or revised approval required."
-                ),
+                "error_message": "Published task failure unresolved; operator Retry or revised approval required.",
             })
             return
 

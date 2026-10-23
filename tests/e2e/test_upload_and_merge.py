@@ -1,6 +1,6 @@
 import time
 
-from tests.e2e.lib.coder_shim import coder_shim
+from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
 
 
 def test_full_happy_path_via_shim_succeeds(
@@ -58,3 +58,82 @@ def test_full_happy_path_via_shim_succeeds(
     assert current_pr is None or current_pr.get("state") == "MERGED", (
         f"unexpected current_pr after merge: {current_pr!r}"
     )
+
+
+def test_legacy_size_label_pr_merges_and_task_is_done(
+    testbed_slug,
+    wait_for_state,
+    get_state,
+    upload_zip,
+    make_task_zip,
+    reset_testbed,
+):
+    """An obsolete size label does not prevent ordinary FIX and merge."""
+    import base64
+    import json
+    import subprocess
+
+    repo = testbed_slug.replace("__", "/", 1)
+    wait_for_state(["IDLE"], timeout_sec=30)
+    pr_id_int = time.time_ns() // 1_000_000
+    task_id = f"PR-{pr_id_int}"
+    branch = f"pr-{pr_id_int}-e2e-legacy-size-label"
+    with coder_shim("success_pending_ci"):
+        assert upload_zip(make_task_zip(pr_id_int, "e2e-legacy-size-label")) in (200, 201)
+        coding = wait_for_state(["CODING"], timeout_sec=150)
+        assert (coding.get("current_task") or {}).get("pr_id") == task_id
+        watch = wait_for_state(["WATCH"], timeout_sec=120)
+        pr = watch.get("current_pr") or {}
+        assert pr.get("branch") == branch, pr
+        number = pr["number"]
+        head = pr["head_sha"]
+        assert len(head) == 40
+        label = "quarantine:large_diff"
+        created = subprocess.run(
+            ["gh", "label", "create", label, "-R", repo, "--color", "B60205"],
+            capture_output=True, text=True, timeout=30,
+        )
+        assert created.returncode == 0 or "already exists" in created.stderr.lower(), created.stderr
+        subprocess.run(
+            ["gh", "pr", "edit", str(number), "-R", repo, "--add-label", label],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        # The pending status prevents a merge race while the legacy label is
+        # attached. Failure then drives the ordinary FIX path. The successful
+        # FIX shim publishes a fresh HEAD without this engineered gate.
+        SHIM_SCENARIO_PATH.write_text("fix_existing_pr\n")
+        status = subprocess.run(
+            ["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{head}",
+             "-f", "state=failure", "-f", "context=e2e/watch-merge-gate"],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        assert json.loads(status.stdout)["state"] == "failure"
+        try:
+            wait_for_state(["IDLE"], timeout_sec=240)
+        except TimeoutError as exc:
+            state = get_state()
+            raise AssertionError(
+                f"legacy PR did not finish ordinary FIX/MERGE; "
+                f"state={state.get('state') if state else None!r}, "
+                f"current_pr={(state or {}).get('current_pr')!r}"
+            ) from exc
+
+    state = get_state()
+    assert state is not None and any(
+        item.get("state") == "FIX" for item in (state.get("history") or [])
+    ), "legacy PR did not enter ordinary FIX"
+    result = subprocess.run(
+        ["gh", "pr", "view", str(number), "-R", repo,
+         "--json", "state,headRefName,mergedAt"],
+        capture_output=True, text=True, check=True, timeout=30,
+    )
+    merged = json.loads(result.stdout)
+    assert merged["headRefName"] == branch
+    assert merged["state"] == "MERGED" and merged["mergedAt"], merged
+    task = subprocess.run(
+        ["gh", "api", f"repos/{repo}/contents/tasks/{task_id}.md?ref=main"],
+        capture_output=True, text=True, check=True, timeout=30,
+    )
+    content = base64.b64decode(json.loads(task.stdout)["content"]).decode()
+    assert content.startswith("---\nstatus: DONE\n"), content[:300]
+    assert state["state"] == "IDLE"

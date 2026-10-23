@@ -18,6 +18,7 @@ SHIM_SCENARIO_PATH = REPO_DIR / "tests/e2e/data/shim-scenario"
 VALID_SCENARIOS = {
     "success",
     "success_pending_ci",
+    "fix_existing_pr",
     "no_pr",
     "exit_nonzero",
     "hang",

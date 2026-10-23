@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,12 +19,10 @@ from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
 from src.daemon.quarantine import (
     OBSOLETE_SIZE_LABEL,
-    complete_size_fix_marker,
-    continued_size_label,
-    fixing_size_label,
 )
 from src.daemon.runner import PipelineRunner
 from src.keyspace import pipeline_state
+from src.metrics import RunRecord
 from src.models import (
     CIStatus,
     InvocationSnapshot,
@@ -39,25 +39,9 @@ from src.subsource_registry import SuppressionReason
 from src.suppression import SuppressionRecord
 from src.task_status import MergedState
 
-
-def test_size_continuation_label_requires_published_head() -> None:
-    with pytest.raises(ValueError, match="published PR HEAD"):
-        continued_size_label("invalid")
-
-
-def test_size_fix_completion_is_idempotent_without_marker() -> None:
-    pr = PRInfo(number=17, branch="pr-042-inflight", head_sha="a" * 40)
-    assert complete_size_fix_marker(_make_runner(), pr)
-    assert pr.quarantine_labels == set()
-
-
-def test_size_fix_completion_waits_for_published_head() -> None:
-    pr = PRInfo(
-        number=17, branch="pr-042-inflight", head_sha="",
-        quarantine_labels={fixing_size_label("a" * 40)},
-    )
-    assert complete_size_fix_marker(_make_runner(), pr) is False
-    assert fixing_size_label("a" * 40) in pr.quarantine_labels
+from tests.legacy_recovery_git import git as real_git
+from tests.legacy_recovery_git import legacy_repo
+from tests.legacy_size_labels import continued_size_label, fixing_size_label
 
 
 class _FakeRedis:
@@ -270,40 +254,143 @@ def test_recover_rehydrates_quarantine_from_pr_labels(
     )
 
 
-@pytest.mark.parametrize("refresh", ["ok", "unavailable", "invalid_base"])
-def test_recover_completed_size_fix_from_doing_header(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, refresh: str,
+def test_legacy_size_label_does_not_require_base_refresh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     task = _doing_task()
-    pr = PRInfo(
-        number=17, branch="pr-042-inflight", head_sha="a" * 40,
-        quarantine_labels={fixing_size_label("a" * 40)},
-    )
+    pr = PRInfo(number=17, branch="pr-042-inflight", head_sha="a" * 40,
+                quarantine_labels={fixing_size_label("a" * 40)})
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
     runner = _make_runner()
     (tmp_path / ".git").mkdir()
     runner.repo_path = str(tmp_path)
     calls: list[tuple[str, ...]] = []
-
     def git(_repo: str, *args: str, **kwargs: Any):
         calls.append(args)
-        if args[0] == "check-ref-format":
-            return subprocess.CompletedProcess(args, int(refresh == "invalid_base"), "", "")
-        if args[0] == "fetch" and refresh == "unavailable":
-            raise OSError("offline")
         return subprocess.CompletedProcess(args, 0, "", "")
-
     monkeypatch.setattr(recovery_module.git_ops, "_git", git)
     runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
-    completed = asyncio.run(runner.recover_state())
-    if refresh == "ok":
-        assert completed is True
-        assert runner.state.state == PipelineState.WATCH
-        assert fixing_size_label("a" * 40) in runner.state.current_pr.quarantine_labels
-        assert any(call[0] == "fetch" for call in calls)
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.state == PipelineState.WATCH
+    assert not any(call[0] == "fetch" for call in calls)
+
+
+@pytest.mark.parametrize("label_present", [False, True])
+@pytest.mark.parametrize("first_failure", ["none", "fetch", "invalid_base"])
+@pytest.mark.parametrize("checkout_work", [False, True])
+def test_fresh_legacy_completion_refreshes_stale_base_before_headers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    label_present: bool, first_failure: str, checkout_work: bool,
+) -> None:
+    case = legacy_repo(tmp_path, remote_error=True)
+    assert "status: TODO" in real_git(case.repo, "show", "origin/main:tasks/PR-100.md")
+    assert "status: ERROR" in real_git(case.writer, "show", "HEAD:tasks/PR-100.md")
+    runner = _make_runner()
+    runner.repo_path = str(case.repo)
+    runner.repo_config.url = str(case.remote)
+    marker = fixing_size_label(case.head)
+    pr = PRInfo(number=100, branch="pr-100-size", pr_id="PR-100", head_sha=case.head,
+                quarantine_labels={marker} if label_present else set())
+    invocation = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="run-100", attempt_index=2, phase="fix", fix_iteration=1,
+    )
+    task = QueueTask(pr_id="PR-100", title="Original generation", status=TaskStatus.DOING,
+                     branch=pr.branch, task_file="tasks/PR-100.md")
+    task_hash = task_spec_content_hash(case.task.read_text())
+    receipt = SizeFixCompletion(
+        task_id=task.pr_id, branch=task.branch, pr_number=pr.number,
+        head_sha=case.head, fixing_label=marker, error_revision=case.revision,
+        task_spec_hash=task_hash, invocation=invocation,
+    )
+    saved = RepoState(
+        name=runner.name, url=runner.repo_config.url, state=PipelineState.WATCH,
+        current_task=task, current_pr=pr, active_invocation=invocation,
+        size_fix_completion=receipt,
+    )
+    runner.redis.store[pipeline_state(runner.name)] = saved.model_dump_json()
+    retry_key = f"metrics:retry_count:{runner.name}:PR-100"
+    runner.redis.store[retry_key] = "3"
+    record = RunRecord(
+        run_id="run-100", task_id=task.pr_id, repo_name=runner.name,
+        profile_id="claude:legacy", task_type="feature", complexity="medium",
+        started_at="2026-10-23T00:00:00+00:00", ended_at=None,
+        duration_ms=None, fix_iterations=1, tokens_in=12, tokens_out=34,
+        exit_reason="running", operator_intervention=False,
+        attempt_index=2, task_spec_hash=task_hash, invocations=[invocation],
+    )
+    runner.redis.store["metrics:run:run-100"] = json.dumps(asdict(record))
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_a, **_k: [pr])
+    monkeypatch.setattr(
+        recovery_module, "_resolve_merged_state",
+        lambda *_a, **_k: MergedState(set(), set(), True),
+    )
+    original_git = recovery_module.git_ops._git
+    failed = False
+
+    def maybe_fail_fetch(repo: str, *args: str, **kwargs: Any):
+        nonlocal failed
+        if first_failure == "fetch" and not failed and args[0] == "fetch":
+            failed = True
+            raise OSError("temporary fetch failure")
+        return original_git(repo, *args, **kwargs)
+
+    monkeypatch.setattr(recovery_module.git_ops, "_git", maybe_fail_fetch)
+    if checkout_work:
+        (case.repo / "local_only.py").write_text("unpublished = True\n", encoding="utf-8")
+        real_git(case.repo, "add", "local_only.py")
+        real_git(case.repo, "commit", "-m", "unpublished local work")
+        (case.repo / "staged.py").write_text("staged = True\n", encoding="utf-8")
+        real_git(case.repo, "add", "staged.py")
+        (case.repo / "implementation.py").write_text("published = False\n", encoding="utf-8")
+        (case.repo / "scratch.txt").write_text("untracked work\n", encoding="utf-8")
+    head_before = real_git(case.repo, "rev-parse", "HEAD")
+    index_before = real_git(case.repo, "diff", "--cached", "--binary")
+    work_before = real_git(case.repo, "diff", "--binary")
+    status_before = real_git(case.repo, "status", "--porcelain")
+    if first_failure == "invalid_base":
+        runner.repo_config.branch = "-invalid"
+    if first_failure != "none":
+        assert asyncio.run(runner.recover_state()) is False
+        assert runner.redis.store[pipeline_state(runner.name)] == saved.model_dump_json()
+        assert real_git(case.repo, "rev-parse", "HEAD") == head_before
+        assert "status: TODO" in real_git(case.repo, "show", "origin/main:tasks/PR-100.md")
+        if first_failure == "invalid_base":
+            runner.repo_config.branch = "main"
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_queue[0].status == TaskStatus.ERROR
+    assert runner.state.size_fix_completion == receipt
+    assert runner._current_run_record == record
+    assert "status: ERROR" in real_git(case.repo, "show", "origin/main:tasks/PR-100.md")
+    assert real_git(case.repo, "rev-parse", "HEAD") == head_before
+    assert real_git(case.repo, "branch", "--show-current") == "pr-100-size"
+    assert real_git(case.repo, "rev-parse", "origin/pr-100-size") == case.head
+    assert real_git(case.repo, "diff", "--cached", "--binary") == index_before
+    assert real_git(case.repo, "diff", "--binary") == work_before
+    assert real_git(case.repo, "status", "--porcelain") == status_before
+    assert runner.redis.store[retry_key] == "3"
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_a, **_k: "OPEN")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *_a, **_k: None)
+    monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker", lambda *_a: None)
+    base_before = real_git(case.writer, "ls-remote", "origin", "refs/heads/main").split()[0]
+    asyncio.run(runner.handle_watch())
+    assert runner._current_run_record == record
+    assert runner.redis.store[retry_key] == "3"
+    if checkout_work:
+        assert runner.state.size_fix_completion == receipt
+        assert real_git(case.writer, "ls-remote", "origin", "refs/heads/main").split()[0] == base_before
     else:
-        assert completed is False
-        assert runner._recovered is False
+        assert runner.state.size_fix_completion is None
+        assert runner.state.current_task.status == TaskStatus.DOING
+        assert real_git(case.writer, "ls-remote", "origin", "refs/heads/main").split()[0] != base_before
+        real_git(case.writer, "fetch", "origin", "main")
+        assert "status: TODO" in real_git(case.writer, "show", "FETCH_HEAD:tasks/PR-100.md")
+    assert real_git(case.repo, "rev-parse", "HEAD") == head_before
+    assert real_git(case.repo, "branch", "--show-current") == "pr-100-size"
+    assert real_git(case.repo, "diff", "--cached", "--binary") == index_before
+    assert real_git(case.repo, "diff", "--binary") == work_before
+    assert real_git(case.repo, "status", "--porcelain") == status_before
 
 
 def test_recover_projects_quarantine_when_guardrail_suppression_exists(
@@ -731,8 +818,10 @@ def test_unresolved_size_fix_recovery_completes_in_error(
 
 
 @pytest.mark.parametrize("feature_flag,run_match", [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("label_present", [False, True])
 def test_retained_successful_size_fix_retries_error_header_after_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, feature_flag: bool, run_match: bool,
+    label_present: bool,
 ) -> None:
     task_file = tmp_path / "tasks" / "PR-100.md"
     task_file.parent.mkdir()
@@ -740,7 +829,7 @@ def test_retained_successful_size_fix_retries_error_header_after_restart(
     task_hash = task_spec_content_hash(task_file.read_text())
     marker = fixing_size_label("a" * 40)
     pr = PRInfo(number=100, branch="pr-100-size", pr_id="PR-100", head_sha="a" * 40,
-                quarantine_labels={marker})
+                quarantine_labels={marker} if label_present else set())
     queued = QueueTask(pr_id="PR-100", title="size", status=TaskStatus.ERROR,
                        branch=pr.branch, task_file="tasks/PR-100.md")
     invocation = InvocationSnapshot(
