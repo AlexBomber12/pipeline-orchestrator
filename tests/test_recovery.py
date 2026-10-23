@@ -276,11 +276,11 @@ def test_legacy_size_label_does_not_require_base_refresh(
 
 
 @pytest.mark.parametrize("label_present", [False, True])
-@pytest.mark.parametrize("first_fetch_fails", [False, True])
+@pytest.mark.parametrize("first_failure", ["none", "fetch", "invalid_base"])
 @pytest.mark.parametrize("checkout_work", [False, True])
 def test_fresh_legacy_completion_refreshes_stale_base_before_headers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    label_present: bool, first_fetch_fails: bool, checkout_work: bool,
+    label_present: bool, first_failure: str, checkout_work: bool,
 ) -> None:
     case = legacy_repo(tmp_path, remote_error=True)
     assert "status: TODO" in real_git(case.repo, "show", "origin/main:tasks/PR-100.md")
@@ -330,7 +330,7 @@ def test_fresh_legacy_completion_refreshes_stale_base_before_headers(
 
     def maybe_fail_fetch(repo: str, *args: str, **kwargs: Any):
         nonlocal failed
-        if first_fetch_fails and not failed and args[0] == "fetch":
+        if first_failure == "fetch" and not failed and args[0] == "fetch":
             failed = True
             raise OSError("temporary fetch failure")
         return original_git(repo, *args, **kwargs)
@@ -348,11 +348,15 @@ def test_fresh_legacy_completion_refreshes_stale_base_before_headers(
     index_before = real_git(case.repo, "diff", "--cached", "--binary")
     work_before = real_git(case.repo, "diff", "--binary")
     status_before = real_git(case.repo, "status", "--porcelain")
-    if first_fetch_fails:
+    if first_failure == "invalid_base":
+        runner.repo_config.branch = "-invalid"
+    if first_failure != "none":
         assert asyncio.run(runner.recover_state()) is False
         assert runner.redis.store[pipeline_state(runner.name)] == saved.model_dump_json()
         assert real_git(case.repo, "rev-parse", "HEAD") == head_before
         assert "status: TODO" in real_git(case.repo, "show", "origin/main:tasks/PR-100.md")
+        if first_failure == "invalid_base":
+            runner.repo_config.branch = "main"
     assert asyncio.run(runner.recover_state()) is True
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_queue[0].status == TaskStatus.ERROR
