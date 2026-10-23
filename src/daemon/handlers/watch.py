@@ -129,6 +129,8 @@ class WatchMixin:
 
     async def handle_watch(self) -> None:
         """Poll PR status and decide whether to merge, fix, hang, or wait."""
+        if await self._hold_unresolved_publication():
+            return
         if self.state.current_pr is None:
             self.state.state = PipelineState.IDLE
             self.log_event("[WATCH] WATCH without current_pr -> IDLE.")
@@ -1293,8 +1295,16 @@ class WatchMixin:
         if (self._publication_attempt_matches_dispatch()
             and attempt.pr_number == pr_number
             and attempt.branch == getattr(found, "branch", None)):
-            # Play can resume directly into WATCH with a retained hold. Consume
-            # it before terminal bookkeeping removes its dispatch binding.
+            if attempt.pending and (
+                not attempt.verified or attempt.unverified_head_sha is not None
+                or attempt.head_sha != getattr(found, "head_sha", None)
+            ):
+                await self._transition_to_error(
+                    "Terminal PR publication is unverified; operator Retry recovery required",
+                    save_run_record_as=None, publish=True, log_prefix="[WATCH]",
+                )
+                return
+            # Consume only verified evidence before removing its dispatch binding.
             attempt.pending = False
             await self.publish_state()
         legacy_fragment = (

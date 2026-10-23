@@ -2163,6 +2163,7 @@ def test_watch_terminal_consumes_paused_publication(monkeypatch, terminal, obser
     # Play resumes a paused run with a bound PR directly into WATCH.
     runner.state.state = PipelineState.WATCH
     asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
+    remote["terminal"] = terminal
     pr = runner.state.current_pr.model_copy()
     monkeypatch.setattr(coding_module.gh_prs, "get_open_prs",
                         lambda *a, **kw: [pr] if observation == "listed" else [])
@@ -2319,7 +2320,7 @@ def test_escalation_and_breach_release_only_proven_unpublished_attempts(
     else:
         assert runner.state.state == PipelineState.PAUSED
         if evidence == "published":
-            assert attempt.exit_classification is None
+            assert attempt.exit_classification == "failure"
             expired = datetime.now(timezone.utc) - timedelta(seconds=1)
             runner.state.rate_limited_until = expired
             runner.state.rate_limited_coder_until = {"claude": expired}
@@ -2327,6 +2328,11 @@ def test_escalation_and_breach_release_only_proven_unpublished_attempts(
             assert runner.state.state == PipelineState.ERROR
             assert attempt.pending
             assert runner.state.current_pr.number == 402
+            command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                               task_id="PR-001", branch="pr-001")
+            continuation, pr = asyncio.run(runner._select_retry_continuation(command))
+            assert continuation == "watch"
+            assert pr.number == 402
         if released:
             expired = datetime.now(timezone.utc) - timedelta(seconds=1)
             runner.state.rate_limited_until = expired
@@ -3007,7 +3013,7 @@ def test_guardrail_suppression_precedes_delayed_pr_discovery(monkeypatch, stoppe
     None, "cleanup", "suppression", "absent", "unknown", "publication", "outage",
     "create", "unclassified", "active", "mismatch", "no_baseline", "no_head",
     "remote_drift", "malformed_remote", "baseline_closed", "baseline_draft",
-    "preexisting_head", "changed_head", "unknown_initial_head",
+    "preexisting_head", "changed_head", "unknown_initial_head", "late_breach",
 ])
 def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
     from src.subsource_registry import SuppressionReason
@@ -3021,6 +3027,10 @@ def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
     initial_head = {"preexisting_head": "a" * 40, "changed_head": "b" * 40,
                     "unknown_initial_head": None}.get(blocker, "")
     monkeypatch.setattr(coding_module, "_initial_branch_head_sha", lambda *a: initial_head)
+    if blocker == "late_breach":
+        def late_breach(*args):
+            args[-1]["breached"] = True
+        monkeypatch.setattr(runner, "_check_late_breach", late_breach)
     asyncio.run(runner.handle_coding())
     attempt = runner.state.publication_attempt
     assert attempt.exit_classification == "failure"
@@ -3095,7 +3105,7 @@ def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
     command = _command(_task_text(task_id="PR-001", branch="pr-001"),
                        task_id="PR-001", branch="pr-001")
     result = asyncio.run(runner._select_retry_continuation(command))
-    if blocker in {None, "baseline_closed", "baseline_draft", "changed_head"}:
+    if blocker in {None, "baseline_closed", "baseline_draft", "changed_head", "late_breach"}:
         assert result[0] == "watch"
         assert result[1].head_sha == "a" * 40
         assert attempt.verified
@@ -3463,3 +3473,86 @@ def test_retained_publication_survives_retry_cap_and_next_error_cycle(
     assert saved.publication_attempt.pending
     assert saved.publication_attempt.pr_number == 402
     assert saved.active_invocation == invocation
+
+
+@pytest.mark.parametrize("interruption", ["stop", "breach"])
+@pytest.mark.parametrize("entry", ["paused", "watch", "terminal"])
+@pytest.mark.parametrize("terminal", [None, "MERGED", "CLOSED"])
+def test_interrupted_fix_cannot_release_unpublished_head(
+    monkeypatch, interruption, entry, terminal,
+):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+    asyncio.run(runner.handle_coding())
+    calls = []
+
+    async def interrupted_fix(*args, **kwargs):
+        calls.append(True)
+        monkeypatch.setattr(coding_module, "_local_branch_head_sha", lambda *a: "b" * 40)
+        remote["exact_unknown"] = True
+        if interruption == "stop":
+            runner._stop_requested = True
+            runner.state.user_paused = True
+        return 0, "", ""
+
+    if interruption == "breach":
+        def late_breach(*args):
+            args[-1]["breached"] = True
+        monkeypatch.setattr(runner, "_check_late_breach", late_breach)
+    monkeypatch.setattr(h.claude_cli, "fix_review_async", interrupted_fix)
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.publication_attempt.unverified_head_sha == "b" * 40
+    # Restart, then Play. The old remote PR may already be terminal.
+    runner.state = type(runner.state).model_validate_json(runner.state.model_dump_json())
+    runner.state.user_paused = False
+    runner._stop_requested = False
+    remote["exact_unknown"] = False
+    remote["terminal"] = terminal
+    attempt = runner.state.publication_attempt
+    if entry == "paused":
+        asyncio.run(runner.handle_paused())
+    elif entry == "watch":
+        runner.state.state = PipelineState.WATCH
+        def forbidden(*args, **kwargs):
+            pytest.fail("WATCH cannot review or merge before FIX publication resolves")
+        monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", forbidden)
+        asyncio.run(runner.handle_watch())
+    else:
+        asyncio.run(runner._handle_external_pr_resolution(
+            runner.state.current_pr, terminal or "CLOSED",
+        ))
+    assert runner.state.state == PipelineState.ERROR
+    assert attempt.pending
+    assert attempt.unverified_head_sha == "b" * 40
+    assert runner.state.current_task.pr_id == "PR-001"
+    assert runner.state.current_pr.head_sha == "a" * 40
+    assert calls == [True]
+    # Fresh exact evidence of the candidate is required to resume or consume.
+    remote["head"] = "b" * 40
+    runner.state.error_message = None
+    attempt.failure = None
+    if entry == "paused":
+        runner.state.state = PipelineState.PAUSED
+        asyncio.run(runner.handle_paused())
+    else:
+        runner.state.state = PipelineState.WATCH
+        asyncio.run(runner.handle_watch())
+    assert attempt.unverified_head_sha is None
+    if entry == "paused" and terminal is None:
+        assert attempt.pending
+        asyncio.run(runner.handle_idle())
+    assert runner.state.state == (PipelineState.IDLE if terminal else PipelineState.WATCH)
+    assert not attempt.pending
+
+
+def test_watch_terminal_keeps_unverified_publication(monkeypatch):
+    runner = _runner(monkeypatch)
+    _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    attempt.verified = False
+    asyncio.run(runner._handle_external_pr_resolution(runner.state.current_pr, "CLOSED"))
+    assert attempt.pending
+    assert runner.state.current_task is not None
+    assert runner.state.state == PipelineState.ERROR

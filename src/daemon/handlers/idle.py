@@ -960,6 +960,16 @@ class IdleMixin:
                 save_run_record_as=None, publish=True, log_prefix="[INFRA]",
             )
             return
+        if (not self.state.user_paused and attempt is not None and attempt.pending
+            and invocation is not None and invocation.phase == "fix"):
+            if not await self._resolve_published_attempt():
+                await self._transition_to_error(
+                    attempt.failure or "Interrupted FIX publication requires operator Retry recovery",
+                    save_run_record_as=None, publish=True, log_prefix="[INFRA]",
+                )
+                return
+            if self.state.current_task is None:
+                return
         # PR-330b: per-repo feature flag selects the unified inhibitor
         # exit check over the legacy ``user_paused``/``rate_limited_until``
         # branches. PAUSED is a global state for repo-wide inhibitors,

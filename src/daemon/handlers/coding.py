@@ -1144,6 +1144,11 @@ class CodingMixin:
             self.log_event("[CODING] CODING aborted: user stop requested.")
             return None
 
+        if interruption == "breach" or breach_flag["breached"]:
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.exit_classification = "failure"
+                await self.publish_state()
+
         if interruption == "breach":
             await self._release_unpublished_attempt(target_branch)
             await self._record_pre_pause_pr(
