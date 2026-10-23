@@ -356,7 +356,7 @@ class CodingMixin:
             return False
 
     async def _release_unpublished_attempt(self, target_branch: str) -> None:
-        """After cleanup, require both branch absence and all-state PR absence."""
+        """Prove remote absence and clean the local branch before releasing Retry."""
         attempt = self.state.publication_attempt
         if (attempt is not None and attempt.branch == target_branch
             and attempt.pr_number is None and attempt.candidate is None):
@@ -377,6 +377,28 @@ class CodingMixin:
                     self.log_event(f"[INFRA] Unpublished attempt release deferred: {exc}")
                     return
                 if not any(item.number not in attempt.baseline_numbers for item in publications):
+                    # Retry dispatches CODING directly, so AUTO PR must be able
+                    # to create its branch without an intervening IDLE sync.
+                    try:
+                        if target_branch == self.repo_config.branch:
+                            raise ValueError("task branch is the configured base")
+                        if git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip():
+                            raise ValueError("worktree is dirty")
+                        local = git_ops._git(
+                            self.repo_path, "show-ref", "--verify", "--quiet",
+                            f"refs/heads/{target_branch}", check=False,
+                        )
+                        if local.returncode != 1:
+                            if local.returncode != 0:
+                                raise ValueError(f"local branch probe failed ({local.returncode})")
+                            git_ops._git(
+                                self.repo_path, "checkout", "--detach",
+                                f"origin/{self.repo_config.branch}",
+                            )
+                            git_ops._git(self.repo_path, "branch", "-D", "--", target_branch)
+                    except Exception as exc:
+                        self.log_event(f"[INFRA] Unpublished local branch cleanup deferred: {exc}")
+                        return
                     attempt.pending = False
                     # Checkpoint before callers await terminal bookkeeping:
                     # a headless attempt cannot repeat reconciliation on restart.

@@ -2821,3 +2821,79 @@ def test_play_after_stopped_unchanged_fix_resumes_without_coding_bookkeeping(mon
     assert recorded == []
     checkpoint = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
     assert not type(runner.state).model_validate_json(checkpoint).publication_attempt.pending
+
+
+@pytest.mark.parametrize("local_state", ["absent", "branch", "commit"])
+@pytest.mark.parametrize("blocker", [None, "dirty", "probe", "checkout", "delete", "base"])
+def test_retry_cleans_unpublished_local_branch_before_release(monkeypatch, tmp_path, local_state, blocker):
+    from src.keyspace import pipeline_state
+
+    from tests.runner.test_retry_commands import _command, _task_text
+
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+
+    def git(*args):
+        return _REAL_GIT_RUN(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *args],
+            cwd=repo_path, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "-b", "main")
+    git("commit", "--allow-empty", "-m", "base")
+    base_sha = git("rev-parse", "HEAD")
+    git("update-ref", "refs/remotes/origin/main", base_sha)
+    if local_state != "absent":
+        git("checkout", "-b", "pr-001")
+        if local_state == "commit":
+            git("commit", "--allow-empty", "-m", "unpublished task")
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    remote["omit"] = True
+    asyncio.run(runner.handle_coding())
+    assert runner.state.publication_attempt.pending
+    runner.repo_path = str(repo_path)
+    monkeypatch.setattr(subprocess, "run", _REAL_GIT_RUN)
+    monkeypatch.setattr(coding_module, "_local_branch_head_sha", _REAL_LOCAL_HEAD)
+    monkeypatch.setattr(coding_module, "_remote_branch_exists", lambda *a: False)
+    monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
+    monkeypatch.setattr(coding_module.gh_prs, "get_merged_prs", lambda *a, **kw: [])
+    attempt = runner.state.publication_attempt
+    if blocker == "dirty":
+        (repo_path / "operator.txt").write_text("preserve me")
+    if blocker == "base":
+        runner.repo_config.branch = "pr-001"
+        attempt.base = "pr-001"
+    real_git = git_ops._git
+
+    def checked_git(repo_path, *args, **kwargs):
+        if blocker == "probe" and args[0] == "show-ref":
+            return subprocess.CompletedProcess(args, 128, "", "probe failed")
+        if (blocker == "checkout" and args[0] == "checkout") or (
+            blocker == "delete" and args[0] == "branch"
+        ):
+            raise subprocess.CalledProcessError(1, args, stderr="cleanup failed")
+        return real_git(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops, "_git", checked_git)
+    command = _command(_task_text(task_id="PR-001", branch="pr-001"),
+                       task_id="PR-001", branch="pr-001")
+    blocked = blocker in {"dirty", "probe", "base"} or (
+        local_state != "absent" and blocker in {"checkout", "delete"}
+    )
+    # Exercise the production Retry selection, including recovery cleanup.
+    result = asyncio.run(runner._select_retry_continuation(command))
+    assert attempt.pending is blocked, runner.state.history
+    if blocked:
+        assert result != ("coding", None)
+        if blocker == "dirty":
+            assert (repo_path / "operator.txt").read_text() == "preserve me"
+        assert any("local branch cleanup deferred" in item["event"] for item in runner.state.history)
+        return
+    assert result == ("coding", None)
+    saved = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    assert not type(runner.state).model_validate_json(saved).publication_attempt.pending
+    # The AUTO PR branch-creation command must succeed, including when the
+    # abandoned branch had a clean unpublished commit or was checked out.
+    git("checkout", "-b", "pr-001", "origin/main")
+    assert git("rev-parse", "HEAD") == base_sha
