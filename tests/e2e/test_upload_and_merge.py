@@ -101,7 +101,7 @@ def test_legacy_size_label_pr_merges_and_task_is_done(
         # The pending status prevents a merge race while the legacy label is
         # attached. Failure then drives the ordinary FIX path. The successful
         # FIX shim publishes a fresh HEAD without this engineered gate.
-        SHIM_SCENARIO_PATH.write_text("success\n")
+        SHIM_SCENARIO_PATH.write_text("fix_existing_pr\n")
         status = subprocess.run(
             ["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{head}",
              "-f", "state=failure", "-f", "context=e2e/watch-merge-gate"],
