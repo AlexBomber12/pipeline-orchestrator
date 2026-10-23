@@ -2520,6 +2520,12 @@ def test_successful_fix_holds_unverified_head_until_exact_reconciliation(
     remote["exact_unknown"] = False
     monkeypatch.setattr(coding_module.gh_prs, "get_exact_pr_outcome", _REAL_EXACT_OUTCOME)
     assert not asyncio.run(runner._resolve_published_attempt())
+    assert runner.state.publication_attempt.verified
+    # Play can resume directly into WATCH. Its observation of the verified
+    # old PR head must not consume the hold for the newer local FIX commit.
+    runner._admit_observed_pr(runner.state.current_pr.model_copy())
+    assert runner.state.publication_attempt.pending
+    assert runner.state.publication_attempt.unverified_head_sha == "b" * 40
     asyncio.run(runner.handle_fix())
     assert fixes == [True]
     assert posted == []
@@ -2541,6 +2547,8 @@ def test_successful_fix_holds_unverified_head_until_exact_reconciliation(
         continuation, pr = asyncio.run(runner._select_retry_continuation(command))
         assert continuation == "watch"
         assert pr.head_sha == "b" * 40
+        runner._admit_observed_pr(pr)
+        assert not runner.state.publication_attempt.pending
 
 
 def test_deleted_branch_without_publication_baseline_keeps_hold(monkeypatch):

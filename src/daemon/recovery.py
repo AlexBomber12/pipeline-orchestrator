@@ -1808,6 +1808,7 @@ class RecoveryMixin:
         task = self.state.current_task
         if (
             attempt is not None and attempt.pending and attempt.verified
+            and attempt.unverified_head_sha is None
             and task is not None
             and (attempt.repo, attempt.base, attempt.task_id, attempt.branch,
                  attempt.pr_number, attempt.head_sha) == (
