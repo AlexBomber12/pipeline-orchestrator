@@ -2101,6 +2101,116 @@ def test_terminal_capture_retains_attempt_until_cleanup_consumer(monkeypatch, te
     assert runner.state.current_task is None
 
 
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+def test_terminal_fix_reconciliation_records_verified_head(monkeypatch, terminal):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    attempt.unverified_head_sha = remote["head"] = "b" * 40
+    remote["terminal"] = terminal
+    runner._start_current_run_record("claude", "opus")
+    observed = []
+    original_save = runner._save_current_run_record
+
+    async def save_outcome(outcome):
+        observed.append(runner.state.current_pr.head_sha)
+        await original_save(outcome)
+
+    monkeypatch.setattr(runner, "_save_current_run_record", save_outcome)
+    assert asyncio.run(runner._resolve_published_attempt())
+    assert observed == ["b" * 40]
+    assert attempt.candidate.head_sha == attempt.head_sha == "b" * 40
+    assert attempt.unverified_head_sha is None
+    assert not attempt.pending
+    recent = asyncio.run(runner._metrics_store.recent(
+        task_id="PR-001", limit=1, repo_name=runner.name,
+    ))
+    assert recent[0].exit_reason == (
+        "success_merged" if terminal == "MERGED" else "closed_unmerged"
+    )
+    if terminal == "MERGED":
+        assert recent[0].head_sha == "b" * 40
+
+
+@pytest.mark.parametrize("terminal", ["MERGED", "CLOSED"])
+@pytest.mark.parametrize("observation", ["listed", "state", "fallback"])
+@pytest.mark.parametrize("phase", ["coding", "fix"])
+def test_watch_terminal_consumes_paused_publication(monkeypatch, terminal, observation, phase):
+    from src.keyspace import pipeline_state
+
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner, code=0, stderr="")
+
+    async def paused_coder(*args, **kwargs):
+        remote["calls"] += 1
+        remote["created"] = True
+        runner._stop_requested = True
+        runner.state.user_paused = True
+        return 0, "", ""
+
+    if phase == "coding":
+        monkeypatch.setattr(h.claude_cli, "run_auto_pr_async", paused_coder)
+    asyncio.run(runner.handle_coding())
+    if phase == "fix":
+        monkeypatch.setattr(h.claude_cli, "fix_review_async", paused_coder)
+        asyncio.run(runner.handle_fix())
+    attempt = runner.state.publication_attempt
+    assert runner.state.state == PipelineState.PAUSED
+    assert attempt.pending and attempt.verified
+    runner._stop_requested = False
+    runner.state.user_paused = False
+    # Play resumes a paused run with a bound PR directly into WATCH.
+    runner.state.state = PipelineState.WATCH
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
+    pr = runner.state.current_pr.model_copy()
+    monkeypatch.setattr(coding_module.gh_prs, "get_open_prs",
+                        lambda *a, **kw: [pr] if observation == "listed" else [])
+    monkeypatch.setattr(coding_module.gh_prs, "get_pr_state",
+                        lambda *a: None if observation == "fallback" else terminal)
+    monkeypatch.setattr(coding_module.gh_prs, "is_pr_merged", lambda *a: terminal == "MERGED")
+    original_save = runner._save_current_run_record
+
+    async def save_outcome(outcome):
+        checkpoint = type(runner.state).model_validate_json(
+            await runner.redis.get(pipeline_state(runner.name)),
+        )
+        assert checkpoint.current_task is not None
+        assert not checkpoint.publication_attempt.pending
+        await original_save(outcome)
+
+    monkeypatch.setattr(runner, "_save_current_run_record", save_outcome)
+    asyncio.run(runner.handle_watch())
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert runner.state.current_pr is None
+    assert not attempt.pending
+    assert not asyncio.run(runner._hold_unresolved_publication())
+    saved = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    restarted = h._make_runner()
+    restarted.state = type(runner.state).model_validate_json(saved)
+    assert not asyncio.run(restarted._hold_unresolved_publication())
+    assert restarted.state.state == PipelineState.IDLE
+    assert remote["calls"] == (1 if phase == "coding" else 2)
+
+
+@pytest.mark.parametrize("mismatch", ["dispatch", "number", "branch"])
+def test_terminal_resolution_does_not_consume_unrelated_attempt(monkeypatch, mismatch):
+    runner = _runner(monkeypatch)
+    _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    pr = runner.state.current_pr.model_copy()
+    if mismatch == "dispatch":
+        attempt.run_id = "another-run"
+    elif mismatch == "number":
+        pr.number += 1
+    else:
+        pr.branch = "another-branch"
+    asyncio.run(runner._handle_external_pr_resolution(pr, "CLOSED"))
+    assert attempt.pending
+
+
 def test_stopped_unpublished_attempt_never_probes_before_confirmed_cleanup(monkeypatch):
     runner = _runner(monkeypatch)
     _publication_transport(monkeypatch, runner)

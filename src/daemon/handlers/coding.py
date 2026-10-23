@@ -334,6 +334,8 @@ class CodingMixin:
                 # may finalize the task and release its publication hold.
                 if not resolve_terminal:
                     return False
+                current.head_sha = attempt.head_sha
+                self.state.current_pr = current
                 attempt.verified = True
                 attempt.pending = False
                 await self._handle_external_pr_resolution(current, outcome.state.value)

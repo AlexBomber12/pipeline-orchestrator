@@ -1289,6 +1289,14 @@ class WatchMixin:
     ) -> None:
         """Release WATCH when the current PR is terminal on GitHub."""
         pr_number = getattr(found, "number", None)
+        attempt = self.state.publication_attempt
+        if (self._publication_attempt_matches_dispatch()
+            and attempt.pr_number == pr_number
+            and attempt.branch == getattr(found, "branch", None)):
+            # Play can resume directly into WATCH with a retained hold. Consume
+            # it before terminal bookkeeping removes its dispatch binding.
+            attempt.pending = False
+            await self.publish_state()
         legacy_fragment = (
             "merged externally -> IDLE"
             if pr_state == "MERGED"
