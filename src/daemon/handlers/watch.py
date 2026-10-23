@@ -296,7 +296,7 @@ class WatchMixin:
                 )
                 suppression = await self._suppression_record_for_task(task.pr_id)
                 cause = await self.redis.get(cause_key(self.name, task.pr_id))
-            except (OSError, UnicodeError) as exc:
+            except Exception as exc:
                 self.log_event(f"[WATCH] PR #{found.number} legacy completion validation deferred: {exc}")
                 return
             if (

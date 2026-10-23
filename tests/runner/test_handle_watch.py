@@ -16,6 +16,8 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 from src.cancellation.storage import task_spec_content_hash
 from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, DaemonConfig, RepoConfig, TrustedReviewerIdentity
@@ -693,6 +695,7 @@ def test_handle_watch_rehydrates_quarantine_before_merge(
     "none", "generation", "head", "invocation", "guardrail", "cause",
     "process", "process_unavailable", "task_unavailable", "status_raise",
     "status_false", "todo", "missing_revision",
+    "redis_suppression_unavailable", "redis_cause_unavailable",
 ])
 def test_watch_reconciles_legacy_receipt_without_label_dependency(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, labels: set[str], change: str,
@@ -746,6 +749,25 @@ def test_watch_reconciles_legacy_receipt_without_label_dependency(
         from src.cancellation.storage import CancellationCause, cause_key
         cause = CancellationCause(category="ERROR", payload={"subsource": "guardrail", "rule": "workflow_destruction"})
         asyncio.run(runner.redis.set(cause_key(runner.name, "PR-001"), cause.to_redis()))
+    elif change == "redis_suppression_unavailable":
+        monkeypatch.setattr(runner, "_detect_external_quarantine_release", AsyncMock())
+        monkeypatch.setattr(
+            runner, "_suppression_record_for_task",
+            AsyncMock(side_effect=RedisConnectionError("Redis unavailable")),
+        )
+    elif change == "redis_cause_unavailable":
+        from src.cancellation.storage import cause_key
+
+        monkeypatch.setattr(runner, "_detect_external_quarantine_release", AsyncMock())
+        monkeypatch.setattr(runner, "_suppression_record_for_task", AsyncMock(return_value=None))
+        original_get = runner.redis.get
+
+        async def unavailable_cause(key):
+            if key == cause_key(runner.name, "PR-001"):
+                raise RedisTimeoutError("Redis timed out")
+            return await original_get(key)
+
+        monkeypatch.setattr(runner.redis, "get", unavailable_cause)
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_a, **_k: [pr])
     monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_a, **_k: "OPEN")
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *_a, **_k: None)
@@ -776,10 +798,17 @@ def test_watch_reconciles_legacy_receipt_without_label_dependency(
         deferred = {
             "process", "process_unavailable", "task_unavailable",
             "status_raise", "status_false", "missing_revision",
+            "redis_suppression_unavailable", "redis_cause_unavailable",
         }
         assert runner.state.state == (
             PipelineState.WATCH if change in deferred else PipelineState.ERROR
         ), runner.state.error_message
+        if change.startswith("redis_"):
+            assert runner.state.size_fix_completion is not None
+            assert any(
+                "legacy completion validation deferred" in item["event"]
+                for item in runner.state.history
+            )
 
 
 
