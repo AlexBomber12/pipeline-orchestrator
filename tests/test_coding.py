@@ -3426,6 +3426,75 @@ def test_terminal_publish_rollback_keeps_live_publication_hold(monkeypatch):
     assert not runner.state.publication_attempt.pending
 
 
+@pytest.mark.parametrize("dirty", [False, True])
+@pytest.mark.parametrize("entry", ["idle", "error"])
+def test_retained_publication_allows_safe_staged_upload_without_losing_task_ref(
+    monkeypatch, tmp_path, dirty, entry,
+):
+    import json
+    from datetime import datetime, timezone
+    from unittest.mock import AsyncMock
+
+    from src.keyspace import upload_pending
+    from src.models import PublicationAttempt
+
+    repo_path = tmp_path / "repo"
+    remote_path = tmp_path / "remote.git"
+    staging_dir = tmp_path / "staged"
+    repo_path.mkdir()
+    staging_dir.mkdir()
+
+    def git(*args, cwd=repo_path):
+        return _REAL_GIT_RUN(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "--bare", str(remote_path), cwd=tmp_path)
+    git("init", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    git("commit", "--allow-empty", "-m", "base")
+    git("remote", "add", "origin", str(remote_path))
+    git("push", "-u", "origin", "main")
+    git("checkout", "-b", "pr-001")
+    git("commit", "--allow-empty", "-m", "unpublished task work")
+    task_head = git("rev-parse", "HEAD")
+    if dirty:
+        (repo_path / "operator.txt").write_text("keep uncommitted work")
+    (staging_dir / "PR-001.md").write_text("revised task specification\n")
+
+    runner = _runner(monkeypatch)
+    runner.repo_path = str(repo_path)
+    monkeypatch.setattr(subprocess, "run", _REAL_GIT_RUN)
+    runner.state.publication_attempt = PublicationAttempt(
+        repo=runner.owner_repo, base="main", task_id="PR-001", branch="pr-001",
+        run_id="retained", attempt_index=1, started_at=datetime.now(timezone.utc),
+        baseline_numbers=set(), initial_branch_head_sha="", head_sha=task_head,
+    )
+    monkeypatch.setattr(runner, "_hold_unresolved_publication", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner, "_confirm_current_coder_cleanup", AsyncMock(return_value=True))
+    asyncio.run(runner.redis.set(upload_pending(runner.name), json.dumps({
+        "staging_dir": str(staging_dir), "files": ["PR-001.md"],
+    })))
+    if entry == "idle":
+        asyncio.run(runner.handle_idle())
+    else:
+        runner.state.state = PipelineState.ERROR
+        asyncio.run(runner.handle_error("coder failed"))
+
+    assert git("rev-parse", "refs/heads/pr-001") == task_head
+    assert runner.state.publication_attempt.pending
+    if dirty:
+        assert git("rev-parse", "--abbrev-ref", "HEAD") == "pr-001"
+        assert (repo_path / "operator.txt").read_text() == "keep uncommitted work"
+        assert asyncio.run(runner.redis.get(upload_pending(runner.name))) is not None
+    else:
+        assert git("rev-parse", "--abbrev-ref", "HEAD") == "main"
+        uploaded = git("show", "main:tasks/PR-001.md", cwd=remote_path)
+        assert uploaded == "revised task specification"
+        assert asyncio.run(runner.redis.get(upload_pending(runner.name))) is None
+
+
 def test_crash_after_fix_capture_keeps_unclassified_publication_held(monkeypatch):
     from src.keyspace import pipeline_state
 

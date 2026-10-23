@@ -204,6 +204,7 @@ class ErrorMixin:
         attempt = self.state.publication_attempt
         if attempt is not None and attempt.pending:
             await self._hold_unresolved_publication()
+            await self._process_upload_while_publication_held()
             return
         if context.startswith("Persisted FIX invocation ownership is uncertain; operator Retry required"):
             self.log_event("[RECOVERY] Uncertain FIX invocation remains parked for operator Retry.")

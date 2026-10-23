@@ -15,6 +15,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
+from src.daemon import git_ops
 from src.daemon.backups import create_repo_bundle, prune_old_bundles
 from src.daemon.main_commit_audit import (
     audit_main_commit_shas,
@@ -32,7 +33,7 @@ from src.daemon.selector import (
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, WorkInhibitor, is_work_inhibited
-from src.keyspace import control_stop
+from src.keyspace import control_stop, upload_pending
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.onboarding.markdown_sections import MarkerError
 from src.onboarding.reconciliation import reconcile_agents_md
@@ -713,6 +714,7 @@ class IdleMixin:
     async def handle_idle(self) -> None:
         """Hard-sync to ``origin/{branch}``, pick the next task, hand off."""
         if await self._hold_unresolved_publication():
+            await self._process_upload_while_publication_held()
             return
         self._idle_degraded_done_check_logged = False
         self._error_diagnose_policy.reset(self)
@@ -947,6 +949,39 @@ class IdleMixin:
         self.log_event(f"[INFRA] Picked task {task.pr_id}: {task.title}.")
         await self.publish_state()
         await self.handle_coding()
+
+    async def _process_upload_while_publication_held(self) -> None:
+        """Accept staged task revisions without touching retained task work."""
+        attempt = self.state.publication_attempt
+        if (attempt is None or not attempt.pending or self.state.user_paused
+            or self._coder_invocation_active):
+            return
+        try:
+            if not await self.redis.get(upload_pending(self.name)):
+                return
+        except Exception as exc:
+            self.log_event(f"[INFRA] Retained publication upload check deferred: {exc}")
+            return
+        if not await self._confirm_current_coder_cleanup("retained publication upload"):
+            return
+        base = self.repo_config.branch
+        try:
+            if git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip():
+                raise ValueError("worktree has unpublished changes")
+            git_ops._git(self.repo_path, "fetch", "origin", base, timeout=60)
+            git_ops._git(self.repo_path, "checkout", base)
+            git_ops._git(self.repo_path, "merge", "--ff-only", f"origin/{base}")
+            local = git_ops._git(self.repo_path, "rev-parse", "HEAD").stdout.strip()
+            remote = git_ops._git(
+                self.repo_path, "rev-parse", f"refs/remotes/origin/{base}",
+            ).stdout.strip()
+            if local != remote:
+                raise ValueError("local base has unpublished commits")
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            self.log_event(f"[INFRA] Retained publication upload deferred: {exc}")
+            return
+        if await self.process_pending_uploads(_safe=True) is None:
+            self.log_event("[INFRA] Retained publication upload failed; retrying later.")
 
     async def handle_paused(self) -> None:
         """Wait for rate limit window to expire, then resume previous flow."""
