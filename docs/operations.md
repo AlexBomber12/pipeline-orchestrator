@@ -169,6 +169,57 @@ passes on every repository.
 
 ## Recovery from ERROR
 
+Diff size is a review signal, not a guardrail decision. The daemon logs the
+size once per scanned PR HEAD and continues through the normal CI, Codex
+review, FIX, and MERGE gates. Existing `daemon.large_diff_addition_threshold`
+and `daemon.large_diff_files_threshold` configuration values remain accepted;
+they now control only when that informational event appears. Deployments do
+not need to remove their existing settings.
+
+A legacy `large_diff_threshold` cancellation on a bound, open PR is
+reconciled through the existing validated approval transaction. The daemon
+checks the task generation, live PR identity and HEAD, checkout work, process
+ownership, and any newer failure before clearing only that obsolete decision.
+A pending artificial `status: ERROR` header is restored to `TODO`; the matching
+published PR then derives DOING on restart. A failed status write remains
+retryable through the approval receipt. The historical run HEAD is telemetry:
+it may differ from the live published PR HEAD after a later push.
+
+New CODING and FIX attempts use the ordinary lifecycle regardless of actual
+diff size or differences from planned estimates. They do not write size labels,
+artificial ERROR/TODO pairs, or size completion receipts. The daemon recognizes
+only the former exact `size-ok:<40-hex-SHA>`, `size-fix:<40-hex-SHA>`, and
+`quarantine:large_diff` labels. It removes them from the bound PR when it can;
+GitHub label cleanup failure cannot hold FIX, WATCH, or MERGE. Malformed and
+unrelated labels are left alone. A label alone never proves coder completion
+or authorizes clearing an ERROR.
+
+An old persisted size FIX completion receipt can reconcile a pending artificial
+ERROR header after restart. The receipt must match the task generation,
+invocation and run accounting, live PR identity and HEAD, exact old header
+revision, and a quiescent checkout, with no newer cancellation or suppression.
+The label may already have been removed. Missing or corrupt evidence leaves the
+published PR and real failure parked for operator recovery; no coder is
+redispatched on the strength of a label. These compatibility readers can be
+removed after all deployments have crossed a quiescent upgrade boundary and
+no retained task or Redis state contains these legacy artifacts.
+
+Before upgrading a deployment with an active legacy FIX, pause new dispatch
+and let the old invocation finish and its pending completion reconcile. Confirm
+that no coder or child process owns the checkout and that the task header and
+published PR agree. Upgrade at that quiescent boundary, then resume. If the
+invocation outcome cannot be established, preserve the checkout, task, and PR
+for the existing uncertainty/Retry procedure; an arbitrary restart during an
+active invocation is not a safe migration step.
+
+An externally merged PR remains in WATCH until its DONE task-status write is
+confirmed; a transient write failure is retried on the next WATCH cycle.
+Startup recovery also checks the checkout for unpublished work and active
+processes. It fetches a missing verified PR HEAD without moving local refs;
+unavailable evidence leaves recovery pending for the next cycle.
+Unavailable GitHub evidence or unpublished task work leaves the PR parked
+with a specific recovery reason; no branch synchronization is performed.
+
 When a task ships its terminal failure state to ERROR (frontmatter
 status:ERROR), the operator has two recovery affordances:
 

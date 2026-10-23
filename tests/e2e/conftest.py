@@ -369,8 +369,16 @@ def _reset_testbed_session():
     running e2e tests against a polluted testbed produces nondeterministic
     failures that are far worse than a loud setup abort.
     """
+    # The daemon may have recovered an unfinished merge from the previous CI
+    # run before pytest starts. Pause it before deleting that task on main,
+    # then restart so its in-memory state cannot resurrect the old merge.
+    _stop_daemon_and_wait_paused(TESTBED_SLUG)
     counts = reset_testbed_full(TESTBED_SLUG)
     counts["redis_keys_deleted"] = clear_testbed_redis_state(TESTBED_SLUG)
+    subprocess.run(
+        ["docker", "compose", "-f", "docker-compose.test.yml", "restart", "daemon-test"],
+        cwd=REPO_DIR, check=True, timeout=60,
+    )
     yield counts
 
 

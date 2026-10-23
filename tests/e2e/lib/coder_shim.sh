@@ -205,6 +205,19 @@ run_success_pending_ci() {
     gh pr comment "${pr_url}" --body "@codex review"
 }
 
+run_fix_existing_pr() {
+    # FIX must keep the published branch and PR open. run_success resets the
+    # branch to main first, which closes an existing PR before FIX completes.
+    local pr="$1" branch="$2"
+    git fetch origin
+    git checkout -B "${branch}" "origin/${branch}"
+    write_marker_and_commit "${pr}"
+    safe_push_branch "${branch}"
+    local pr_url
+    pr_url="$(ensure_pr_url "${branch}" "${pr}")"
+    gh pr comment "${pr_url}" --body "@codex review"
+}
+
 run_no_pr() {
     local pr="$1" branch="$2"
     git_setup_branch "${branch}"
@@ -359,6 +372,9 @@ main() {
             ;;
         success_pending_ci)
             run_success_pending_ci "${pr}" "${branch}"
+            ;;
+        fix_existing_pr)
+            run_fix_existing_pr "${pr}" "${branch}"
             ;;
         no_pr)
             run_no_pr "${pr}" "${branch}"

@@ -3,29 +3,45 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
+from src.cancellation.storage import task_spec_content_hash
 from src.config import AppConfig, DaemonConfig, RepoConfig
 from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
+from src.daemon.quarantine import (
+    OBSOLETE_SIZE_LABEL,
+)
 from src.daemon.runner import PipelineRunner
+from src.keyspace import pipeline_state
+from src.metrics import RunRecord
 from src.models import (
     CIStatus,
+    InvocationSnapshot,
     PipelineState,
     PRInfo,
     QueueTask,
+    RepoState,
     ReviewStatus,
+    SizeFixCompletion,
     TaskStatus,
 )
 from src.queue_parser import QueueValidationError, write_frontmatter_status
 from src.subsource_registry import SuppressionReason
 from src.suppression import SuppressionRecord
 from src.task_status import MergedState
+
+from tests.legacy_recovery_git import git as real_git
+from tests.legacy_recovery_git import legacy_repo
+from tests.legacy_size_labels import continued_size_label, fixing_size_label
 
 
 class _FakeRedis:
@@ -218,7 +234,7 @@ def test_recover_rehydrates_quarantine_from_pr_labels(
         branch="pr-042-inflight",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
 
@@ -238,6 +254,145 @@ def test_recover_rehydrates_quarantine_from_pr_labels(
     )
 
 
+def test_legacy_size_label_does_not_require_base_refresh(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    task = _doing_task()
+    pr = PRInfo(number=17, branch="pr-042-inflight", head_sha="a" * 40,
+                quarantine_labels={fixing_size_label("a" * 40)})
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
+    runner = _make_runner()
+    (tmp_path / ".git").mkdir()
+    runner.repo_path = str(tmp_path)
+    calls: list[tuple[str, ...]] = []
+    def git(_repo: str, *args: str, **kwargs: Any):
+        calls.append(args)
+        return subprocess.CompletedProcess(args, 0, "", "")
+    monkeypatch.setattr(recovery_module.git_ops, "_git", git)
+    runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.state == PipelineState.WATCH
+    assert not any(call[0] == "fetch" for call in calls)
+
+
+@pytest.mark.parametrize("label_present", [False, True])
+@pytest.mark.parametrize("first_failure", ["none", "fetch", "invalid_base"])
+@pytest.mark.parametrize("checkout_work", [False, True])
+def test_fresh_legacy_completion_refreshes_stale_base_before_headers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    label_present: bool, first_failure: str, checkout_work: bool,
+) -> None:
+    case = legacy_repo(tmp_path, remote_error=True)
+    assert "status: TODO" in real_git(case.repo, "show", "origin/main:tasks/PR-100.md")
+    assert "status: ERROR" in real_git(case.writer, "show", "HEAD:tasks/PR-100.md")
+    runner = _make_runner()
+    runner.repo_path = str(case.repo)
+    runner.repo_config.url = str(case.remote)
+    marker = fixing_size_label(case.head)
+    pr = PRInfo(number=100, branch="pr-100-size", pr_id="PR-100", head_sha=case.head,
+                quarantine_labels={marker} if label_present else set())
+    invocation = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="run-100", attempt_index=2, phase="fix", fix_iteration=1,
+    )
+    task = QueueTask(pr_id="PR-100", title="Original generation", status=TaskStatus.DOING,
+                     branch=pr.branch, task_file="tasks/PR-100.md")
+    task_hash = task_spec_content_hash(case.task.read_text())
+    receipt = SizeFixCompletion(
+        task_id=task.pr_id, branch=task.branch, pr_number=pr.number,
+        head_sha=case.head, fixing_label=marker, error_revision=case.revision,
+        task_spec_hash=task_hash, invocation=invocation,
+    )
+    saved = RepoState(
+        name=runner.name, url=runner.repo_config.url, state=PipelineState.WATCH,
+        current_task=task, current_pr=pr, active_invocation=invocation,
+        size_fix_completion=receipt,
+    )
+    runner.redis.store[pipeline_state(runner.name)] = saved.model_dump_json()
+    retry_key = f"metrics:retry_count:{runner.name}:PR-100"
+    runner.redis.store[retry_key] = "3"
+    record = RunRecord(
+        run_id="run-100", task_id=task.pr_id, repo_name=runner.name,
+        profile_id="claude:legacy", task_type="feature", complexity="medium",
+        started_at="2026-10-23T00:00:00+00:00", ended_at=None,
+        duration_ms=None, fix_iterations=1, tokens_in=12, tokens_out=34,
+        exit_reason="running", operator_intervention=False,
+        attempt_index=2, task_spec_hash=task_hash, invocations=[invocation],
+    )
+    runner.redis.store["metrics:run:run-100"] = json.dumps(asdict(record))
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_a, **_k: [pr])
+    monkeypatch.setattr(
+        recovery_module, "_resolve_merged_state",
+        lambda *_a, **_k: MergedState(set(), set(), True),
+    )
+    original_git = recovery_module.git_ops._git
+    failed = False
+
+    def maybe_fail_fetch(repo: str, *args: str, **kwargs: Any):
+        nonlocal failed
+        if first_failure == "fetch" and not failed and args[0] == "fetch":
+            failed = True
+            raise OSError("temporary fetch failure")
+        return original_git(repo, *args, **kwargs)
+
+    monkeypatch.setattr(recovery_module.git_ops, "_git", maybe_fail_fetch)
+    if checkout_work:
+        (case.repo / "local_only.py").write_text("unpublished = True\n", encoding="utf-8")
+        real_git(case.repo, "add", "local_only.py")
+        real_git(case.repo, "commit", "-m", "unpublished local work")
+        (case.repo / "staged.py").write_text("staged = True\n", encoding="utf-8")
+        real_git(case.repo, "add", "staged.py")
+        (case.repo / "implementation.py").write_text("published = False\n", encoding="utf-8")
+        (case.repo / "scratch.txt").write_text("untracked work\n", encoding="utf-8")
+    head_before = real_git(case.repo, "rev-parse", "HEAD")
+    index_before = real_git(case.repo, "diff", "--cached", "--binary")
+    work_before = real_git(case.repo, "diff", "--binary")
+    status_before = real_git(case.repo, "status", "--porcelain")
+    if first_failure == "invalid_base":
+        runner.repo_config.branch = "-invalid"
+    if first_failure != "none":
+        assert asyncio.run(runner.recover_state()) is False
+        assert runner.redis.store[pipeline_state(runner.name)] == saved.model_dump_json()
+        assert real_git(case.repo, "rev-parse", "HEAD") == head_before
+        assert "status: TODO" in real_git(case.repo, "show", "origin/main:tasks/PR-100.md")
+        if first_failure == "invalid_base":
+            runner.repo_config.branch = "main"
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_queue[0].status == TaskStatus.ERROR
+    assert runner.state.size_fix_completion == receipt
+    assert runner._current_run_record == record
+    assert "status: ERROR" in real_git(case.repo, "show", "origin/main:tasks/PR-100.md")
+    assert real_git(case.repo, "rev-parse", "HEAD") == head_before
+    assert real_git(case.repo, "branch", "--show-current") == "pr-100-size"
+    assert real_git(case.repo, "rev-parse", "origin/pr-100-size") == case.head
+    assert real_git(case.repo, "diff", "--cached", "--binary") == index_before
+    assert real_git(case.repo, "diff", "--binary") == work_before
+    assert real_git(case.repo, "status", "--porcelain") == status_before
+    assert runner.redis.store[retry_key] == "3"
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_a, **_k: "OPEN")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *_a, **_k: None)
+    monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker", lambda *_a: None)
+    base_before = real_git(case.writer, "ls-remote", "origin", "refs/heads/main").split()[0]
+    asyncio.run(runner.handle_watch())
+    assert runner._current_run_record == record
+    assert runner.redis.store[retry_key] == "3"
+    if checkout_work:
+        assert runner.state.size_fix_completion == receipt
+        assert real_git(case.writer, "ls-remote", "origin", "refs/heads/main").split()[0] == base_before
+    else:
+        assert runner.state.size_fix_completion is None
+        assert runner.state.current_task.status == TaskStatus.DOING
+        assert real_git(case.writer, "ls-remote", "origin", "refs/heads/main").split()[0] != base_before
+        real_git(case.writer, "fetch", "origin", "main")
+        assert "status: TODO" in real_git(case.writer, "show", "FETCH_HEAD:tasks/PR-100.md")
+    assert real_git(case.repo, "rev-parse", "HEAD") == head_before
+    assert real_git(case.repo, "branch", "--show-current") == "pr-100-size"
+    assert real_git(case.repo, "diff", "--cached", "--binary") == index_before
+    assert real_git(case.repo, "diff", "--binary") == work_before
+    assert real_git(case.repo, "status", "--porcelain") == status_before
+
+
 def test_recover_projects_quarantine_when_guardrail_suppression_exists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -248,7 +403,7 @@ def test_recover_projects_quarantine_when_guardrail_suppression_exists(
         pr_id="PR-042",
         ci_status=CIStatus.PENDING,
         review_status=ReviewStatus.PENDING,
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [matching_pr])
 
@@ -571,6 +726,172 @@ def test_recovery_marks_error_tasks_in_crashed_set(
     assert runner._crashed_task_pr_ids == {"PR-100"}
     assert runner.state.current_queue is not None
     assert runner.state.current_queue[0].status == TaskStatus.ERROR
+
+
+@pytest.mark.parametrize("label_kind", ["obsolete", "continued", "both", "workflow", "none"])
+@pytest.mark.parametrize("saved_watch", [False, True])
+def test_guardrail_error_with_open_pr_remains_parked_after_redis_loss(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, label_kind: str, saved_watch: bool,
+) -> None:
+    repo, remote = tmp_path / "repo", tmp_path / "remote.git"
+
+    def git(path: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), *args], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git(tmp_path, "init", "--bare", str(remote))
+    git(tmp_path, "init", "-b", "main", str(repo))
+    git(repo, "config", "user.name", "Recovery Test")
+    git(repo, "config", "user.email", "recovery@example.test")
+    _write_task_file(repo, "PR-100", "ERROR", "pr-100-size")
+    task_path = repo / "tasks/PR-100.md"
+    task_path.write_text(task_path.read_text().replace("status: ERROR", "status: ERROR\nblocked_reason: guardrail"))
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "guardrail decision")
+    git(repo, "remote", "add", "origin", str(remote))
+    git(repo, "push", "-u", "origin", "main")
+    git(repo, "checkout", "-b", "pr-100-size")
+    (repo / "implementation.py").write_text("published work\n")
+    git(repo, "add", ".")
+    git(repo, "commit", "-m", "published work")
+    git(repo, "push", "-u", "origin", "pr-100-size")
+    head_sha = git(repo, "rev-parse", "HEAD")
+    labels = {
+        "obsolete": {OBSOLETE_SIZE_LABEL},
+        "continued": {continued_size_label(head_sha)},
+        "both": {OBSOLETE_SIZE_LABEL, continued_size_label(head_sha)},
+        "workflow": {"quarantine:workflow"},
+        "none": set(),
+    }[label_kind]
+    pr = PRInfo(
+        number=100, branch="pr-100-size", pr_id="PR-100", head_sha=head_sha,
+        quarantine_labels=labels,
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [pr])
+    monkeypatch.setattr(
+        recovery_module, "_resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+    runner = _make_runner()
+    runner.repo_path = str(repo)
+    if saved_watch:
+        runner.redis.store[pipeline_state(runner.name)] = RepoState(
+            name=runner.name, url=runner.repo_config.url, state=PipelineState.WATCH,
+            current_task=QueueTask(
+                pr_id="PR-100", title="Legacy size", status=TaskStatus.DOING,
+                branch="pr-100-size", task_file="tasks/PR-100.md",
+            ),
+            current_pr=pr,
+        ).model_dump_json()
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task.pr_id == "PR-100"
+    assert runner.state.current_pr.number == 100
+    assert runner.state.current_queue[0].status == TaskStatus.ERROR
+    assert "operator Retry" in runner.state.error_message
+    assert "status: ERROR" in task_path.read_text()
+
+
+@pytest.mark.parametrize("blocked_reason", ["guardrail", "crash"])
+def test_unresolved_size_fix_recovery_completes_in_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocked_reason: str,
+) -> None:
+    _write_task_file(tmp_path, "PR-100", "ERROR", "pr-100-size")
+    path = tmp_path / "tasks/PR-100.md"
+    path.write_text(path.read_text().replace("status: ERROR", f"status: ERROR\nblocked_reason: {blocked_reason}"))
+    pr = PRInfo(
+        number=100, branch="pr-100-size", pr_id="PR-100", head_sha="a" * 40,
+        quarantine_labels={continued_size_label("a" * 40), fixing_size_label("a" * 40)},
+    )
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [pr])
+    monkeypatch.setattr(
+        recovery_module, "_resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_queue[0].status == TaskStatus.ERROR
+    assert "operator Retry" in runner.state.error_message
+
+
+@pytest.mark.parametrize("feature_flag,run_match", [(False, True), (True, True), (True, False)])
+@pytest.mark.parametrize("label_present", [False, True])
+def test_retained_successful_size_fix_retries_error_header_after_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, feature_flag: bool, run_match: bool,
+    label_present: bool,
+) -> None:
+    task_file = tmp_path / "tasks" / "PR-100.md"
+    task_file.parent.mkdir()
+    task_file.write_text("same task generation\n")
+    task_hash = task_spec_content_hash(task_file.read_text())
+    marker = fixing_size_label("a" * 40)
+    pr = PRInfo(number=100, branch="pr-100-size", pr_id="PR-100", head_sha="a" * 40,
+                quarantine_labels={marker} if label_present else set())
+    queued = QueueTask(pr_id="PR-100", title="size", status=TaskStatus.ERROR,
+                       branch=pr.branch, task_file="tasks/PR-100.md")
+    invocation = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="run-100", attempt_index=1, phase="fix", fix_iteration=1,
+    )
+    receipt = SizeFixCompletion(
+        task_id=queued.pr_id, branch=pr.branch, pr_number=pr.number,
+        head_sha=pr.head_sha, fixing_label=marker, error_revision="e" * 64,
+        task_spec_hash=task_hash, invocation=invocation,
+    )
+    saved = RepoState(
+        name="octo__demo", url="https://github.com/octo/demo.git",
+        state=PipelineState.WATCH,
+        current_task=queued.model_copy(update={"status": TaskStatus.DOING}),
+        current_pr=pr, active_invocation=invocation, size_fix_completion=receipt,
+    )
+    record = SimpleNamespace(
+        run_id="run-100" if run_match else "different-run", task_id=queued.pr_id,
+        invocations=[invocation],
+        fix_iterations=1, attempt_index=1, task_spec_hash=task_hash,
+    )
+    runner = _make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.repo_config.feature_flags.use_single_error_exit = feature_flag
+    runner._persisted_fix_recovery = RepoState.model_validate_json(saved.model_dump_json())
+    runner._recovery_task_headers = {
+        queued.pr_id: SimpleNamespace(
+            pr_id=queued.pr_id, branch=queued.branch,
+            frontmatter_status="error", blocked_reason="crash",
+        ),
+    }
+
+    async def restore_record() -> None:
+        runner._current_run_record = record
+
+    monkeypatch.setattr(runner, "_restore_current_run_record", restore_record)
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda *_args: None)
+    asyncio.run(runner._apply_recovery_decisions([queued], [pr]))
+    if not run_match:
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.size_fix_completion is None
+        return
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.size_fix_completion == receipt
+
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_args, **_kwargs: [pr])
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_args, **_kwargs: "OPEN")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task",
+        lambda: ("error", SuppressionReason.CRASH, "e" * 64),
+    )
+    monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker", lambda *_args: None)
+    monkeypatch.setattr("src.daemon.handlers.watch.bound_checkout_work_blocker_for_ref", lambda *_args: None)
+    write = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_commit_task_status_change", write)
+    asyncio.run(runner.handle_watch())
+    assert write.await_count == 1
+    assert write.await_args.kwargs["expected_task_sha256"] == "e" * 64
+    assert runner.state.size_fix_completion is None
+    assert runner.state.current_task.status == TaskStatus.DOING
 
 
 def test_recovery_does_not_mark_todo_or_done(
@@ -1505,6 +1826,7 @@ def test_run_cycle_transient_discovery_failure_stays_retryable(
     runner._parse_tasks_from_headers = lambda: [task]  # type: ignore[method-assign]
     runner.ensure_repo_cloned = noop_ensure  # type: ignore[method-assign]
     runner.preflight = clean_preflight  # type: ignore[method-assign]
+    runner._check_github_api_budget = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
     # First cycle: discovery fails, cycle bails with ERROR.
     asyncio.run(runner.run_cycle())
@@ -1580,6 +1902,7 @@ def test_run_cycle_subsequent_cycle_still_runs_preflight(
     runner.recover_state = noop_recover  # type: ignore[method-assign]
     runner.preflight = ok_preflight  # type: ignore[method-assign]
     runner.handle_idle = noop_idle  # type: ignore[method-assign]
+    runner._check_github_api_budget = AsyncMock(return_value=True)  # type: ignore[method-assign]
 
     asyncio.run(runner.run_cycle())  # recovery cycle: skips preflight
     asyncio.run(runner.run_cycle())  # normal cycle: runs preflight

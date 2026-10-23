@@ -13,7 +13,13 @@ from src.daemon import runner as runner_module
 from src.daemon.guardrails import GuardrailViolation
 from src.daemon.handlers import merge as merge_module
 from src.daemon.handlers import watch as watch_module
-from src.daemon.quarantine import apply_quarantine_label_for_violation
+from src.daemon.quarantine import (
+    apply_quarantine_label_for_violation,
+    cleanup_obsolete_size_labels,
+    is_continued_size_label,
+    is_fixing_size_label,
+    obsolete_size_labels,
+)
 from src.models import (
     CIStatus,
     PipelineState,
@@ -25,12 +31,31 @@ from src.models import (
 from tests.runner import _helpers as h
 
 
-def _violation(category: str = "large_diff_threshold") -> GuardrailViolation:
+def _violation(category: str = "workflow_destruction") -> GuardrailViolation:
     return GuardrailViolation(
         tier=2,
         category=category,
         excerpt="+900 LOC",
         rule="Large diffs require operator review",
+    )
+
+
+@pytest.mark.parametrize(
+    ("predicate", "prefix"),
+    [(is_continued_size_label, "size-ok:"), (is_fixing_size_label, "size-fix:")],
+)
+def test_size_markers_require_published_head(predicate, prefix: str) -> None:
+    assert predicate(prefix + "a" * 40)
+    assert predicate(prefix + "A" * 40)
+    for suffix in ("", "pending", "a" * 39, "a" * 41, "g" * 40):
+        assert not predicate(prefix + suffix)
+
+
+def test_size_violation_is_informational_without_label_write(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("src.daemon.quarantine.gh_runner.run_gh",
+                        lambda *_a, **_k: pytest.fail("size label write"))
+    assert apply_quarantine_label_for_violation(
+        h._make_runner(), 42, _violation("large_diff_threshold")
     )
 
 
@@ -47,8 +72,8 @@ def test_quarantine_apply_creates_label_and_comment(
 
     assert apply_quarantine_label_for_violation(h._make_runner(), 42, _violation())
 
-    assert calls[0][:3] == ["label", "create", "quarantine:large_diff"]
-    assert calls[1] == ["pr", "edit", "42", "--add-label", "quarantine:large_diff"]
+    assert calls[0][:3] == ["label", "create", "quarantine:workflow"]
+    assert calls[1] == ["pr", "edit", "42", "--add-label", "quarantine:workflow"]
     assert calls[2][:3] == ["pr", "comment", "42"]
 
 
@@ -68,7 +93,7 @@ def test_quarantine_apply_soft_fails_on_label_create_failure(
     monkeypatch.setattr("src.daemon.quarantine.gh_runner.run_gh", fake_run_gh)
 
     assert apply_quarantine_label_for_violation(h._make_runner(), 42, _violation())
-    assert ["pr", "edit", "42", "--add-label", "quarantine:large_diff"] in calls
+    assert ["pr", "edit", "42", "--add-label", "quarantine:workflow"] in calls
 
 
 def test_quarantine_apply_returns_false_on_apply_failure(
@@ -287,7 +312,7 @@ def test_label_rehydrate_projects_quarantine_without_task_id() -> None:
             PRInfo(
                 number=10,
                 branch="pr-unknown",
-                quarantine_labels={"quarantine:large_diff"},
+                quarantine_labels={"quarantine:workflow"},
             )
         )
     )
@@ -350,7 +375,7 @@ def test_label_removal_check_keeps_labeled_pr(monkeypatch: pytest.MonkeyPatch) -
     runner.state.quarantined_prs.add(10)
     monkeypatch.setattr(
         "src.github.gh_runner.run_gh",
-        lambda *a, **kw: "quarantine:large_diff\n",
+        lambda *a, **kw: "quarantine:workflow\n",
     )
 
     asyncio.run(runner._detect_external_quarantine_release(10))
@@ -403,3 +428,23 @@ def test_operator_action_audit_swallows_oserror(tmp_path: Path) -> None:
         )
     finally:
         operator_actions.AUDIT_DIR = original
+
+
+def test_obsolete_size_cleanup_is_exact_and_best_effort(monkeypatch: pytest.MonkeyPatch) -> None:
+    labels = {"quarantine:large_diff", "size-ok:" + "a" * 40,
+              "size-fix:" + "b" * 40, "size-ok:malformed", "quarantine:workflow"}
+    pr = PRInfo(number=42, branch="pr-042", quarantine_labels=set(labels))
+    runner = h._make_runner()
+    calls: list[list[str]] = []
+    def run_gh(args, **_kwargs):
+        calls.append(args)
+        if args[-1].startswith("size-fix:"):
+            raise OSError("offline")
+    monkeypatch.setattr("src.daemon.quarantine.gh_runner.run_gh", run_gh)
+    assert obsolete_size_labels(labels) == {
+        "quarantine:large_diff", "size-ok:" + "a" * 40, "size-fix:" + "b" * 40,
+    }
+    cleanup_obsolete_size_labels(runner, pr)
+    assert pr.quarantine_labels == {"size-fix:" + "b" * 40, "size-ok:malformed", "quarantine:workflow"}
+    assert all(call[:4] == ["pr", "edit", "42", "--remove-label"] for call in calls)
+    assert len(calls) == 3

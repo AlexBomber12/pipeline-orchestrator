@@ -2,18 +2,17 @@
 
 from __future__ import annotations
 
+import re
 from typing import TYPE_CHECKING
 
 from src.audit.operator_actions import write_operator_action_audit
-from src.daemon.fix_escalation import (
-    _exception_text,
-    _is_label_already_exists_error,
-)
+from src.daemon.fix_escalation import _exception_text, _is_label_already_exists_error
 from src.daemon.guardrails import GuardrailViolation
 from src.github import gh_runner
 
 if TYPE_CHECKING:
     from src.daemon.runner import PipelineRunner
+    from src.models import PRInfo
 
 _QUARANTINE_LABEL_COLOR = "B60205"
 
@@ -24,6 +23,46 @@ _CATEGORY_LABEL_ALIASES = {
     "governance_file_modified": "governance",
     "workflow_destruction": "workflow",
 }
+
+OBSOLETE_SIZE_LABEL = "quarantine:large_diff"
+CONTINUED_SIZE_PREFIX = "size-ok:"
+FIXING_SIZE_PREFIX = "size-fix:"
+
+
+def is_continued_size_label(label: str) -> bool:
+    return re.fullmatch(rf"{CONTINUED_SIZE_PREFIX}[0-9a-fA-F]{{40}}", label) is not None
+
+
+def is_fixing_size_label(label: str) -> bool:
+    return re.fullmatch(rf"{FIXING_SIZE_PREFIX}[0-9a-fA-F]{{40}}", label) is not None
+
+
+def obsolete_size_labels(labels: set[str]) -> set[str]:
+    """Only labels emitted by the former size protocol are eligible for cleanup."""
+    return {
+        label for label in labels
+        if label == OBSOLETE_SIZE_LABEL or is_continued_size_label(label)
+        or is_fixing_size_label(label)
+    }
+
+
+def cleanup_obsolete_size_labels(runner: "PipelineRunner", pr: "PRInfo") -> None:
+    """Best-effort, bounded housekeeping; GitHub availability never gates work."""
+    for label in sorted(obsolete_size_labels(pr.quarantine_labels)):
+        try:
+            gh_runner.run_gh(
+                ["pr", "edit", str(pr.number), "--remove-label", label],
+                repo=runner.owner_repo,
+            )
+        except Exception as exc:
+            runner.log_event(f"[RECOVERY] Obsolete size label cleanup deferred: {exc}")
+            continue
+        pr.quarantine_labels.discard(label)
+
+
+def blocking_quarantine_labels(labels: set[str]) -> set[str]:
+    """Ignore only the former size decision; retain every other quarantine."""
+    return labels - obsolete_size_labels(labels)
 
 
 def quarantine_label_for_category(category: str) -> str:
@@ -41,6 +80,9 @@ def apply_quarantine_label_for_violation(
     GitHub-side writes are best effort. The durable daemon protection is the
     guardrail suppression record plus the MERGE gate.
     """
+    if violation.category == "large_diff_threshold":
+        runner.log_event(f"[GUARDRAIL] Informational diff size: {violation.excerpt}")
+        return True
     label = quarantine_label_for_category(violation.category)
     try:
         gh_runner.run_gh(

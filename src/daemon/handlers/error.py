@@ -152,6 +152,10 @@ class ErrorMixin:
             await self._admit_fix_idle_timeout()
             return
 
+        if context.startswith("Size FIX outcome unresolved; operator Retry"):
+            self.log_event("[RECOVERY] Size FIX remains parked for operator Retry.")
+            return
+
         if "status:ERROR write failed; operator Retry required" in context:
             reason_text = context.partition(":")[0]
             try:
@@ -200,6 +204,9 @@ class ErrorMixin:
         attempt = self.state.publication_attempt
         if attempt is not None and attempt.pending:
             await self._hold_unresolved_publication()
+            return
+        if context.startswith("Persisted FIX invocation ownership is uncertain; operator Retry required"):
+            self.log_event("[RECOVERY] Uncertain FIX invocation remains parked for operator Retry.")
             return
 
         async def _clear_cause_for_retry() -> None:

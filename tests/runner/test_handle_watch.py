@@ -16,6 +16,9 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
+from src.cancellation.storage import task_spec_content_hash
 from src.coders import claude as claude_plugin_module
 from src.config import AppConfig, DaemonConfig, RepoConfig, TrustedReviewerIdentity
 from src.daemon import runner as runner_module
@@ -27,12 +30,14 @@ from src.keyspace import pipeline_state
 from src.models import (
     CIStatus,
     FeedbackCheckResult,
+    InvocationSnapshot,
     PipelineState,
     PRInfo,
     PublicationMigration,
     QueueTask,
     RepoState,
     ReviewStatus,
+    SizeFixCompletion,
     TaskStatus,
 )
 from src.publication_migration import (
@@ -43,7 +48,10 @@ from src.publication_migration import (
     command_key as migration_command_key,
 )
 from src.publication_migration import enqueue as enqueue_migration
+from src.subsource_registry import SuppressionReason
 
+from tests.legacy_recovery_git import git as real_git
+from tests.legacy_recovery_git import legacy_repo
 from tests.runner import _helpers as h
 
 claude_cli = claude_plugin_module.claude_cli
@@ -118,6 +126,7 @@ def test_watch_620_evidence_drives_fix_without_rereading(
     def open_prs(repo: str, **kwargs: object) -> list[PRInfo]:
         result = PRInfo(
             number=42, branch="pr-459", head_sha=head, ci_status=ci_status,
+            quarantine_labels={"quarantine:large_diff"},
             review_status=gh_reviews.get_pr_review_status(
                 repo, 42, "author", head, policy=kwargs["reviewer_policy"]
             ),
@@ -593,8 +602,10 @@ def test_retry_failed_workflow_returns_true_after_rerun(
     )
 
 
+@pytest.mark.parametrize("labels", [set(), {"quarantine:large_diff"}])
 def test_handle_watch_approved_and_green_merges(
     monkeypatch: pytest.MonkeyPatch,
+    labels: set[str],
 ) -> None:
     monkeypatch.setattr(
         "src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", AsyncMock(return_value=True)
@@ -607,6 +618,7 @@ def test_handle_watch_approved_and_green_merges(
         review_status=ReviewStatus.APPROVED,
         head_sha="green001",
         diff_scanned_at_sha="green001",
+        quarantine_labels=labels,
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
 
@@ -642,12 +654,12 @@ def test_handle_watch_rehydrates_quarantine_before_merge(
         review_status=ReviewStatus.APPROVED,
         head_sha="green001",
         diff_scanned_at_sha="green001",
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
     monkeypatch.setattr("src.github.prs.get_open_prs", lambda repo, **kw: [pr])
     monkeypatch.setattr(
         "src.github.gh_runner.run_gh",
-        lambda cmd, **kw: "quarantine:large_diff\n",
+        lambda cmd, **kw: "quarantine:workflow\n",
     )
 
     merged: list[tuple[str, int]] = []
@@ -680,11 +692,214 @@ def test_handle_watch_rehydrates_quarantine_before_merge(
     )
 
 
+@pytest.mark.parametrize("labels", [set(), {"size-fix:" + "a" * 40}])
+@pytest.mark.parametrize("change", [
+    "none", "generation", "head", "invocation", "guardrail", "cause",
+    "process", "process_unavailable", "task_unavailable", "status_raise",
+    "status_false", "todo", "missing_revision",
+    "redis_suppression_unavailable", "redis_cause_unavailable",
+])
+def test_watch_reconciles_legacy_receipt_without_label_dependency(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, labels: set[str], change: str,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    task_path = tmp_path / "tasks" / "PR-001.md"
+    task_path.parent.mkdir()
+    task_path.write_text("approved generation\n")
+    task_hash = task_spec_content_hash(task_path.read_text())
+    invocation = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="run-1", attempt_index=1, phase="fix", fix_iteration=1,
+    )
+    pr = PRInfo(number=5, branch="pr-001", pr_id="PR-001", head_sha="a" * 40,
+                quarantine_labels=set(labels))
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = pr
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.ERROR,
+        branch="pr-001", task_file="tasks/PR-001.md",
+    )
+    runner.state.active_invocation = invocation
+    runner.state.size_fix_completion = SizeFixCompletion(
+        task_id="PR-001", branch="pr-001", pr_number=5,
+        head_sha="a" * 40, fixing_label="size-fix:" + "a" * 40,
+        error_revision="e" * 64, task_spec_hash=task_hash, invocation=invocation,
+    )
+    runner._current_run_record = types.SimpleNamespace(
+        run_id="run-1", task_id="PR-001", invocations=[invocation],
+        fix_iterations=1, attempt_index=1, task_spec_hash=task_hash,
+    )
+    if change == "generation":
+        task_path.write_text("revised generation\n")
+    elif change == "task_unavailable":
+        monkeypatch.setattr(
+            watch_module, "task_spec_content_hash",
+            lambda *_args: (_ for _ in ()).throw(OSError("task unavailable")),
+        )
+    elif change == "head":
+        pr.head_sha = "b" * 40
+    elif change == "invocation":
+        runner.state.active_invocation = invocation.__class__(
+            plugin_id="claude", model_override=None, reasoning_effort_override=None,
+            run_id="later-run", attempt_index=2, phase="fix", fix_iteration=2,
+        )
+    elif change == "guardrail":
+        pr.quarantine_labels.add("quarantine:workflow")
+    elif change == "cause":
+        from src.cancellation.storage import CancellationCause, cause_key
+        cause = CancellationCause(category="ERROR", payload={"subsource": "guardrail", "rule": "workflow_destruction"})
+        asyncio.run(runner.redis.set(cause_key(runner.name, "PR-001"), cause.to_redis()))
+    elif change == "redis_suppression_unavailable":
+        monkeypatch.setattr(runner, "_detect_external_quarantine_release", AsyncMock())
+        monkeypatch.setattr(
+            runner, "_suppression_record_for_task",
+            AsyncMock(side_effect=RedisConnectionError("Redis unavailable")),
+        )
+    elif change == "redis_cause_unavailable":
+        from src.cancellation.storage import cause_key
+
+        monkeypatch.setattr(runner, "_detect_external_quarantine_release", AsyncMock())
+        monkeypatch.setattr(runner, "_suppression_record_for_task", AsyncMock(return_value=None))
+        original_get = runner.redis.get
+
+        async def unavailable_cause(key):
+            if key == cause_key(runner.name, "PR-001"):
+                raise RedisTimeoutError("Redis timed out")
+            return await original_get(key)
+
+        monkeypatch.setattr(runner.redis, "get", unavailable_cause)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_a, **_k: [pr])
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_a, **_k: "OPEN")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *_a, **_k: None)
+    monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
+                        lambda: (("todo", None, "t" * 64) if change == "todo" else
+                                 ("error", SuppressionReason.CRASH,
+                                  None if change == "missing_revision" else "e" * 64)))
+    def process_blocker(*_args):
+        if change == "process_unavailable":
+            raise OSError("inspection unavailable")
+        return "active coder" if change == "process" else None
+    monkeypatch.setattr("src.daemon.handlers.watch.checkout_process_blocker", process_blocker)
+    monkeypatch.setattr("src.daemon.handlers.watch.bound_checkout_work_blocker_for_ref", lambda *_a: None)
+    write = AsyncMock(return_value=change != "status_false")
+    if change == "status_raise":
+        write.side_effect = OSError("status unavailable")
+    monkeypatch.setattr(runner, "_commit_task_status_change", write)
+    asyncio.run(runner.handle_watch())
+    if change in {"none", "todo"}:
+        assert write.await_count == 1
+        assert write.await_args.args[1] == "TODO"
+        assert runner.state.size_fix_completion is None
+        assert runner.state.current_task.status == TaskStatus.DOING
+    else:
+        if change not in {"status_raise", "status_false"}:
+            write.assert_not_awaited()
+        deferred = {
+            "process", "process_unavailable", "task_unavailable",
+            "status_raise", "status_false", "missing_revision",
+            "redis_suppression_unavailable", "redis_cause_unavailable",
+        }
+        assert runner.state.state == (
+            PipelineState.WATCH if change in deferred else PipelineState.ERROR
+        ), runner.state.error_message
+        if change.startswith("redis_"):
+            assert runner.state.size_fix_completion is not None
+            assert any(
+                "legacy completion validation deferred" in item["event"]
+                for item in runner.state.history
+            )
+
+
+@pytest.mark.parametrize("remote_case", [
+    "todo_same", "todo_revised", "error_valid", "error_guardrail", "pr_mismatch",
+])
+def test_watch_legacy_receipt_validates_real_remote_generation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, remote_case: str,
+) -> None:
+    case = legacy_repo(tmp_path, remote_error=remote_case in {"error_valid", "error_guardrail"})
+    if remote_case == "todo_revised":
+        case.remote_task.write_text(
+            case.remote_task.read_text().replace("Original generation", "Revised generation"),
+            encoding="utf-8",
+        )
+    elif remote_case == "error_guardrail":
+        case.remote_task.write_text(
+            case.remote_task.read_text().replace("blocked_reason: crash", "blocked_reason: guardrail"),
+            encoding="utf-8",
+        )
+    if remote_case in {"todo_revised", "error_guardrail"}:
+        real_git(case.writer, "add", "tasks/PR-100.md")
+        real_git(case.writer, "commit", "-m", "newer task decision")
+        real_git(case.writer, "push", "origin", "main")
+    base_before = real_git(case.writer, "rev-parse", "HEAD")
+    local_before = real_git(case.repo, "rev-parse", "HEAD")
+    task_hash = task_spec_content_hash(case.task.read_text())
+    invocation = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="run-100", attempt_index=2, phase="fix", fix_iteration=1,
+    )
+    pr = PRInfo(
+        number=100, branch="pr-100-size", pr_id="PR-OTHER" if remote_case == "pr_mismatch" else "PR-100",
+        head_sha=case.head, fix_iteration_count=1, no_push_fix_count=2,
+    )
+    runner = h._make_runner()
+    runner.repo_path = str(case.repo)
+    runner.repo_config.url = str(case.remote)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = pr
+    runner.state.current_task = QueueTask(
+        pr_id="PR-100", title="Original generation", status=TaskStatus.ERROR,
+        branch="pr-100-size", task_file="tasks/PR-100.md",
+    )
+    runner.state.active_invocation = invocation
+    runner.state.size_fix_completion = SizeFixCompletion(
+        task_id="PR-100", branch="pr-100-size", pr_number=100,
+        head_sha=case.head, fixing_label="size-fix:" + case.head,
+        error_revision=case.revision, task_spec_hash=task_hash, invocation=invocation,
+    )
+    record = types.SimpleNamespace(
+        run_id="run-100", task_id="PR-100", invocations=[invocation],
+        fix_iterations=1, attempt_index=2, task_spec_hash=task_hash,
+    )
+    runner._current_run_record = record
+    coder = AsyncMock(side_effect=AssertionError("legacy completion must not rerun coder"))
+    monkeypatch.setattr(runner, "handle_coding", coder)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_a, **_k: [pr])
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_a, **_k: "OPEN")
+    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *_a, **_k: None)
+    monkeypatch.setattr(watch_module, "checkout_process_blocker", lambda *_a: None)
+    asyncio.run(runner.handle_watch())
+    coder.assert_not_awaited()
+    assert real_git(case.repo, "rev-parse", "HEAD") == local_before
+    assert real_git(case.repo, "rev-parse", "origin/pr-100-size") == case.head
+    assert runner._current_run_record is record
+    assert runner.state.current_pr.fix_iteration_count == 1
+    assert runner.state.current_pr.no_push_fix_count == 2
+    if remote_case in {"todo_same", "error_valid"}:
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_task.status == TaskStatus.DOING
+        assert runner.state.size_fix_completion is None
+        remote_head = real_git(case.writer, "ls-remote", "origin", "refs/heads/main").split()[0]
+        assert (remote_head == base_before) == (remote_case == "todo_same")
+        real_git(case.writer, "fetch", "origin", "main")
+        assert "status: TODO" in real_git(case.writer, "show", "FETCH_HEAD:tasks/PR-100.md")
+    else:
+        if remote_case == "todo_revised":
+            assert runner.state.state == PipelineState.WATCH
+            assert runner.state.size_fix_completion is not None
+        else:
+            assert runner.state.state == PipelineState.ERROR
+        assert real_git(case.writer, "ls-remote", "origin", "refs/heads/main").split()[0] == base_before
+
+
+
 def test_watch_quarantine_rehydrate_ignores_invalid_or_existing_pr() -> None:
     runner = h._make_runner()
     invalid = types.SimpleNamespace(
         number="5",
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
 
     asyncio.run(runner._rehydrate_quarantine_from_pr_labels(invalid))
@@ -695,7 +910,7 @@ def test_watch_quarantine_rehydrate_ignores_invalid_or_existing_pr() -> None:
     existing = PRInfo(
         number=5,
         branch="pr-001",
-        quarantine_labels={"quarantine:large_diff"},
+        quarantine_labels={"quarantine:workflow"},
     )
 
     asyncio.run(runner._rehydrate_quarantine_from_pr_labels(existing))
@@ -1723,6 +1938,33 @@ def test_handle_watch_captures_success_merged_on_external_merge(
     )
     assert len(recent) == 1
     assert recent[0].exit_reason == "success_merged"
+
+
+def test_external_merge_retries_failed_done_status_before_releasing_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_args, **_kwargs: "MERGED")
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=5, branch="pr-001", pr_id="PR-001")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.ERROR,
+        branch="pr-001", task_file="tasks/PR-001.md",
+    )
+    write = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(runner, "_commit_task_status_change", write)
+    saved = AsyncMock()
+    monkeypatch.setattr(runner, "_save_current_run_record", saved)
+    asyncio.run(runner.handle_watch())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task.pr_id == "PR-001"
+    saved.assert_not_awaited()
+    asyncio.run(runner.handle_watch())
+    assert write.await_count == 2
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    saved.assert_awaited_once()
 
 
 def test_handle_watch_captures_closed_unmerged(
@@ -4286,6 +4528,27 @@ def test_scan_pr_diff_once_runs_when_cache_mismatches_head_sha(
     assert fetched == [(runner.owner_repo, 8)]
     assert runner.state.current_pr.diff_scanned_at_sha == "deadbeef"
     assert runner.state.state != PipelineState.ERROR
+
+
+def test_large_diff_is_review_signal_after_each_push(monkeypatch: pytest.MonkeyPatch) -> None:
+    import re as _re
+
+    monkeypatch.setattr(watch_module.guardrails, "_DIFF_PATTERNS", {"never": _re.compile("NEVER")})
+    diff = "diff --git a/src/large.py b/src/large.py\n--- a/src/large.py\n+++ b/src/large.py\n"
+    diff += "".join(f"+line {index}\n" for index in range(1600))
+    monkeypatch.setattr("src.github.prs.get_pr_diff", lambda *_: diff)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=8, branch="pr-008", head_sha="first")
+
+    assert asyncio.run(runner._scan_pr_diff_once())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.quarantined_prs == set()
+    assert sum("[WATCH] PR #8 diff size review signal" in item["event"] for item in runner.state.history) == 1
+    assert not asyncio.run(runner._scan_pr_diff_once())
+    runner.state.current_pr.head_sha = "second"
+    assert asyncio.run(runner._scan_pr_diff_once())
+    assert sum("[WATCH] PR #8 diff size review signal" in item["event"] for item in runner.state.history) == 2
 
 
 def test_scan_pr_diff_once_leaves_cache_unchanged_on_fetch_failure(

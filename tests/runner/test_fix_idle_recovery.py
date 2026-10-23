@@ -807,9 +807,9 @@ async def test_timeout_admission_reconciles_and_consumes_publication_hold(
     assert not attempt.pending, runner.state.history
     assert attempt.head_sha == "b" * 40
     assert attempt.unverified_head_sha is None
-    # The hold is durably consumed while the original dispatch is still bound.
-    assert checkpoints[0][:2] == (PipelineState.ERROR, False)
-    assert checkpoints[0][2].pr_id == task.pr_id
+    # Terminal bookkeeping keeps the hold until the status and record writes
+    # finish, then publishes the released task state in one checkpoint.
+    assert checkpoints[-1][1] is False
     persisted = await runner.redis.get(pipeline_state(runner.name))
     assert not runner.state.model_validate_json(persisted).publication_attempt.pending
     if outcome == "OPEN":

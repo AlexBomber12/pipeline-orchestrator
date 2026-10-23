@@ -32,6 +32,12 @@ def _runner(
 
     monkeypatch.setattr(h.runner_module.asyncio, "sleep", _sleep)
     runner = h._make_runner()
+    # The runner fixture has no real task branch or task file. Model the
+    # successful absence probe and status write unless a test overrides them.
+    monkeypatch.setattr(coding_module, "_initial_branch_head_sha", lambda *a: "")
+    async def status_written(*args, **kwargs):
+        return True
+    monkeypatch.setattr(runner, "_commit_task_status_change", status_written)
     runner.state.current_task = QueueTask(
         pr_id="PR-001",
         title="Sample task",
@@ -1379,6 +1385,7 @@ def test_should_skip_codex_review_post_rejects_empty_bound_head(
 _REAL_PUBLICATIONS = coding_module.gh_prs.get_branch_publications
 _REAL_EXACT_OUTCOME = coding_module.gh_prs.get_exact_pr_outcome
 _REAL_LOCAL_HEAD = coding_module._local_branch_head_sha
+_REAL_INITIAL_HEAD = coding_module._initial_branch_head_sha
 _REAL_GIT_RUN = subprocess.run
 
 
@@ -1571,6 +1578,7 @@ def test_published_attempt_uses_real_task_branch_commit(monkeypatch, tmp_path):
     remote["head"] = head
     monkeypatch.setattr(subprocess, "run", _REAL_GIT_RUN)
     monkeypatch.setattr(coding_module, "_local_branch_head_sha", _REAL_LOCAL_HEAD)
+    monkeypatch.setattr(coding_module, "_initial_branch_head_sha", _REAL_INITIAL_HEAD)
     asyncio.run(runner.handle_coding())
     assert runner.state.publication_attempt.head_sha == head
     assert runner.state.current_pr.number == 402
@@ -2177,7 +2185,7 @@ def test_watch_terminal_consumes_paused_publication(monkeypatch, terminal, obser
             await runner.redis.get(pipeline_state(runner.name)),
         )
         assert checkpoint.current_task is not None
-        assert not checkpoint.publication_attempt.pending
+        assert checkpoint.publication_attempt.pending
         await original_save(outcome)
 
     monkeypatch.setattr(runner, "_save_current_run_record", save_outcome)
@@ -2867,10 +2875,16 @@ def test_retry_cleans_unpublished_local_branch_before_release(monkeypatch, tmp_p
     runner.repo_path = str(repo_path)
     monkeypatch.setattr(subprocess, "run", _REAL_GIT_RUN)
     monkeypatch.setattr(coding_module, "_local_branch_head_sha", _REAL_LOCAL_HEAD)
+    monkeypatch.setattr(coding_module, "_initial_branch_head_sha", _REAL_INITIAL_HEAD)
     monkeypatch.setattr(coding_module, "_remote_branch_exists", lambda *a: False)
     monkeypatch.setattr(coding_module.gh_prs, "get_open_prs", lambda *a, **kw: [])
     monkeypatch.setattr(coding_module.gh_prs, "get_merged_prs", lambda *a, **kw: [])
     attempt = runner.state.publication_attempt
+    # The temporary ref represents work created by this attempt after its
+    # recorded pre-launch absence probe.
+    attempt.initial_branch_head_sha = ""
+    if local_state != "absent":
+        attempt.head_sha = git("rev-parse", "refs/heads/pr-001")
     if blocker == "dirty":
         (repo_path / "operator.txt").write_text("preserve me")
     if blocker == "base":
@@ -2879,7 +2893,7 @@ def test_retry_cleans_unpublished_local_branch_before_release(monkeypatch, tmp_p
     real_git = git_ops._git
 
     def checked_git(repo_path, *args, **kwargs):
-        if blocker == "probe" and args[0] == "show-ref":
+        if blocker == "probe" and args[0] == "rev-parse":
             return subprocess.CompletedProcess(args, 128, "", "probe failed")
         if (blocker == "checkout" and args[0] == "checkout") or (
             blocker == "delete" and args[0] == "branch"
@@ -3286,6 +3300,92 @@ def test_initial_branch_snapshot_uses_real_git_refs(tmp_path):
     )
     assert result.returncode != 0
     assert coding_module._local_branch_head_sha(str(tmp_path), "pr-001") == old_head
+
+
+@pytest.mark.parametrize(
+    ("ownership", "released"),
+    [
+        ("preexisting", False),
+        ("owned", True),
+        ("prelaunch", False),
+        ("unknown", False),
+        ("changed", False),
+    ],
+)
+def test_unpublished_cleanup_preserves_unowned_git_refs_after_restart(
+    monkeypatch, tmp_path, ownership, released,
+):
+    from datetime import datetime, timezone
+
+    from src.models import PublicationAttempt
+
+    repo_path = tmp_path / "repo"
+    repo_path.mkdir()
+
+    def git(*args):
+        return _REAL_GIT_RUN(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *args],
+            cwd=repo_path, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "-b", "main")
+    git("commit", "--allow-empty", "-m", "base")
+    git("update-ref", "refs/remotes/origin/main", git("rev-parse", "HEAD"))
+    if ownership in {"preexisting", "prelaunch"}:
+        git("checkout", "-b", "pr-001")
+        git("commit", "--allow-empty", "-m", "earlier unpublished work")
+        initial_head = git("rev-parse", "HEAD")
+    else:
+        initial_head = "" if ownership != "unknown" else None
+        git("checkout", "-b", "pr-001")
+        git("commit", "--allow-empty", "-m", "current attempt work")
+    captured_head = git("rev-parse", "refs/heads/pr-001")
+    if ownership == "changed":
+        git("commit", "--allow-empty", "-m", "later unowned work")
+    preserved_head = git("rev-parse", "refs/heads/pr-001")
+
+    runner = _runner(monkeypatch)
+    runner.repo_path = str(repo_path)
+    monkeypatch.setattr(subprocess, "run", _REAL_GIT_RUN)
+    monkeypatch.setattr(coding_module, "_initial_branch_head_sha", _REAL_INITIAL_HEAD)
+    monkeypatch.setattr(coding_module, "_remote_branch_exists", lambda *a: False)
+    monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", lambda *a: [])
+    runner.state.publication_attempt = PublicationAttempt(
+        repo=runner.owner_repo, base="main", task_id="PR-001", branch="pr-001",
+        run_id="attempt", attempt_index=1, started_at=datetime.now(timezone.utc),
+        baseline_numbers=set(), initial_branch_head_sha=initial_head,
+        head_sha=None if ownership == "prelaunch" else captured_head,
+    )
+    # A daemon restart keeps the original pre-launch snapshot, even when its
+    # local Git ref has since changed or the launch never happened.
+    runner.state = type(runner.state).model_validate_json(runner.state.model_dump_json())
+    for _ in range(2):
+        asyncio.run(runner._release_unpublished_attempt("pr-001"))
+        assert runner.state.publication_attempt.pending is not released
+        if not released:
+            assert git("rev-parse", "refs/heads/pr-001") == preserved_head
+        else:
+            assert _REAL_INITIAL_HEAD(str(repo_path), "pr-001") == ""
+
+
+def test_retained_terminal_publication_survives_failed_status_write(monkeypatch):
+    runner = _runner(monkeypatch)
+    remote = _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    remote["terminal"] = "MERGED"
+    writes = []
+
+    async def write_status(*args, **kwargs):
+        writes.append(True)
+        return len(writes) > 1
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", write_status)
+    assert not asyncio.run(runner._resolve_published_attempt())
+    assert runner.state.publication_attempt.pending
+    assert runner.state.current_task is not None
+    assert asyncio.run(runner._resolve_published_attempt())
+    assert not runner.state.publication_attempt.pending
+    assert runner.state.current_task is None
 
 
 def test_watch_admission_consumes_retained_verified_publication(monkeypatch):

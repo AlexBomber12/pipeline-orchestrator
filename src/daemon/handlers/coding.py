@@ -382,9 +382,9 @@ class CodingMixin:
                     and attempt.exit_classification is None
                 )):
                     return False
-                attempt.pending = False
-                await self._handle_external_pr_resolution(current, outcome.state.value)
-                return True
+                return await self._handle_external_pr_resolution(
+                    current, outcome.state.value,
+                )
             if outcome.discovery_complete and outcome.state == gh_prs.ExactPRState.OPEN:
                 current.head_sha = attempt.head_sha
                 attempt.verified = True
@@ -419,6 +419,15 @@ class CodingMixin:
                     self.log_event(f"[INFRA] Unpublished attempt release deferred: {exc}")
                     return
                 if not any(item.number not in attempt.baseline_numbers for item in publications):
+                    # Remote absence does not establish ownership of a local
+                    # ref. Preserve a branch that predates this invocation,
+                    # and defer when the pre-launch probe was unavailable.
+                    if attempt.initial_branch_head_sha != "":
+                        self.log_event(
+                            "[INFRA] Unpublished local branch cleanup deferred: "
+                            "pre-launch branch ownership is unproven"
+                        )
+                        return
                     # Retry dispatches CODING directly, so AUTO PR must be able
                     # to create its branch without an intervening IDLE sync.
                     try:
@@ -426,13 +435,12 @@ class CodingMixin:
                             raise ValueError("task branch is the configured base")
                         if git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip():
                             raise ValueError("worktree is dirty")
-                        local = git_ops._git(
-                            self.repo_path, "show-ref", "--verify", "--quiet",
-                            f"refs/heads/{target_branch}", check=False,
-                        )
-                        if local.returncode != 1:
-                            if local.returncode != 0:
-                                raise ValueError(f"local branch probe failed ({local.returncode})")
+                        local_head = _initial_branch_head_sha(self.repo_path, target_branch)
+                        if local_head is None:
+                            raise ValueError("local branch probe unavailable")
+                        if local_head:
+                            if attempt.head_sha is None or local_head != attempt.head_sha:
+                                raise ValueError("local branch HEAD changed or was not captured")
                             git_ops._git(
                                 self.repo_path, "checkout", "--detach",
                                 f"origin/{self.repo_config.branch}",

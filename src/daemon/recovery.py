@@ -27,6 +27,9 @@ from src.cancellation import (
 )
 from src.daemon import git_ops
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
+from src.daemon.quarantine import (
+    blocking_quarantine_labels,
+)
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state, recovery_backup_branch
 from src.models import (
@@ -762,6 +765,31 @@ class RecoveryMixin:
                 log_message=f"recover_state failed: {exc}",
             )
             return False
+        # Load the retained receipt before deciding whether the configured
+        # base ref needs refreshing. A fresh runner has no in-memory
+        # _persisted_fix_recovery until this snapshot read completes.
+        if not await self._hydrate_current_task_from_persisted_state():
+            return False
+        base_refreshed = False
+        saved_fix = getattr(self, "_persisted_fix_recovery", None)
+        if (
+            saved_fix is not None and saved_fix.size_fix_completion is not None
+            and (Path(self.repo_path) / ".git").exists()
+        ):
+            try:
+                base = self.repo_config.branch
+                if not base or base.startswith("-") or git_ops._git(
+                    self.repo_path, "check-ref-format", "--branch", base, check=False,
+                ).returncode != 0:
+                    raise ValueError("invalid configured base branch")
+                git_ops._git(
+                    self.repo_path, "fetch", "--no-tags", "origin",
+                    f"refs/heads/{base}:refs/remotes/origin/{base}", timeout=120,
+                )
+                base_refreshed = True
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                self.log_event(f"[RECOVERY] Legacy FIX task header refresh deferred: {exc}")
+                return False
         # PR-266b crash-no-PR fix: the headers helper derives ``DOING``
         # via ``current_task_pr_id`` when no matching open PR exists.
         # ``state.current_task`` is reset on daemon restart, so without
@@ -770,11 +798,6 @@ class RecoveryMixin:
         # decisions`` only runs the PR-186 crash path on a DOING entry,
         # so the task would be silently re-dispatched into a crash loop
         # instead of being marked ERROR pending manual re-upload.
-        # Run after the ``get_open_prs`` probe so a transient GitHub
-        # outage during recovery still surfaces as ERROR with no
-        # current_task.
-        if not await self._hydrate_current_task_from_persisted_state():
-            return False
         # Publication recovery can complete early in ERROR. Restore failed
         # status writes first so subsequent ERROR cycles can repair the header.
         await self._hydrate_status_write_failed_task_pr_ids()
@@ -791,6 +814,25 @@ class RecoveryMixin:
         try:
             try:
                 tasks = self._parse_tasks_from_headers()
+                if (
+                    not base_refreshed and tasks and (Path(self.repo_path) / ".git").exists()
+                    and any(
+                        task.status == TaskStatus.ERROR
+                        and (header := self._recovery_task_headers.get(task.pr_id)) is not None
+                        and header.blocked_reason == SuppressionReason.GUARDRAIL.value
+                        and find_matching_open_pr(task.pr_id, task.branch, prs) is not None
+                        for task in tasks
+                    )
+                ):
+                    # The status writer uses an isolated checkout. Refresh the
+                    # base ref before treating a cached ERROR header as final.
+                    base = self.repo_config.branch
+                    # _parse_tasks_from_headers already validated this base.
+                    git_ops._git(
+                        self.repo_path, "fetch", "--no-tags", "origin",
+                        f"refs/heads/{base}:refs/remotes/origin/{base}", timeout=120,
+                    )
+                    tasks = self._parse_tasks_from_headers()
             except MergeStatusUnavailable as exc:
                 self.log_event(f"[INFRA] recover_state deferred: {exc}")
                 return False
@@ -903,7 +945,7 @@ class RecoveryMixin:
         for pr in prs:
             if not any(
                 label.startswith("quarantine:")
-                for label in getattr(pr, "quarantine_labels", set())
+                for label in blocking_quarantine_labels(getattr(pr, "quarantine_labels", set()))
             ):
                 continue
             if not pr.pr_id:
@@ -929,6 +971,35 @@ class RecoveryMixin:
                 "from GitHub labels."
             )
 
+    async def _recover_unresolved_error_pr(
+        self, tasks: list[QueueTask], prs: list[PRInfo],
+    ) -> tuple[QueueTask, PRInfo] | None:
+        """Preserve a bound ERROR PR until its real cause is reconciled.
+
+        A legacy size label is neither completion evidence nor required for
+        preserving a published PR with a crash or guardrail header.
+        """
+        for task in tasks:
+            header = getattr(self, "_recovery_task_headers", {}).get(task.pr_id)
+            if (
+                task.status != TaskStatus.ERROR or header is None
+                or header.frontmatter_status != "error"
+            ):
+                continue
+            pr = find_matching_open_pr(task.pr_id, task.branch, prs)
+            if pr is not None and (
+                header.blocked_reason in {
+                    SuppressionReason.GUARDRAIL.value,
+                    SuppressionReason.CRASH.value,
+                }
+            ):
+                self.log_event(
+                    f"[RECOVERY] ERROR task {task.pr_id} retains PR #{pr.number}; "
+                    "task header does not authorize continuation."
+                )
+                return task, pr
+        return None
+
     async def _apply_recovery_decisions(
         self, tasks: list[QueueTask], prs: list[PRInfo]
     ) -> None:
@@ -936,6 +1007,7 @@ class RecoveryMixin:
 
         The body mirrors the original recover_state decision tree.
         """
+        unresolved_error_pr = await self._recover_unresolved_error_pr(tasks, prs)
         self._set_queue_progress(
             sum(1 for t in tasks if t.status == TaskStatus.DONE),
             len(tasks),
@@ -945,6 +1017,15 @@ class RecoveryMixin:
         if self.repo_config.feature_flags.use_single_error_exit:
             for queued in tasks:
                 if queued.status != TaskStatus.ERROR:
+                    continue
+                saved_fix = getattr(self, "_persisted_fix_recovery", None)
+                if (
+                    saved_fix is not None and saved_fix.size_fix_completion is not None
+                    and saved_fix.size_fix_completion.task_id == queued.pr_id
+                ):
+                    # The completion receipt is checked against the bound
+                    # run and remote header below. Do not add a new CRASH
+                    # suppression that would defeat its pending TODO retry.
                     continue
                 record = await self._suppression_record_for_task(queued.pr_id)
                 if record is None:
@@ -1009,6 +1090,25 @@ class RecoveryMixin:
             queued = next((task for task in tasks if task.pr_id == saved_task.pr_id), None)
             recovered_state = saved.state
             confirmed_timeout = False
+            completion = saved.size_fix_completion
+            live_completion_pr = next(
+                (pr for pr in prs if pr.number == bound.number and pr.branch == bound.branch),
+                None,
+            )
+            pending_size_completion = (
+                completion is not None and saved.state == PipelineState.WATCH
+                and queued is not None and queued.status == TaskStatus.ERROR
+                and completion.task_id == queued.pr_id
+                and completion.branch == queued.branch
+                and completion.pr_number == bound.number
+                and saved.active_invocation == completion.invocation
+                and completion.invocation.run_id is not None
+                and live_completion_pr is not None
+                and live_completion_pr.head_sha == completion.head_sha
+                and (header := self._recovery_task_headers.get(queued.pr_id)) is not None
+                and header.frontmatter_status == "error"
+                and header.blocked_reason == SuppressionReason.CRASH.value
+            )
             if queued is not None and saved.state != PipelineState.ERROR:
                 if queued.pr_id in self._status_write_failed_task_pr_ids:
                     recovered_state = PipelineState.ERROR
@@ -1049,7 +1149,8 @@ class RecoveryMixin:
                 and find_matching_open_pr(queued.pr_id, queued.branch, [bound]) is bound
                 and queued.status in {TaskStatus.ERROR, TaskStatus.TODO, TaskStatus.DOING}
                 and recovered_state != PipelineState.FIX
-                and (queued.status != TaskStatus.ERROR or recovered_state == PipelineState.ERROR)
+                and (queued.status != TaskStatus.ERROR or recovered_state == PipelineState.ERROR
+                     or pending_size_completion)
                 and not (
                     recovered_state == PipelineState.WATCH
                     and not any(item.number == bound.number for item in prs)
@@ -1076,6 +1177,7 @@ class RecoveryMixin:
                     })
                 self.state.current_pr = live_bound or bound
                 self.state.active_invocation = saved.active_invocation
+                self.state.size_fix_completion = completion if pending_size_completion else None
                 if recovered_state == PipelineState.ERROR and saved.state != PipelineState.ERROR:
                     self.state.error_message = (
                         "FIX idle timeout: recovered confirmed timeout"
@@ -1086,6 +1188,22 @@ class RecoveryMixin:
                     self.state.error_message = saved.error_message
                 self.state.state = recovered_state
                 await self._restore_current_run_record()
+                if pending_size_completion:
+                    record = self._current_run_record
+                    if (
+                        record is None or record.run_id != completion.invocation.run_id
+                        or record.task_id != queued.pr_id or not record.invocations
+                        or record.invocations[-1] != completion.invocation
+                        or record.fix_iterations != completion.invocation.fix_iteration
+                        or record.attempt_index != completion.invocation.attempt_index
+                        or record.task_spec_hash not in ("", completion.task_spec_hash)
+                    ):
+                        self.state.size_fix_completion = None
+                        await self._transition_to_error(
+                            "Size FIX completion accounting unavailable; operator Retry or revised approval required.",
+                            save_run_record_as=None, publish=False, log_prefix="[RECOVERY]",
+                        )
+                        return
                 self.log_event(
                     f"[RECOVERY] Restored bound FIX PR #{bound.number} for "
                     f"{queued.pr_id} in {recovered_state.value}."
@@ -1290,6 +1408,17 @@ class RecoveryMixin:
                 f"[INFRA] Recovered: {matched_task.status.value} task "
                 f"{matched_task.pr_id} -> WATCH PR #{matched_pr.number}."
             )
+            return
+
+        if unresolved_error_pr is not None:
+            task, pr = unresolved_error_pr
+            header = self._recovery_task_headers.get(task.pr_id)
+            self.state = self.state.model_copy(update={
+                "current_task": task,
+                "current_pr": pr,
+                "state": PipelineState.ERROR,
+                "error_message": "Published task failure unresolved; operator Retry or revised approval required.",
+            })
             return
 
         self.state.state = PipelineState.IDLE
