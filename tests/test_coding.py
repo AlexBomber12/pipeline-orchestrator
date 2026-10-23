@@ -2998,6 +2998,7 @@ def test_guardrail_suppression_precedes_delayed_pr_discovery(monkeypatch, stoppe
     None, "cleanup", "suppression", "absent", "unknown", "publication", "outage",
     "create", "unclassified", "active", "mismatch", "no_baseline", "no_head",
     "remote_drift", "malformed_remote", "baseline_closed", "baseline_draft",
+    "preexisting_head", "changed_head", "unknown_initial_head",
 ])
 def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
     from src.subsource_registry import SuppressionReason
@@ -3008,6 +3009,9 @@ def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
     remote = _publication_transport(monkeypatch, runner)
     remote["omit"] = True
     _patch_branch_state(monkeypatch, local_exists=True, remote_exists=True)
+    initial_head = {"preexisting_head": "a" * 40, "changed_head": "b" * 40,
+                    "unknown_initial_head": None}.get(blocker, "")
+    monkeypatch.setattr(coding_module, "_initial_branch_head_sha", lambda *a: initial_head)
     asyncio.run(runner.handle_coding())
     attempt = runner.state.publication_attempt
     assert attempt.exit_classification == "failure"
@@ -3082,7 +3086,7 @@ def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
     command = _command(_task_text(task_id="PR-001", branch="pr-001"),
                        task_id="PR-001", branch="pr-001")
     result = asyncio.run(runner._select_retry_continuation(command))
-    if blocker in {None, "baseline_closed", "baseline_draft"}:
+    if blocker in {None, "baseline_closed", "baseline_draft", "changed_head"}:
         assert result[0] == "watch"
         assert result[1].head_sha == "a" * 40
         assert attempt.verified
@@ -3092,7 +3096,7 @@ def test_retry_recovers_pushed_branch_without_pr(monkeypatch, blocker):
     else:
         assert result != ("coding", None)
         assert len(creates) == (1 if blocker == "create" else 0)
-    assert attempt.pending is (blocker != "absent")
+    assert attempt.pending is (blocker not in {None, "baseline_closed", "baseline_draft", "changed_head", "absent"})
     assert remote["calls"] == 1
 
 
@@ -3224,3 +3228,55 @@ def test_published_escalation_remains_retryable_after_restart(monkeypatch, code)
     assert result[1].number == 402
     assert result[1].head_sha == "a" * 40
     assert remote["calls"] == 1
+
+
+@pytest.mark.parametrize("probe", ["absent", "present", "malformed", "failed", "exception"])
+def test_initial_branch_snapshot_distinguishes_absence_and_uncertainty(monkeypatch, probe):
+    def git_probe(*args, **kwargs):
+        assert args[1:] == ("rev-parse", "--verify", "--quiet", "refs/heads/pr-001^{commit}")
+        if probe == "exception":
+            raise OSError("git unavailable")
+        return subprocess.CompletedProcess(
+            args, {"absent": 1, "failed": 128}.get(probe, 0),
+            "short" if probe == "malformed" else "a" * 40, "",
+        )
+
+    monkeypatch.setattr(git_ops, "_git", git_probe)
+    expected = {"absent": "", "present": "a" * 40}.get(probe)
+    assert coding_module._initial_branch_head_sha("/repo", "pr-001") == expected
+
+
+def test_initial_branch_snapshot_uses_real_git_refs(tmp_path):
+    def git(*args):
+        return _REAL_GIT_RUN(
+            ["git", "-c", "user.name=Test", "-c", "user.email=test@example.com", *args],
+            cwd=tmp_path, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "-b", "main")
+    git("commit", "--allow-empty", "-m", "base")
+    assert coding_module._initial_branch_head_sha(str(tmp_path), "pr-001") == ""
+    git("checkout", "-b", "pr-001")
+    git("commit", "--allow-empty", "-m", "older attempt")
+    old_head = git("rev-parse", "HEAD")
+    assert coding_module._initial_branch_head_sha(str(tmp_path), "pr-001") == old_head
+    # This is the required AUTO PR launch command when an older ref remains.
+    result = _REAL_GIT_RUN(
+        ["git", "checkout", "-b", "pr-001", "main"], cwd=tmp_path,
+        capture_output=True, text=True,
+    )
+    assert result.returncode != 0
+    assert coding_module._local_branch_head_sha(str(tmp_path), "pr-001") == old_head
+
+
+def test_watch_admission_consumes_retained_verified_publication(monkeypatch):
+    runner = _runner(monkeypatch)
+    _publication_transport(monkeypatch, runner)
+    asyncio.run(runner.handle_coding())
+    attempt = runner.state.publication_attempt
+    assert attempt.pending and attempt.verified
+    # Play can resume WATCH directly, without going through operator Retry.
+    # Its exact observed PR admission must still consume the validated hold.
+    runner._admit_observed_pr(runner.state.current_pr.model_copy())
+    assert not attempt.pending
+    assert attempt.failure == "coder failed"

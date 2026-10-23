@@ -206,6 +206,8 @@ class PublicationAttempt(BaseModel):
     attempt_index: int | None
     started_at: datetime
     baseline_numbers: set[int] | None = None
+    # None is unknown (including older snapshots); empty means proven absent.
+    initial_branch_head_sha: str | None = None
     head_sha: str | None = None
     unverified_head_sha: str | None = None
     pr_number: int | None = None

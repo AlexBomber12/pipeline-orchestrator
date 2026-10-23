@@ -537,6 +537,10 @@ class RetryCommandMixin:
                 return await self._defer_retry_command(
                     command, "Coder exit is unclassified; operator recovery required.",
                 )
+            # Consume while the validated invocation still binds this attempt.
+            # Retry accounting below may replace it with a fresh FIX run record.
+            attempt.pending = False
+            await self.publish_state()
             return "watch", pr
         try:
             open_prs = await asyncio.to_thread(

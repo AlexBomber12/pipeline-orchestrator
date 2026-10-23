@@ -129,6 +129,23 @@ def _remote_branch_exists(
     return None
 
 
+def _initial_branch_head_sha(repo_path: str, branch: str) -> str | None:
+    """Snapshot the pre-launch ref; distinguish absence from a failed probe."""
+    try:
+        probe = git_ops._git(
+            repo_path, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}^{{commit}}",
+            timeout=10, check=False,
+        )
+    except (subprocess.SubprocessError, OSError):
+        return None
+    if probe.returncode == 1:
+        return ""
+    sha = probe.stdout.strip()
+    if probe.returncode == 0 and re.fullmatch(r"[0-9a-fA-F]{40}", sha):
+        return sha
+    return None
+
+
 def _local_branch_head_sha(repo_path: str, branch: str) -> str | None:
     """Return the local task branch commit when it is a full GitHub SHA."""
     try:
@@ -445,6 +462,8 @@ class CodingMixin:
         if (not self._publication_attempt_matches_dispatch()
             or attempt.pr_number is not None or attempt.baseline_numbers is None
             or attempt.exit_classification is None or not attempt.head_sha
+            or attempt.initial_branch_head_sha is None
+            or attempt.head_sha == attempt.initial_branch_head_sha
             or self._coder_invocation_active):
             return False
         if not await self._confirm_current_coder_cleanup("Retry PR creation"):
@@ -854,6 +873,9 @@ class CodingMixin:
             self._begin_publication_attempt(
                 started_at=publication_not_before,
                 baseline_numbers=publication_baseline,
+            )
+            self.state.publication_attempt.initial_branch_head_sha = await asyncio.to_thread(
+                _initial_branch_head_sha, self.repo_path, self.state.current_task.branch,
             )
             await self.publish_state()
             await self._checkpoint_current_run_record()

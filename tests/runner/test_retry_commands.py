@@ -1716,8 +1716,9 @@ async def test_run_cycle_propagates_cancellation_during_retry_coding(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("available", [False, True])
+@pytest.mark.parametrize("completed", [False, True])
 async def test_retry_reconciles_retained_publication_before_replacing_invocation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, available: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, available: bool, completed: bool,
 ) -> None:
     from src.github import cache
 
@@ -1732,6 +1733,20 @@ async def test_retry_reconciles_retained_publication_before_replacing_invocation
     attempt.pr_number, attempt.candidate, attempt.head_sha = pr.number, pr, pr.head_sha
     attempt.failure = "prior failure"
     attempt.exit_classification = "failure"
+    if completed:
+        runner._current_run_record.ended_at = NOW.isoformat()
+    checkpoint = runner._checkpoint_current_run_record
+
+    async def checkpoint_after_consumption():
+        if available:
+            saved = RepoState.model_validate_json(
+                await runner.redis.get(pipeline_state(runner.name))
+            )
+            assert not saved.publication_attempt.pending
+            assert saved.active_invocation == invocation
+        await checkpoint()
+
+    monkeypatch.setattr(runner, "_checkpoint_current_run_record", checkpoint_after_consumption)
 
     monkeypatch.setattr(cache, "_etag_get", lambda path: {
         "number": 42, "state": "open", "merged": False,
