@@ -15,6 +15,10 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
+
+import yaml
+from src.github.ci_evidence import _status_producer
 
 from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
 
@@ -50,6 +54,31 @@ def _post_failed_status(head_sha: str) -> None:
     assert isinstance(payload, dict), payload
     assert payload.get("state") == "failure", payload
     assert payload.get("context") == WATCH_GATE_CONTEXT, payload
+    configured = yaml.safe_load(
+        (Path(__file__).resolve().parents[2] / "tests/e2e/data/config.test.yml").read_text()
+    )["repositories"][0]["ci_fix_trusted_statuses"][WATCH_GATE_CONTEXT]
+    posted_producer = _status_producer(payload)
+    assert posted_producer in configured, (
+        f"POST status producer {posted_producer!r} does not match configured {configured!r}"
+    )
+    observed = None
+    deadline = time.monotonic() + 10
+    while observed is None and time.monotonic() < deadline:
+        combined = subprocess.run(
+            ["gh", "api", f"repos/{TESTBED_REPO}/commits/{head_sha}/status"],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        statuses = json.loads(combined.stdout)["statuses"]
+        observed = next((item for item in statuses if item.get("id") == payload.get("id")), None)
+        if observed is None:
+            time.sleep(0.5)
+    assert observed is not None, f"posted status {payload.get('id')!r} absent from combined status"
+    observed_producer = _status_producer(observed)
+    assert observed_producer in configured, (
+        f"combined status producer {observed_producer!r} does not match configured "
+        f"{configured!r}; creator={(observed.get('creator') or {}).get('login')!r}, "
+        f"app_id={observed.get('app_id')!r}"
+    )
 
 
 def _get_pr_head_sha(pr_number: int) -> str:
