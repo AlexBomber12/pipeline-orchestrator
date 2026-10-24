@@ -520,7 +520,10 @@ class WatchMixin:
             )
         # Review reminders are independent of CI progress. An approved
         # current-HEAD verdict already satisfies the review side of WATCH.
-        if review != ReviewStatus.APPROVED and not self.repo_config.allow_merge_without_review:
+        if review != ReviewStatus.APPROVED and not (
+            self.repo_config.allow_merge_without_review
+            and review == ReviewStatus.PENDING
+        ):
             await self._maybe_remind_review(found)
         elif review == ReviewStatus.APPROVED:
             self.log_event(

@@ -272,6 +272,44 @@ def test_approved_review_waits_for_ci_without_reminder(
     assert runner.state.state == PipelineState.WATCH
 
 
+@pytest.mark.parametrize(
+    ("review", "expected_reminders"),
+    [
+        (ReviewStatus.EYES, 1),
+        (ReviewStatus.CHANGES_REQUESTED, 1),
+        (ReviewStatus.PENDING, 0),
+        (ReviewStatus.APPROVED, 0),
+    ],
+)
+def test_permissive_review_policy_reminds_only_merge_blocking_reviews(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    review: ReviewStatus, expected_reminders: int,
+) -> None:
+    runner = _runner(tmp_path, monkeypatch)
+    runner.repo_config.allow_merge_without_review = True
+    pr = _pr(review=review, ci=CIStatus.SUCCESS)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_a, **_k: [pr])
+    monkeypatch.setattr("src.github.prs.get_pr_state", lambda *_a: "OPEN")
+
+    async def quiet(*_args, **_kwargs):
+        return False
+
+    runner._scan_pr_diff_once = quiet
+    runner._maybe_reclassify_stuck_pending = quiet
+    runner._validate_publication_observation = lambda *_a, **_k: (pr.publication_at, None)
+    runner._has_new_codex_feedback_since_last_push = lambda *_a: FeedbackCheckResult.NONE
+    reminders: list[int] = []
+
+    async def remind(found: PRInfo) -> None:
+        reminders.append(found.number)
+
+    runner._maybe_remind_review = remind
+    runner.handle_merge = quiet
+    asyncio.run(runner.handle_watch())
+    assert len(reminders) == expected_reminders
+    assert runner.state.state == PipelineState.WATCH
+
+
 def test_new_head_resets_review_budget(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runner = _runner(tmp_path, monkeypatch)
     runner.state.review_request_pr = 5
