@@ -27,7 +27,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
     assert isinstance(cfg, AppConfig)
     assert cfg.repositories == []
     assert cfg.daemon.poll_interval_sec == 60
-    assert cfg.daemon.review_timeout_min == 20
+    assert cfg.daemon.review_timeout_min == 10
     assert cfg.daemon.hung_fallback_codex_review is True
     assert cfg.daemon.error_handler_use_ai is True
     assert cfg.daemon.claude_model == "opus"
@@ -669,7 +669,7 @@ def test_update_daemon_config_updates_fields(tmp_path: Path) -> None:
     assert cfg.daemon.poll_interval_sec == 120
     assert cfg.daemon.error_handler_use_ai is False
     # Unchanged fields keep their previous values.
-    assert cfg.daemon.review_timeout_min == 20
+    assert cfg.daemon.review_timeout_min == 10
     assert cfg.daemon.hung_fallback_codex_review is True
 
     reloaded = load_config(str(path))

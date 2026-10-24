@@ -1136,6 +1136,36 @@ async def _build_tasks_panel_context(
     redis_client: aioredis.Redis | None,
     retry_cap: int,
 ) -> dict[str, object]:
+    # The queue snapshot may lag a terminal WATCH failure. Bind the visible
+    # Retry row to the authoritative failed task and cancellation record.
+    if redis_client is not None:
+        state = await _repo_state_for_retry(redis_client, name)
+        if (
+            state is not None
+            and state.state == PipelineState.ERROR
+            and state.current_task is not None
+            and state.current_pr is not None
+            and state.current_task.branch == state.current_pr.branch
+            and state.current_pr.head_sha
+        ):
+            failed = state.current_task
+            try:
+                cause = await get_cancellation_cause(
+                    redis_client, name, failed.pr_id, refresh_ttl=False
+                )
+            except Exception:
+                cause = None
+            if (
+                cause is not None
+                and cause.payload.get("subsource") == "review_timeout"
+            ):
+                replacement = failed.model_copy(update={"status": TaskStatus.ERROR})
+                tasks = [
+                    replacement if item.pr_id == failed.pr_id else item
+                    for item in tasks
+                ]
+                if not any(item.pr_id == failed.pr_id for item in tasks):
+                    tasks.append(replacement)
     async def _views_for(status: TaskStatus) -> list[dict[str, object]]:
         views = [
             await _task_view(

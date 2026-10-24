@@ -316,6 +316,15 @@ class RepoState(BaseModel):
     # escalation instead of a full new review window. Reset on the same
     # boundaries as ``review_timeout_repost_attempted``.
     review_timeout_repost_at: datetime | None = None
+    # Current review identity and request history survive daemon restarts.
+    review_request_pr: int | None = None
+    review_request_head: str = ""
+    review_request_task: str = ""
+    review_request_generation: str = ""
+    review_requested_at: datetime | None = None
+    review_post_attempted_at: datetime | None = None
+    review_reminder_count: int = 0
+    review_overdue_reported: bool = False
     # PR-316 review feedback: when True, ``run_cycle`` keeps the runner
     # parked in ERROR without invoking ``handle_error``. Set by WATCH on
     # ``review_timeout`` so the AI diagnose loop does not burn budget on
@@ -351,6 +360,19 @@ class RepoState(BaseModel):
             return PipelineState.ERROR
         return value
 
+    def _reset_review_request_history(self) -> None:
+        for key, value in (
+            ("review_request_pr", None),
+            ("review_request_head", ""),
+            ("review_request_task", ""),
+            ("review_request_generation", ""),
+            ("review_requested_at", None),
+            ("review_post_attempted_at", None),
+            ("review_reminder_count", 0),
+            ("review_overdue_reported", False),
+        ):
+            super().__setattr__(key, value)
+
     def __setattr__(self, name: str, value: object) -> None:
         """Couple related task/PR fields so a single write resets them together.
 
@@ -376,11 +398,13 @@ class RepoState(BaseModel):
         if name == "current_pr":
             current_pr = getattr(self, "current_pr", None)
             if self._is_new_pr_transition(current_pr, value):
+                self._reset_review_request_history()
                 super().__setattr__("last_stale_retrigger_at", None)
                 super().__setattr__("last_codex_retrigger_at", None)
                 super().__setattr__("review_timeout_repost_attempted", False)
                 super().__setattr__("review_timeout_repost_at", None)
             elif self._is_new_head_sha(current_pr, value):
+                self._reset_review_request_history()
                 # PR-358 review feedback (P3): a new HEAD on the same PR
                 # number/branch is a fresh review iteration — the operator
                 # (or daemon FIX loop) pushed new code and Codex needs to
@@ -394,6 +418,7 @@ class RepoState(BaseModel):
                 super().__setattr__("review_timeout_repost_attempted", False)
                 super().__setattr__("review_timeout_repost_at", None)
         if name == "current_task" and value is None:
+            self._reset_review_request_history()
             super().__setattr__("current_pr", None)
             super().__setattr__("error_message", None)
             super().__setattr__("active_invocation", None)

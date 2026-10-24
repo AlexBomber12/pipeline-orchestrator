@@ -2341,6 +2341,94 @@ class PipelineRunner(
             return False
         return cause is None
 
+    async def _maybe_resume_review_timeout(self) -> bool:
+        """Admit a late trusted result for a retained timeout failure."""
+        from src.github.reviewer_policy import reviewer_policy_from_config
+        from src.models import FeedbackCheckResult, ReviewStatus
+
+        task, bound = self.state.current_task, self.state.current_pr
+        if task is None or bound is None or not bound.head_sha or not task.branch:
+            return False
+        if bound.branch != task.branch or bound.pr_id not in (None, task.pr_id):
+            return False
+        try:
+            cause = await get_cancellation_cause(
+                self.redis, self.name, task.pr_id, refresh_ttl=False
+            )
+            suppression = await self._suppression_record_for_task(task.pr_id)
+        except Exception:
+            return False
+        if (
+            cause is None or cause.payload.get("subsource") != "review_timeout"
+            or (suppression is not None and suppression.reason != SuppressionReason.REVIEW_TIMEOUT)
+            or self.state.user_paused
+            or task.pr_id in self._user_stopped_task_pr_ids
+        ):
+            return False
+        status, reason, revision = self._remote_frontmatter_error_status_for_current_task()
+        if status != "error" or reason != SuppressionReason.REVIEW_TIMEOUT or revision is None:
+            return False
+        if self.state.review_request_generation:
+            try:
+                current_generation = task_spec_content_hash(
+                    (Path(self.repo_path) / task.task_file).read_text(encoding="utf-8")
+                )
+            except (OSError, TypeError, ValueError):
+                return False
+            if current_generation != self.state.review_request_generation:
+                return False
+        try:
+            policy = reviewer_policy_from_config(load_config())
+            candidates = gh_prs.get_open_prs(
+                self.owner_repo,
+                allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                reviewer_policy=policy,
+            )
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Review timeout evidence unavailable: {exc}")
+            return False
+        found = next((pr for pr in candidates if pr.number == bound.number), None)
+        if (
+            found is None or found.branch != task.branch
+            or found.head_sha != bound.head_sha
+            or found.pr_id not in (None, task.pr_id)
+        ):
+            return False
+        found = self._approval_filtered_pr(found)
+        if found.review_status == ReviewStatus.CHANGES_REQUESTED:
+            prior = self.state.current_pr
+            self.state.current_pr = found
+            self._rehydrate_last_push_at(found)
+            fresh = self._has_new_codex_feedback_since_last_push(policy)
+            self.state.current_pr = prior
+            if fresh != FeedbackCheckResult.NEW:
+                return False
+        elif found.review_status != ReviewStatus.APPROVED:
+            return False
+        if not await self._commit_task_status_change(
+            task, "TODO", "Late Codex review received; continuing published PR",
+            expected_task_sha256=revision,
+        ):
+            return False
+        await safe_delete_cancellation_cause(
+            self.redis, self.name, task.pr_id, log=self.log_event
+        )
+        if suppression is not None:
+            await self._clear_task_suppression(task.pr_id)
+        self.state.current_task = task.model_copy(update={"status": TaskStatus.DOING})
+        self.state.current_queue = [
+            self.state.current_task if item.pr_id == task.pr_id else item
+            for item in (self.state.current_queue or [task])
+        ]
+        self.state.skip_ai_error_diagnose = False
+        self.state.error_message = None
+        self.state.state = PipelineState.WATCH
+        self.log_event(
+            f"[RECOVERY] PR #{bound.number} late review admitted for "
+            f"{bound.head_sha[:7]}; resuming WATCH."
+        )
+        return True
+
     async def _exit_error_to_idle_for_retry(self, reason: SuppressionReason | None) -> None:
         """Leave ERROR for a plain retry when AI diagnosis is disabled."""
         task = self.state.current_task
@@ -3885,6 +3973,8 @@ class PipelineRunner(
         elif current == PipelineState.ERROR:
             if (self.state.error_message or "").startswith("FIX idle timeout"):
                 await self._admit_fix_idle_timeout()
+            elif await self._maybe_resume_review_timeout():
+                await self.handle_watch()
             elif self.repo_config.feature_flags.use_single_error_exit:
                 await self._handle_single_error_exit()
             elif self.state.rate_limited_until is not None:

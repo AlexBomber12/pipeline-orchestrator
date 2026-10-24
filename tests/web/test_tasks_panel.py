@@ -6,7 +6,8 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
-from src.models import PipelineState, QueueTask, RepoState, TaskStatus
+from src.cancellation.storage import CancellationCause, cause_key
+from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.web import app as web_app
 from src.web.app import app
 from src.web.routes import repo_control
@@ -131,6 +132,31 @@ def test_renders_retry_button_when_below_cap(
     assert 'hx-confirm="Retry PR-283? Counter will increment to 3/3."' in body
     assert "Retry count 2/3" in body
     assert "disabled" not in body
+
+
+def test_stale_todo_snapshot_shows_retry_for_bound_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_panel(tmp_path, monkeypatch, retry_count=0, task_status=TaskStatus.TODO)
+    redis_client = web_app.aioredis.from_url("unused")
+    key = "pipeline:example__alpha"
+    state = RepoState.model_validate_json(redis_client.store[key])
+    state.state = PipelineState.ERROR
+    state.current_task = state.current_queue[0]
+    state.current_pr = PRInfo(
+        number=635, branch="pr-283", head_sha="a" * 40, pr_id="PR-283"
+    )
+    redis_client.store[key] = state.model_dump_json()
+    redis_client.store[cause_key("example__alpha", "PR-283")] = (
+        CancellationCause(
+            category="ERROR", payload={"subsource": "review_timeout"}
+        ).to_redis()
+    )
+    with TestClient(app) as client:
+        response = client.get("/repos/example__alpha/tasks")
+    assert response.status_code == 200
+    assert 'hx-post="/repos/example__alpha/tasks/PR-283/retry"' in response.text
+    assert response.text.index("PR-283") < response.text.index("Retry")
 
 
 def test_renders_disabled_button_at_cap(

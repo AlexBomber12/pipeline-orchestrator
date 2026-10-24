@@ -280,8 +280,8 @@ def test_label_removal_detected_in_watch(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     monkeypatch.setattr(
         runner,
-        "_maybe_retrigger_stale_review",
-        lambda number: asyncio.sleep(0),
+        "_maybe_remind_review",
+        lambda pr: asyncio.sleep(0),
     )
 
     asyncio.run(runner.handle_watch())

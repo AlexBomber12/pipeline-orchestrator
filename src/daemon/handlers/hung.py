@@ -155,6 +155,39 @@ class HungMixin:
             ).stdout.strip() or None
         except Exception:
             head_sha = None
+        if (
+            current_pr is not None
+            and current_pr.number == pr_number
+            and head_sha == current_pr.head_sha
+            and head_sha
+            and (self.state.review_request_pr, self.state.review_request_head)
+            != (pr_number, head_sha)
+        ):
+            # Some push paths mutate PRInfo.head_sha in place. They bypass
+            # RepoState.__setattr__, so reset explicitly on the observed HEAD.
+            self.state._reset_review_request_history()
+            self.state.review_request_pr = pr_number
+            self.state.review_request_head = head_sha
+            self.state.review_request_task = (
+                self.state.current_task.pr_id if self.state.current_task else ""
+            )
+        if (
+            not bypass_same_head_dedup
+            and current_pr is not None
+            and current_pr.number == pr_number
+            and head_sha == current_pr.head_sha
+            and self.state.review_request_pr == pr_number
+            and self.state.review_request_head == head_sha
+            and self.state.review_requested_at is not None
+        ):
+            interval = timedelta(minutes=(
+                self.repo_config.review_timeout_min
+                if self.repo_config.review_timeout_min is not None
+                else self.app_config.daemon.review_timeout_min
+            ))
+            retry_at = self.state.review_requested_at + interval
+            if datetime.now(timezone.utc) < retry_at:
+                return True, False, retry_at
         try:
             metadata = gh_prs.get_pr_metadata(
                 self.owner_repo, pr_number
@@ -236,10 +269,17 @@ class HungMixin:
 
         try:
             if current_pr is not None and current_pr.number == pr_number:
-                current_pr.last_activity = datetime.now(timezone.utc)
+                self.state.review_post_attempted_at = datetime.now(timezone.utc)
             gh_comments.post_comment(
                 self.owner_repo, pr_number, "@codex review"
             )
+            if current_pr is not None and current_pr.number == pr_number:
+                self.state.review_request_pr = pr_number
+                self.state.review_request_head = current_pr.head_sha
+                self.state.review_request_task = (
+                    self.state.current_task.pr_id if self.state.current_task else ""
+                )
+                self.state.review_requested_at = self.state.review_post_attempted_at
             kind = (
                 "force_repost"
                 if bypass_same_head_dedup or bypass_author_dedup

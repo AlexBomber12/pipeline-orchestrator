@@ -1,12 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
-
 import pytest
-from src.config import TrustedReviewerIdentity
 from src.daemon.handlers.watch import CODEX_BOT_ERROR_PATTERNS
-
-from tests.runner import _helpers as h
 
 OBSERVED_ERROR_BODY = (
     "Codex Review: Something went wrong. Try again later by commenting "
@@ -42,62 +37,3 @@ def test_original_codex_bot_error_patterns_still_match_reference_bodies() -> Non
     for pattern, body in reference_bodies.items():
         assert pattern in CODEX_BOT_ERROR_PATTERNS
         assert pattern in body
-
-
-def test_codex_bot_download_error_retriggers_review(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = h._make_runner()
-    posted: list[tuple[int, bool]] = []
-    monkeypatch.setattr(
-        "src.github.cache._gh_api_paginated",
-        lambda path: [h._codex_bot_error_comment(body=OBSERVED_ERROR_BODY)],
-    )
-
-    def fake_post(
-        number: int,
-        *,
-        bypass_same_head_dedup: bool = False,
-    ) -> tuple[bool, bool, datetime | None]:
-        posted.append((number, bypass_same_head_dedup))
-        return True, True, None
-
-    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
-
-    assert runner._maybe_retrigger_on_codex_bot_error(42) is True
-    assert posted == [(42, True)]
-
-
-def test_codex_bot_error_retrigger_uses_trusted_user_id(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = h._make_runner()
-    runner.app_config.daemon.trusted_reviewer_identities = [
-        TrustedReviewerIdentity(user_id=424242424, login="old-reviewer-name[bot]")
-    ]
-    posted: list[int] = []
-    monkeypatch.setattr(
-        "src.github.cache._gh_api_paginated",
-        lambda path: [
-            h._codex_bot_error_comment(
-                user={
-                    "id": 424242424,
-                    "login": "renamed-reviewer[bot]",
-                },
-                body=OBSERVED_ERROR_BODY,
-            )
-        ],
-    )
-
-    def fake_post(
-        number: int,
-        *,
-        bypass_same_head_dedup: bool = False,
-    ) -> tuple[bool, bool, datetime | None]:
-        posted.append(number)
-        return True, True, None
-
-    runner._post_codex_review_result = fake_post  # type: ignore[assignment]
-
-    assert runner._maybe_retrigger_on_codex_bot_error(42) is True
-    assert posted == [42]

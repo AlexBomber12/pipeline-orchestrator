@@ -720,7 +720,6 @@ def test_settings_page_renders_daemon_section(empty_config: Path) -> None:
     assert 'name="review_timeout_min"' in body
     assert 'name="auto_fallback"' in body
     assert 'name="exploration_epsilon"' in body
-    assert 'name="hung_fallback_codex_review"' in body
     assert 'name="error_handler_use_ai"' in body
     assert "Coders" in body
     assert "GitHub CLI" in body
@@ -780,7 +779,7 @@ def test_coder_cards_keep_controls_and_login_preservation(
         assert "Preferred default" in markup
         assert 'hx-put="/settings/daemon"' in markup
         assert 'hx-target="#settings-daemon"' in markup
-        assert f'data-model-catalog-status="' in markup
+        assert 'data-model-catalog-status="' in markup
         assert 'class="primary-interactive block w-full min-w-0 max-w-full' in markup
     assert 'id="coder-codex-device-login"' in body
     assert 'data-device-login-shell' in body
@@ -2967,7 +2966,7 @@ def test_put_daemon_empty_numeric_inputs_are_no_ops(empty_config: Path) -> None:
     assert response.status_code == 200
     cfg = load_config(str(empty_config))
     assert cfg.daemon.poll_interval_sec == 60
-    assert cfg.daemon.review_timeout_min == 20
+    assert cfg.daemon.review_timeout_min == 10
     assert cfg.daemon.hung_fallback_codex_review is False
 
 
@@ -3003,7 +3002,7 @@ def test_put_daemon_non_positive_review_timeout_returns_422(
             assert "at least 1" in response.text
 
     cfg = load_config(str(empty_config))
-    assert cfg.daemon.review_timeout_min == 20
+    assert cfg.daemon.review_timeout_min == 10
 
 
 def test_put_daemon_invalid_int_returns_422_html(empty_config: Path) -> None:
@@ -5436,7 +5435,6 @@ def test_settings_daemon_renders_hints_for_all_fields(empty_config: Path) -> Non
         "fix_idle_timeout_sec",
         "review_timeout_min",
         "auto_fallback",
-        "hung_fallback_codex_review",
         "error_handler_use_ai",
         "exploration_epsilon",
     ]
@@ -5447,9 +5445,8 @@ def test_settings_daemon_renders_hints_for_all_fields(empty_config: Path) -> Non
         "Seconds between daemon checks across configured repositories.",
         "Seconds before the coder subprocess is killed if no activity.",
         "FIX time budget, reset on each successful push.",
-        "Minutes to wait for review before the PR moves to HUNG.",
+        "Minutes between automatic review requests. The daemon keeps observing after the reminder budget is exhausted.",
         "Switch to another eligible coder when the preferred one is unavailable.",
-        "Re-post the review trigger when a PR times out waiting for Codex.",
         "Use the coder to diagnose ERROR before generic recovery kicks in.",
         "Percent (0-50) of runs that use a different eligible coder for comparison data.",
     ]

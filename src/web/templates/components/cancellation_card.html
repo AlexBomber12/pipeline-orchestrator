@@ -42,9 +42,9 @@
         {% elif subsource == 'review_timeout' %}
             <span class="cause-badge cause-stale">Stale review</span>
             {% if cause.payload.get('elapsed_min') is not none %}
-            <p>Codex did not respond within {{ cause.payload.get('elapsed_min') }}m. Push a manual review or close the PR.</p>
+            <p>Codex had not responded after {{ cause.payload.get('elapsed_min') }}m. The daemon checks for a late result; Retry remains available.</p>
             {% else %}
-            <p>Codex did not respond within the review_timeout window. Push a manual review or close the PR.</p>
+            <p>Codex review timed out under the earlier policy. The daemon checks for a late result; Retry remains available.</p>
             {% endif %}
             {% if cause.payload.get('reason_text') %}
             <div class="cancellation-reason">{{ cause.payload.get('reason_text') }}</div>
