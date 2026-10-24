@@ -96,8 +96,11 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - name: Install shared integration config
+        env:
+          TESTBED_STATUS_APP_SLUG: ${{ steps.testbed-token.outputs.app-slug }}
         run: |
-          python scripts/prepare_test_config.py config.test.yml tests/e2e/data/config.test.yml
+          python scripts/prepare_test_config.py config.test.yml tests/e2e/data/config.test.yml \
+            --status-app-slug "$TESTBED_STATUS_APP_SLUG"
           # Host pytest and UID-1000 containers both atomically replace files here.
           chmod 0777 tests/e2e/data
 

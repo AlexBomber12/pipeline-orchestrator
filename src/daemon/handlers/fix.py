@@ -54,7 +54,7 @@ _GITHUB_ACTIONS_APP_ID = 15368
 
 def _current_ci_failure(
     repo: str, pr_number: int, sha: str, required_checks: tuple[str, ...] | None,
-    empty_is_success: bool,
+    empty_is_success: bool, trusted_statuses: dict[str, str] | None = None,
 ) -> dict | None:
     """Return bound, current terminal failure evidence for a live PR head."""
     if len(sha) != 40 or gh_prs.get_pr_metadata(repo, pr_number).get("head_sha") != sha:
@@ -76,22 +76,27 @@ def _current_ci_failure(
     )
     if evidence.policy_result != CIStatus.FAILURE:
         return None
-    # A failing status or third-party check can name itself arbitrarily. Only
-    # configured Actions jobs may authorize a CI-driven coder invocation.
+    # A failing status or third-party check can name itself arbitrarily. Admit
+    # only configured Actions jobs or an exact configured status/producer pair.
     required = set(required_checks or ())
+    trusted_statuses = trusted_statuses or {}
     failures = [
         ctx for name, producers in _latest(evidence.contexts).items()
         for ctx in producers.values()
-        if name in required and ctx.state == "failure"
-        and ctx.producer == f"app:{_GITHUB_ACTIONS_APP_ID}"
-        and ctx.run_id is not None and ctx.run_id[0] == "check"
+        if ctx.state == "failure" and ctx.run_id is not None and (
+            (not required or name in required)
+            and ctx.producer == f"app:{_GITHUB_ACTIONS_APP_ID}"
+            and ctx.run_id[0] == "check"
+            or ctx.run_id[0] == "status"
+            and trusted_statuses.get(name) == ctx.producer
+        )
     ]
     contexts = []
     for ctx in failures:
         source, identity = ctx.run_id or (None, None)
         run = next((r for r in retrieval.check_runs if source == "check" and r.get("id") == identity), None)
         match = _ACTIONS_JOB_URL.search(str(run.get("details_url") or "")) if run else None
-        if match is None:
+        if source == "check" and match is None:
             continue
         contexts.append({
             "name": ctx.name, "producer": ctx.producer, "source": source,
@@ -416,7 +421,7 @@ class FixMixin(BreachMixin):
         sections: list[str] = []
         if ci_failure is not None:
             identities = ", ".join(
-                f"check={c['check_id']} run={c['workflow_run_id']} "
+                f"{c['source']}={c['check_id']} run={c['workflow_run_id']} "
                 f"job={c['job_id']} attempt={c['attempt']} outcome={c['state']}"
                 for c in ci_failure["contexts"]
             )
@@ -439,7 +444,7 @@ class FixMixin(BreachMixin):
                 )
             else:
                 sections.append(
-                    "Confirmed failed check logs unavailable."
+                    "Confirmed CI failure logs unavailable."
                 )
         if current_pr.review_status == ReviewStatus.CHANGES_REQUESTED:
             if review_feedback:
@@ -533,6 +538,7 @@ class FixMixin(BreachMixin):
                 _current_ci_failure, self.owner_repo, current_pr.number,
                 current_pr.head_sha, self.repo_config.required_checks,
                 self.repo_config.allow_merge_without_checks,
+                self.repo_config.ci_fix_trusted_statuses,
             )
             if ci_failure is None:
                 if not (review_feedback and review_head == current_pr.head_sha):
@@ -847,6 +853,7 @@ class FixMixin(BreachMixin):
                     _current_ci_failure, self.owner_repo, self.state.current_pr.number,
                     self.state.current_pr.head_sha, self.repo_config.required_checks,
                     self.repo_config.allow_merge_without_checks,
+                    self.repo_config.ci_fix_trusted_statuses,
                 )
                 if latest_failure != ci_failure:
                     self.log_event("[FIX] CI failure changed before coder launch; returning to WATCH.")
