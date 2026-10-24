@@ -32,7 +32,7 @@ from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github import reviews as gh_reviews
-from src.github.ci_evidence import _latest, evaluate_ci_evidence
+from src.github.ci_evidence import CIContextEvidence, _latest, _newer, evaluate_ci_evidence
 from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
@@ -498,13 +498,27 @@ class WatchMixin:
                         commit_task_status=True,
                     )
                     return
-                if not await self._infra_retry_has_new_failed_attempt(found.number, found.head_sha):
+                post_retry = await self._infra_retry_has_new_failed_attempt(
+                    found.number, found.head_sha,
+                )
+                if post_retry is not True:
                     if review == ReviewStatus.CHANGES_REQUESTED:
                         result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
                         if result == FeedbackCheckResult.NEW:
                             self._fix_feedback_reviewer_policy = reviewer_policy
                             await self.handle_fix()
                             return
+                    if post_retry is None:
+                        await self._transition_to_error(
+                            "A new infrastructure CI failure appeared outside the rerun "
+                            "workflows; operator Retry required",
+                            save_run_record_as=None, log_prefix="[WATCH]",
+                            cancellation_cause=CancellationCause(
+                                category="ERROR", payload={"subsource": "infra_failure"},
+                            ),
+                            commit_task_status=True,
+                        )
+                        return
                     self.log_event(
                         f"[WATCH] PR #{found.number} awaiting post-retry terminal CI evidence."
                     )
@@ -1154,8 +1168,8 @@ class WatchMixin:
         elapsed = time.time() - marker_ts
         return True, elapsed >= _INFRA_RETRY_GRACE_SECONDS
 
-    async def _infra_retry_has_new_failed_attempt(self, pr_number: int, head_sha: str) -> bool:
-        """Require a new terminal check identity after the bounded rerun."""
+    async def _infra_retry_has_new_failed_attempt(self, pr_number: int, head_sha: str) -> bool | None:
+        """Return True for a new failed rerun, None for an unrereun failure, else False."""
         if self.redis is None:
             return False
         raw = await self.redis.get(ci_infra_retried(self.owner_repo, pr_number, head_sha))
@@ -1188,9 +1202,13 @@ class WatchMixin:
         )
         if evidence.policy_result != CIStatus.FAILURE:
             return False
-        failures = [
+        latest = [
             ctx for producers in _latest(evidence.contexts).values()
-            for ctx in producers.values() if ctx.state == "failure"
+            for ctx in producers.values()
+        ]
+        failures = [
+            ctx for ctx in latest
+            if ctx.state == "failure"
         ]
         if "rerunnable_checks" in marker:
             issued_runs = set(marker.get("issued_runs", []))
@@ -1204,14 +1222,38 @@ class WatchMixin:
                 match = _DETAILS_URL_RUN_RE.search(str(run.get("details_url") or ""))
                 if match:
                     run_ids[run.get("id")] = int(match.group(1))
-            relevant = [
-                ctx for ctx in failures
-                if ctx.run_id is not None and ctx.run_id[0] == "check"
-                and run_ids.get(ctx.run_id[1]) in issued_runs
-            ]
-            return bool(relevant) and all(
-                (ctx.run_id[1], ctx.attempt) not in baseline for ctx in relevant
-            )
+            latest_issued: dict[tuple[int, str, str | None], CIContextEvidence] = {}
+            for ctx in evidence.contexts:
+                if ctx.run_id is None or ctx.run_id[0] != "check":
+                    continue
+                run_id = run_ids.get(ctx.run_id[1])
+                if run_id not in issued_runs:
+                    continue
+                key = (run_id, ctx.name, ctx.producer)
+                previous = latest_issued.get(key)
+                if previous is None or _newer(ctx, previous):
+                    latest_issued[key] = ctx
+            relevant = [ctx for ctx in latest_issued.values() if ctx.state == "failure"]
+            if relevant:
+                return all(
+                    (ctx.run_id[1], ctx.attempt) not in baseline for ctx in relevant
+                )
+            if any(
+                ctx.run_id is None or ctx.run_id[0] != "check"
+                or run_ids.get(ctx.run_id[1]) not in issued_runs
+                for ctx in failures
+            ):
+                checks = list(latest_issued.values())
+                if (
+                    issued_runs == {run_id for run_id, _, _ in latest_issued}
+                    and all(
+                        ctx.state == "success"
+                        and (ctx.run_id[1], ctx.attempt) not in baseline
+                        for ctx in checks
+                    )
+                ):
+                    return None
+            return False
         for ctx in failures:
             if ctx.run_id is None or ctx.run_id[0] != "check":
                 return False

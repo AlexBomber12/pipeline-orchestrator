@@ -3349,6 +3349,77 @@ def test_infra_retry_identity_ignores_checks_outside_issued_workflow(
     assert asyncio.run(runner._infra_retry_has_new_failed_attempt(78, sha)) is not unsupported
 
 
+@pytest.mark.parametrize("issued_state", ["success", "pending", "stale"])
+@pytest.mark.parametrize("outside_name", ["integration", "unit"])
+def test_new_infra_failure_after_issued_rerun_has_bounded_outcome(
+    monkeypatch: pytest.MonkeyPatch, issued_state: str, outside_name: str,
+) -> None:
+    from src.github import checks as gh_checks
+    from src.keyspace import ci_infra_retried
+
+    runner = h._make_runner()
+    sha = "d" * 40
+    asyncio.run(runner.redis.set(
+        ci_infra_retried(runner.owner_repo, 78, sha), json.dumps({
+            "at": time.time() - 120, "checks": [[1, 1]],
+            "rerunnable_checks": [[1, 1, 11]], "issued_runs": [11],
+            "unsupported": False,
+        }),
+    ))
+    runs = [
+        {"id": 1, "name": "unit", "head_sha": sha, "app": {"id": 15368},
+         "conclusion": "cancelled", "run_attempt": 1,
+         "details_url": _actions_url(11, 1),
+         "started_at": "2026-10-24T00:00:00Z"},
+        {"id": 2, "name": "unit", "head_sha": sha, "app": {"id": 15368},
+         "status": "in_progress" if issued_state == "pending" else "completed",
+         "conclusion": None if issued_state == "pending" else (
+             "cancelled" if issued_state == "stale" else "success"
+         ),
+         "run_attempt": 2, "details_url": _actions_url(11, 2),
+         "started_at": "2026-10-24T00:10:00Z"},
+        {"id": 3, "name": outside_name, "head_sha": sha,
+         "app": {"id": 15368}, "conclusion": "cancelled", "run_attempt": 1,
+         "details_url": _actions_url(22, 3),
+         "started_at": "2026-10-24T00:11:00Z"},
+    ]
+    retrieval = gh_checks._make_ci_retrieval(
+        runner.owner_repo, sha, 0.0, runs,
+        {"sha": sha, "state": "pending", "statuses": []},
+        gh_checks._CiSourceResult(True, False),
+        gh_checks._CiSourceResult(True, True),
+    )
+    monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
+
+    expected = None if issued_state == "success" else (
+        True if issued_state == "stale" else False
+    )
+    assert asyncio.run(runner._infra_retry_has_new_failed_attempt(78, sha)) is expected
+
+
+def test_new_infra_failure_outside_rerun_routes_to_operator_recovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.keyspace import ci_infra_retried
+
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=78, head_sha="d" * 40)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(runner.redis.set(
+        ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha),
+        json.dumps({"at": time.time() - 120, "checks": [[1, 1]],
+                    "issued": True, "tries": 1}),
+    ))
+    monkeypatch.setattr(runner, "_infra_retry_has_new_failed_attempt", AsyncMock(return_value=None))
+
+    asyncio.run(runner.handle_watch())
+
+    assert runner.state.state == PipelineState.ERROR
+    assert "outside the rerun workflows" in runner.state.error_message
+    assert "operator Retry required" in runner.state.error_message
+
+
 def test_persisted_infra_result_without_new_attempt_remains_in_watch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
