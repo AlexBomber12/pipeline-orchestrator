@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from src.github import comments
@@ -50,3 +50,24 @@ def test_request_history_ignores_malformed_time_and_normalizes_naive_time(
     assert comments.latest_codex_review_request_time(
         "octo/demo", 5, after=datetime(2026, 10, 24, 12, tzinfo=timezone.utc)
     ) == datetime(2026, 10, 24, 12, 3, tzinfo=timezone.utc)
+
+
+def test_author_dedup_and_history_recognize_same_extended_trigger(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    publication = datetime.now(timezone.utc) - timedelta(minutes=2)
+    requested = publication + timedelta(minutes=1)
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        lambda _path: [{
+            "user": {"login": "author"},
+            "body": "@codex review\nPlease check the latest changes.",
+            "created_at": requested.isoformat(),
+        }],
+    )
+    assert comments.get_recent_codex_review_request_time(
+        "octo/demo", 5, "author", after_iso=publication.isoformat()
+    ) == requested
+    assert comments.latest_codex_review_request_time(
+        "octo/demo", 5, after=publication
+    ) == requested

@@ -142,7 +142,7 @@ def latest_codex_review_request_time(
     comments = cache._gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
     latest = None
     for comment in comments:
-        if (comment.get("body") or "").strip().lower() != "@codex review":
+        if "@codex review" not in (comment.get("body") or "").lower():
             continue
         stamp = gh_runner._parse_iso(comment.get("created_at"))
         if stamp is None:
