@@ -461,6 +461,30 @@ class WatchMixin:
                 found.number, found.head_sha
             )
             if marker_exists and grace_elapsed:
+                issued, tries = await self._infra_retry_issue_state(found.number, found.head_sha)
+                if not issued:
+                    if review == ReviewStatus.CHANGES_REQUESTED:
+                        result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
+                        if result == FeedbackCheckResult.NEW:
+                            self._fix_feedback_reviewer_policy = reviewer_policy
+                            await self.handle_fix()
+                            return
+                    if tries < 2:
+                        self._infra_retry_baseline = None
+                        retried = self._retry_failed_workflow(found.number, found.head_sha)
+                        await self._mark_infra_retry_attempted(
+                            found.number, found.head_sha, issued=retried, tries=tries + 1,
+                        )
+                        return
+                    await self._transition_to_error(
+                        "Infrastructure CI rerun could not be issued after two attempts; operator Retry required",
+                        save_run_record_as=None, log_prefix="[WATCH]",
+                        cancellation_cause=CancellationCause(
+                            category="ERROR", payload={"subsource": "infra_failure"},
+                        ),
+                        commit_task_status=True,
+                    )
+                    return
                 if not await self._infra_retry_has_new_failed_attempt(found.number, found.head_sha):
                     self.log_event(
                         f"[WATCH] PR #{found.number} awaiting post-retry terminal CI evidence."
@@ -501,9 +525,9 @@ class WatchMixin:
                 f"FIX."
             )
             self._infra_retry_baseline = None
-            self._retry_failed_workflow(found.number, found.head_sha)
+            issued = self._retry_failed_workflow(found.number, found.head_sha)
             await self._mark_infra_retry_attempted(
-                found.number, found.head_sha
+                found.number, found.head_sha, issued=issued,
             )
             return
         elif review == ReviewStatus.CHANGES_REQUESTED:
@@ -1150,6 +1174,19 @@ class WatchMixin:
                 return False
         return True
 
+    async def _infra_retry_issue_state(self, pr_number: int, head_sha: str) -> tuple[bool, int]:
+        """Return bounded rerun issuance state; unknown markers need operator recovery."""
+        if self.redis is None:
+            return False, 2
+        raw = await self.redis.get(ci_infra_retried(self.owner_repo, pr_number, head_sha))
+        try:
+            marker = json.loads(raw)
+            if isinstance(marker, dict):
+                return marker.get("issued") is not False, max(1, int(marker.get("tries", 1)))
+        except (TypeError, ValueError):
+            pass
+        return False, 2
+
     async def _handle_external_pr_resolution(
         self,
         found: object,
@@ -1242,7 +1279,7 @@ class WatchMixin:
         return True
 
     async def _mark_infra_retry_attempted(
-        self, pr_number: int, head_sha: str
+        self, pr_number: int, head_sha: str, *, issued: bool = True, tries: int = 1,
     ) -> None:
         """Record that WATCH issued the one-shot infra retry for ``head_sha``.
 
@@ -1255,7 +1292,7 @@ class WatchMixin:
             return
         key = ci_infra_retried(self.owner_repo, pr_number, head_sha)
         await self.redis.set(
-            key, json.dumps({"at": time.time(), "checks": getattr(
+            key, json.dumps({"at": time.time(), "issued": issued, "tries": tries, "checks": getattr(
                 self, "_infra_retry_baseline", None,
             ) or []}), ex=_CI_INFRA_RETRIED_TTL_SECONDS,
         )

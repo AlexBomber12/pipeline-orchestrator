@@ -2969,6 +2969,81 @@ def test_first_infra_failure_retries_workflow(
     assert "infra retry: re-ran failed jobs" in history
 
 
+def test_failed_infra_rerun_issuance_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.keyspace import ci_infra_retried
+
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=81, head_sha="d" * 40)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    reruns: list[list[str]] = []
+
+    def unavailable(args: list[str], **kwargs: Any) -> str:
+        if args[:2] == ["run", "rerun"]:
+            reruns.append(args)
+            raise RuntimeError("GitHub unavailable")
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", unavailable)
+    marker_key = ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha)
+    for attempt in (1, 2):
+        asyncio.run(runner.handle_watch())
+        marker = json.loads(asyncio.run(runner.redis.get(marker_key)))
+        assert marker["issued"] is False
+        assert marker["tries"] == attempt
+        marker["at"] = time.time() - 120
+        asyncio.run(runner.redis.set(marker_key, json.dumps(marker)))
+    asyncio.run(runner.handle_watch())
+    assert len(reruns) == 2
+    assert runner.state.state == PipelineState.ERROR
+    assert "operator Retry required" in runner.state.error_message
+
+
+def test_failed_infra_rerun_still_allows_current_review_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.keyspace import ci_infra_retried
+
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=82, head_sha="d" * 40)
+    pr.review_status = ReviewStatus.CHANGES_REQUESTED
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(runner.redis.set(
+        ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha),
+        json.dumps({"at": time.time() - 120, "checks": [[1, 1]],
+                    "issued": False, "tries": 1}),
+    ))
+    monkeypatch.setattr(
+        runner, "_has_new_codex_feedback_since_last_push",
+        lambda policy: FeedbackCheckResult.NEW,
+    )
+    fix = AsyncMock()
+    monkeypatch.setattr(runner, "handle_fix", fix)
+    asyncio.run(runner.handle_watch())
+    fix.assert_awaited_once()
+
+
+def test_infra_rerun_marker_without_issuance_proof_needs_operator_recovery() -> None:
+    from src.keyspace import ci_infra_retried
+
+    runner = h._make_runner()
+    sha = "d" * 40
+    runner.redis = None
+    assert asyncio.run(runner._infra_retry_issue_state(81, sha)) == (False, 2)
+    runner = h._make_runner()
+    asyncio.run(runner.redis.set(
+        ci_infra_retried(runner.owner_repo, 81, sha), "1",
+    ))
+    assert asyncio.run(runner._infra_retry_issue_state(81, sha)) == (False, 2)
+    asyncio.run(runner.redis.set(
+        ci_infra_retried(runner.owner_repo, 81, sha), "malformed",
+    ))
+    assert asyncio.run(runner._infra_retry_issue_state(81, sha)) == (False, 2)
+
+
 @pytest.mark.parametrize(
     ("review_status", "feedback_result"),
     [
@@ -3012,18 +3087,16 @@ def test_second_infra_failure_routes_to_fix(
         return feedback_result
 
     monkeypatch.setattr(runner, "_has_new_codex_feedback_since_last_push", feedback_check)
-    # Pre-seed the marker with a wall-clock timestamp older than the
-    # grace window so the next cycle treats the retry as "elapsed
-    # enough to escalate." A legacy "1" marker would also work (it's
-    # treated as elapsed for backwards compatibility) but the realistic
-    # daemon write-path stores a timestamp.
+    # Pre-seed a successful issuance with an elapsed grace window.
     from src.keyspace import ci_infra_retried as _ci_infra_retried_key
 
     key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
     stale_marker_ts = (
         time.time() - watch_module._INFRA_RETRY_GRACE_SECONDS - 1.0
     )
-    asyncio.run(runner.redis.set(key, str(stale_marker_ts)))
+    asyncio.run(runner.redis.set(key, json.dumps({
+        "at": stale_marker_ts, "checks": [[1, 1]], "issued": True, "tries": 1,
+    })))
 
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
@@ -3155,7 +3228,9 @@ def test_persisted_infra_result_without_new_attempt_remains_in_watch(
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
     marker = ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha)
-    asyncio.run(runner.redis.set(marker, str(time.time() - 120)))
+    asyncio.run(runner.redis.set(marker, json.dumps({
+        "at": time.time() - 120, "checks": [[1, 1]], "issued": True, "tries": 1,
+    })))
     monkeypatch.setattr(runner, "_infra_retry_has_new_failed_attempt", AsyncMock(return_value=False))
     fix = AsyncMock()
     rerun = []

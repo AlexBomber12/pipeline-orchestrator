@@ -151,7 +151,13 @@ class RecoveryMixin:
                 f"{self.name}:{task.pr_id}:{snapshot.run_id}:obsolete-ci-continuation",
             ))
             continuation = await self._metrics_store.get(continuation_id)
-            task_bytes = (Path(self.repo_path) / task.task_file).read_bytes()
+            if (Path(self.repo_path) / ".git").exists():
+                base_ref = f"refs/remotes/origin/{self.repo_config.branch}"
+                task_bytes = git_ops._git(
+                    self.repo_path, "show", f"{base_ref}:{task.task_file}", timeout=60,
+                ).stdout.encode("utf-8")
+            else:
+                task_bytes = (Path(self.repo_path) / task.task_file).read_bytes()
             task_hash = task_spec_content_hash(task_bytes.decode("utf-8"))
             metadata = gh_prs.get_pr_metadata(self.owner_repo, pr.number)
             retrieval = (

@@ -33,6 +33,7 @@ Tests do not change production behavior; they only assert it.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 
 # PR-224a: imports needed by tests moved from tests/test_runner.py
@@ -2868,7 +2869,7 @@ def test_header_merge_recovery_prioritizes_unfinished_attempt(
 
 @pytest.mark.parametrize(
     "case",
-    ["success", "success_live", "success_live_stale_startup",
+    ["success", "success_live", "success_live_stale_startup", "stale_coder_checkout",
      "suppression_disappeared", "identity_changed",
      "provider_unavailable", "incomplete_evidence", "still_failed", "wrong_run_cause",
      "unrelated_hold", "status_write_failed", "label_cleanup_failed", "cleanup_failed",
@@ -2979,6 +2980,14 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
         )
     elif case == "wrong_run_cause":
         run.cause_subsource = "guardrail"
+    elif case == "stale_coder_checkout":
+        (tmp_path / ".git").mkdir()
+        task_path.write_text(task_path.read_text().replace("status: ERROR", "status: TODO"))
+        remote_text = "---\nPR_ID: PR-019\nBranch: pr-019\nstatus: ERROR\n---\nTask\n"
+        monkeypatch.setattr(
+            recovery_module.git_ops, "_git",
+            lambda *args, **kwargs: types.SimpleNamespace(stdout=remote_text),
+        )
     elif case == "suppression_disappeared":
         monkeypatch.setattr(runner, "_suppression_record_for_task", AsyncMock(return_value=None))
     elif case == "paused":
@@ -3011,6 +3020,7 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
         )
 
     if case not in {"success", "success_live", "success_live_stale_startup",
+                    "stale_coder_checkout",
                     "suppression_disappeared"}:
         assert not asyncio.run(runner._recover_obsolete_ci_error([task], [pr]))
         assert runner.state.state == PipelineState.ERROR
@@ -3048,6 +3058,10 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
     assert runner._current_run_record is not run
     assert runner._current_run_record.fix_iterations == run.fix_iterations
     assert runner._current_run_record.ended_at is None
+    if case == "stale_coder_checkout":
+        assert write.await_args.kwargs["expected_task_sha256"] == hashlib.sha256(
+            remote_text.encode("utf-8")
+        ).hexdigest()
     if case == "success":
         from src.coders.claude import claude_cli
         from src.daemon.handlers import fix as fix_module
