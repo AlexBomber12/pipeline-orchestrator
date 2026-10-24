@@ -470,8 +470,19 @@ class WatchMixin:
                             await self.handle_fix()
                             return
                     if tries < 2:
-                        self._infra_retry_baseline = None
-                        retried = self._retry_failed_workflow(found.number, found.head_sha)
+                        raw_marker = await self.redis.get(
+                            ci_infra_retried(self.owner_repo, found.number, found.head_sha)
+                        )
+                        marker = json.loads(raw_marker)
+                        targets = set(marker.get("targets", []))
+                        issued_runs = set(marker.get("issued_runs", []))
+                        self._infra_retry_baseline = marker.get("checks", [])
+                        self._infra_retry_target_run_ids = sorted(targets)
+                        self._infra_retry_issued_run_ids = sorted(issued_runs)
+                        retried = self._retry_failed_workflow(
+                            found.number, found.head_sha,
+                            only_run_ids=targets - issued_runs if targets else None,
+                        )
                         await self._mark_infra_retry_attempted(
                             found.number, found.head_sha, issued=retried, tries=tries + 1,
                         )
@@ -525,6 +536,8 @@ class WatchMixin:
                 f"FIX."
             )
             self._infra_retry_baseline = None
+            self._infra_retry_target_run_ids = []
+            self._infra_retry_issued_run_ids = []
             issued = self._retry_failed_workflow(found.number, found.head_sha)
             await self._mark_infra_retry_attempted(
                 found.number, found.head_sha, issued=issued,
@@ -1292,12 +1305,17 @@ class WatchMixin:
             return
         key = ci_infra_retried(self.owner_repo, pr_number, head_sha)
         await self.redis.set(
-            key, json.dumps({"at": time.time(), "issued": issued, "tries": tries, "checks": getattr(
-                self, "_infra_retry_baseline", None,
-            ) or []}), ex=_CI_INFRA_RETRIED_TTL_SECONDS,
+            key, json.dumps({
+                "at": time.time(), "issued": issued, "tries": tries,
+                "checks": getattr(self, "_infra_retry_baseline", None) or [],
+                "targets": getattr(self, "_infra_retry_target_run_ids", None) or [],
+                "issued_runs": getattr(self, "_infra_retry_issued_run_ids", None) or [],
+            }), ex=_CI_INFRA_RETRIED_TTL_SECONDS,
         )
 
-    def _retry_failed_workflow(self, pr_number: int, head_sha: str) -> bool:
+    def _retry_failed_workflow(
+        self, pr_number: int, head_sha: str, *, only_run_ids: set[int] | None = None,
+    ) -> bool:
         """Re-run the failed jobs of failing workflow runs attached to ``head_sha``.
 
         PR-251 (OBS-BC). Returns ``True`` when at least one ``gh run
@@ -1346,10 +1364,11 @@ class WatchMixin:
                 in gh_checks._REST_CI_FAILURE_STATES
             )
         ]
-        self._infra_retry_baseline = [
-            [run["id"], run.get("run_attempt")]
-            for run in failing_runs if isinstance(run.get("id"), int)
-        ]
+        if only_run_ids is None:
+            self._infra_retry_baseline = [
+                [run["id"], run.get("run_attempt")]
+                for run in failing_runs if isinstance(run.get("id"), int)
+            ]
         if not failing_runs:
             self.log_event(
                 f"[WATCH] PR #{pr_number} infra retry skipped — no "
@@ -1375,6 +1394,10 @@ class WatchMixin:
                 f"workflow run ID in details_url."
             )
             return False
+        if only_run_ids is None:
+            self._infra_retry_target_run_ids = run_ids
+            self._infra_retry_issued_run_ids = []
+        run_ids = [run_id for run_id in run_ids if only_run_ids is None or run_id in only_run_ids]
         rerun_count = 0
         for run_id in run_ids:
             try:
@@ -1389,10 +1412,14 @@ class WatchMixin:
                 )
                 continue
             rerun_count += 1
+            if run_id not in self._infra_retry_issued_run_ids:
+                self._infra_retry_issued_run_ids.append(run_id)
         if rerun_count == 0:
             return False
         self.log_event(
             f"[WATCH] PR #{pr_number} infra retry: re-ran failed jobs "
             f"of {rerun_count} workflow run(s) on sha {head_sha[:7]}."
         )
-        return True
+        return bool(self._infra_retry_target_run_ids) and set(
+            self._infra_retry_target_run_ids
+        ).issubset(self._infra_retry_issued_run_ids)

@@ -2459,8 +2459,8 @@ class PipelineRunner(
             f"({label}) -> IDLE for retry."
         )
 
-    async def _handle_single_error_exit(self) -> None:
-        """Feature-flagged ERROR dispatcher with one visible exit per cycle."""
+    async def _maybe_resume_obsolete_ci_error(self) -> bool | None:
+        """Admit a proven obsolete CI-only escalation in either ERROR dispatcher."""
         task = self.state.current_task
         snapshot = self.state.active_invocation
         if (
@@ -2484,9 +2484,17 @@ class PipelineRunner(
                         allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
                     )
                     if tasks is not None and await self._recover_obsolete_ci_error(tasks, prs):
-                        return
+                        return True
+                    return False
             except Exception as exc:
                 self.log_event(f"[RECOVERY] Obsolete CI observation deferred: {exc}.")
+                return False
+        return None
+
+    async def _handle_single_error_exit(self) -> None:
+        """Feature-flagged ERROR dispatcher with one visible exit per cycle."""
+        if await self._maybe_resume_obsolete_ci_error() is not None:
+            return
         if self.state.rate_limited_until is not None:
             self.state.state = PipelineState.PAUSED
             self.log_event(
@@ -4003,7 +4011,15 @@ class PipelineRunner(
         elif current == PipelineState.PAUSED:
             await self.handle_paused()
         elif current == PipelineState.ERROR:
-            if (self.state.error_message or "").startswith("FIX idle timeout"):
+            obsolete_ci = (
+                await self._maybe_resume_obsolete_ci_error()
+                if not self.repo_config.feature_flags.use_single_error_exit else None
+            )
+            if obsolete_ci is True:
+                await self.handle_watch()
+            elif obsolete_ci is False:
+                pass
+            elif (self.state.error_message or "").startswith("FIX idle timeout"):
                 await self._admit_fix_idle_timeout()
             elif await self._maybe_resume_review_timeout():
                 await self.handle_watch()

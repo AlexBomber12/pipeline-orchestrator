@@ -3026,6 +3026,49 @@ def test_failed_infra_rerun_still_allows_current_review_fix(
     fix.assert_awaited_once()
 
 
+def test_partial_infra_rerun_retries_only_unissued_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.keyspace import ci_infra_retried
+
+    pr = _patch_infra_failure_pr(
+        monkeypatch, pr_number=83, head_sha="d" * 40,
+        check_runs=[
+            {"id": 101, "run_attempt": 1, "conclusion": "cancelled",
+             "details_url": _actions_url(11, 101)},
+            {"id": 202, "run_attempt": 1, "conclusion": "cancelled",
+             "details_url": _actions_url(22, 202)},
+        ],
+    )
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    attempts: list[int] = []
+
+    def partial(args: list[str], **kwargs: Any) -> str:
+        if args[:2] == ["run", "rerun"]:
+            run_id = int(args[-1])
+            attempts.append(run_id)
+            if run_id == 22 and attempts.count(22) == 1:
+                raise RuntimeError("GitHub unavailable")
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", partial)
+    marker_key = ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha)
+    asyncio.run(runner.handle_watch())
+    marker = json.loads(asyncio.run(runner.redis.get(marker_key)))
+    assert marker["issued"] is False
+    assert marker["targets"] == [11, 22]
+    assert marker["issued_runs"] == [11]
+    marker["at"] = time.time() - 120
+    asyncio.run(runner.redis.set(marker_key, json.dumps(marker)))
+    asyncio.run(runner.handle_watch())
+    marker = json.loads(asyncio.run(runner.redis.get(marker_key)))
+    assert attempts == [11, 22, 22]
+    assert marker["issued"] is True
+    assert marker["issued_runs"] == [11, 22]
+
+
 def test_infra_rerun_marker_without_issuance_proof_needs_operator_recovery() -> None:
     from src.keyspace import ci_infra_retried
 
@@ -3635,13 +3678,12 @@ def test_retry_failed_workflow_matches_failing_status_with_empty_conclusion(
     assert calls == [["run", "rerun", "--failed", "7"]]
 
 
-def test_retry_failed_workflow_partial_rerun_failure_returns_true(
+def test_retry_failed_workflow_partial_rerun_failure_remains_unissued(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """PR-251 follow-up: when several workflow runs need rerunning and
-    one of the calls fails, the helper logs that failure but reports
-    success as long as at least one rerun went through — partial
-    progress is still progress against the one-shot retry budget.
+    one of the calls fails, the marker must retain that workflow as
+    unissued so the bounded follow-up retries only its request.
     """
     runner = h._make_runner()
     _patch_check_runs(
@@ -3660,7 +3702,9 @@ def test_retry_failed_workflow_partial_rerun_failure_returns_true(
         return ""
 
     monkeypatch.setattr(watch_module.gh_runner, "run_gh", fake_run_gh)
-    assert runner._retry_failed_workflow(11, "abc1234") is True
+    assert runner._retry_failed_workflow(11, "abc1234") is False
+    assert runner._infra_retry_target_run_ids == [900, 901]
+    assert runner._infra_retry_issued_run_ids == [901]
     history = " ".join(entry.get("event", "") for entry in runner.state.history)
     assert "infra retry rerun failed" in history
     assert "infra retry: re-ran failed jobs" in history

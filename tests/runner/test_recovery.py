@@ -2869,9 +2869,11 @@ def test_header_merge_recovery_prioritizes_unfinished_attempt(
 
 @pytest.mark.parametrize(
     "case",
-    ["success", "success_live", "success_live_stale_startup", "stale_coder_checkout",
+    ["success", "success_live", "success_live_stale_startup",
+     "success_default_dispatch", "stale_coder_checkout",
      "suppression_disappeared", "identity_changed",
-     "provider_unavailable", "incomplete_evidence", "still_failed", "wrong_run_cause",
+     "provider_unavailable", "incomplete_evidence", "still_failed",
+     "still_failed_default_dispatch", "wrong_run_cause",
      "unrelated_hold", "status_write_failed", "label_cleanup_failed", "cleanup_failed",
      "continuation_corrupt", "continuation_save_failed", "paused"],
 )
@@ -2947,7 +2949,8 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
         runner.owner_repo, pr.head_sha, 0.0,
         [{"id": 42, "name": "unit", "head_sha": pr.head_sha,
           "app": {"id": 1}, "status": "completed",
-          "conclusion": "failure" if case == "still_failed" else "success"}],
+          "conclusion": "failure" if case in {"still_failed", "still_failed_default_dispatch"}
+          else "success"}],
         {"sha": pr.head_sha, "state": "pending", "statuses": []},
         gh_checks._CiSourceResult(case != "incomplete_evidence", False),
         gh_checks._CiSourceResult(True, True),
@@ -3020,6 +3023,7 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
         )
 
     if case not in {"success", "success_live", "success_live_stale_startup",
+                    "success_default_dispatch",
                     "stale_coder_checkout",
                     "suppression_disappeared"}:
         assert not asyncio.run(runner._recover_obsolete_ci_error([task], [pr]))
@@ -3040,16 +3044,42 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
             suppression = asyncio.run(runner._suppression_record_for_task(task.pr_id))
             assert suppression is not None
             assert suppression.reason == SuppressionReason.CODER_ESCALATE
+        if case == "still_failed_default_dispatch":
+            runner._recovered = True
+            runner._scaffolded = True
+            monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+            monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+            monkeypatch.setattr(runner, "reload_repo_config_if_dirty", AsyncMock())
+            monkeypatch.setattr(runner, "_maybe_auto_pause_for_error_rate", AsyncMock(return_value=False))
+            monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [task])
+            monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: [pr])
+            diagnose = AsyncMock()
+            monkeypatch.setattr(runner, "handle_error", diagnose)
+            asyncio.run(runner.run_cycle())
+            assert runner.state.state == PipelineState.ERROR
+            diagnose.assert_not_awaited()
         return
 
     if case != "success_live_stale_startup":
         assert asyncio.run(runner._recover_unresolved_error_pr([task], [pr])) == (task, pr)
-    if case in {"success_live", "success_live_stale_startup"}:
+    if case in {"success_live", "success_live_stale_startup", "success_default_dispatch"}:
         if case == "success_live_stale_startup":
             runner._persisted_fix_recovery.state = PipelineState.WATCH
         monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [task])
         monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: [pr])
-        asyncio.run(runner._handle_single_error_exit())
+        if case == "success_default_dispatch":
+            runner._recovered = True
+            runner._scaffolded = True
+            monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+            monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+            monkeypatch.setattr(runner, "reload_repo_config_if_dirty", AsyncMock())
+            monkeypatch.setattr(runner, "_maybe_auto_pause_for_error_rate", AsyncMock(return_value=False))
+            watch = AsyncMock()
+            monkeypatch.setattr(runner, "handle_watch", watch)
+            asyncio.run(runner.run_cycle())
+            watch.assert_awaited_once()
+        else:
+            asyncio.run(runner._handle_single_error_exit())
     else:
         asyncio.run(runner._apply_recovery_decisions([task], [pr]))
     assert runner.state.state == PipelineState.WATCH
