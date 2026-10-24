@@ -3922,6 +3922,265 @@ def _bound_ci_failure() -> dict:
     }
 
 
+def _controlled_actions_failure(
+    monkeypatch: pytest.MonkeyPatch, metadata: list[dict | None],
+    *, check_attempt: int | None = 1, check_id: int = 55,
+) -> list[list[str]]:
+    """Keep checks stale while workflow metadata changes between real admission calls."""
+    from src.github import checks as gh_checks
+
+    sha = "a" * 40
+    check = {
+        "id": check_id, "name": "integration", "head_sha": sha,
+        "app": {"id": 15368}, "status": "completed", "conclusion": "failure",
+        "started_at": "2026-10-24T00:00:00Z",
+        "details_url": "https://github.com/octo/demo/actions/runs/99/job/55",
+    }
+    if check_attempt is not None:
+        check["run_attempt"] = check_attempt
+    retrieval = gh_checks._make_ci_retrieval(
+        "octo/demo", sha, 0.0, [check],
+        {"sha": sha, "state": "pending", "statuses": []},
+        gh_checks._CiSourceResult(True, False),
+        gh_checks._CiSourceResult(True, True),
+    )
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": sha})
+    monkeypatch.setattr(
+        gh_checks, "_retrieve_ci_status_evidence",
+        lambda *args, **kwargs: retrieval,
+    )
+    calls: list[list[str]] = []
+    snapshots = iter(metadata)
+
+    def fake_gh(args: list[str], **kwargs: Any) -> object:
+        calls.append(args)
+        if "--json" in args:
+            value = next(snapshots)
+            if value is None:
+                raise RuntimeError("workflow metadata unavailable")
+            return value
+        raise RuntimeError("job logs unavailable")
+
+    monkeypatch.setattr(fix_module.gh_runner, "run_gh", fake_gh)
+    return calls
+
+
+def _workflow_attempt(
+    attempt: int = 1, status: str = "completed", conclusion: str = "failure",
+    *, job_id: int = 55, sha: str = "a" * 40,
+) -> dict:
+    return {
+        "databaseId": 99, "headSha": sha, "attempt": attempt,
+        "status": status, "conclusion": conclusion,
+        "jobs": [{"databaseId": job_id, "name": "integration", "conclusion": conclusion}],
+    }
+
+
+def _assert_deferred_ci_fix(runner: PipelineRunner, captured: dict) -> None:
+    assert "kwargs" not in captured
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr is not None
+    assert runner.state.current_pr.number == 19
+    assert runner.state.current_pr.fix_iteration_count == 0
+    assert not runner.state.current_pr.is_escalated
+    assert runner.state.active_invocation is None
+    assert runner.state.publication_attempt is None
+    assert runner.state.error_message is None
+    assert not any(key.startswith("cancellation:") for key in runner.redis.store)
+
+
+@pytest.mark.parametrize("status", ["queued", "waiting", "in_progress"])
+def test_handle_fix_defers_stale_failed_check_for_newer_attempt(
+    monkeypatch: pytest.MonkeyPatch, status: str,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    calls = _controlled_actions_failure(
+        monkeypatch, [_workflow_attempt(2, status, "")],
+    )
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40, ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    _assert_deferred_ci_fix(runner, captured)
+    assert len([call for call in calls if "--json" in call]) == 1
+
+
+def test_handle_fix_defers_stale_check_after_successful_rerun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    _controlled_actions_failure(monkeypatch, [_workflow_attempt(2, conclusion="success")])
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40, ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    _assert_deferred_ci_fix(runner, captured)
+
+
+@pytest.mark.parametrize("phase", ["logs", "prelaunch"])
+def test_handle_fix_remembers_newer_attempt_when_checks_and_metadata_lag(
+    monkeypatch: pytest.MonkeyPatch, phase: str,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    old = _workflow_attempt()
+    new = _workflow_attempt(2, "in_progress", "")
+    snapshots = [old, new, old] if phase == "logs" else [old, old, new]
+    _controlled_actions_failure(monkeypatch, snapshots)
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40, ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    _assert_deferred_ci_fix(runner, captured)
+
+
+@pytest.mark.parametrize("metadata", [None, _workflow_attempt(job_id=56),
+                                      _workflow_attempt(sha="b" * 40),
+                                      {key: value for key, value in _workflow_attempt().items()
+                                       if key != "attempt"}])
+def test_handle_fix_defers_unverified_workflow_identity(
+    monkeypatch: pytest.MonkeyPatch, metadata: dict | None,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    _controlled_actions_failure(monkeypatch, [metadata], check_attempt=None)
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40, ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    _assert_deferred_ci_fix(runner, captured)
+
+
+def test_handle_fix_accepts_matching_job_without_check_attempt_or_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    _controlled_actions_failure(
+        monkeypatch, [_workflow_attempt(2)] * 3, check_attempt=None,
+    )
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40, ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    context = captured["kwargs"]["extra_context"]
+    assert "Confirmed current CI failure:" in context
+    assert "Confirmed CI failure logs unavailable." in context
+    assert "attempt=2" in context
+
+
+def test_handle_fix_keeps_fresh_review_when_ci_attempt_is_obsolete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    _controlled_actions_failure(monkeypatch, [_workflow_attempt(2, "queued", "")])
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE, review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    runner._fix_review_feedback = "P1: current review finding"
+    runner._fix_review_head = "a" * 40
+    asyncio.run(runner.handle_fix())
+    context = captured["kwargs"]["extra_context"]
+    assert "P1: current review finding" in context
+    assert "Confirmed current CI failure" not in context
+
+
+def test_handle_fix_drops_ci_assertion_when_attempt_changes_during_logs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    _controlled_actions_failure(
+        monkeypatch, [_workflow_attempt(), _workflow_attempt(2, "queued", ""),
+                      _workflow_attempt()],
+    )
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE, review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    runner._fix_review_feedback = "P1: current review finding"
+    runner._fix_review_head = "a" * 40
+    asyncio.run(runner.handle_fix())
+    context = captured["kwargs"]["extra_context"]
+    assert "P1: current review finding" in context
+    assert "Confirmed current CI failure" not in context
+
+
+def test_handle_fix_defers_when_non_actionable_review_remains_after_ci_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    _controlled_actions_failure(
+        monkeypatch, [_workflow_attempt(), _workflow_attempt(2, "queued", ""),
+                      _workflow_attempt()],
+    )
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE, review_status=ReviewStatus.PENDING,
+    )
+    runner._fix_review_feedback = "Old review finding"
+    runner._fix_review_head = "a" * 40
+    asyncio.run(runner.handle_fix())
+    _assert_deferred_ci_fix(runner, captured)
+
+
+def test_actions_job_validation_rejects_missing_identity() -> None:
+    assert fix_module._current_failed_actions_job(
+        "octo/demo", "a" * 40, {"workflow_run_id": 99},
+    ) is None
+
+
+def test_handle_fix_admits_configured_status_without_actions_workflow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.github import checks as gh_checks
+
+    h._patch_subprocess(monkeypatch)
+    sha = "a" * 40
+    status = {
+        "id": 91, "context": "e2e/watch-merge-gate", "sha": sha,
+        "state": "failure", "creator": {"login": "testbed[bot]"},
+    }
+    retrieval = gh_checks._make_ci_retrieval(
+        "octo/demo", sha, 0.0, [],
+        {"sha": sha, "state": "failure", "statuses": [status]},
+        gh_checks._CiSourceResult(True, False),
+        gh_checks._CiSourceResult(True, True),
+    )
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": sha})
+    monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
+    def no_actions_workflow(args: list[str], **kwargs: Any) -> None:
+        if args[:2] == ["run", "view"]:
+            pytest.fail("status admission must not read Actions workflow")
+        return None
+
+    monkeypatch.setattr(fix_module.gh_runner, "run_gh", no_actions_workflow)
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner(ci_fix_trusted_statuses={
+        "e2e/watch-merge-gate": ["user:testbed[bot]"],
+    })
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha=sha, ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    context = captured["kwargs"]["extra_context"]
+    assert "Confirmed current CI failure:" in context
+    assert "status=91" in context
+
+
 @pytest.mark.parametrize(
     ("latest", "complete", "live_head", "expected"),
     [
@@ -3942,13 +4201,13 @@ def test_current_ci_failure_uses_live_head_and_latest_complete_check(
     monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": live_head})
     runs = [
         {
-            "id": 41, "name": "unit", "head_sha": sha, "app": {"id": 15368},
+            "id": 55, "name": "unit", "head_sha": sha, "app": {"id": 15368},
             "status": "completed", "conclusion": "failure", "run_attempt": 1,
             "started_at": "2026-10-24T00:00:00Z",
             "details_url": "https://github.com/octo/demo/actions/runs/12345/job/55",
         },
         {
-            "id": 42, "name": "unit", "head_sha": sha, "app": {"id": 15368},
+            "id": 56, "name": "unit", "head_sha": sha, "app": {"id": 15368},
             "status": "in_progress" if latest == "pending" else "completed",
             "conclusion": None if latest == "pending" else latest,
             "run_attempt": 2, "started_at": "2026-10-24T00:10:00Z",
@@ -3966,10 +4225,18 @@ def test_current_ci_failure_uses_live_head_and_latest_complete_check(
         gh_checks, "_retrieve_ci_status_evidence",
         lambda repo, head, *, fresh: retrieval if fresh else None,
     )
+    monkeypatch.setattr(
+        fix_module.gh_runner, "run_gh",
+        lambda *a, **kw: {
+            "databaseId": 12345, "headSha": sha, "attempt": 2,
+            "status": "completed", "conclusion": "failure",
+            "jobs": [{"databaseId": 56, "name": "unit", "conclusion": "failure"}],
+        },
+    )
     result = fix_module._current_ci_failure("octo/demo", 19, sha, ("unit",), False)
     assert (result is not None) is expected
     if expected:
-        assert result["contexts"][0]["check_id"] == 42
+        assert result["contexts"][0]["check_id"] == 56
         assert result["contexts"][0]["attempt"] == 2
 
 
@@ -4035,7 +4302,7 @@ def test_current_ci_failure_accepts_actions_job_without_named_check_policy(
     monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": sha})
     retrieval = gh_checks._make_ci_retrieval(
         "octo/demo", sha, 0.0,
-        [{"id": 41, "name": "unit", "head_sha": sha, "app": {"id": 15368},
+        [{"id": 55, "name": "unit", "head_sha": sha, "app": {"id": 15368},
           "status": "completed", "conclusion": "failure",
           "details_url": "https://github.com/octo/demo/actions/runs/12345/job/55"}],
         {"sha": sha, "state": "failure", "statuses": []},
@@ -4043,10 +4310,18 @@ def test_current_ci_failure_accepts_actions_job_without_named_check_policy(
         gh_checks._CiSourceResult(True, True),
     )
     monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
+    monkeypatch.setattr(
+        fix_module.gh_runner, "run_gh",
+        lambda *a, **kw: {
+            "databaseId": 12345, "headSha": sha, "attempt": 1,
+            "status": "completed", "conclusion": "failure",
+            "jobs": [{"databaseId": 55, "name": "unit", "conclusion": "failure"}],
+        },
+    )
 
     failure = fix_module._current_ci_failure("octo/demo", 19, sha, None, False)
     assert failure is not None
-    assert failure["contexts"][0]["check_id"] == 41
+    assert failure["contexts"][0]["check_id"] == 55
 
 
 @pytest.mark.parametrize("trusted", [True, False])

@@ -49,13 +49,13 @@ from src.subsource_registry import SuppressionReason
 logger = logging.getLogger(__name__)
 
 _FIX_CI_LOG_TRUNCATE_CHARS = 5000
-_ACTIONS_JOB_URL = re.compile(r"/actions/runs/(\d+)/job/(\d+)")
 _GITHUB_ACTIONS_APP_ID = 15368
 
 
 def _current_ci_failure(
     repo: str, pr_number: int, sha: str, required_checks: tuple[str, ...] | None,
     empty_is_success: bool, trusted_statuses: dict[str, list[str]] | None = None,
+    observed_attempts: dict[int, int] | None = None,
 ) -> dict | None:
     """Return bound, current terminal failure evidence for a live PR head."""
     if len(sha) != 40 or gh_prs.get_pr_metadata(repo, pr_number).get("head_sha") != sha:
@@ -133,18 +133,72 @@ def _current_ci_failure(
     for ctx in failures:
         source, identity = ctx.run_id or (None, None)
         run = next((r for r in retrieval.check_runs if source == "check" and r.get("id") == identity), None)
-        match = _ACTIONS_JOB_URL.search(str(run.get("details_url") or "")) if run else None
-        if source == "check" and match is None:
+        url = str(run.get("details_url") or "") if run else ""
+        match = re.fullmatch(
+            rf"https://github\.com/{re.escape(repo)}/actions/runs/(\d+)/job/(\d+)", url,
+        ) if source == "check" else None
+        if source == "check" and (
+            match is None or identity != int(match.group(2))
+        ):
             continue
-        contexts.append({
+        context = {
             "name": ctx.name, "producer": ctx.producer, "source": source,
             "check_id": identity, "attempt": ctx.attempt, "state": ctx.state,
             "workflow_run_id": int(match.group(1)) if match else None,
             "job_id": int(match.group(2)) if match else None,
-        })
+        }
+        if source == "check":
+            workflow = _current_failed_actions_job(repo, sha, context, observed_attempts)
+            if workflow is None:
+                continue
+            context["attempt"] = workflow["attempt"]
+        contexts.append(context)
     if not contexts:
         return None
     return {"repo": repo, "pr_number": pr_number, "head_sha": sha, "contexts": contexts}
+
+
+def _current_failed_actions_job(
+    repo: str, sha: str, context: dict,
+    observed_attempts: dict[int, int] | None = None,
+) -> dict | None:
+    """Bind an Actions check to the latest failed attempt and its exact job."""
+    run_id = context.get("workflow_run_id")
+    job_id = context.get("job_id")
+    if not isinstance(run_id, int) or not isinstance(job_id, int):
+        return None
+    try:
+        run = gh_runner.run_gh(
+            ["run", "view", str(run_id), "--json", "databaseId,headSha,attempt,status,conclusion,jobs"],
+            repo=repo,
+        )
+    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+        return None
+    if not isinstance(run, dict) or run.get("databaseId") != run_id or run.get("headSha") != sha:
+        return None
+    attempt = run.get("attempt")
+    if not isinstance(attempt, int) or attempt < 1:
+        return None
+    if observed_attempts is not None:
+        observed_attempts[run_id] = max(attempt, observed_attempts.get(run_id, 0))
+        if observed_attempts[run_id] != attempt:
+            return None
+    if context.get("attempt") is not None and context["attempt"] != attempt:
+        return None
+    jobs = run.get("jobs")
+    if (
+        run.get("status") != "completed"
+        or run.get("conclusion") not in {"failure", "timed_out", "action_required"}
+        or not isinstance(jobs, list)
+        or not any(
+            isinstance(job, dict) and job.get("databaseId") == job_id
+            and job.get("name") == context.get("name")
+            and job.get("conclusion") in {"failure", "timed_out", "action_required"}
+            for job in jobs
+        )
+    ):
+        return None
+    return run
 
 
 def _fetch_failed_ci_logs(repo: str, failure: dict) -> str | None:
@@ -153,31 +207,12 @@ def _fetch_failed_ci_logs(repo: str, failure: dict) -> str | None:
     for context in failure.get("contexts", []):
         run_id = context.get("workflow_run_id")
         job_id = context.get("job_id")
-        attempt = context.get("attempt")
         if not isinstance(run_id, int) or not isinstance(job_id, int):
             continue
-        try:
-            run = gh_runner.run_gh(
-                ["run", "view", str(run_id), "--json", "databaseId,headSha,attempt,status,conclusion,jobs"],
-                repo=repo,
-            )
-        except (RuntimeError, subprocess.TimeoutExpired, OSError):
-            continue
-        if not isinstance(run, dict) or (
-            run.get("databaseId") != run_id or run.get("headSha") != sha
-            or not isinstance(run.get("attempt"), int)
-            or (attempt is not None and run.get("attempt") != attempt)
-            or run.get("status") != "completed"
-            or run.get("conclusion") not in {"failure", "timed_out", "action_required"}
-        ):
-            continue
-        jobs = run.get("jobs")
-        if not isinstance(jobs, list) or not any(
-            isinstance(job, dict) and job.get("databaseId") == job_id
-            and job.get("name") == context.get("name")
-            and job.get("conclusion") in {"failure", "timed_out", "action_required"}
-            for job in jobs
-        ):
+        run = _current_failed_actions_job(
+            repo, sha, context, failure.setdefault("_observed_attempts", {}),
+        )
+        if run is None:
             continue
         try:
             logs = gh_runner.run_gh(
@@ -887,16 +922,38 @@ class FixMixin(BreachMixin):
                     self.state.state = PipelineState.WATCH
                     return
             if ci_failure is not None:
+                observed_attempts = ci_failure.get("_observed_attempts", {})
                 latest_failure = await asyncio.to_thread(
                     _current_ci_failure, self.owner_repo, self.state.current_pr.number,
                     self.state.current_pr.head_sha, self.repo_config.required_checks,
                     self.repo_config.allow_merge_without_checks,
                     self.repo_config.ci_fix_trusted_statuses,
+                    *([observed_attempts] if observed_attempts else []),
                 )
-                if latest_failure != ci_failure:
-                    self.log_event("[FIX] CI failure changed before coder launch; returning to WATCH.")
-                    self.state.state = PipelineState.WATCH
-                    return
+                admitted_failure = {
+                    key: value for key, value in ci_failure.items()
+                    if key != "_observed_attempts"
+                }
+                if latest_failure != admitted_failure:
+                    if admitted_feedback:
+                        ci_failure = None
+                        self.state.current_pr.ci_status = CIStatus.PENDING
+                        review_context = await self._build_fix_feedback_context(
+                            self.state.current_pr,
+                            reviewer_policy=fix_feedback_reviewer_policy,
+                            review_feedback=admitted_feedback,
+                            review_limitation=review_limitation,
+                        )
+                        if review_context is not None:
+                            fix_kwargs["extra_context"] = review_context
+                        else:
+                            self.log_event("[FIX] Current actionable review findings unavailable; returning to WATCH.")
+                            self.state.state = PipelineState.WATCH
+                            return
+                    else:
+                        self.log_event("[FIX] CI failure changed before coder launch; returning to WATCH.")
+                        self.state.state = PipelineState.WATCH
+                        return
         if reused_prelaunch:
             snapshot = pending_fix_record.invocations[-1]
             if (
