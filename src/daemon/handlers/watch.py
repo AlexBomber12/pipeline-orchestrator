@@ -477,8 +477,10 @@ class WatchMixin:
                         targets = set(marker.get("targets", []))
                         issued_runs = set(marker.get("issued_runs", []))
                         self._infra_retry_baseline = marker.get("checks", [])
+                        self._infra_retry_rerunnable_checks = marker.get("rerunnable_checks", [])
                         self._infra_retry_target_run_ids = sorted(targets)
                         self._infra_retry_issued_run_ids = sorted(issued_runs)
+                        self._infra_retry_unsupported = marker.get("unsupported", False)
                         retried = self._retry_failed_workflow(
                             found.number, found.head_sha,
                             only_run_ids=targets - issued_runs if targets else None,
@@ -542,8 +544,10 @@ class WatchMixin:
                 f"FIX."
             )
             self._infra_retry_baseline = None
+            self._infra_retry_rerunnable_checks = []
             self._infra_retry_target_run_ids = []
             self._infra_retry_issued_run_ids = []
+            self._infra_retry_unsupported = False
             issued = self._retry_failed_workflow(found.number, found.head_sha)
             await self._mark_infra_retry_attempted(
                 found.number, found.head_sha, issued=issued,
@@ -1163,6 +1167,8 @@ class WatchMixin:
             return False
         if retry_at < 1_000_000_000 or not baseline:
             return False
+        if marker.get("unsupported"):
+            return False
         retrieval = gh_checks._retrieve_ci_status_evidence(
             self.owner_repo, head_sha, fresh=True,
         )
@@ -1186,6 +1192,26 @@ class WatchMixin:
             ctx for producers in _latest(evidence.contexts).values()
             for ctx in producers.values() if ctx.state == "failure"
         ]
+        if "rerunnable_checks" in marker:
+            issued_runs = set(marker.get("issued_runs", []))
+            baseline = {
+                (check_id, attempt)
+                for check_id, attempt, run_id in marker["rerunnable_checks"]
+                if run_id in issued_runs
+            }
+            run_ids = {}
+            for run in retrieval.check_runs:
+                match = _DETAILS_URL_RUN_RE.search(str(run.get("details_url") or ""))
+                if match:
+                    run_ids[run.get("id")] = int(match.group(1))
+            relevant = [
+                ctx for ctx in failures
+                if ctx.run_id is not None and ctx.run_id[0] == "check"
+                and run_ids.get(ctx.run_id[1]) in issued_runs
+            ]
+            return bool(relevant) and all(
+                (ctx.run_id[1], ctx.attempt) not in baseline for ctx in relevant
+            )
         for ctx in failures:
             if ctx.run_id is None or ctx.run_id[0] != "check":
                 return False
@@ -1314,8 +1340,10 @@ class WatchMixin:
             key, json.dumps({
                 "at": time.time(), "issued": issued, "tries": tries,
                 "checks": getattr(self, "_infra_retry_baseline", None) or [],
+                "rerunnable_checks": getattr(self, "_infra_retry_rerunnable_checks", None) or [],
                 "targets": getattr(self, "_infra_retry_target_run_ids", None) or [],
                 "issued_runs": getattr(self, "_infra_retry_issued_run_ids", None) or [],
+                "unsupported": getattr(self, "_infra_retry_unsupported", False),
             }), ex=_CI_INFRA_RETRIED_TTL_SECONDS,
         )
 
@@ -1370,11 +1398,6 @@ class WatchMixin:
                 in gh_checks._REST_CI_FAILURE_STATES
             )
         ]
-        if only_run_ids is None:
-            self._infra_retry_baseline = [
-                [run["id"], run.get("run_attempt")]
-                for run in failing_runs if isinstance(run.get("id"), int)
-            ]
         if not failing_runs:
             self.log_event(
                 f"[WATCH] PR #{pr_number} infra retry skipped — no "
@@ -1383,12 +1406,19 @@ class WatchMixin:
             return False
         run_ids: list[int] = []
         seen: set[int] = set()
+        rerunnable_checks: list[list[int | None]] = []
+        unsupported = False
         for run in failing_runs:
             url = run.get("details_url") or run.get("html_url") or ""
             match = _DETAILS_URL_RUN_RE.search(str(url))
             if not match:
+                unsupported = True
                 continue
             run_id = int(match.group(1))
+            if isinstance(run.get("id"), int):
+                rerunnable_checks.append([run["id"], run.get("run_attempt"), run_id])
+            else:
+                unsupported = True
             if run_id in seen:
                 continue
             seen.add(run_id)
@@ -1401,6 +1431,9 @@ class WatchMixin:
             )
             return False
         if only_run_ids is None:
+            self._infra_retry_baseline = [item[:2] for item in rerunnable_checks]
+            self._infra_retry_rerunnable_checks = rerunnable_checks
+            self._infra_retry_unsupported = unsupported
             self._infra_retry_target_run_ids = run_ids
             self._infra_retry_issued_run_ids = []
         run_ids = [run_id for run_id in run_ids if only_run_ids is None or run_id in only_run_ids]
@@ -1428,4 +1461,4 @@ class WatchMixin:
         )
         return bool(self._infra_retry_target_run_ids) and set(
             self._infra_retry_target_run_ids
-        ).issubset(self._infra_retry_issued_run_ids)
+        ).issubset(self._infra_retry_issued_run_ids) and not self._infra_retry_unsupported
