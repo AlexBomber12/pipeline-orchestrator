@@ -2366,7 +2366,10 @@ class PipelineRunner(
         ):
             return False
         status, reason, revision = self._remote_frontmatter_error_status_for_current_task()
-        if status != "error" or reason != SuppressionReason.REVIEW_TIMEOUT or revision is None:
+        if revision is None or not (
+            (status == "error" and reason == SuppressionReason.REVIEW_TIMEOUT)
+            or (status == "todo" and reason is None)
+        ):
             return False
         if self.state.review_request_generation:
             try:
@@ -2405,11 +2408,12 @@ class PipelineRunner(
                 return False
         elif found.review_status != ReviewStatus.APPROVED:
             return False
-        if not await self._commit_task_status_change(
-            task, "TODO", "Late Codex review received; continuing published PR",
-            expected_task_sha256=revision,
-        ):
-            return False
+        if status == "error":
+            if not await self._commit_task_status_change(
+                task, "TODO", "Late Codex review received; continuing published PR",
+                expected_task_sha256=revision,
+            ):
+                return False
         await safe_delete_cancellation_cause(
             self.redis, self.name, task.pr_id, log=self.log_event
         )

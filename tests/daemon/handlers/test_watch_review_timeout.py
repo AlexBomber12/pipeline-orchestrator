@@ -552,6 +552,52 @@ def test_timeout_recovery_rejects_changed_head_and_other_failures(
     assert asyncio.run(runner._maybe_resume_review_timeout()) is False
 
 
+def test_timeout_recovery_reconciles_todo_after_lost_status_confirmation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(tmp_path, monkeypatch)
+    runner.state.state = PipelineState.ERROR
+    runner.state.skip_ai_error_diagnose = True
+    remote_status = ["error"]
+    writes: list[tuple[str, str | None]] = []
+    cleared: list[str] = []
+
+    async def cause(*_args, **_kwargs):
+        return CancellationCause(category="ERROR", payload={"subsource": "review_timeout"})
+
+    async def no_suppression(*_args, **_kwargs):
+        return None
+
+    async def commit(_task, status: str, _reason: str, **kwargs):
+        writes.append((status, kwargs.get("expected_task_sha256")))
+        remote_status[0] = "todo"
+        return False  # Push landed, confirmation fetch failed.
+
+    async def clear(_redis, _name, task_id: str, **_kwargs):
+        cleared.append(task_id)
+
+    monkeypatch.setattr("src.daemon.runner.get_cancellation_cause", cause)
+    monkeypatch.setattr("src.daemon.runner.safe_delete_cancellation_cause", clear)
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_a, **_k: [
+        _pr(review=ReviewStatus.APPROVED, ci=CIStatus.PENDING)
+    ])
+    runner._suppression_record_for_task = no_suppression
+    runner._remote_frontmatter_error_status_for_current_task = lambda: (
+        remote_status[0],
+        watch_module.SuppressionReason.REVIEW_TIMEOUT if remote_status[0] == "error" else None,
+        "remote-revision",
+    )
+    runner._commit_task_status_change = commit
+
+    assert asyncio.run(runner._maybe_resume_review_timeout()) is False
+    assert runner.state.state == PipelineState.ERROR
+    assert cleared == []
+    assert asyncio.run(runner._maybe_resume_review_timeout()) is True
+    assert runner.state.state == PipelineState.WATCH
+    assert writes == [("TODO", "remote-revision")]
+    assert cleared == ["PR-005"]
+
+
 @pytest.mark.parametrize("feedback", [FeedbackCheckResult.NEW, FeedbackCheckResult.UNKNOWN])
 def test_timeout_recovery_requires_fresh_actionable_findings(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, feedback: FeedbackCheckResult,
