@@ -592,6 +592,8 @@ def test_retry_failed_workflow_returns_true_after_rerun(
         return (
             [
                 {
+                    "id": 7,
+                    "run_attempt": 1,
                     "conclusion": "FAILURE",
                     "details_url": (
                         "https://github.com/o/r/actions/runs/123456/job/1"
@@ -603,6 +605,7 @@ def test_retry_failed_workflow_returns_true_after_rerun(
         )
 
     def fake_run_gh(args: list[str], **kwargs: Any) -> str:
+        assert runner._infra_retry_baseline == [[7, 1]]
         rerun_calls.append(args)
         return ""
 
@@ -2953,18 +2956,13 @@ def test_first_infra_failure_retries_workflow(
     # the merge commit and would silently miss the failing PR run.
     assert all(args[:2] != ["run", "list"] for args in gh_calls)
     assert ["run", "rerun", "--failed", "9876"] in gh_calls
-    # Retry marker is in Redis. PR-251 follow-up: the marker now stores
-    # the wall-clock rerun timestamp (float seconds) so a grace window
-    # can be applied before the next cycle treats INFRA_FAILURE as
-    # "persistent". Older "1" markers are treated as
-    # ``(exists, elapsed)`` for backwards compatibility, but new
-    # writes always carry a numeric value.
+    # The marker records both the rerun time and original check identities.
     from src.keyspace import ci_infra_retried as _ci_infra_retried_key
 
     key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
     raw = asyncio.run(runner.redis.get(key))
     assert raw is not None
-    marker_ts = float(raw)
+    marker_ts = json.loads(raw)["at"]
     assert marker_ts > 0
     history = " ".join(entry.get("event", "") for entry in runner.state.history)
     assert "INFRA_FAILURE detected" in history
@@ -3051,12 +3049,12 @@ def test_second_infra_failure_routes_to_fix(
 
 
 @pytest.mark.parametrize(
-    ("new_state", "started_after_retry", "expected"),
+    ("new_state", "new_identity", "expected"),
     [("failure", True, True), ("failure", False, False), ("pending", True, False)],
 )
 def test_infra_retry_waits_for_new_terminal_attempt(
     monkeypatch: pytest.MonkeyPatch, new_state: str,
-    started_after_retry: bool, expected: bool,
+    new_identity: bool, expected: bool,
 ) -> None:
     from src.github import checks as gh_checks
     from src.keyspace import ci_infra_retried
@@ -3064,22 +3062,23 @@ def test_infra_retry_waits_for_new_terminal_attempt(
     runner = h._make_runner()
     sha = "d" * 40
     retry_at = time.time() - 120
-    asyncio.run(runner.redis.set(ci_infra_retried(runner.owner_repo, 78, sha), str(retry_at)))
-    started = datetime.fromtimestamp(
-        retry_at + (10 if started_after_retry else -10), timezone.utc,
-    ).isoformat()
+    asyncio.run(runner.redis.set(ci_infra_retried(runner.owner_repo, 78, sha), json.dumps({
+        "at": retry_at, "checks": [[1, 1]],
+    })))
+    # A rerun may start before WATCH writes its marker; identity still proves it is new.
+    started = datetime.fromtimestamp(retry_at - 10, timezone.utc).isoformat()
     runs = [
         {
             "id": 1, "name": "unit", "head_sha": sha, "app": {"id": 1},
             "status": "completed", "conclusion": "cancelled", "run_attempt": 1,
             "started_at": datetime.fromtimestamp(retry_at - 100, timezone.utc).isoformat(),
         },
-        {
+        *([{
             "id": 2, "name": "unit", "head_sha": sha, "app": {"id": 1},
             "status": "in_progress" if new_state == "pending" else "completed",
             "conclusion": None if new_state == "pending" else "failure",
             "run_attempt": 2, "started_at": started,
-        },
+        }] if new_identity else []),
     ]
     retrieval = gh_checks._make_ci_retrieval(
         runner.owner_repo, sha, 0.0, runs,
@@ -3096,7 +3095,8 @@ def test_infra_retry_waits_for_new_terminal_attempt(
 @pytest.mark.parametrize(
     "case",
     ["no_redis", "missing_marker", "legacy_marker", "incomplete",
-     "malformed_status", "status_only", "missing_start", "invalid_start"],
+     "malformed_status", "status_only", "same_identity", "empty_baseline",
+     "malformed_marker"],
 )
 def test_infra_retry_requires_complete_new_check_provenance(
     monkeypatch: pytest.MonkeyPatch, case: str,
@@ -3114,17 +3114,19 @@ def test_infra_retry_requires_complete_new_check_provenance(
     if case != "missing_marker":
         asyncio.run(runner.redis.set(
             ci_infra_retried(runner.owner_repo, 78, sha),
-            "1" if case == "legacy_marker" else str(retry_at),
+            "1" if case == "legacy_marker" else (
+                "bad marker" if case == "malformed_marker" else json.dumps({
+                    "at": retry_at, "checks": [] if case == "empty_baseline" else [[1, 1]],
+                })
+            ),
         ))
     run = {
-        "id": 2, "name": "unit", "head_sha": sha, "app": {"id": 1},
-        "status": "completed", "conclusion": "failure", "run_attempt": 2,
+        "id": 1 if case == "same_identity" else 2,
+        "name": "unit", "head_sha": sha, "app": {"id": 1},
+        "status": "completed", "conclusion": "failure",
+        "run_attempt": 1 if case == "same_identity" else 2,
         "started_at": datetime.fromtimestamp(retry_at + 10, timezone.utc).isoformat(),
     }
-    if case == "missing_start":
-        del run["started_at"]
-    elif case == "invalid_start":
-        run["started_at"] = "not-a-date"
     runs = [] if case == "status_only" else [run]
     statuses = (
         [{"context": "unit", "sha": sha, "state": "failure",
@@ -3628,14 +3630,14 @@ def test_retry_failed_workflow_handles_no_run_found(
 
     # First cycle: no rerun was issued (no run found), but the marker
     # is written (with a timestamp) so a later cycle — once the grace
-    # window has elapsed — goes straight to FIX.
+    # window has elapsed — waits for proven post-rerun failure evidence.
     assert fix_calls == []
     from src.keyspace import ci_infra_retried as _ci_infra_retried_key
 
     key = _ci_infra_retried_key(runner.owner_repo, pr.number, pr.head_sha)
     raw = asyncio.run(runner.redis.get(key))
     assert raw is not None
-    assert float(raw) > 0
+    assert json.loads(raw)["at"] > 0
     history = " ".join(entry.get("event", "") for entry in runner.state.history)
     assert "no Actions workflow run ID" in history
 

@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -144,48 +145,82 @@ class RecoveryMixin:
                 self.redis, self.name, task.pr_id, refresh_ttl=False,
             )
             run = await self._metrics_store.get(snapshot.run_id)
+            continuation_id = str(uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{self.name}:{task.pr_id}:{snapshot.run_id}:obsolete-ci-continuation",
+            ))
+            continuation = await self._metrics_store.get(continuation_id)
             task_bytes = (Path(self.repo_path) / task.task_file).read_bytes()
             task_hash = task_spec_content_hash(task_bytes.decode("utf-8"))
             metadata = gh_prs.get_pr_metadata(self.owner_repo, pr.number)
-            retrieval = gh_checks._retrieve_ci_status_evidence(
-                self.owner_repo, pr.head_sha, fresh=True,
+            retrieval = (
+                gh_checks._retrieve_ci_status_evidence(
+                    self.owner_repo, pr.head_sha, fresh=True,
+                ) if cause is not None else None
             )
         except Exception as exc:
             self.log_event(f"[RECOVERY] Obsolete CI evidence unavailable: {exc}.")
             return False
         claim = cause.payload.get("obsolete_ci_trigger") if cause is not None else None
+        completed_cleanup = (
+            cause is None and task.status == TaskStatus.DOING
+            and continuation is not None and not pr.is_escalated
+        )
+        exact_cause = (
+            cause is not None and cause.payload.get("subsource") == "coder_escalate"
+            and cause.payload.get("reason_text") == "OBSOLETE_CI_EVIDENCE"
+            and isinstance(claim, dict) and claim.get("ci") == ci
+            and claim.get("task_id") == task.pr_id
+            and claim.get("branch") == task.branch
+            and claim.get("run_id") == snapshot.run_id
+            and claim.get("attempt_index") == snapshot.attempt_index
+            and claim.get("fix_iteration") == snapshot.fix_iteration
+            and claim.get("task_spec_hash") == task_hash
+        )
         if (
-            cause is None or cause.payload.get("subsource") != "coder_escalate"
-            or cause.payload.get("reason_text") != "OBSOLETE_CI_EVIDENCE"
-            or not isinstance(claim, dict) or claim.get("ci") != ci
-            or claim.get("task_id") != task.pr_id
-            or claim.get("branch") != task.branch
-            or claim.get("run_id") != snapshot.run_id
-            or claim.get("attempt_index") != snapshot.attempt_index
-            or claim.get("fix_iteration") != snapshot.fix_iteration
-            or claim.get("task_spec_hash") != task_hash
+            not (exact_cause or completed_cleanup)
             or run is None or run.task_id != task.pr_id or run.repo_name != self.name
             or run.run_id != snapshot.run_id or not run.invocations
             or run.invocations[-1] != snapshot or run.ended_at is None
             or run.cause_subsource != "coder_escalate"
             or metadata.get("head_sha") != pr.head_sha
-            or not retrieval.evidence.sources_complete
-            or not retrieval.status_source.sha_matches
         ):
             return False
-        ci_status = gh_checks._classify_ci_retrieval(
-            retrieval,
-            required_contexts=self.repo_config.required_checks,
-            empty_is_success=self.repo_config.allow_merge_without_checks,
-        )
-        if ci_status not in {CIStatus.SUCCESS, CIStatus.PENDING}:
+        if continuation is not None and (
+            run is None or continuation.run_id != continuation_id
+            or continuation.task_id != task.pr_id
+            or continuation.repo_name != self.name
+            or continuation.ended_at is not None
+            or continuation.attempt_index != run.attempt_index + 1
+            or continuation.fix_iterations != run.fix_iterations
+            or continuation.fix_recovery_baseline != run.fix_recovery_baseline
+            or continuation.task_spec_hash != task_hash
+            or continuation.invocations
+        ):
             return False
+        if exact_cause:
+            if (not retrieval.evidence.sources_complete
+                    or not retrieval.status_source.sha_matches):
+                return False
+            ci_status = gh_checks._classify_ci_retrieval(
+                retrieval,
+                required_contexts=self.repo_config.required_checks,
+                empty_is_success=self.repo_config.allow_merge_without_checks,
+            )
+            if ci_status not in {CIStatus.SUCCESS, CIStatus.PENDING}:
+                return False
         suppression = await self._suppression_record_for_task(task.pr_id)
         if suppression is not None and suppression.reason != SuppressionReason.CODER_ESCALATE:
             return False
         try:
-            self._current_run_record = run
-            if cause.payload.get("label_applied") and pr.is_escalated:
+            if continuation is None:
+                continuation = self._new_fix_run_record(
+                    run, task_spec_hash=task_hash,
+                )
+                continuation.run_id = continuation_id
+                await self._metrics_store.save(continuation)
+            self._current_run_record = continuation
+            if cause is not None and cause.payload.get("label_applied") and pr.is_escalated:
                 gh_runner.run_gh(
                     ["pr", "edit", str(pr.number), "--remove-label", "escalated"],
                     repo=self.owner_repo,
@@ -199,7 +234,7 @@ class RecoveryMixin:
             # A restart can then finish cleanup after the header became DOING.
             if suppression is not None:
                 await self._clear_task_suppression(task.pr_id)
-            else:
+            elif cause is not None:
                 await delete_cancellation_cause(self.redis, self.name, task.pr_id)
         except Exception as exc:
             self.log_event(f"[RECOVERY] Obsolete CI cleanup deferred: {exc}.")
@@ -209,10 +244,10 @@ class RecoveryMixin:
         pr.is_escalated = False
         self.state.current_task = resumed
         self.state.current_pr = pr
-        self.state.active_invocation = snapshot
+        self.state.active_invocation = None
         self.state.state = PipelineState.WATCH
         self.state.error_message = None
-        self._current_run_record = run
+        self._current_run_record = continuation
         self._rehydrate_last_push_at(pr)
         self.log_event(f"[RECOVERY] Obsolete CI-only condition cleared for PR #{pr.number}; resuming WATCH.")
         return True

@@ -62,7 +62,9 @@ from src.daemon.handlers import watch as watch_module  # noqa: F401,F811
 from src.github import checks as gh_checks
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state
+from src.metrics import RunRecord
 from src.models import (
+    CIStatus,
     InvocationSnapshot,
     PipelineState,  # noqa: F811
     PRInfo,  # noqa: F811
@@ -2867,9 +2869,9 @@ def test_header_merge_recovery_prioritizes_unfinished_attempt(
 @pytest.mark.parametrize(
     "case",
     ["success", "success_live", "suppression_disappeared", "identity_changed",
-     "provider_unavailable", "still_failed",
+     "provider_unavailable", "incomplete_evidence", "still_failed",
      "unrelated_hold", "status_write_failed", "label_cleanup_failed", "cleanup_failed",
-     "paused"],
+     "continuation_corrupt", "continuation_save_failed", "paused"],
 )
 def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str,
@@ -2891,7 +2893,8 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
                 is_escalated=True)
     ci = {
         "repo": runner.owner_repo, "pr_number": 19, "head_sha": pr.head_sha,
-        "contexts": [{"name": "unit", "check_id": 41, "attempt": 1, "state": "failure"}],
+        "contexts": [{"name": "unit", "check_id": 41, "attempt": 1,
+                      "state": "failure", "workflow_run_id": 99, "job_id": 41}],
     }
     snapshot = InvocationSnapshot(
         plugin_id="claude", model_override=None, reasoning_effort_override=None,
@@ -2917,12 +2920,26 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
     asyncio.run(safe_record_cancellation_cause(
         runner.redis, runner.name, task.pr_id, cause,
     ))
-    run = types.SimpleNamespace(
-        task_id=task.pr_id, repo_name=runner.name, run_id=snapshot.run_id,
-        invocations=[snapshot], ended_at="2026-10-24T00:00:00Z",
-        cause_subsource="coder_escalate", fix_iterations=1,
+    run = RunRecord(
+        run_id=snapshot.run_id, task_id=task.pr_id, repo_name=runner.name,
+        profile_id="claude:default:container", task_type="fix", complexity="low",
+        started_at="2026-10-24T00:00:00Z", ended_at="2026-10-24T00:01:00Z",
+        duration_ms=60000, fix_iterations=1, tokens_in=0, tokens_out=0,
+        exit_reason="ESCALATE", operator_intervention=False,
+        outcome="failed", cause="ESCALATE", cause_subsource="coder_escalate",
+        run_phase="fix", attempt_index=1, task_spec_hash=task_hash,
+        invocations=[snapshot],
     )
-    monkeypatch.setattr(runner._metrics_store, "get", AsyncMock(return_value=run))
+    stored_runs: dict[str, RunRecord] = {run.run_id: run}
+    monkeypatch.setattr(
+        runner._metrics_store, "get",
+        AsyncMock(side_effect=lambda run_id: stored_runs.get(run_id)),
+    )
+    async def save_run(record: RunRecord) -> None:
+        stored_runs[record.run_id] = record
+
+    monkeypatch.setattr(runner._metrics_store, "save", save_run)
+    monkeypatch.setattr(runner, "_git_rev_parse", lambda ref: "b" * 40)
     monkeypatch.setattr(gh_prs, "get_pr_metadata", lambda *args: {"head_sha": pr.head_sha})
     retrieval = gh_checks._make_ci_retrieval(
         runner.owner_repo, pr.head_sha, 0.0,
@@ -2930,7 +2947,8 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
           "app": {"id": 1}, "status": "completed",
           "conclusion": "failure" if case == "still_failed" else "success"}],
         {"sha": pr.head_sha, "state": "pending", "statuses": []},
-        gh_checks._CiSourceResult(True, False), gh_checks._CiSourceResult(True, True),
+        gh_checks._CiSourceResult(case != "incomplete_evidence", False),
+        gh_checks._CiSourceResult(True, True),
     )
     monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
     labels: list[list[str]] = []
@@ -2974,6 +2992,20 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
             await original_clear(task_id)
 
         monkeypatch.setattr(runner, "_clear_task_suppression", flaky_clear)
+    elif case == "continuation_corrupt":
+        import uuid
+
+        bad = runner._new_fix_run_record(run, task_spec_hash="wrong")
+        bad.run_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{runner.name}:{task.pr_id}:{snapshot.run_id}:obsolete-ci-continuation",
+        ))
+        stored_runs[bad.run_id] = bad
+    elif case == "continuation_save_failed":
+        monkeypatch.setattr(
+            runner._metrics_store, "save",
+            AsyncMock(side_effect=RuntimeError("metrics unavailable")),
+        )
 
     if case not in {"success", "success_live", "suppression_disappeared"}:
         assert not asyncio.run(runner._recover_obsolete_ci_error([task], [pr]))
@@ -3005,9 +3037,37 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
         asyncio.run(runner._apply_recovery_decisions([task], [pr]))
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_task.status == TaskStatus.DOING
-    assert labels == [["pr", "edit", "19", "--remove-label", "escalated"]]
+    assert runner.state.active_invocation is None
+    assert runner._current_run_record is not run
+    assert runner._current_run_record.fix_iterations == run.fix_iterations
+    assert runner._current_run_record.ended_at is None
+    if case == "success":
+        from src.coders.claude import claude_cli
+        from src.daemon.handlers import fix as fix_module
+
+        h._patch_subprocess(monkeypatch)
+        monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
+        monkeypatch.setattr(fix_module, "_current_ci_failure", lambda *args: ci)
+        monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda *args: None)
+        runner.state.current_pr.ci_status = CIStatus.FAILURE
+        asyncio.run(runner.handle_fix())
+        assert runner._current_run_record.fix_iterations == run.fix_iterations + 1
+        assert not any(
+            "Completed or unrelated run record" in event["event"]
+            for event in runner.state.history
+        )
+    assert labels[0] == ["pr", "edit", "19", "--remove-label", "escalated"]
     assert run.fix_iterations == 1
-    assert not asyncio.run(runner._recover_obsolete_ci_error([task], [pr]))
+    if case == "success":
+        assert not asyncio.run(runner._recover_obsolete_ci_error([task], [pr]))
+    else:
+        resumed = task.model_copy(update={"status": TaskStatus.DOING})
+        monkeypatch.setattr(
+            gh_checks, "_retrieve_ci_status_evidence",
+            lambda *args, **kwargs: 1 / 0,
+        )
+        assert asyncio.run(runner._recover_obsolete_ci_error([resumed], [pr]))
+        assert len(stored_runs) == 2
     assert write.await_count == 1
 
     unrelated = CancellationCause(category="ERROR", payload={

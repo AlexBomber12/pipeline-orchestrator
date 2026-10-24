@@ -8,6 +8,7 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import subprocess
@@ -447,12 +448,9 @@ class WatchMixin:
             await self.handle_fix()
             return
         elif ci == CIStatus.INFRA_FAILURE:
-            # PR-251 (OBS-BC): a single infra-class failure (cancelled
-            # / action_required / stale conclusion, or known infra
-            # annotation keyword) earns one workflow rerun per
-            # ``head_sha``. A second INFRA_FAILURE classification on the
-            # same SHA means the rerun also failed — treat as a real
-            # logic FAILURE and route to FIX so the coder can act on it.
+            # A single infra-class failure earns one workflow rerun per
+            # ``head_sha``. Route a persistent failure to FIX only after
+            # the current failed check has a new attempt identity.
             #
             # PR-251 follow-up: the marker is gated by
             # ``_INFRA_RETRY_GRACE_SECONDS`` so the cached pre-rerun CI
@@ -502,6 +500,7 @@ class WatchMixin:
                 f"detected; retrying workflow once before routing to "
                 f"FIX."
             )
+            self._infra_retry_baseline = None
             self._retry_failed_workflow(found.number, found.head_sha)
             await self._mark_infra_retry_attempted(
                 found.number, found.head_sha
@@ -1083,21 +1082,16 @@ class WatchMixin:
     ) -> tuple[bool, bool]:
         """Return ``(marker_exists, grace_elapsed)`` for the infra-retry marker.
 
-        PR-251 (OBS-BC) + follow-up. The marker stores the wall-clock
-        timestamp at which WATCH issued ``gh run rerun --failed`` for
-        ``head_sha``; ``grace_elapsed`` is ``True`` only after
+        The marker stores the wall-clock timestamp and original failed
+        check identities for ``head_sha``; ``grace_elapsed`` is ``True`` only after
         ``_INFRA_RETRY_GRACE_SECONDS`` have passed since that
         timestamp, ensuring that an immediate re-poll on a fast WATCH
         cadence cannot escalate to FIX while the CI fetch is still
         serving the pre-rerun cached payload.
 
-        Without ``redis`` or ``head_sha`` we conservatively report
-        ``(True, True)`` so the caller routes straight to FIX rather than
-        looping retries against a missing tracker. Legacy markers written
-        before the timestamp format (value ``"1"``) are also treated as
-        ``(True, True)`` — they came from a prior daemon version where
-        the grace window did not exist, and we cannot recover the
-        original rerun time.
+        Without ``redis`` or ``head_sha`` we report ``(True, True)`` to
+        avoid repeated reruns. Legacy markers have no original check
+        identities, so they cannot establish a post-rerun failure.
         """
         if self.redis is None or not head_sha:
             return True, True
@@ -1106,22 +1100,25 @@ class WatchMixin:
         if existing is None:
             return False, False
         try:
-            marker_ts = float(existing)
+            marker = json.loads(existing)
+            marker_ts = float(marker["at"] if isinstance(marker, dict) else marker)
         except (TypeError, ValueError):
             return True, True
         elapsed = time.time() - marker_ts
         return True, elapsed >= _INFRA_RETRY_GRACE_SECONDS
 
     async def _infra_retry_has_new_failed_attempt(self, pr_number: int, head_sha: str) -> bool:
-        """Require a newly started terminal check after the bounded rerun."""
+        """Require a new terminal check identity after the bounded rerun."""
         if self.redis is None:
             return False
         raw = await self.redis.get(ci_infra_retried(self.owner_repo, pr_number, head_sha))
         try:
-            retry_at = float(raw)
-        except (TypeError, ValueError):
+            marker = json.loads(raw)
+            retry_at = float(marker["at"])
+            baseline = {tuple(item) for item in marker["checks"]}
+        except (TypeError, ValueError, KeyError, AttributeError):
             return False
-        if retry_at < 1_000_000_000:
+        if retry_at < 1_000_000_000 or not baseline:
             return False
         retrieval = gh_checks._retrieve_ci_status_evidence(
             self.owner_repo, head_sha, fresh=True,
@@ -1149,17 +1146,7 @@ class WatchMixin:
         for ctx in failures:
             if ctx.run_id is None or ctx.run_id[0] != "check":
                 return False
-            run = next(
-                (item for item in retrieval.check_runs if item.get("id") == ctx.run_id[1]),
-                None,
-            )
-            if not run.get("started_at"):
-                return False
-            try:
-                started = datetime.fromisoformat(str(run["started_at"]).replace("Z", "+00:00"))
-            except ValueError:
-                return False
-            if started.timestamp() <= retry_at:
+            if (ctx.run_id[1], ctx.attempt) in baseline:
                 return False
         return True
 
@@ -1259,16 +1246,18 @@ class WatchMixin:
     ) -> None:
         """Record that WATCH issued the one-shot infra retry for ``head_sha``.
 
-        Stores the current wall-clock timestamp so :meth:`_infra_retry_attempted`
-        can apply ``_INFRA_RETRY_GRACE_SECONDS`` before reporting the
-        retry as "elapsed enough to escalate" — see that helper's
-        docstring for the rationale.
+        Stores the timestamp and original check identities captured before
+        issuing the rerun. The grace window avoids acting on a cached
+        pre-rerun result; identity remains valid if the new job started
+        before this marker was written.
         """
         if self.redis is None or not head_sha:
             return
         key = ci_infra_retried(self.owner_repo, pr_number, head_sha)
         await self.redis.set(
-            key, str(time.time()), ex=_CI_INFRA_RETRIED_TTL_SECONDS
+            key, json.dumps({"at": time.time(), "checks": getattr(
+                self, "_infra_retry_baseline", None,
+            ) or []}), ex=_CI_INFRA_RETRIED_TTL_SECONDS,
         )
 
     def _retry_failed_workflow(self, pr_number: int, head_sha: str) -> bool:
@@ -1319,6 +1308,10 @@ class WatchMixin:
                 or str(run.get("status") or "").upper()
                 in gh_checks._REST_CI_FAILURE_STATES
             )
+        ]
+        self._infra_retry_baseline = [
+            [run["id"], run.get("run_attempt")]
+            for run in failing_runs if isinstance(run.get("id"), int)
         ]
         if not failing_runs:
             self.log_event(
