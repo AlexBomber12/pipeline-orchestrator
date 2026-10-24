@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from src.cancellation.storage import CancellationCause
@@ -157,6 +158,99 @@ def test_failed_history_read_does_not_post(
     assert runner.state.review_reminder_count == 0
 
 
+def test_no_request_evidence_does_not_use_old_push_as_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "src.github.comments.latest_codex_review_request_time",
+        lambda *_args, **_kwargs: None,
+    )
+    runner._post_codex_review_result = lambda *_args, **_kwargs: pytest.fail("post")
+    asyncio.run(runner._maybe_remind_review(_pr()))
+    assert runner.state.review_requested_at is None
+
+
+def test_initial_post_clock_gets_task_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner(tmp_path, monkeypatch)
+    runner.state.review_request_pr = 5
+    runner.state.review_request_head = HEAD
+    runner.state.review_request_task = "PR-005"
+    runner.state.review_requested_at = NOW - timedelta(minutes=5)
+    monkeypatch.setattr(
+        "src.github.comments.latest_codex_review_request_time",
+        lambda *_args, **_kwargs: None,
+    )
+    asyncio.run(runner._maybe_remind_review(_pr()))
+    assert runner.state.review_request_generation
+    assert runner.state.review_requested_at == NOW - timedelta(minutes=5)
+
+
+def test_naive_publication_time_is_normalized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "src.github.comments.latest_codex_review_request_time",
+        lambda *_args, **_kwargs: NOW - timedelta(minutes=5),
+    )
+    pr = _pr().model_copy(update={"publication_at": (NOW - timedelta(minutes=30)).replace(tzinfo=None)})
+    asyncio.run(runner._maybe_remind_review(pr))
+    assert runner.state.review_requested_at == NOW - timedelta(minutes=5)
+
+
+@pytest.mark.parametrize("receipt", ["2026-10-24T11:49:00", "older", "error"])
+def test_automatic_eyes_receipt_uses_one_clock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, receipt: str
+) -> None:
+    runner = _runner(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "src.github.comments.latest_codex_review_request_time",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def reactions(*_args, **_kwargs):
+        if receipt == "error":
+            raise RuntimeError("reactions unavailable")
+        return [{"created_at": (
+            "2026-10-24T11:49:00" if receipt != "older" else "2026-10-24T11:00:00Z"
+        )}]
+
+    monkeypatch.setattr("src.github.reactions._get_codex_issue_reactions", reactions)
+    monkeypatch.setattr("src.github.reactions._is_reaction_content", lambda *_args, **_kw: True)
+    posts: list[int] = []
+    runner._post_codex_review_result = lambda number, **_kwargs: (
+        posts.append(number) is None, True, None
+    )
+    asyncio.run(runner._maybe_remind_review(_pr(review=ReviewStatus.EYES)))
+    assert posts == ([5] if receipt.startswith("2026") else [])
+
+
+def test_inhibition_and_helper_exception_are_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        "src.github.comments.latest_codex_review_request_time",
+        lambda *_args, **_kwargs: NOW - timedelta(minutes=11),
+    )
+    runner._watch_retrigger_inhibited = lambda *_args: True
+    runner._post_codex_review_result = lambda *_args, **_kw: pytest.fail("inhibited")
+    asyncio.run(runner._maybe_remind_review(_pr()))
+    assert runner.state.review_reminder_count == 0
+    runner._watch_retrigger_inhibited = lambda *_args: False
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("ambiguous post")
+
+    runner._post_codex_review_result = fail
+    asyncio.run(runner._maybe_remind_review(_pr()))
+    assert runner.state.review_reminder_count == 1
+    assert runner.state.review_requested_at == NOW - timedelta(minutes=11)
+
+
 def test_approved_review_waits_for_ci_without_reminder(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -186,6 +280,20 @@ def test_new_head_resets_review_budget(tmp_path: Path, monkeypatch: pytest.Monke
     runner.state.current_pr = _pr().model_copy(update={"head_sha": "b" * 40})
     assert runner.state.review_reminder_count == 0
     assert runner.state.review_request_head == ""
+
+
+def test_initial_request_helper_observes_durable_cooldown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner(tmp_path, monkeypatch)
+    runner.state.review_request_pr = 5
+    runner.state.review_request_head = HEAD
+    runner.state.review_requested_at = datetime.now(timezone.utc)
+    monkeypatch.setattr(
+        "src.daemon.handlers.hung.git_ops._git",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=HEAD),
+    )
+    assert runner._post_codex_review_result(5)[0:2] == (True, False)
 
 
 @pytest.mark.parametrize("single_error_exit", [False, True])
@@ -293,3 +401,121 @@ def test_timeout_recovery_requires_fresh_actionable_findings(
     resumed = asyncio.run(runner._maybe_resume_review_timeout())
     assert resumed is (feedback == FeedbackCheckResult.NEW)
     assert runner.state.state == (PipelineState.WATCH if resumed else PipelineState.ERROR)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["identity", "cause_read", "remote_status", "generation", "generation_read",
+     "github_read", "pending", "commit"],
+)
+def test_timeout_recovery_rejects_unverified_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    runner = _runner(tmp_path, monkeypatch)
+    runner.state.state = PipelineState.ERROR
+
+    async def cause(*_args, **_kwargs):
+        if case == "cause_read":
+            raise RuntimeError("redis unavailable")
+        return CancellationCause(category="ERROR", payload={"subsource": "review_timeout"})
+
+    async def no_suppression(*_args, **_kwargs):
+        return None
+
+    async def commit(*_args, **_kwargs):
+        return case != "commit"
+
+    monkeypatch.setattr("src.daemon.runner.get_cancellation_cause", cause)
+    runner._suppression_record_for_task = no_suppression
+    runner._remote_frontmatter_error_status_for_current_task = lambda: (
+        "todo" if case == "remote_status" else "error",
+        watch_module.SuppressionReason.REVIEW_TIMEOUT,
+        "revision",
+    )
+    runner._commit_task_status_change = commit
+    if case == "identity":
+        runner.state.current_pr.pr_id = "PR-OTHER"
+    if case in {"generation", "generation_read"}:
+        runner.state.review_request_generation = "different"
+    if case == "generation_read":
+        (tmp_path / "tasks/PR-005.md").unlink()
+
+    def open_prs(*_args, **_kwargs):
+        if case == "github_read":
+            raise RuntimeError("GitHub unavailable")
+        return [_pr(review=(
+            ReviewStatus.PENDING if case == "pending" else ReviewStatus.APPROVED
+        ))]
+
+    monkeypatch.setattr("src.github.prs.get_open_prs", open_prs)
+    assert asyncio.run(runner._maybe_resume_review_timeout()) is False
+    assert runner.state.state == PipelineState.ERROR
+
+
+def test_timeout_recovery_clears_only_its_suppression(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner(tmp_path, monkeypatch)
+    runner.state.state = PipelineState.ERROR
+
+    async def cause(*_args, **_kwargs):
+        return CancellationCause(category="ERROR", payload={"subsource": "review_timeout"})
+
+    async def suppression(*_args, **_kwargs):
+        return SimpleNamespace(reason=watch_module.SuppressionReason.REVIEW_TIMEOUT)
+
+    async def commit(*_args, **_kwargs):
+        return True
+
+    cleared: list[str] = []
+
+    async def clear_suppression(task_id: str):
+        cleared.append(task_id)
+
+    async def clear_cause(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr("src.daemon.runner.get_cancellation_cause", cause)
+    monkeypatch.setattr("src.daemon.runner.safe_delete_cancellation_cause", clear_cause)
+    runner._suppression_record_for_task = suppression
+    runner._clear_task_suppression = clear_suppression
+    runner._remote_frontmatter_error_status_for_current_task = lambda: (
+        "error", watch_module.SuppressionReason.REVIEW_TIMEOUT, "revision"
+    )
+    runner._commit_task_status_change = commit
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *_args, **_kwargs: [
+        _pr(review=ReviewStatus.APPROVED)
+    ])
+    assert asyncio.run(runner._maybe_resume_review_timeout()) is True
+    assert cleared == ["PR-005"]
+
+
+def test_error_dispatch_runs_watch_after_late_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runner = _runner(tmp_path, monkeypatch)
+    runner._recovered = True
+    runner._scaffolded = True
+    runner.state.state = PipelineState.ERROR
+    calls: list[str] = []
+
+    async def clone():
+        return None
+
+    async def admit():
+        runner.state.state = PipelineState.WATCH
+        return True
+
+    async def watch():
+        calls.append("watch")
+
+    async def publish():
+        return None
+
+    runner.ensure_repo_cloned = clone
+    runner.preflight = lambda: asyncio.sleep(0, result=True)
+    runner._maybe_resume_review_timeout = admit
+    runner.handle_watch = watch
+    runner.publish_state = publish
+    asyncio.run(runner.run_cycle())
+    assert calls == ["watch"]

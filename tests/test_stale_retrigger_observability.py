@@ -35,3 +35,18 @@ def test_request_history_transport_failure_is_not_absence(
         comments.latest_codex_review_request_time(
             "octo/demo", 5, after=datetime(2026, 10, 24, tzinfo=timezone.utc)
         )
+
+
+def test_request_history_ignores_malformed_time_and_normalizes_naive_time(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "src.github.cache._gh_api_paginated",
+        lambda _path: [
+            {"body": "@codex review", "created_at": "bad timestamp"},
+            {"body": "@codex review", "created_at": "2026-10-24T12:03:00"},
+        ],
+    )
+    assert comments.latest_codex_review_request_time(
+        "octo/demo", 5, after=datetime(2026, 10, 24, 12, tzinfo=timezone.utc)
+    ) == datetime(2026, 10, 24, 12, 3, tzinfo=timezone.utc)

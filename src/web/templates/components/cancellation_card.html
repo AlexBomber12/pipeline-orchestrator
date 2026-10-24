@@ -49,6 +49,9 @@
             {% if cause.payload.get('reason_text') %}
             <div class="cancellation-reason">{{ cause.payload.get('reason_text') }}</div>
             {% endif %}
+        {% elif subsource == 'watch_retrigger_cap' %}
+            <span class="cause-badge cause-stale">Legacy review reminder cap</span>
+            <p>This earlier failure remains available for operator Retry.</p>
         {% elif subsource == 'fix_iteration_cap' %}
             <span class="cause-badge cause-deadlock">FIX iteration cap</span>
             {% if cause.payload.get('iteration_count') is not none %}
