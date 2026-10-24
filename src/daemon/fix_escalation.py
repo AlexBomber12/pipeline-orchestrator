@@ -279,6 +279,7 @@ async def escalate_fix_coder_initiated(
         extra_payload={
             "pr_number": pr_number,
             "label_applied": label_applied,
+            **({"reason_text": clean_reason} if ci_trigger else {}),
             **({"obsolete_ci_trigger": ci_trigger} if ci_trigger else {}),
         },
     )

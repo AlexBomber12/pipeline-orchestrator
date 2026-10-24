@@ -50,6 +50,7 @@ from typing import Any
 import pytest
 from src.cancellation import (
     CancellationCause,
+    get_cancellation_cause,
     safe_record_cancellation_cause,
 )
 from src.cancellation.storage import task_spec_content_hash
@@ -2921,9 +2922,28 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
         "subsource": "coder_escalate", "reason_text": "OBSOLETE_CI_EVIDENCE",
         "obsolete_ci_trigger": claim, "label_applied": True,
     })
-    asyncio.run(safe_record_cancellation_cause(
-        runner.redis, runner.name, task.pr_id, cause,
-    ))
+    if case == "success":
+        monkeypatch.setattr("src.github.comments.post_comment", lambda *args: None)
+        monkeypatch.setattr(
+            recovery_module.gh_runner, "run_gh", lambda *args, **kwargs: "",
+        )
+        monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
+        monkeypatch.setattr(runner, "_save_current_run_record", AsyncMock())
+        runner.state.state = PipelineState.FIX
+        asyncio.run(runner._escalate_fix_coder_initiated(
+            pr, "OBSOLETE_CI_EVIDENCE", ci_trigger=claim,
+        ))
+        recorded = asyncio.run(get_cancellation_cause(
+            runner.redis, runner.name, task.pr_id, refresh_ttl=False,
+        ))
+        assert recorded is not None
+        assert recorded.payload["reason_text"] == "OBSOLETE_CI_EVIDENCE"
+        assert recorded.payload["label_applied"] is True
+        assert recorded.payload["obsolete_ci_trigger"] == claim
+    else:
+        asyncio.run(safe_record_cancellation_cause(
+            runner.redis, runner.name, task.pr_id, cause,
+        ))
     run = RunRecord(
         run_id=snapshot.run_id, task_id=task.pr_id, repo_name=runner.name,
         profile_id="claude:default:container", task_type="fix", complexity="low",

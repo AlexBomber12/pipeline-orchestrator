@@ -4197,6 +4197,38 @@ def test_exact_obsolete_ci_marker_resumes_without_escalating(
     assert not any(args[:2] == ["pr", "edit"] for args in gh_calls)
 
 
+def test_obsolete_ci_escalation_records_owned_label_after_application(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    from src.cancellation import get_cancellation_cause
+
+    h._patch_fix_with_stdout(monkeypatch, stdout="ESCALATE: OBSOLETE_CI_EVIDENCE\n")
+    _admit_ci_failure(monkeypatch)
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    task_file = tmp_path / "tasks" / "PR-019.md"
+    task_file.parent.mkdir()
+    task_file.write_text("---\nPR_ID: PR-019\nBranch: pr-019\nstatus: DOING\n---\nTask\n")
+    runner.state.current_task = QueueTask(
+        pr_id="PR-019", title="CI", status=TaskStatus.DOING,
+        branch="pr-019", task_file="tasks/PR-019.md",
+    )
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40, ci_status=CIStatus.FAILURE,
+    )
+    monkeypatch.setattr(runner, "_ci_only_trigger_obsolete", AsyncMock(return_value=False))
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
+    monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda *args: None)
+    asyncio.run(runner.handle_fix())
+    cause = asyncio.run(get_cancellation_cause(
+        runner.redis, runner.name, "PR-019", refresh_ttl=False,
+    ))
+    assert cause is not None
+    assert cause.payload["reason_text"] == "OBSOLETE_CI_EVIDENCE"
+    assert cause.payload["label_applied"] is True
+    assert cause.payload["obsolete_ci_trigger"]["ci"]["head_sha"] == "a" * 40
+
+
 @pytest.mark.parametrize("log", ["tiny failure trace", "X" * 6000])
 @pytest.mark.parametrize("check_attempt", [None, 2])
 def test_fetch_failed_ci_logs_only_from_bound_attempt(

@@ -1330,7 +1330,7 @@ class FixMixin(BreachMixin):
             # ESCALATE is not a no-push success — it is a deliberate
             # bail-out and should not feed the deadlock counter.
             no_push_policy.reset(self.state.current_pr)
-            if self.state.current_task is not None:
+            if self.state.current_task is not None and obsolete_ci_claim is None:
                 await safe_record_cancellation_cause(
                     self.redis,
                     self.name,
