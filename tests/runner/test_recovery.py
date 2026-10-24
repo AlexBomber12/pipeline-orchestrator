@@ -2876,7 +2876,8 @@ def test_header_merge_recovery_prioritizes_unfinished_attempt(
      "provider_unavailable", "incomplete_evidence", "still_failed",
      "still_failed_default_dispatch", "wrong_run_cause",
      "unrelated_hold", "status_write_failed", "label_cleanup_failed", "cleanup_failed",
-     "continuation_corrupt", "continuation_save_failed", "paused"],
+     "continuation_corrupt", "continuation_save_failed", "paused",
+     "mismatched_hold"],
 )
 def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str,
@@ -2915,6 +2916,11 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
     runner.state.current_pr = pr
     runner.state.active_invocation = snapshot
     runner.state.state = PipelineState.ERROR
+    if case in {"success", "mismatched_hold"}:
+        runner._begin_publication_attempt(started_at=datetime.now(timezone.utc))
+        if case == "mismatched_hold":
+            runner.state.publication_attempt.exit_classification = "failure"
+            runner.state.publication_attempt.head_sha = "b" * 40
     runner._persisted_fix_recovery = RepoState.model_validate_json(
         runner.state.model_dump_json(),
     )
@@ -2930,6 +2936,7 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
         monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
         monkeypatch.setattr(runner, "_save_current_run_record", AsyncMock())
         runner.state.state = PipelineState.FIX
+        runner.state.publication_attempt.exit_classification = "failure"
         asyncio.run(runner._escalate_fix_coder_initiated(
             pr, "OBSOLETE_CI_EVIDENCE", ci_trigger=claim,
         ))
@@ -2940,6 +2947,8 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
         assert recorded.payload["reason_text"] == "OBSOLETE_CI_EVIDENCE"
         assert recorded.payload["label_applied"] is True
         assert recorded.payload["obsolete_ci_trigger"] == claim
+        assert runner.state.publication_attempt.pending
+        assert runner.state.publication_attempt.exit_classification == "failure"
     else:
         asyncio.run(safe_record_cancellation_cause(
             runner.redis, runner.name, task.pr_id, cause,
@@ -3105,6 +3114,10 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_task.status == TaskStatus.DOING
     assert runner.state.active_invocation is None
+    if case == "success":
+        assert runner.state.publication_attempt is not None
+        assert not runner.state.publication_attempt.pending
+        assert not asyncio.run(runner._hold_unresolved_publication())
     assert runner._current_run_record is not run
     assert runner._current_run_record.fix_iterations == run.fix_iterations
     assert runner._current_run_record.ended_at is None

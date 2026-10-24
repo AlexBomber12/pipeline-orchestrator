@@ -141,6 +141,25 @@ class RecoveryMixin:
             or len(pr.head_sha) != 40
         ):
             return False
+        attempt = saved.publication_attempt
+        if attempt is not None and attempt.pending:
+            candidate = attempt.candidate
+            if (
+                (attempt.repo, attempt.base, attempt.task_id, attempt.branch,
+                 attempt.run_id, attempt.attempt_index, attempt.pr_number,
+                 attempt.head_sha, attempt.exit_classification) != (
+                    self.owner_repo, self.repo_config.branch or "main",
+                    task.pr_id, task.branch, snapshot.run_id,
+                    snapshot.attempt_index, pr.number, pr.head_sha, "failure",
+                )
+                or attempt.unverified_head_sha is not None
+                or candidate is None or candidate.number != pr.number
+                or candidate.branch != pr.branch or candidate.head_sha != pr.head_sha
+            ):
+                return False
+        current_attempt = self.state.publication_attempt
+        if current_attempt is not None and current_attempt.pending and current_attempt != attempt:
+            return False
         try:
             cause = await get_cancellation_cause(
                 self.redis, self.name, task.pr_id, refresh_ttl=False,
@@ -251,6 +270,11 @@ class RecoveryMixin:
         pr.is_escalated = False
         self.state.current_task = resumed
         self.state.current_pr = pr
+        if attempt is not None and attempt.pending:
+            # The exact no-push escalation and fresh PR HEAD observation release
+            # this FIX hold while its invocation binding is still available.
+            attempt.pending = False
+            self.state.publication_attempt = attempt
         self.state.active_invocation = None
         self.state.state = PipelineState.WATCH
         self.state.error_message = None
