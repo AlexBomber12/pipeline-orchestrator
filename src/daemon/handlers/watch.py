@@ -497,6 +497,12 @@ class WatchMixin:
                     )
                     return
                 if not await self._infra_retry_has_new_failed_attempt(found.number, found.head_sha):
+                    if review == ReviewStatus.CHANGES_REQUESTED:
+                        result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
+                        if result == FeedbackCheckResult.NEW:
+                            self._fix_feedback_reviewer_policy = reviewer_policy
+                            await self.handle_fix()
+                            return
                     self.log_event(
                         f"[WATCH] PR #{found.number} awaiting post-retry terminal CI evidence."
                     )

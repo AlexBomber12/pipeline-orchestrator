@@ -3287,6 +3287,34 @@ def test_persisted_infra_result_without_new_attempt_remains_in_watch(
                for e in runner.state.history)
 
 
+def test_persisted_infra_wait_allows_actionable_review_fix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.keyspace import ci_infra_retried
+
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=78, head_sha="d" * 40)
+    pr.review_status = ReviewStatus.CHANGES_REQUESTED
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    marker = ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha)
+    asyncio.run(runner.redis.set(marker, json.dumps({
+        "at": time.time() - 120, "checks": [[1, 1]], "issued": True, "tries": 1,
+    })))
+    monkeypatch.setattr(runner, "_infra_retry_has_new_failed_attempt", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        runner, "_has_new_codex_feedback_since_last_push",
+        lambda policy: FeedbackCheckResult.NEW,
+    )
+    fix = AsyncMock()
+    monkeypatch.setattr(runner, "handle_fix", fix)
+
+    asyncio.run(runner.handle_watch())
+
+    fix.assert_awaited_once()
+    assert runner._fix_feedback_reviewer_policy is not None
+
+
 def test_infra_failure_on_fork_pr_logs_no_retry(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
