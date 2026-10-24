@@ -937,6 +937,17 @@ class FixMixin(BreachMixin):
                 }
                 if latest_failure != admitted_failure:
                     if admitted_feedback:
+                        metadata = await asyncio.to_thread(
+                            gh_prs.get_pr_metadata, self.owner_repo, self.state.current_pr.number,
+                        )
+                        if (
+                            metadata.get("head_sha") != review_head
+                            or self.state.current_pr is not current_pr
+                            or self.state.current_pr.head_sha != review_head
+                        ):
+                            self.log_event("[FIX] PR HEAD changed before review dispatch; returning to WATCH.")
+                            self.state.state = PipelineState.WATCH
+                            return
                         ci_failure = None
                         self.state.current_pr.ci_status = CIStatus.PENDING
                         review_context = await self._build_fix_feedback_context(

@@ -4139,6 +4139,32 @@ def test_handle_fix_drops_ci_assertion_when_attempt_changes_during_logs(
     assert "Confirmed current CI failure" not in context
 
 
+def test_handle_fix_defers_review_fallback_when_pr_head_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    _controlled_actions_failure(
+        monkeypatch, [_workflow_attempt(), _workflow_attempt()],
+    )
+    heads = iter(["a" * 40, "a" * 40, "b" * 40, "b" * 40])
+    monkeypatch.setattr(
+        fix_module.gh_prs, "get_pr_metadata",
+        lambda *_: {"head_sha": next(heads)},
+    )
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE, review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    runner._fix_review_feedback = "P1: finding on old HEAD"
+    runner._fix_review_head = "a" * 40
+    asyncio.run(runner.handle_fix())
+    _assert_deferred_ci_fix(runner, captured)
+    assert any("PR HEAD changed before review dispatch" in event["event"]
+               for event in runner.state.history)
+
+
 def test_handle_fix_defers_when_non_actionable_review_remains_after_ci_change(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
