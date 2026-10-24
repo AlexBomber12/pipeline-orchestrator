@@ -3340,9 +3340,12 @@ def test_infra_retry_identity_ignores_checks_outside_issued_workflow(
     ]
     retrieval = gh_checks._make_ci_retrieval(
         runner.owner_repo, sha, 0.0, runs,
-        {"sha": sha, "state": "pending", "statuses": []},
+        {"sha": sha, "state": "pending", "statuses": [
+            {"id": 4, "context": "observer", "state": "pending",
+             "creator": {"login": "observer"}},
+        ]},
         gh_checks._CiSourceResult(True, False),
-        gh_checks._CiSourceResult(True, True),
+        gh_checks._CiSourceResult(True, False),
     )
     monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
 
