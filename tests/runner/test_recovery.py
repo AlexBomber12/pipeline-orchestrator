@@ -2877,7 +2877,7 @@ def test_header_merge_recovery_prioritizes_unfinished_attempt(
      "still_failed_default_dispatch", "wrong_run_cause",
      "unrelated_hold", "status_write_failed", "label_cleanup_failed", "cleanup_failed",
      "continuation_corrupt", "continuation_save_failed", "paused",
-     "mismatched_hold"],
+     "mismatched_hold", "different_live_hold"],
 )
 def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str,
@@ -2916,14 +2916,18 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
     runner.state.current_pr = pr
     runner.state.active_invocation = snapshot
     runner.state.state = PipelineState.ERROR
-    if case in {"success", "mismatched_hold"}:
+    if case in {"success", "mismatched_hold", "different_live_hold"}:
         runner._begin_publication_attempt(started_at=datetime.now(timezone.utc))
-        if case == "mismatched_hold":
+        if case in {"mismatched_hold", "different_live_hold"}:
             runner.state.publication_attempt.exit_classification = "failure"
-            runner.state.publication_attempt.head_sha = "b" * 40
+            if case == "mismatched_hold":
+                runner.state.publication_attempt.head_sha = "b" * 40
     runner._persisted_fix_recovery = RepoState.model_validate_json(
         runner.state.model_dump_json(),
     )
+    if case == "different_live_hold":
+        runner.state.state = PipelineState.WATCH
+        runner.state.publication_attempt.head_sha = "b" * 40
     cause = CancellationCause(category="ERROR", payload={
         "subsource": "coder_escalate", "reason_text": "OBSOLETE_CI_EVIDENCE",
         "obsolete_ci_trigger": claim, "label_applied": True,
@@ -3056,7 +3060,9 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
                     "stale_coder_checkout",
                     "suppression_disappeared"}:
         assert not asyncio.run(runner._recover_obsolete_ci_error([task], [pr]))
-        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.state == (
+            PipelineState.WATCH if case == "different_live_hold" else PipelineState.ERROR
+        )
         assert write.await_count == (1 if case in {"status_write_failed", "cleanup_failed"} else 0)
         if case == "cleanup_failed":
             assert asyncio.run(runner._suppression_record_for_task(task.pr_id)) is not None
