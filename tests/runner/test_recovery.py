@@ -2856,3 +2856,48 @@ def test_header_merge_recovery_prioritizes_unfinished_attempt(
     assert saved.current_pr.head_sha == "a" * 40
     assert saved.merge_phase == "post_merge_cleanup"
     assert runner._current_run_record is (record if current_evidence == "run" else None)
+
+
+@pytest.mark.parametrize("mode", ["missing", "incomplete", "status-incomplete", "passing"])
+@pytest.mark.parametrize("changed_sha", [False, True])
+def test_restart_rehydrates_required_ci_for_exact_head(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ci_policy_transport: dict,
+    mode: str, changed_sha: bool,
+) -> None:
+    """Persisted SUCCESS is never used in place of current policy evidence."""
+    from src.github import checks
+    from src.models import CIStatus
+
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner(required_checks=["unit", "integration"])
+    runner.repo_path = str(tmp_path)
+    task = QueueTask(pr_id="PR-404", title="CI policy", status=TaskStatus.DOING,
+                     branch="pr-404", task_file="tasks/PR-404.md")
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_task = task
+    runner.state.current_pr = PRInfo(number=404, branch="pr-404", pr_id="PR-404",
+                                   head_sha="a" * 40, ci_status=CIStatus.SUCCESS)
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
+    ci_policy_transport.update(mode=mode, sha=("b" if changed_sha else "a") * 40)
+    restarted = h._make_runner(required_checks=["unit", "integration"])
+    restarted.repo_path = str(tmp_path)
+    restarted.redis = runner.redis
+    monkeypatch.setattr(restarted, "_parse_tasks_from_headers", lambda: [task])
+    assert asyncio.run(restarted.recover_state()) is True
+    assert restarted.state.state == PipelineState.WATCH
+    found = restarted.state.current_pr
+    assert found.head_sha == ci_policy_transport["sha"]
+    expected = CIStatus.SUCCESS if mode == "passing" else CIStatus.PENDING
+    assert found.ci_status == expected
+    # Persist and restart again on the same SHA, retaining incomplete cache metadata.
+    asyncio.run(restarted.redis.set(pipeline_state(restarted.name), restarted.state.model_dump_json()))
+    again = h._make_runner(required_checks=["unit", "integration"])
+    again.repo_path = str(tmp_path)
+    again.redis = restarted.redis
+    monkeypatch.setattr(again, "_parse_tasks_from_headers", lambda: [task])
+    assert asyncio.run(again.recover_state()) is True
+    assert again.state.current_pr.ci_status == expected
+    assert again.state.current_pr.head_sha == found.head_sha
+    retrieval = checks._retrieve_ci_status_evidence(again.owner_repo, found.head_sha)
+    assert retrieval.evidence.sources_complete == (mode in {"missing", "passing"})
+    assert ci_policy_transport["reads"] == (2 if mode == "incomplete" else 1)

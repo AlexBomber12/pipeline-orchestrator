@@ -147,6 +147,7 @@ class WatchMixin:
                 self.owner_repo,
                 allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
                 reviewer_policy=reviewer_policy,
+                required_checks=self.repo_config.required_checks,
             )
         except Exception as exc:
             await self._transition_to_error(
@@ -888,6 +889,7 @@ class WatchMixin:
         )
         canonical_status = gh_checks._classify_ci_retrieval(
             retrieval,
+            required_contexts=self.repo_config.required_checks,
             empty_is_success=self.repo_config.allow_merge_without_checks,
         )
         reclassified, reason = await gh_checks.classify_ci_status_with_age(
