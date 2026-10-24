@@ -47,8 +47,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from src.daemon import recovery as recovery_module
 from src.cancellation.storage import task_spec_content_hash
+from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
 from src.daemon.handlers import coding as coding_module  # noqa: F401,F811
 from src.daemon.handlers import error as error_module  # noqa: F401,F811
@@ -76,8 +76,8 @@ from src.publication_migration import (
     enqueue as enqueue_migration,
 )
 from src.publication_migration import pending_key as migration_pending_key
-from src.task_status import MergedState
 from src.subsource_registry import SuppressionReason
+from src.task_status import MergedState
 
 from tests.runner import _helpers as h
 
@@ -2205,12 +2205,58 @@ def test_watch_recovery_restores_current_head_reminder_budget(
     assert runner.state.review_post_attempted_at == saved.review_post_attempted_at
 
 
-@pytest.mark.parametrize("change", ["changed_generation", "missing_task_file"])
-def test_watch_recovery_rejects_unverified_task_generation(
-    tmp_path: Path, change: str,
+def test_watch_recovery_restores_unconfirmed_initial_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     runner = h._make_runner()
     task, pr, saved = _saved_review_state(runner, tmp_path, error=False)
+    saved.review_requested_at = None
+    saved.review_post_attempted_at = datetime.now(timezone.utc) - timedelta(minutes=31)
+    saved.review_reminder_count = 0
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
+
+    fresh = h._make_runner()
+    fresh.redis = runner.redis
+    fresh.repo_path = str(tmp_path)
+    fresh._recovery_task_headers = {}
+    fresh._rehydrate_last_push_at = lambda *_args: None
+    assert asyncio.run(fresh._hydrate_current_task_from_persisted_state()) is True
+    asyncio.run(fresh._apply_recovery_decisions([task], [pr]))
+    assert fresh.state.state == PipelineState.WATCH
+    assert fresh.state.review_request_pr == pr.number
+    assert fresh.state.review_request_head == pr.head_sha
+    assert fresh.state.review_request_task == task.pr_id
+    assert fresh.state.review_request_generation == saved.review_request_generation
+    assert fresh.state.review_requested_at is None
+    assert fresh.state.review_post_attempted_at == saved.review_post_attempted_at
+    assert fresh.state.review_reminder_count == 0
+    monkeypatch.setattr(
+        "src.github.comments.latest_codex_review_request_time",
+        lambda *_args, **_kwargs: None,
+    )
+    posts: list[int] = []
+    fresh._post_codex_review_result = lambda number, **_kwargs: (
+        posts.append(number) is None, True, None
+    )
+    fresh._watch_retrigger_inhibited = lambda *_args: False
+    observed = pr.model_copy(update={
+        "publication_at": datetime.now(timezone.utc) - timedelta(minutes=40),
+    })
+    asyncio.run(fresh._maybe_remind_review(observed))
+    asyncio.run(fresh._maybe_remind_review(observed))
+    assert posts == [pr.number]
+    assert fresh.state.review_reminder_count == 1
+
+
+@pytest.mark.parametrize("change", ["changed_generation", "missing_task_file"])
+@pytest.mark.parametrize("unconfirmed", [False, True])
+def test_watch_recovery_rejects_unverified_task_generation(
+    tmp_path: Path, change: str, unconfirmed: bool,
+) -> None:
+    runner = h._make_runner()
+    task, pr, saved = _saved_review_state(runner, tmp_path, error=False)
+    if unconfirmed:
+        saved.review_requested_at = None
     asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
     task_path = tmp_path / "tasks/PR-405.md"
     if change == "changed_generation":

@@ -276,10 +276,12 @@ def test_new_head_resets_review_budget(tmp_path: Path, monkeypatch: pytest.Monke
     runner = _runner(tmp_path, monkeypatch)
     runner.state.review_request_pr = 5
     runner.state.review_request_head = HEAD
+    runner.state.review_post_attempted_at = NOW - timedelta(minutes=20)
     runner.state.review_reminder_count = 3
     runner.state.current_pr = _pr().model_copy(update={"head_sha": "b" * 40})
     assert runner.state.review_reminder_count == 0
     assert runner.state.review_request_head == ""
+    assert runner.state.review_post_attempted_at is None
 
 
 def test_initial_request_helper_observes_durable_cooldown(
@@ -294,6 +296,89 @@ def test_initial_request_helper_observes_durable_cooldown(
         lambda *_args, **_kwargs: SimpleNamespace(stdout=HEAD),
     )
     assert runner._post_codex_review_result(5)[0:2] == (True, False)
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_failed_initial_delivery_reconciles_before_bounded_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, accepted: bool,
+) -> None:
+    from src.daemon.handlers import hung as hung_module
+
+    runner = _runner(tmp_path, monkeypatch)
+    clock = [NOW - timedelta(minutes=20)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz: timezone | None = None) -> datetime:
+            return clock[0]
+
+    monkeypatch.setattr(watch_module, "datetime", Clock)
+    monkeypatch.setattr(hung_module, "datetime", Clock)
+    monkeypatch.setattr(hung_module.git_ops, "_git", lambda *_a: SimpleNamespace(stdout=HEAD))
+    monkeypatch.setattr(hung_module.gh_prs, "get_pr_metadata", lambda *_a: {"author": "author"})
+    monkeypatch.setattr(hung_module.gh_prs, "get_pr_head_publication", lambda *_a, **_k: (
+        SimpleNamespace(published_at=NOW - timedelta(minutes=30), unknown_reason=None)
+    ))
+    runner._validate_publication_observation = lambda *_a, **_k: (
+        NOW - timedelta(minutes=30), None
+    )
+    monkeypatch.setattr(hung_module, "_author_already_requested_review", lambda *_a: False)
+    posted: list[datetime] = []
+
+    def transport(*_args):
+        posted.append(clock[0])
+        if len(posted) == 1:
+            raise RuntimeError("response lost" if accepted else "delivery failed")
+
+    monkeypatch.setattr(hung_module.gh_comments, "post_comment", transport)
+    assert runner._post_codex_review_result(5)[:2] == (False, False)
+    assert runner.state.review_requested_at is None
+    assert runner.state.review_request_generation
+    assert runner.state.review_post_attempted_at == clock[0]
+
+    # Other posting paths and WATCH share the same cooldown. A successful
+    # history read can distinguish acceptance from a failed delivery.
+    monkeypatch.setattr(
+        "src.github.comments.latest_codex_review_request_time",
+        lambda *_a, **_k: posted[0] if accepted else None,
+    )
+    clock[0] = NOW - timedelta(minutes=15)
+    assert runner._post_codex_review_result(5)[:2] == (True, False)
+    asyncio.run(runner._maybe_remind_review(_pr()))
+    assert len(posted) == 1
+    assert runner.state.review_requested_at == (posted[0] if accepted else None)
+    clock[0] = NOW
+    asyncio.run(runner._maybe_remind_review(_pr()))
+    assert len(posted) == 2
+    assert runner.state.review_reminder_count == 1
+
+
+def test_unconfirmed_initial_attempt_waits_for_history_and_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = _runner(tmp_path, monkeypatch)
+    runner.state.review_request_pr = 5
+    runner.state.review_request_head = HEAD
+    runner.state.review_request_task = "PR-005"
+    from src.cancellation.storage import task_spec_content_hash
+
+    runner.state.review_request_generation = task_spec_content_hash(
+        (tmp_path / "tasks/PR-005.md").read_text(encoding="utf-8")
+    )
+    runner.state.review_post_attempted_at = NOW - timedelta(minutes=20)
+
+    def unavailable(*_a, **_k):
+        raise RuntimeError("history unavailable")
+
+    monkeypatch.setattr("src.github.comments.latest_codex_review_request_time", unavailable)
+    runner._post_codex_review_result = lambda *_a, **_k: pytest.fail("uncertain history")
+    asyncio.run(runner._maybe_remind_review(_pr()))
+    assert runner.state.review_requested_at is None
+    assert runner.state.review_reminder_count == 0
+    monkeypatch.setattr("src.github.comments.latest_codex_review_request_time", lambda *_a, **_k: None)
+    runner.state.review_reminder_count = runner.app_config.daemon.watch_retrigger_cap
+    asyncio.run(runner._maybe_remind_review(_pr()))
+    assert runner.state.review_reminder_count == runner.app_config.daemon.watch_retrigger_cap
 
 
 @pytest.mark.parametrize("single_error_exit", [False, True])

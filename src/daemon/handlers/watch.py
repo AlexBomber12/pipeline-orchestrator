@@ -603,16 +603,18 @@ class WatchMixin:
             if fresh:
                 self.state.review_requested_at = max(fresh)
         anchor = self.state.review_requested_at
-        if anchor is None:
-            # A missing trigger is not inferred from PR updatedAt or push age.
+        last_attempt = self.state.review_post_attempted_at
+        if anchor is None and last_attempt is None:
+            # Neither publication nor polling time establishes a request clock.
             return
         interval = timedelta(minutes=(
             self.repo_config.review_timeout_min
             if self.repo_config.review_timeout_min is not None
             else self.app_config.daemon.review_timeout_min
         ))
-        last_attempt = self.state.review_post_attempted_at
-        if now - anchor < interval or (last_attempt and now - last_attempt < interval):
+        if (anchor is not None and now - anchor < interval) or (
+            last_attempt is not None and now - last_attempt < interval
+        ):
             return
         cap = self.app_config.daemon.watch_retrigger_cap
         if self.state.review_reminder_count >= cap:

@@ -1644,6 +1644,10 @@ class CodingMixin:
             )
         else:
             self._post_codex_review(candidate.number)
+        # The initial request may fail without a confirmed GitHub comment.
+        # Keep its bound attempt clock available to a fresh daemon so WATCH
+        # can reconcile and retry after the shared cooldown.
+        await self.publish_state()
 
     async def _diagnose_exit_zero_no_pr(
         self,

@@ -43,7 +43,7 @@ TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 FIX_TRANSITION_DEADLINE_SEC = 90
 # A WATCH cycle can include several serial GitHub calls; align the finite
 # pre-review synchronization bound with the downstream transition deadline.
-WATCH_WAIT_LOG_DEADLINE_SEC = FIX_TRANSITION_DEADLINE_SEC
+WATCH_READY_DEADLINE_SEC = FIX_TRANSITION_DEADLINE_SEC
 # After flipping the shim to ``escalate``, the FIX-cycle parser parks the
 # failed task in ERROR without further coder work.
 ESCALATE_TO_ERROR_DEADLINE_SEC = 60
@@ -152,44 +152,48 @@ def test_changes_requested_review_drives_watch_to_fix(
         history_floor = len(watch_entry.get("history") or [])
         SHIM_SCENARIO_PATH.write_text("escalate\n")
 
-        # The initial WATCH snapshot can precede the handler's first waiting
-        # cycle. Wait for that cycle before posting feedback so a fast
-        # CHANGES_REQUESTED transition cannot bypass its history marker.
-        watch_waiting_marker = f"[WATCH] PR #{watch_pr_number} waiting "
-        deadline = time.monotonic() + WATCH_WAIT_LOG_DEADLINE_SEC
-        waiting_entry: dict | None = None
+        # The first WATCH snapshot can precede review-request handoff.
+        # Wait for a confirmed request on this task and published HEAD before
+        # the independent reviewer posts findings against that same HEAD.
+        deadline = time.monotonic() + WATCH_READY_DEADLINE_SEC
+        ready_entry: dict | None = None
         last_wait_state = None
         last_wait_pr_number = None
-        last_wait_events: list[str] = []
+        last_wait_task = None
+        last_wait_head = None
+        last_wait_request = None
         while time.monotonic() < deadline:
             entry = get_state(testbed_slug)
             if entry is not None:
                 last_wait_state = entry.get("state")
                 current_pr = entry.get("current_pr") or {}
                 last_wait_pr_number = current_pr.get("number")
-                last_wait_events = [
-                    item.get("event", "")
-                    for item in entry.get("history") or []
-                    if isinstance(item, dict)
-                ]
+                last_wait_head = current_pr.get("head_sha")
+                last_wait_task = (entry.get("current_task") or {}).get("pr_id")
+                last_wait_request = entry.get("review_requested_at")
                 if (
                     last_wait_state == "WATCH"
                     and last_wait_pr_number == watch_pr_number
-                    and any(
-                        watch_waiting_marker in event
-                        for event in last_wait_events
-                    )
+                    and last_wait_task == expected_pr_id
+                    and current_pr.get("branch") == expected_branch
+                    and last_wait_head == watch_pr.get("head_sha")
+                    and current_pr.get("publication_at")
+                    and entry.get("review_request_pr") == watch_pr_number
+                    and entry.get("review_request_head") == last_wait_head
+                    and entry.get("review_request_task") == expected_pr_id
+                    and last_wait_request
                 ):
-                    waiting_entry = entry
+                    ready_entry = entry
                     break
             time.sleep(1)
-        assert waiting_entry is not None, (
-            f"PR #{watch_pr_number} did not remain in WATCH and emit "
-            f"{watch_waiting_marker!r} within "
-            f"{WATCH_WAIT_LOG_DEADLINE_SEC}s; "
+        assert ready_entry is not None, (
+            f"PR #{watch_pr_number} did not confirm review request for "
+            f"{expected_pr_id} on its published HEAD within "
+            f"{WATCH_READY_DEADLINE_SEC}s; "
             f"last_state={last_wait_state!r}, "
             f"last_pr_number={last_wait_pr_number!r}, "
-            f"recent events={last_wait_events[-10:]!r}"
+            f"last_task={last_wait_task!r}, last_head={last_wait_head!r}, "
+            f"last_request={last_wait_request!r}"
         )
 
         # The fixture uses a separate Codex-named reviewer App, binds the
@@ -200,6 +204,7 @@ def test_changes_requested_review_drives_watch_to_fix(
         assert "codex" in (review["reviewer"] or "").lower()
         assert review["state"] == "CHANGES_REQUESTED"
         assert review["commit_id"] == review["head_sha"]
+        assert review["head_sha"] == last_wait_head
 
         # FIX can be shorter than the polling interval, so history below is
         # also accepted as proof that this PR entered the real FIX handler.
