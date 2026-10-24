@@ -30,8 +30,10 @@ from __future__ import annotations
 
 import subprocess
 import time
+from datetime import datetime
 
 import pytest
+from src.github.comments import latest_codex_review_request_time
 
 from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
 
@@ -153,8 +155,8 @@ def test_changes_requested_review_drives_watch_to_fix(
         SHIM_SCENARIO_PATH.write_text("escalate\n")
 
         # The first WATCH snapshot can precede review-request handoff.
-        # Wait for a confirmed request on this task and published HEAD before
-        # the independent reviewer posts findings against that same HEAD.
+        # Wait for a request comment on this task's published HEAD before the
+        # independent reviewer verifies the author anchor and posts findings.
         deadline = time.monotonic() + WATCH_READY_DEADLINE_SEC
         ready_entry: dict | None = None
         last_wait_state = None
@@ -162,6 +164,7 @@ def test_changes_requested_review_drives_watch_to_fix(
         last_wait_task = None
         last_wait_head = None
         last_wait_request = None
+        last_request_error = None
         while time.monotonic() < deadline:
             entry = get_state(testbed_slug)
             if entry is not None:
@@ -170,7 +173,6 @@ def test_changes_requested_review_drives_watch_to_fix(
                 last_wait_pr_number = current_pr.get("number")
                 last_wait_head = current_pr.get("head_sha")
                 last_wait_task = (entry.get("current_task") or {}).get("pr_id")
-                last_wait_request = entry.get("review_requested_at")
                 if (
                     last_wait_state == "WATCH"
                     and last_wait_pr_number == watch_pr_number
@@ -181,10 +183,18 @@ def test_changes_requested_review_drives_watch_to_fix(
                     and entry.get("review_request_pr") == watch_pr_number
                     and entry.get("review_request_head") == last_wait_head
                     and entry.get("review_request_task") == expected_pr_id
-                    and last_wait_request
                 ):
-                    ready_entry = entry
-                    break
+                    try:
+                        publication = datetime.fromisoformat(current_pr["publication_at"])
+                        last_wait_request = latest_codex_review_request_time(
+                            TESTBED_REPO, watch_pr_number, after=publication
+                        )
+                        last_request_error = None
+                    except (OSError, RuntimeError, ValueError) as exc:
+                        last_request_error = str(exc)
+                    if last_wait_request is not None:
+                        ready_entry = entry
+                        break
             time.sleep(1)
         assert ready_entry is not None, (
             f"PR #{watch_pr_number} did not confirm review request for "
@@ -193,7 +203,8 @@ def test_changes_requested_review_drives_watch_to_fix(
             f"last_state={last_wait_state!r}, "
             f"last_pr_number={last_wait_pr_number!r}, "
             f"last_task={last_wait_task!r}, last_head={last_wait_head!r}, "
-            f"last_request={last_wait_request!r}"
+            f"last_request={last_wait_request!r}, "
+            f"request_error={last_request_error!r}"
         )
 
         # The fixture uses a separate Codex-named reviewer App, binds the
