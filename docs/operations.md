@@ -271,3 +271,11 @@ of inventing required contexts from unrelated repositories. Preserved
 server configs and production overlays must opt in explicitly during the
 final production update; this repository change only updates committed
 examples and validation.
+
+CI-driven FIX admits failed GitHub Actions jobs from the current PR HEAD.
+For commit statuses posted by another trusted producer, configure
+`ci_fix_trusted_statuses` as context names mapped to explicit producer lists,
+for example `{"external/gate": ["app:12345", "user:ci-app[bot]"]}`.
+This policy controls coder admission only; it does not change required
+checks or merge eligibility. Unconfigured status producers remain visible
+as CI failures but do not launch a coder.

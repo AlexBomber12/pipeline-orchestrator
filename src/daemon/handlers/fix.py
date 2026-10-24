@@ -54,7 +54,7 @@ _GITHUB_ACTIONS_APP_ID = 15368
 
 def _current_ci_failure(
     repo: str, pr_number: int, sha: str, required_checks: tuple[str, ...] | None,
-    empty_is_success: bool, trusted_statuses: dict[str, str] | None = None,
+    empty_is_success: bool, trusted_statuses: dict[str, list[str]] | None = None,
 ) -> dict | None:
     """Return bound, current terminal failure evidence for a live PR head."""
     if len(sha) != 40 or gh_prs.get_pr_metadata(repo, pr_number).get("head_sha") != sha:
@@ -88,7 +88,7 @@ def _current_ci_failure(
             and ctx.producer == f"app:{_GITHUB_ACTIONS_APP_ID}"
             and ctx.run_id[0] == "check"
             or ctx.run_id[0] == "status"
-            and trusted_statuses.get(name) == ctx.producer
+            and ctx.producer in trusted_statuses.get(name, ())
         )
     ]
     contexts = []

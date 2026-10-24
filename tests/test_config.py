@@ -40,7 +40,9 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     "statuses",
-    [[], {"": "user:bot"}, {"unit": "user:"}, {"unit": "app:0"}, {"unit": "other:bot"}],
+    [[], {"": ["user:bot"]}, {"unit": []}, {"unit": ["user:"]},
+     {"unit": ["app:0"]}, {"unit": ["other:bot"]},
+     {"unit": ["user:ci[bot]", "user:ci[bot]"]}],
 )
 def test_ci_fix_trusted_statuses_rejects_invalid_policy(statuses: object) -> None:
     with pytest.raises(ValueError, match="ci_fix_trusted_statuses"):
@@ -50,9 +52,9 @@ def test_ci_fix_trusted_statuses_rejects_invalid_policy(statuses: object) -> Non
 def test_ci_fix_trusted_statuses_accepts_configured_producers() -> None:
     repo = RepoConfig(
         url="https://github.com/example/repo.git",
-        ci_fix_trusted_statuses={"gate": "user:ci-app[bot]", "other": "app:15368"},
+        ci_fix_trusted_statuses={"gate": ["user:ci-app[bot]", "app:15368"]},
     )
-    assert repo.ci_fix_trusted_statuses["gate"] == "user:ci-app[bot]"
+    assert repo.ci_fix_trusted_statuses["gate"] == ["user:ci-app[bot]", "app:15368"]
 
 
 def test_load_config_missing_file_applies_env_overrides(

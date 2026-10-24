@@ -4050,24 +4050,31 @@ def test_current_ci_failure_accepts_actions_job_without_named_check_policy(
 
 
 @pytest.mark.parametrize("trusted", [True, False])
+@pytest.mark.parametrize("identity", ["creator", "app_id"])
 def test_current_ci_failure_admits_only_bound_status_producer(
-    monkeypatch: pytest.MonkeyPatch, trusted: bool,
+    monkeypatch: pytest.MonkeyPatch, trusted: bool, identity: str,
 ) -> None:
     from src.github import checks as gh_checks
 
     sha = "a" * 40
     monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": sha})
+    status = {
+        "id": 41, "context": "e2e/watch-merge-gate", "sha": sha,
+        "state": "failure", "creator": {"login": "testbed[bot]"},
+    }
+    if identity == "app_id":
+        status["app_id"] = 12345
     retrieval = gh_checks._make_ci_retrieval(
         "octo/demo", sha, 0.0, [],
-        {"sha": sha, "state": "failure", "statuses": [{
-            "id": 41, "context": "e2e/watch-merge-gate", "sha": sha,
-            "state": "failure", "creator": {"login": "testbed[bot]"},
-        }]},
+        {"sha": sha, "state": "failure", "statuses": [status]},
         gh_checks._CiSourceResult(True, False),
         gh_checks._CiSourceResult(True, True),
     )
     monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
-    allowlist = {"e2e/watch-merge-gate": "user:testbed[bot]" if trusted else "user:other[bot]"}
+    allowlist = {"e2e/watch-merge-gate": [
+        "app:12345" if trusted else "app:999",
+        "user:testbed[bot]" if trusted else "user:other[bot]",
+    ]}
     failure = fix_module._current_ci_failure(
         "octo/demo", 19, sha, None, True, allowlist,
     )
