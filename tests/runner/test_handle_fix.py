@@ -3925,6 +3925,7 @@ def _bound_ci_failure() -> dict:
 def _controlled_actions_failure(
     monkeypatch: pytest.MonkeyPatch, metadata: list[dict | None],
     *, check_attempt: int | None = 1, check_id: int = 55,
+    check_conclusion: str = "failure",
 ) -> list[list[str]]:
     """Keep checks stale while workflow metadata changes between real admission calls."""
     from src.github import checks as gh_checks
@@ -3932,7 +3933,7 @@ def _controlled_actions_failure(
     sha = "a" * 40
     check = {
         "id": check_id, "name": "integration", "head_sha": sha,
-        "app": {"id": 15368}, "status": "completed", "conclusion": "failure",
+        "app": {"id": 15368}, "status": "completed", "conclusion": check_conclusion,
         "started_at": "2026-10-24T00:00:00Z",
         "details_url": "https://github.com/octo/demo/actions/runs/99/job/55",
     }
@@ -4068,6 +4069,27 @@ def test_handle_fix_accepts_matching_job_without_check_attempt_or_logs(
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(
         number=19, branch="pr-019", head_sha="a" * 40, ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    context = captured["kwargs"]["extra_context"]
+    assert "Confirmed current CI failure:" in context
+    assert "Confirmed CI failure logs unavailable." in context
+    assert "attempt=2" in context
+
+
+def test_handle_fix_admits_cancelled_rerun_as_terminal_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    _controlled_actions_failure(
+        monkeypatch, [_workflow_attempt(2, conclusion="cancelled")] * 3,
+        check_attempt=2, check_conclusion="cancelled",
+    )
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE,
     )
     asyncio.run(runner.handle_fix())
     context = captured["kwargs"]["extra_context"]

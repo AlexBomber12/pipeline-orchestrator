@@ -50,6 +50,7 @@ logger = logging.getLogger(__name__)
 
 _FIX_CI_LOG_TRUNCATE_CHARS = 5000
 _GITHUB_ACTIONS_APP_ID = 15368
+_FAILED_ACTIONS_OUTCOMES = {"failure", "timed_out", "action_required", "cancelled"}
 
 
 def _current_ci_failure(
@@ -188,12 +189,12 @@ def _current_failed_actions_job(
     jobs = run.get("jobs")
     if (
         run.get("status") != "completed"
-        or run.get("conclusion") not in {"failure", "timed_out", "action_required"}
+        or run.get("conclusion") not in _FAILED_ACTIONS_OUTCOMES
         or not isinstance(jobs, list)
         or not any(
             isinstance(job, dict) and job.get("databaseId") == job_id
             and job.get("name") == context.get("name")
-            and job.get("conclusion") in {"failure", "timed_out", "action_required"}
+            and job.get("conclusion") in _FAILED_ACTIONS_OUTCOMES
             for job in jobs
         )
     ):
