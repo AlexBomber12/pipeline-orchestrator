@@ -8,6 +8,7 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import re
 import subprocess
@@ -31,6 +32,7 @@ from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github import reviews as gh_reviews
+from src.github.ci_evidence import CIContextEvidence, _latest, _newer, evaluate_ci_evidence
 from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
@@ -446,12 +448,9 @@ class WatchMixin:
             await self.handle_fix()
             return
         elif ci == CIStatus.INFRA_FAILURE:
-            # PR-251 (OBS-BC): a single infra-class failure (cancelled
-            # / action_required / stale conclusion, or known infra
-            # annotation keyword) earns one workflow rerun per
-            # ``head_sha``. A second INFRA_FAILURE classification on the
-            # same SHA means the rerun also failed — treat as a real
-            # logic FAILURE and route to FIX so the coder can act on it.
+            # A single infra-class failure earns one workflow rerun per
+            # ``head_sha``. Route a persistent failure to FIX only after
+            # the current failed check has a new attempt identity.
             #
             # PR-251 follow-up: the marker is gated by
             # ``_INFRA_RETRY_GRACE_SECONDS`` so the cached pre-rerun CI
@@ -462,6 +461,68 @@ class WatchMixin:
                 found.number, found.head_sha
             )
             if marker_exists and grace_elapsed:
+                issued, tries = await self._infra_retry_issue_state(found.number, found.head_sha)
+                if not issued:
+                    if review == ReviewStatus.CHANGES_REQUESTED:
+                        result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
+                        if result == FeedbackCheckResult.NEW:
+                            self._fix_feedback_reviewer_policy = reviewer_policy
+                            await self.handle_fix()
+                            return
+                    if tries < 2:
+                        raw_marker = await self.redis.get(
+                            ci_infra_retried(self.owner_repo, found.number, found.head_sha)
+                        )
+                        marker = json.loads(raw_marker)
+                        targets = set(marker.get("targets", []))
+                        issued_runs = set(marker.get("issued_runs", []))
+                        self._infra_retry_baseline = marker.get("checks", [])
+                        self._infra_retry_rerunnable_checks = marker.get("rerunnable_checks", [])
+                        self._infra_retry_target_run_ids = sorted(targets)
+                        self._infra_retry_issued_run_ids = sorted(issued_runs)
+                        self._infra_retry_unsupported = marker.get("unsupported", False)
+                        retried = self._retry_failed_workflow(
+                            found.number, found.head_sha,
+                            only_run_ids=targets - issued_runs if targets else None,
+                        )
+                        await self._mark_infra_retry_attempted(
+                            found.number, found.head_sha, issued=retried, tries=tries + 1,
+                        )
+                        return
+                    await self._transition_to_error(
+                        "Infrastructure CI rerun could not be issued after two attempts; operator Retry required",
+                        save_run_record_as=None, log_prefix="[WATCH]",
+                        cancellation_cause=CancellationCause(
+                            category="ERROR", payload={"subsource": "infra_failure"},
+                        ),
+                        commit_task_status=True,
+                    )
+                    return
+                post_retry = await self._infra_retry_has_new_failed_attempt(
+                    found.number, found.head_sha,
+                )
+                if post_retry is not True:
+                    if review == ReviewStatus.CHANGES_REQUESTED:
+                        result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
+                        if result == FeedbackCheckResult.NEW:
+                            self._fix_feedback_reviewer_policy = reviewer_policy
+                            await self.handle_fix()
+                            return
+                    if post_retry is None:
+                        await self._transition_to_error(
+                            "A new infrastructure CI failure appeared outside the rerun "
+                            "workflows; operator Retry required",
+                            save_run_record_as=None, log_prefix="[WATCH]",
+                            cancellation_cause=CancellationCause(
+                                category="ERROR", payload={"subsource": "infra_failure"},
+                            ),
+                            commit_task_status=True,
+                        )
+                        return
+                    self.log_event(
+                        f"[WATCH] PR #{found.number} awaiting post-retry terminal CI evidence."
+                    )
+                    return
                 self.log_event(
                     f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
                     f"persisted after retry; routing to FIX as "
@@ -496,9 +557,14 @@ class WatchMixin:
                 f"detected; retrying workflow once before routing to "
                 f"FIX."
             )
-            self._retry_failed_workflow(found.number, found.head_sha)
+            self._infra_retry_baseline = None
+            self._infra_retry_rerunnable_checks = []
+            self._infra_retry_target_run_ids = []
+            self._infra_retry_issued_run_ids = []
+            self._infra_retry_unsupported = False
+            issued = self._retry_failed_workflow(found.number, found.head_sha)
             await self._mark_infra_retry_attempted(
-                found.number, found.head_sha
+                found.number, found.head_sha, issued=issued,
             )
             return
         elif review == ReviewStatus.CHANGES_REQUESTED:
@@ -862,18 +928,9 @@ class WatchMixin:
         await self.publish_state()
 
     async def _maybe_reclassify_stuck_pending(self, found: object) -> None:
-        """Upgrade ``found.ci_status`` to FAILURE when CI has been PENDING too long.
-
-        PR-250 (OBS-BM): GitHub Actions occasionally registers a check-run
-        as ``queued`` or ``in_progress`` and never publishes a terminal
-        state. WATCH would otherwise poll forever; instead we track the
-        first-seen-PENDING timestamp per ``head_sha`` in Redis and, once
-        ``daemon.ci_pending_max_min`` minutes have elapsed on the same
-        SHA, rewrite the in-memory ``ci_status`` to FAILURE so the
-        existing FAILURE branch routes through ``handle_fix``. The raw
-        REST classifier is left untouched — only the daemon-side view
-        of CI is affected.
-        """
+        """Report a long pending interval without claiming a code failure."""
+        if getattr(found, "ci_status", None) != CIStatus.PENDING:
+            return
         head_sha = getattr(found, "head_sha", "") or ""
         if not head_sha:
             return
@@ -889,8 +946,9 @@ class WatchMixin:
         canonical_status = gh_checks._classify_ci_retrieval(
             retrieval,
             empty_is_success=self.repo_config.allow_merge_without_checks,
+            required_contexts=self.repo_config.required_checks,
         )
-        reclassified, reason = await gh_checks.classify_ci_status_with_age(
+        _, reason = await gh_checks.classify_ci_status_with_age(
             self.owner_repo,
             found.number,
             head_sha,
@@ -902,15 +960,17 @@ class WatchMixin:
             fetch_ok=retrieval.evidence.sources_complete,
             canonical_status=canonical_status,
         )
-        if reason != "stuck_pending":
+        if reason != "pending_overdue":
+            return
+        marker = f"ci_pending_overdue:{self.owner_repo}:{found.number}:{head_sha}"
+        if not await self.redis.set(marker, "1", nx=True, ex=7 * 24 * 60 * 60):
             return
         age_min = pending_max_seconds // 60
         sha_short = head_sha[:7]
         self.log_event(
-            f"[WATCH] PR #{found.number} CI reclassified PENDING -> FAILURE "
-            f"(stuck_pending: {age_min}min on sha {sha_short})."
+            f"[WATCH] PR #{found.number} CI still pending after "
+            f"{age_min}min on sha {sha_short}; awaiting terminal evidence."
         )
-        found.ci_status = reclassified
 
     def _observe_watch_event_signature(self, found: object) -> None:
         """Update ``_watch_last_event_at`` when polled PR signature changes.
@@ -1083,21 +1143,16 @@ class WatchMixin:
     ) -> tuple[bool, bool]:
         """Return ``(marker_exists, grace_elapsed)`` for the infra-retry marker.
 
-        PR-251 (OBS-BC) + follow-up. The marker stores the wall-clock
-        timestamp at which WATCH issued ``gh run rerun --failed`` for
-        ``head_sha``; ``grace_elapsed`` is ``True`` only after
+        The marker stores the wall-clock timestamp and original failed
+        check identities for ``head_sha``; ``grace_elapsed`` is ``True`` only after
         ``_INFRA_RETRY_GRACE_SECONDS`` have passed since that
         timestamp, ensuring that an immediate re-poll on a fast WATCH
         cadence cannot escalate to FIX while the CI fetch is still
         serving the pre-rerun cached payload.
 
-        Without ``redis`` or ``head_sha`` we conservatively report
-        ``(True, True)`` so the caller routes straight to FIX rather than
-        looping retries against a missing tracker. Legacy markers written
-        before the timestamp format (value ``"1"``) are also treated as
-        ``(True, True)`` — they came from a prior daemon version where
-        the grace window did not exist, and we cannot recover the
-        original rerun time.
+        Without ``redis`` or ``head_sha`` we report ``(True, True)`` to
+        avoid repeated reruns. Legacy markers have no original check
+        identities, so they cannot establish a post-rerun failure.
         """
         if self.redis is None or not head_sha:
             return True, True
@@ -1106,11 +1161,118 @@ class WatchMixin:
         if existing is None:
             return False, False
         try:
-            marker_ts = float(existing)
+            marker = json.loads(existing)
+            marker_ts = float(marker["at"] if isinstance(marker, dict) else marker)
         except (TypeError, ValueError):
             return True, True
         elapsed = time.time() - marker_ts
         return True, elapsed >= _INFRA_RETRY_GRACE_SECONDS
+
+    async def _infra_retry_has_new_failed_attempt(self, pr_number: int, head_sha: str) -> bool | None:
+        """Return True for a new failed rerun, None for an unrereun failure, else False."""
+        if self.redis is None:
+            return False
+        raw = await self.redis.get(ci_infra_retried(self.owner_repo, pr_number, head_sha))
+        try:
+            marker = json.loads(raw)
+            retry_at = float(marker["at"])
+            baseline = {tuple(item) for item in marker["checks"]}
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return False
+        if retry_at < 1_000_000_000 or not baseline:
+            return False
+        if marker.get("unsupported"):
+            return False
+        retrieval = gh_checks._retrieve_ci_status_evidence(
+            self.owner_repo, head_sha, fresh=True,
+        )
+        if not retrieval.evidence.sources_complete or not retrieval.status_source.sha_matches:
+            return False
+        statuses = retrieval.status_payload.get("statuses", [])
+        if not isinstance(statuses, list) or any(not isinstance(item, dict) for item in statuses):
+            return False
+        evidence = evaluate_ci_evidence(
+            repo=self.owner_repo, pr_number=pr_number, sha=head_sha,
+            check_runs=retrieval.check_runs,
+            statuses=statuses,
+            check_runs_complete=retrieval.check_runs_source.complete,
+            statuses_complete=retrieval.status_source.complete,
+            required_contexts=self.repo_config.required_checks,
+            empty_is_success=self.repo_config.allow_merge_without_checks,
+        )
+        if evidence.policy_result != CIStatus.FAILURE:
+            return False
+        latest = [
+            ctx for producers in _latest(evidence.contexts).values()
+            for ctx in producers.values()
+        ]
+        failures = [
+            ctx for ctx in latest
+            if ctx.state == "failure"
+        ]
+        if "rerunnable_checks" in marker:
+            issued_runs = set(marker.get("issued_runs", []))
+            baseline = {
+                (check_id, attempt)
+                for check_id, attempt, run_id in marker["rerunnable_checks"]
+                if run_id in issued_runs
+            }
+            run_ids = {}
+            for run in retrieval.check_runs:
+                match = _DETAILS_URL_RUN_RE.search(str(run.get("details_url") or ""))
+                if match:
+                    run_ids[run.get("id")] = int(match.group(1))
+            latest_issued: dict[tuple[int, str, str | None], CIContextEvidence] = {}
+            for ctx in evidence.contexts:
+                if ctx.run_id is None or ctx.run_id[0] != "check":
+                    continue
+                run_id = run_ids.get(ctx.run_id[1])
+                if run_id not in issued_runs:
+                    continue
+                key = (run_id, ctx.name, ctx.producer)
+                previous = latest_issued.get(key)
+                if previous is None or _newer(ctx, previous):
+                    latest_issued[key] = ctx
+            relevant = [ctx for ctx in latest_issued.values() if ctx.state == "failure"]
+            if relevant:
+                return all(
+                    (ctx.run_id[1], ctx.attempt) not in baseline for ctx in relevant
+                )
+            if any(
+                ctx.run_id is None or ctx.run_id[0] != "check"
+                or run_ids.get(ctx.run_id[1]) not in issued_runs
+                for ctx in failures
+            ):
+                checks = list(latest_issued.values())
+                if (
+                    issued_runs == {run_id for run_id, _, _ in latest_issued}
+                    and all(
+                        ctx.state == "success"
+                        and (ctx.run_id[1], ctx.attempt) not in baseline
+                        for ctx in checks
+                    )
+                ):
+                    return None
+            return False
+        for ctx in failures:
+            if ctx.run_id is None or ctx.run_id[0] != "check":
+                return False
+            if (ctx.run_id[1], ctx.attempt) in baseline:
+                return False
+        return True
+
+    async def _infra_retry_issue_state(self, pr_number: int, head_sha: str) -> tuple[bool, int]:
+        """Return bounded rerun issuance state; unknown markers need operator recovery."""
+        if self.redis is None:
+            return False, 2
+        raw = await self.redis.get(ci_infra_retried(self.owner_repo, pr_number, head_sha))
+        try:
+            marker = json.loads(raw)
+            if isinstance(marker, dict):
+                return marker.get("issued") is not False, max(1, int(marker.get("tries", 1)))
+        except (TypeError, ValueError):
+            pass
+        return False, 2
 
     async def _handle_external_pr_resolution(
         self,
@@ -1204,23 +1366,32 @@ class WatchMixin:
         return True
 
     async def _mark_infra_retry_attempted(
-        self, pr_number: int, head_sha: str
+        self, pr_number: int, head_sha: str, *, issued: bool = True, tries: int = 1,
     ) -> None:
         """Record that WATCH issued the one-shot infra retry for ``head_sha``.
 
-        Stores the current wall-clock timestamp so :meth:`_infra_retry_attempted`
-        can apply ``_INFRA_RETRY_GRACE_SECONDS`` before reporting the
-        retry as "elapsed enough to escalate" — see that helper's
-        docstring for the rationale.
+        Stores the timestamp and original check identities captured before
+        issuing the rerun. The grace window avoids acting on a cached
+        pre-rerun result; identity remains valid if the new job started
+        before this marker was written.
         """
         if self.redis is None or not head_sha:
             return
         key = ci_infra_retried(self.owner_repo, pr_number, head_sha)
         await self.redis.set(
-            key, str(time.time()), ex=_CI_INFRA_RETRIED_TTL_SECONDS
+            key, json.dumps({
+                "at": time.time(), "issued": issued, "tries": tries,
+                "checks": getattr(self, "_infra_retry_baseline", None) or [],
+                "rerunnable_checks": getattr(self, "_infra_retry_rerunnable_checks", None) or [],
+                "targets": getattr(self, "_infra_retry_target_run_ids", None) or [],
+                "issued_runs": getattr(self, "_infra_retry_issued_run_ids", None) or [],
+                "unsupported": getattr(self, "_infra_retry_unsupported", False),
+            }), ex=_CI_INFRA_RETRIED_TTL_SECONDS,
         )
 
-    def _retry_failed_workflow(self, pr_number: int, head_sha: str) -> bool:
+    def _retry_failed_workflow(
+        self, pr_number: int, head_sha: str, *, only_run_ids: set[int] | None = None,
+    ) -> bool:
         """Re-run the failed jobs of failing workflow runs attached to ``head_sha``.
 
         PR-251 (OBS-BC). Returns ``True`` when at least one ``gh run
@@ -1277,12 +1448,19 @@ class WatchMixin:
             return False
         run_ids: list[int] = []
         seen: set[int] = set()
+        rerunnable_checks: list[list[int | None]] = []
+        unsupported = False
         for run in failing_runs:
             url = run.get("details_url") or run.get("html_url") or ""
             match = _DETAILS_URL_RUN_RE.search(str(url))
             if not match:
+                unsupported = True
                 continue
             run_id = int(match.group(1))
+            if isinstance(run.get("id"), int):
+                rerunnable_checks.append([run["id"], run.get("run_attempt"), run_id])
+            else:
+                unsupported = True
             if run_id in seen:
                 continue
             seen.add(run_id)
@@ -1294,6 +1472,13 @@ class WatchMixin:
                 f"workflow run ID in details_url."
             )
             return False
+        if only_run_ids is None:
+            self._infra_retry_baseline = [item[:2] for item in rerunnable_checks]
+            self._infra_retry_rerunnable_checks = rerunnable_checks
+            self._infra_retry_unsupported = unsupported
+            self._infra_retry_target_run_ids = run_ids
+            self._infra_retry_issued_run_ids = []
+        run_ids = [run_id for run_id in run_ids if only_run_ids is None or run_id in only_run_ids]
         rerun_count = 0
         for run_id in run_ids:
             try:
@@ -1308,10 +1493,14 @@ class WatchMixin:
                 )
                 continue
             rerun_count += 1
+            if run_id not in self._infra_retry_issued_run_ids:
+                self._infra_retry_issued_run_ids.append(run_id)
         if rerun_count == 0:
             return False
         self.log_event(
             f"[WATCH] PR #{pr_number} infra retry: re-ran failed jobs "
             f"of {rerun_count} workflow run(s) on sha {head_sha[:7]}."
         )
-        return True
+        return bool(self._infra_retry_target_run_ids) and set(
+            self._infra_retry_target_run_ids
+        ).issubset(self._infra_retry_issued_run_ids) and not self._infra_retry_unsupported

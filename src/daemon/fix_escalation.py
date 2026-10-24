@@ -233,7 +233,8 @@ async def escalate_fix_no_push_deadlock(
 
 
 async def escalate_fix_coder_initiated(
-    runner: "PipelineRunner", current_pr: PRInfo, reason: str
+    runner: "PipelineRunner", current_pr: PRInfo, reason: str, *,
+    ci_trigger: dict | None = None,
 ) -> None:
     """Park the task after the coder emits an ESCALATE marker.
 
@@ -278,6 +279,8 @@ async def escalate_fix_coder_initiated(
         extra_payload={
             "pr_number": pr_number,
             "label_applied": label_applied,
+            **({"reason_text": clean_reason} if ci_trigger else {}),
+            **({"obsolete_ci_trigger": ci_trigger} if ci_trigger else {}),
         },
     )
 

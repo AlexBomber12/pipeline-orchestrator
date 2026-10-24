@@ -102,7 +102,7 @@ def test_pending_within_threshold_returns_pending(
     assert reason is None
 
 
-def test_pending_beyond_threshold_returns_failure(
+def test_pending_beyond_threshold_reports_overdue_without_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     redis = _FakeRedis()
@@ -128,8 +128,8 @@ def test_pending_beyond_threshold_returns_failure(
         )
     )
 
-    assert status == CIStatus.FAILURE
-    assert reason == "stuck_pending"
+    assert status == CIStatus.PENDING
+    assert reason == "pending_overdue"
 
 
 def test_canonical_pending_ages_when_legacy_payload_looks_successful(
@@ -173,8 +173,8 @@ def test_canonical_pending_ages_when_legacy_payload_looks_successful(
         )
     )
 
-    assert terminal == CIStatus.FAILURE
-    assert terminal_reason == "stuck_pending"
+    assert terminal == CIStatus.PENDING
+    assert terminal_reason == "pending_overdue"
 
 
 @pytest.mark.parametrize(
@@ -267,7 +267,7 @@ def test_head_sha_rotation_resets_tracker(
 
 
 def test_config_threshold_honored(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Same elapsed PENDING returns PENDING under a high threshold and FAILURE under a low one."""
+    """The threshold changes reporting, never the CI verdict."""
     runs, statuses = _runs_pending()
     base = 1_700_000_000.0
 
@@ -312,8 +312,8 @@ def test_config_threshold_honored(monkeypatch: pytest.MonkeyPatch) -> None:
             statuses_payload=statuses,
         )
     )
-    assert status_low == CIStatus.FAILURE
-    assert reason_low == "stuck_pending"
+    assert status_low == CIStatus.PENDING
+    assert reason_low == "pending_overdue"
 
 
 def test_first_seen_uses_redis_server_time_when_available() -> None:
@@ -511,8 +511,8 @@ def test_classify_uses_redis_time_for_age_when_clock_skewed(
             statuses_payload=statuses,
         )
     )
-    assert status_after == CIStatus.FAILURE
-    assert reason_after == "stuck_pending"
+    assert status_after == CIStatus.PENDING
+    assert reason_after == "pending_overdue"
 
 
 def test_classify_does_not_misfire_under_local_clock_step_back(
@@ -556,8 +556,8 @@ def test_classify_does_not_misfire_under_local_clock_step_back(
             statuses_payload=statuses,
         )
     )
-    assert status_after == CIStatus.FAILURE
-    assert reason_after == "stuck_pending"
+    assert status_after == CIStatus.PENDING
+    assert reason_after == "pending_overdue"
 
 
 def test_resolve_now_seconds_falls_back_to_local_clock(

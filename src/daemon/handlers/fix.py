@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import subprocess
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 
 from src.approval_commands import load_approval, matches_state
 from src.branch_context import BranchContext
@@ -14,7 +16,7 @@ from src.cancellation import (
     CancellationCause,
     safe_record_cancellation_cause,
 )
-from src.cancellation.storage import cause_key
+from src.cancellation.storage import cause_key, task_spec_content_hash
 from src.daemon import (
     fix_codex_trigger,
     fix_escalation,
@@ -33,8 +35,11 @@ from src.daemon.quarantine import (
 )
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.daemon.selector import CoderSelectionUnavailable
+from src.github import cache as gh_cache
+from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
+from src.github.ci_evidence import _latest, _status_producer, evaluate_ci_evidence
 from src.github.reviewer_policy import ReviewerPolicy
 from src.keyspace import control_stop, pipeline_state
 from src.models import CIStatus, PipelineState, PRInfo, RepoState, ReviewStatus
@@ -44,59 +49,224 @@ from src.subsource_registry import SuppressionReason
 logger = logging.getLogger(__name__)
 
 _FIX_CI_LOG_TRUNCATE_CHARS = 5000
+_GITHUB_ACTIONS_APP_ID = 15368
+_FAILED_ACTIONS_OUTCOMES = {"failure", "timed_out", "action_required", "cancelled"}
 
 
-def _fetch_failed_ci_logs(repo: str, branch: str) -> str | None:
-    """Return the last 5000 chars of failed CI logs for ``branch``, or ``None``.
+def _current_ci_failure(
+    repo: str, pr_number: int, sha: str, required_checks: tuple[str, ...] | None,
+    empty_is_success: bool, trusted_statuses: dict[str, list[str]] | None = None,
+    observed_attempts: dict[int, int] | None = None,
+) -> dict | None:
+    """Return bound, current terminal failure evidence for a live PR head."""
+    if len(sha) != 40 or gh_prs.get_pr_metadata(repo, pr_number).get("head_sha") != sha:
+        return None
+    retrieval = gh_checks._retrieve_ci_status_evidence(repo, sha, fresh=True)
+    if not retrieval.evidence.sources_complete or not retrieval.status_source.sha_matches:
+        return None
+    raw_statuses = retrieval.status_payload.get("statuses", [])
+    if not isinstance(raw_statuses, list) or any(not isinstance(s, dict) for s in raw_statuses):
+        return None
+    trusted_statuses = trusted_statuses or {}
+    if any(
+        status.get("context") in trusted_statuses
+        and isinstance(status.get("id"), int) and status["id"] > 0
+        and _status_producer(status) is None
+        for status in raw_statuses
+    ):
+        # The combined-status endpoint can omit both creator and app_id for
+        # App-posted statuses. Bind the producer from the status-history API
+        # only when that complete response contains the same immutable ID,
+        # context, state, and timestamp on this exact commit.
+        history = gh_cache._etag_get_paginated_evidence(
+            f"repos/{repo}/commits/{sha}/statuses?per_page=100"
+        )
+        if history.complete:
+            bound = []
+            for status in raw_statuses:
+                if (
+                    status.get("context") not in trusted_statuses
+                    or not isinstance(status.get("id"), int)
+                    or status["id"] <= 0
+                    or _status_producer(status) is not None
+                ):
+                    bound.append(status)
+                    continue
+                matches = [
+                    item for item in history.items
+                    if item.get("id") == status.get("id")
+                    and item.get("context") == status.get("context")
+                    and item.get("state") == status.get("state")
+                    and item.get("created_at") == status.get("created_at")
+                    and item.get("sha", sha) == sha
+                ]
+                if len(matches) == 1 and _status_producer(matches[0]) is not None:
+                    status = {**status, "app_id": matches[0].get("app_id"),
+                              "creator": matches[0].get("creator")}
+                bound.append(status)
+            raw_statuses = bound
+    evidence = evaluate_ci_evidence(
+        repo=repo, pr_number=pr_number, sha=sha,
+        check_runs=retrieval.check_runs, statuses=raw_statuses,
+        check_runs_complete=retrieval.check_runs_source.complete,
+        statuses_complete=retrieval.status_source.complete,
+        required_contexts=required_checks,
+        observed_at=retrieval.evidence.observed_at,
+        empty_is_success=empty_is_success,
+    )
+    if evidence.policy_result != CIStatus.FAILURE:
+        return None
+    # A failing status or third-party check can name itself arbitrarily. Admit
+    # only configured Actions jobs or an exact configured status/producer pair.
+    required = set(required_checks or ())
+    failures = [
+        ctx for name, producers in _latest(evidence.contexts).items()
+        for ctx in producers.values()
+        if ctx.state == "failure" and ctx.run_id is not None and (
+            (not required or name in required)
+            and ctx.producer == f"app:{_GITHUB_ACTIONS_APP_ID}"
+            and ctx.run_id[0] == "check"
+            or ctx.run_id[0] == "status"
+            and ctx.producer in trusted_statuses.get(name, ())
+        )
+    ]
+    contexts = []
+    for ctx in failures:
+        source, identity = ctx.run_id or (None, None)
+        run = next((r for r in retrieval.check_runs if source == "check" and r.get("id") == identity), None)
+        url = str(run.get("details_url") or "") if run else ""
+        match = re.fullmatch(
+            rf"https://github\.com/{re.escape(repo)}/actions/runs/(\d+)/job/(\d+)", url,
+        ) if source == "check" else None
+        if source == "check" and (
+            match is None or identity != int(match.group(2))
+        ):
+            continue
+        context = {
+            "name": ctx.name, "producer": ctx.producer, "source": source,
+            "check_id": identity, "attempt": ctx.attempt, "state": ctx.state,
+            "workflow_run_id": int(match.group(1)) if match else None,
+            "job_id": int(match.group(2)) if match else None,
+        }
+        if source == "check":
+            workflow = _current_failed_actions_job(repo, sha, context, observed_attempts)
+            if workflow is None:
+                continue
+            context["attempt"] = workflow["attempt"]
+        contexts.append(context)
+    if not contexts:
+        return None
+    return {"repo": repo, "pr_number": pr_number, "head_sha": sha, "contexts": contexts}
 
-    Resolves the most recent failed run via ``gh run list`` filtered by
-    branch, then pulls the failure-only output via ``gh run view
-    --log-failed``. Returns ``None`` on any lookup error so the FIX
-    prompt simply omits the section instead of blocking on observability.
-    """
+
+def _current_failed_actions_job(
+    repo: str, sha: str, context: dict,
+    observed_attempts: dict[int, int] | None = None,
+) -> dict | None:
+    """Bind an Actions check to the latest failed attempt and its exact job."""
+    run_id = context.get("workflow_run_id")
+    job_id = context.get("job_id")
+    if not isinstance(run_id, int) or not isinstance(job_id, int):
+        return None
     try:
-        runs = gh_runner.run_gh(
-            [
-                "run",
-                "list",
-                "--branch",
-                branch,
-                "--status",
-                "failure",
-                "--limit",
-                "1",
-                "--json",
-                "databaseId",
-            ],
+        run = gh_runner.run_gh(
+            ["run", "view", str(run_id), "--json", "databaseId,headSha,attempt,status,conclusion,jobs"],
             repo=repo,
         )
     except (RuntimeError, subprocess.TimeoutExpired, OSError):
         return None
-    if not isinstance(runs, list) or not runs:
+    if not isinstance(run, dict) or run.get("databaseId") != run_id or run.get("headSha") != sha:
         return None
-    first = runs[0]
-    if not isinstance(first, dict):
+    attempt = run.get("attempt")
+    if not isinstance(attempt, int) or attempt < 1:
         return None
-    run_id = first.get("databaseId")
-    if not run_id:
+    if observed_attempts is not None:
+        observed_attempts[run_id] = max(attempt, observed_attempts.get(run_id, 0))
+        if observed_attempts[run_id] != attempt:
+            return None
+    if context.get("attempt") is not None and context["attempt"] != attempt:
         return None
-    try:
-        logs = gh_runner.run_gh(
-            ["run", "view", str(run_id), "--log-failed"],
-            repo=repo,
-            timeout=60,
+    jobs = run.get("jobs")
+    if (
+        run.get("status") != "completed"
+        or run.get("conclusion") not in _FAILED_ACTIONS_OUTCOMES
+        or not isinstance(jobs, list)
+        or not any(
+            isinstance(job, dict) and job.get("databaseId") == job_id
+            and job.get("name") == context.get("name")
+            and job.get("conclusion") in _FAILED_ACTIONS_OUTCOMES
+            for job in jobs
         )
-    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+    ):
         return None
-    if not isinstance(logs, str) or not logs:
-        return None
-    if len(logs) > _FIX_CI_LOG_TRUNCATE_CHARS:
-        return f"[truncated]\n{logs[-_FIX_CI_LOG_TRUNCATE_CHARS:]}"
-    return logs
+    return run
+
+
+def _fetch_failed_ci_logs(repo: str, failure: dict) -> str | None:
+    """Read logs only for a workflow job matching admitted CI evidence."""
+    sha = failure.get("head_sha")
+    for context in failure.get("contexts", []):
+        run_id = context.get("workflow_run_id")
+        job_id = context.get("job_id")
+        if not isinstance(run_id, int) or not isinstance(job_id, int):
+            continue
+        run = _current_failed_actions_job(
+            repo, sha, context, failure.setdefault("_observed_attempts", {}),
+        )
+        if run is None:
+            continue
+        try:
+            logs = gh_runner.run_gh(
+                ["run", "view", str(run_id), "--attempt", str(run["attempt"]),
+                 "--job", str(job_id), "--log-failed"],
+                repo=repo, timeout=60,
+            )
+        except (RuntimeError, subprocess.TimeoutExpired, OSError):
+            continue
+        if isinstance(logs, str) and logs:
+            return (
+                f"[truncated]\n{logs[-_FIX_CI_LOG_TRUNCATE_CHARS:]}"
+                if len(logs) > _FIX_CI_LOG_TRUNCATE_CHARS else logs
+            )
+    return None
 
 
 class FixMixin(BreachMixin):
     """FIX FEEDBACK handler with idle timeout and breach monitoring."""
+
+    async def _ci_only_trigger_obsolete(self) -> bool:
+        """Revalidate only a structured CI-only invocation against its PR."""
+        snapshot = self.state.active_invocation
+        pr = self.state.current_pr
+        trigger = snapshot.fix_trigger if snapshot is not None else None
+        if (
+            not isinstance(trigger, dict) or trigger.get("review") is not False
+            or not isinstance(trigger.get("ci"), dict) or pr is None
+        ):
+            return False
+        admitted = trigger["ci"]
+        if (
+            admitted.get("repo") != self.owner_repo
+            or admitted.get("pr_number") != pr.number
+            or admitted.get("head_sha") != pr.head_sha
+        ):
+            return False
+        metadata = await asyncio.to_thread(
+            gh_prs.get_pr_metadata, self.owner_repo, pr.number,
+        )
+        if metadata.get("head_sha") != pr.head_sha:
+            return False
+        retrieval = await asyncio.to_thread(
+            gh_checks._retrieve_ci_status_evidence,
+            self.owner_repo, pr.head_sha, fresh=True,
+        )
+        if not retrieval.evidence.sources_complete or not retrieval.status_source.sha_matches:
+            return False
+        return gh_checks._classify_ci_retrieval(
+            retrieval,
+            required_contexts=self.repo_config.required_checks,
+            empty_is_success=self.repo_config.allow_merge_without_checks,
+        ) in {CIStatus.SUCCESS, CIStatus.PENDING}
 
     async def _approved_guardrail_fix_attempt(self, record, current_pr):
         """Return the bound approval only for its finalized guardrail run.
@@ -237,11 +407,11 @@ class FixMixin(BreachMixin):
         await fix_escalation.escalate_fix_no_push_deadlock(self, current_pr)
 
     async def _escalate_fix_coder_initiated(
-        self, current_pr: PRInfo, reason: str
+        self, current_pr: PRInfo, reason: str, *, ci_trigger: dict | None = None,
     ) -> None:
         """Thin wrapper — see ``fix_escalation.escalate_fix_coder_initiated``."""
         await fix_escalation.escalate_fix_coder_initiated(
-            self, current_pr, reason
+            self, current_pr, reason, ci_trigger=ci_trigger
         )
 
     async def _escalate_fix_iteration_cap(self, current_pr: PRInfo) -> None:
@@ -313,6 +483,7 @@ class FixMixin(BreachMixin):
         reviewer_policy: ReviewerPolicy | None = None,
         review_feedback: str | None = None,
         review_limitation: str | None = None,
+        ci_failure: dict | None = None,
     ) -> str | None:
         """Compose CI failure logs + latest review feedback for the FIX prompt.
 
@@ -322,9 +493,24 @@ class FixMixin(BreachMixin):
         ``FIX FEEDBACK``.
         """
         sections: list[str] = []
-        if current_pr.ci_status == CIStatus.FAILURE:
+        if ci_failure is not None:
+            identities = ", ".join(
+                f"{c['source']}={c['check_id']} run={c['workflow_run_id']} "
+                f"job={c['job_id']} attempt={c['attempt']} outcome={c['state']}"
+                for c in ci_failure["contexts"]
+            )
+            sections.append(
+                f"Confirmed current CI failure: repo={ci_failure['repo']} "
+                f"PR #{ci_failure['pr_number']} HEAD={ci_failure['head_sha']}; {identities}."
+            )
+            if not review_feedback:
+                sections.append(
+                    "If this CI failure becomes obsolete before any repair is needed, "
+                    "make no change and end stdout with exactly "
+                    "ESCALATE: OBSOLETE_CI_EVIDENCE."
+                )
             ci_logs = await asyncio.to_thread(
-                _fetch_failed_ci_logs, self.owner_repo, current_pr.branch
+                _fetch_failed_ci_logs, self.owner_repo, ci_failure
             )
             if ci_logs:
                 sections.append(
@@ -332,8 +518,7 @@ class FixMixin(BreachMixin):
                 )
             else:
                 sections.append(
-                    f"CI failed for PR #{current_pr.number} on {current_pr.branch}; "
-                    "failed-run logs unavailable."
+                    "Confirmed CI failure logs unavailable."
                 )
         if current_pr.review_status == ReviewStatus.CHANGES_REQUESTED:
             if review_feedback:
@@ -415,6 +600,26 @@ class FixMixin(BreachMixin):
             if review_origin != expected_origin:
                 review_feedback = None
                 review_limitation = "status-poll review identity changed before dispatch"
+        ci_failure = None
+        approval_candidate = (
+            self._current_approval(current_pr) if current_pr is not None else None
+        )
+        if (
+            current_pr is not None and current_pr.ci_status == CIStatus.FAILURE
+            and approval_candidate is None
+        ):
+            ci_failure = await asyncio.to_thread(
+                _current_ci_failure, self.owner_repo, current_pr.number,
+                current_pr.head_sha, self.repo_config.required_checks,
+                self.repo_config.allow_merge_without_checks,
+                self.repo_config.ci_fix_trusted_statuses,
+            )
+            if ci_failure is None:
+                if not (review_feedback and review_head == current_pr.head_sha):
+                    self.log_event("[FIX] CI failure no longer actionable; returning to WATCH.")
+                    self.state.state = PipelineState.WATCH
+                    return
+                current_pr.ci_status = CIStatus.PENDING
         if (
             current_pr is not None
             and current_pr.ci_status != CIStatus.FAILURE
@@ -472,6 +677,10 @@ class FixMixin(BreachMixin):
                         )
                         return
             if record is None:
+                if approval_candidate is not None:
+                    self.log_event("[FIX] Approved guardrail run accounting unavailable; deferring dispatch.")
+                    self.state.state = PipelineState.WATCH
+                    return
                 if (
                     self.state.active_invocation is not None
                     and self.state.active_invocation.phase == "fix"
@@ -680,6 +889,7 @@ class FixMixin(BreachMixin):
         if self.state.current_task is not None:
             fix_kwargs["pr_id"] = self.state.current_task.pr_id
             fix_kwargs["task_file"] = self.state.current_task.task_file
+        admitted_feedback = None
         if self.state.current_pr is not None:
             admitted_feedback = (
                 review_feedback if review_head and review_head == self.state.current_pr.head_sha else None
@@ -696,6 +906,7 @@ class FixMixin(BreachMixin):
                 reviewer_policy=fix_feedback_reviewer_policy,
                 review_feedback=admitted_feedback,
                 review_limitation=review_limitation,
+                ci_failure=ci_failure,
             )
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context
@@ -711,6 +922,50 @@ class FixMixin(BreachMixin):
                     self.log_event("[FIX] PR HEAD changed before review dispatch; returning to WATCH.")
                     self.state.state = PipelineState.WATCH
                     return
+            if ci_failure is not None:
+                observed_attempts = ci_failure.get("_observed_attempts", {})
+                latest_failure = await asyncio.to_thread(
+                    _current_ci_failure, self.owner_repo, self.state.current_pr.number,
+                    self.state.current_pr.head_sha, self.repo_config.required_checks,
+                    self.repo_config.allow_merge_without_checks,
+                    self.repo_config.ci_fix_trusted_statuses,
+                    *([observed_attempts] if observed_attempts else []),
+                )
+                admitted_failure = {
+                    key: value for key, value in ci_failure.items()
+                    if key != "_observed_attempts"
+                }
+                if latest_failure != admitted_failure:
+                    if admitted_feedback:
+                        metadata = await asyncio.to_thread(
+                            gh_prs.get_pr_metadata, self.owner_repo, self.state.current_pr.number,
+                        )
+                        if (
+                            metadata.get("head_sha") != review_head
+                            or self.state.current_pr is not current_pr
+                            or self.state.current_pr.head_sha != review_head
+                        ):
+                            self.log_event("[FIX] PR HEAD changed before review dispatch; returning to WATCH.")
+                            self.state.state = PipelineState.WATCH
+                            return
+                        ci_failure = None
+                        self.state.current_pr.ci_status = CIStatus.PENDING
+                        review_context = await self._build_fix_feedback_context(
+                            self.state.current_pr,
+                            reviewer_policy=fix_feedback_reviewer_policy,
+                            review_feedback=admitted_feedback,
+                            review_limitation=review_limitation,
+                        )
+                        if review_context is not None:
+                            fix_kwargs["extra_context"] = review_context
+                        else:
+                            self.log_event("[FIX] Current actionable review findings unavailable; returning to WATCH.")
+                            self.state.state = PipelineState.WATCH
+                            return
+                    else:
+                        self.log_event("[FIX] CI failure changed before coder launch; returning to WATCH.")
+                        self.state.state = PipelineState.WATCH
+                        return
         if reused_prelaunch:
             snapshot = pending_fix_record.invocations[-1]
             if (
@@ -771,6 +1026,7 @@ class FixMixin(BreachMixin):
                     fix_kwargs,
                     phase="fix",
                     fix_iteration=fix_iteration,
+                    fix_trigger={"ci": ci_failure, "review": bool(admitted_feedback)},
                 )
                 if run_record is not None:
                     await self._checkpoint_current_run_record()
@@ -1150,7 +1406,47 @@ class FixMixin(BreachMixin):
             return
         await capture_stop_requested_after_exit()
         escalate_reason = fix_escalation.parse_escalate_marker(stdout)
+        if (
+            escalate_reason == "OBSOLETE_CI_EVIDENCE"
+            and head_before
+            and await read_head_after_fix() == head_before
+            and await self._ci_only_trigger_obsolete()
+        ):
+            if await pause_for_stop_after_bookkeeping():
+                return
+            if self.state.publication_attempt is not None:
+                self.state.publication_attempt.pending = False
+            self.log_event("[FIX] Bound CI-only failure became obsolete; resuming WATCH.")
+            self.state.state = PipelineState.WATCH
+            await self.publish_state()
+            return
         if escalate_reason is not None and self.state.current_pr is not None:
+            snapshot = self.state.active_invocation
+            trigger = snapshot.fix_trigger if snapshot is not None else None
+            obsolete_ci_claim = (
+                {
+                    "ci": trigger["ci"],
+                    "task_id": self.state.current_task.pr_id,
+                    "branch": self.state.current_pr.branch,
+                    "run_id": snapshot.run_id,
+                    "attempt_index": snapshot.attempt_index,
+                    "fix_iteration": snapshot.fix_iteration,
+                    "task_spec_hash": task_spec_content_hash(
+                        (Path(self.repo_path) / self.state.current_task.task_file).read_text(encoding="utf-8")
+                    ),
+                }
+                if escalate_reason == "OBSOLETE_CI_EVIDENCE"
+                and isinstance(trigger, dict)
+                and trigger.get("review") is False
+                and isinstance(trigger.get("ci"), dict)
+                and self.state.current_task is not None
+                and self.state.current_task.task_file is not None
+                and snapshot is not None
+                and snapshot.run_id is not None
+                and head_before
+                and await read_head_after_fix() == head_before
+                else None
+            )
             if self.state.publication_attempt is not None:
                 self.state.publication_attempt.exit_classification = "failure"
             # Coder semantic circuit breaker (PR-166): an explicit
@@ -1159,7 +1455,7 @@ class FixMixin(BreachMixin):
             # ESCALATE is not a no-push success — it is a deliberate
             # bail-out and should not feed the deadlock counter.
             no_push_policy.reset(self.state.current_pr)
-            if self.state.current_task is not None:
+            if self.state.current_task is not None and obsolete_ci_claim is None:
                 await safe_record_cancellation_cause(
                     self.redis,
                     self.name,
@@ -1169,12 +1465,13 @@ class FixMixin(BreachMixin):
                         payload={
                             "subsource": "coder_escalate",
                             "reason_text": escalate_reason,
+                            **({"obsolete_ci_trigger": obsolete_ci_claim} if obsolete_ci_claim else {}),
                         },
                     ),
                     log=self.log_event,
                 )
             await self._escalate_fix_coder_initiated(
-                self.state.current_pr, escalate_reason
+                self.state.current_pr, escalate_reason, ci_trigger=obsolete_ci_claim,
             )
             # If a stop arrived while the coder was running, honor the
             # deferred pause: PAUSED takes precedence over the IDLE/HUNG
@@ -1294,6 +1591,15 @@ class FixMixin(BreachMixin):
                 )
 
         if local_no_push or remote_no_push:
+            if await self._ci_only_trigger_obsolete():
+                if await pause_for_stop_after_bookkeeping():
+                    return
+                if self.state.publication_attempt is not None:
+                    self.state.publication_attempt.pending = False
+                self.log_event("[FIX] Bound CI-only failure became obsolete; resuming WATCH.")
+                self.state.state = PipelineState.WATCH
+                await self.publish_state()
+                return
             if self.state.current_pr is not None:
                 self._last_push_at = self._canonical_push_timestamp(
                     self.state.current_pr.number
