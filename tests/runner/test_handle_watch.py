@@ -3688,7 +3688,7 @@ def test_retry_failed_workflow_extracts_run_id_from_details_url(
     _patch_check_runs(
         monkeypatch,
         [
-            {"conclusion": "cancelled", "details_url": _actions_url(9876, 12345)},
+            {"id": 12345, "conclusion": "cancelled", "details_url": _actions_url(9876, 12345)},
         ],
     )
     calls: list[list[str]] = []
@@ -3714,9 +3714,9 @@ def test_retry_failed_workflow_dedupes_jobs_in_same_workflow_run(
     _patch_check_runs(
         monkeypatch,
         [
-            {"conclusion": "cancelled", "details_url": _actions_url(700, 1)},
-            {"conclusion": "failure", "details_url": _actions_url(700, 2)},
-            {"conclusion": "stale", "details_url": _actions_url(800, 3)},
+            {"id": 1, "conclusion": "cancelled", "details_url": _actions_url(700, 1)},
+            {"id": 2, "conclusion": "failure", "details_url": _actions_url(700, 2)},
+            {"id": 3, "conclusion": "stale", "details_url": _actions_url(800, 3)},
         ],
     )
     calls: list[list[str]] = []
@@ -3779,6 +3779,7 @@ def test_retry_failed_workflow_matches_failing_status_with_empty_conclusion(
             {
                 "conclusion": None,
                 "status": "failed",
+                    "id": 7,
                 "details_url": _actions_url(7),
             },
         ],
