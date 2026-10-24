@@ -2869,7 +2869,7 @@ def test_header_merge_recovery_prioritizes_unfinished_attempt(
 @pytest.mark.parametrize(
     "case",
     ["success", "success_live", "suppression_disappeared", "identity_changed",
-     "provider_unavailable", "incomplete_evidence", "still_failed",
+     "provider_unavailable", "incomplete_evidence", "still_failed", "wrong_run_cause",
      "unrelated_hold", "status_write_failed", "label_cleanup_failed", "cleanup_failed",
      "continuation_corrupt", "continuation_save_failed", "paused"],
 )
@@ -2976,6 +2976,8 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
             runner, "_suppression_record_for_task",
             AsyncMock(return_value=types.SimpleNamespace(reason=SuppressionReason.GUARDRAIL)),
         )
+    elif case == "wrong_run_cause":
+        run.cause_subsource = "guardrail"
     elif case == "suppression_disappeared":
         monkeypatch.setattr(runner, "_suppression_record_for_task", AsyncMock(return_value=None))
     elif case == "paused":
