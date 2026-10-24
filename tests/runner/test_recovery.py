@@ -48,6 +48,7 @@ from typing import Any
 
 import pytest
 from src.daemon import recovery as recovery_module
+from src.cancellation.storage import task_spec_content_hash
 from src.daemon import runner as runner_module
 from src.daemon.handlers import coding as coding_module  # noqa: F401,F811
 from src.daemon.handlers import error as error_module  # noqa: F401,F811
@@ -76,6 +77,7 @@ from src.publication_migration import (
 )
 from src.publication_migration import pending_key as migration_pending_key
 from src.task_status import MergedState
+from src.subsource_registry import SuppressionReason
 
 from tests.runner import _helpers as h
 
@@ -2159,6 +2161,74 @@ def test_hydrate_current_task_restores_coding_snapshot() -> None:
     asyncio.run(runner._hydrate_current_task_from_persisted_state())
 
     assert runner.state.current_task == task
+
+
+def _saved_review_state(
+    runner: object, tmp_path: Path, *, error: bool,
+) -> tuple[QueueTask, PRInfo, RepoState]:
+    runner.repo_path = str(tmp_path)
+    task_path = tmp_path / "tasks" / "PR-405.md"
+    task_path.parent.mkdir()
+    task_path.write_text("# PR-405\nBranch: pr-405\n", encoding="utf-8")
+    task = QueueTask(
+        pr_id="PR-405", title="Review", branch="pr-405",
+        task_file="tasks/PR-405.md",
+        status=TaskStatus.ERROR if error else TaskStatus.DOING,
+    )
+    pr = PRInfo(number=640, branch="pr-405", head_sha="a" * 40, pr_id="PR-405")
+    saved = runner.state.model_copy(deep=True)
+    saved.state = PipelineState.ERROR if error else PipelineState.WATCH
+    saved.current_task = task
+    saved.current_pr = pr
+    saved.review_request_pr = pr.number
+    saved.review_request_head = pr.head_sha
+    saved.review_request_task = task.pr_id
+    saved.review_request_generation = task_spec_content_hash(task_path.read_text())
+    saved.review_requested_at = datetime.now(timezone.utc) - timedelta(minutes=31)
+    saved.review_post_attempted_at = datetime.now(timezone.utc) - timedelta(minutes=11)
+    saved.review_reminder_count = 3
+    return task, pr, saved
+
+
+def test_watch_recovery_restores_current_head_reminder_budget(
+    tmp_path: Path,
+) -> None:
+    runner = h._make_runner()
+    task, pr, saved = _saved_review_state(runner, tmp_path, error=False)
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
+    runner._recovery_task_headers = {}
+    runner._rehydrate_last_push_at = lambda *_args: None
+    assert asyncio.run(runner._hydrate_current_task_from_persisted_state()) is True
+    asyncio.run(runner._apply_recovery_decisions([task], [pr]))
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.review_reminder_count == 3
+    assert runner.state.review_post_attempted_at == saved.review_post_attempted_at
+
+
+@pytest.mark.parametrize("single_error_exit", [False, True])
+def test_legacy_review_timeout_recovery_keeps_bound_pr(
+    tmp_path: Path, single_error_exit: bool,
+) -> None:
+    runner = h._make_runner()
+    runner.repo_config.feature_flags.use_single_error_exit = single_error_exit
+    task, pr, saved = _saved_review_state(runner, tmp_path, error=True)
+    saved.skip_ai_error_diagnose = True
+    saved.error_message = "review timeout"
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
+    runner._recovery_task_headers = {
+        task.pr_id: types.SimpleNamespace(
+            frontmatter_status="error",
+            blocked_reason=SuppressionReason.REVIEW_TIMEOUT.value,
+        )
+    }
+    assert asyncio.run(runner._hydrate_current_task_from_persisted_state()) is True
+    asyncio.run(runner._apply_recovery_decisions([task], [pr]))
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task.pr_id == task.pr_id
+    assert runner.state.current_pr.head_sha == pr.head_sha
+    assert runner.state.review_reminder_count == 3
+    assert runner.state.skip_ai_error_diagnose is True
+    assert task.pr_id not in runner._crashed_task_pr_ids
 
 
 # ---------------------------------------------------------------------------

@@ -24,6 +24,7 @@ from src.cancellation import (
     get_cancellation_cause,
     get_current_run_started_at,
     safe_record_cancellation_cause,
+    task_spec_content_hash,
 )
 from src.daemon import git_ops
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
@@ -487,6 +488,7 @@ class RecoveryMixin:
         """
         self._persisted_fix_recovery = None
         self._persisted_merge_recovery = None
+        self._persisted_review_timeout_recovery = None
         try:
             raw = await self.redis.get(pipeline_state(self.name))
         except Exception as exc:
@@ -660,6 +662,17 @@ class RecoveryMixin:
             )
         ):
             self._persisted_fix_recovery = persisted
+        if (
+            persisted.name == self.name
+            and persisted.url == self.repo_config.url
+            and persisted.state == PipelineState.ERROR
+            and persisted.current_task is not None
+            and persisted.current_pr is not None
+            and persisted.current_task.branch == persisted.current_pr.branch
+            and persisted.current_pr.pr_id in (None, persisted.current_task.pr_id)
+            and re.fullmatch(r"[0-9a-fA-F]{40}", persisted.current_pr.head_sha)
+        ):
+            self._persisted_review_timeout_recovery = persisted
         if (
             persisted.name == self.name
             and persisted.url == self.repo_config.url
@@ -987,6 +1000,19 @@ class RecoveryMixin:
             ):
                 continue
             pr = find_matching_open_pr(task.pr_id, task.branch, prs)
+            saved_timeout = getattr(self, "_persisted_review_timeout_recovery", None)
+            if (
+                pr is not None
+                and header.blocked_reason == SuppressionReason.REVIEW_TIMEOUT.value
+                and saved_timeout is not None
+                and saved_timeout.current_task.pr_id == task.pr_id
+                and saved_timeout.current_task.branch == task.branch
+                and saved_timeout.current_pr.number == pr.number
+                and saved_timeout.current_pr.head_sha == pr.head_sha
+            ):
+                # Preserve the published PR even if Redis is temporarily
+                # unavailable. Admission still requires its timeout cause.
+                return task, pr
             if pr is not None and (
                 header.blocked_reason in {
                     SuppressionReason.GUARDRAIL.value,
@@ -999,6 +1025,35 @@ class RecoveryMixin:
                 )
                 return task, pr
         return None
+
+    def _restore_review_request_history(
+        self, saved: RepoState, task: QueueTask, pr: PRInfo
+    ) -> None:
+        """Restore a consumed budget only for the same task generation/HEAD."""
+        if (
+            saved.review_request_pr != pr.number
+            or saved.review_request_head != pr.head_sha
+            or saved.review_request_task != task.pr_id
+            or not saved.review_request_generation
+            or not task.task_file
+        ):
+            return
+        try:
+            generation = task_spec_content_hash(
+                (Path(self.repo_path) / task.task_file).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return
+        if generation != saved.review_request_generation:
+            return
+        self.state.review_request_pr = saved.review_request_pr
+        self.state.review_request_head = saved.review_request_head
+        self.state.review_request_task = saved.review_request_task
+        self.state.review_request_generation = generation
+        self.state.review_requested_at = saved.review_requested_at
+        self.state.review_post_attempted_at = saved.review_post_attempted_at
+        self.state.review_reminder_count = saved.review_reminder_count
+        self.state.review_overdue_reported = saved.review_overdue_reported
 
     async def _apply_recovery_decisions(
         self, tasks: list[QueueTask], prs: list[PRInfo]
@@ -1018,6 +1073,11 @@ class RecoveryMixin:
             for queued in tasks:
                 if queued.status != TaskStatus.ERROR:
                     continue
+                if unresolved_error_pr is not None and queued.pr_id == unresolved_error_pr[0].pr_id and (
+                    self._recovery_task_headers[queued.pr_id].blocked_reason
+                    == SuppressionReason.REVIEW_TIMEOUT.value
+                ):
+                    continue
                 saved_fix = getattr(self, "_persisted_fix_recovery", None)
                 if (
                     saved_fix is not None and saved_fix.size_fix_completion is not None
@@ -1036,7 +1096,15 @@ class RecoveryMixin:
                     )
         else:
             for queued in tasks:
-                if queued.status == TaskStatus.ERROR:
+                if (
+                    queued.status == TaskStatus.ERROR
+                    and not (
+                        unresolved_error_pr is not None
+                        and queued.pr_id == unresolved_error_pr[0].pr_id
+                        and self._recovery_task_headers[queued.pr_id].blocked_reason
+                        == SuppressionReason.REVIEW_TIMEOUT.value
+                    )
+                ):
                     self._crashed_task_pr_ids.add(queued.pr_id)
 
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
@@ -1176,6 +1244,8 @@ class RecoveryMixin:
                         ),
                     })
                 self.state.current_pr = live_bound or bound
+                if self.state.current_pr.head_sha == bound.head_sha:
+                    self._restore_review_request_history(saved, queued, self.state.current_pr)
                 self.state.active_invocation = saved.active_invocation
                 self.state.size_fix_completion = completion if pending_size_completion else None
                 if recovered_state == PipelineState.ERROR and saved.state != PipelineState.ERROR:
@@ -1413,12 +1483,25 @@ class RecoveryMixin:
         if unresolved_error_pr is not None:
             task, pr = unresolved_error_pr
             header = self._recovery_task_headers.get(task.pr_id)
+            saved_timeout = getattr(self, "_persisted_review_timeout_recovery", None)
             self.state = self.state.model_copy(update={
                 "current_task": task,
                 "current_pr": pr,
                 "state": PipelineState.ERROR,
-                "error_message": "Published task failure unresolved; operator Retry or revised approval required.",
+                "error_message": (
+                    saved_timeout.error_message
+                    if saved_timeout is not None
+                    and header is not None
+                    and header.blocked_reason == SuppressionReason.REVIEW_TIMEOUT.value
+                    else "Published task failure unresolved; operator Retry or revised approval required."
+                ),
             })
+            if (
+                saved_timeout is not None and header is not None
+                and header.blocked_reason == SuppressionReason.REVIEW_TIMEOUT.value
+            ):
+                self.state.skip_ai_error_diagnose = True
+                self._restore_review_request_history(saved_timeout, task, pr)
             return
 
         self.state.state = PipelineState.IDLE
