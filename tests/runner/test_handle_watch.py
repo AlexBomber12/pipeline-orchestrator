@@ -61,7 +61,7 @@ claude_cli = claude_plugin_module.claude_cli
 def _admit_ci_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         fix_module, "_current_ci_failure",
-        lambda repo, number, sha, required, empty: {
+        lambda repo, number, sha, required, empty, trusted: {
             "repo": repo, "pr_number": number, "head_sha": sha,
             "contexts": [{
                 "name": "unit", "producer": "app:1", "source": "check",

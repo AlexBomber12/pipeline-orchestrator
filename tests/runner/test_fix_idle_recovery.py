@@ -93,9 +93,9 @@ async def _watch_requires_fix(runner, pr, monkeypatch: pytest.MonkeyPatch) -> No
     pr.ci_status = CIStatus.FAILURE
     monkeypatch.setattr(
         "src.daemon.handlers.fix._current_ci_failure",
-        lambda repo, number, sha, required, empty: {
+        lambda repo, number, sha, required, empty, trusted: {
             "repo": repo, "pr_number": number, "head_sha": sha,
-            "contexts": [{"name": "unit", "check_id": 1, "attempt": 1,
+            "contexts": [{"name": "unit", "source": "check", "check_id": 1, "attempt": 1,
                           "state": "failure", "workflow_run_id": None, "job_id": None}],
         },
     )

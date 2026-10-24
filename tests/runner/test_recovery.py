@@ -2899,7 +2899,7 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
                 is_escalated=True)
     ci = {
         "repo": runner.owner_repo, "pr_number": 19, "head_sha": pr.head_sha,
-        "contexts": [{"name": "unit", "check_id": 41, "attempt": 1,
+        "contexts": [{"name": "unit", "source": "check", "check_id": 41, "attempt": 1,
                       "state": "failure", "workflow_run_id": 99, "job_id": 41}],
     }
     snapshot = InvocationSnapshot(

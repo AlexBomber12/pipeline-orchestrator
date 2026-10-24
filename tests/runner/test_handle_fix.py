@@ -4076,6 +4076,11 @@ def test_current_ci_failure_admits_only_bound_status_producer(
         assert failure["contexts"][0]["source"] == "status"
         assert failure["contexts"][0]["check_id"] == 41
         assert failure["contexts"][0]["workflow_run_id"] is None
+        monkeypatch.setattr(
+            fix_module.gh_runner, "run_gh",
+            lambda *args, **kwargs: pytest.fail("status has no Actions job logs"),
+        )
+        assert fix_module._fetch_failed_ci_logs("octo/demo", failure) is None
 
 
 @pytest.mark.parametrize("case", ["obsolete", "wrong_binding", "head_changed", "incomplete"])
