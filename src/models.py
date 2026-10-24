@@ -193,6 +193,8 @@ class InvocationSnapshot:
     attempt_index: int | None
     phase: Literal["coding", "fix"]
     fix_iteration: int | None = None
+    # Structured dispatch cause. Older records have no proof of a CI-only fix.
+    fix_trigger: dict | None = None
 
 
 class PublicationAttempt(BaseModel):

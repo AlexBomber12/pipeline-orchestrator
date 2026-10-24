@@ -31,6 +31,7 @@ from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.github import reviews as gh_reviews
+from src.github.ci_evidence import _latest, evaluate_ci_evidence
 from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
 from src.inhibitor import InhibitorType, is_work_inhibited
 from src.keyspace import ci_infra_retried
@@ -462,6 +463,11 @@ class WatchMixin:
                 found.number, found.head_sha
             )
             if marker_exists and grace_elapsed:
+                if not await self._infra_retry_has_new_failed_attempt(found.number, found.head_sha):
+                    self.log_event(
+                        f"[WATCH] PR #{found.number} awaiting post-retry terminal CI evidence."
+                    )
+                    return
                 self.log_event(
                     f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
                     f"persisted after retry; routing to FIX as "
@@ -862,18 +868,9 @@ class WatchMixin:
         await self.publish_state()
 
     async def _maybe_reclassify_stuck_pending(self, found: object) -> None:
-        """Upgrade ``found.ci_status`` to FAILURE when CI has been PENDING too long.
-
-        PR-250 (OBS-BM): GitHub Actions occasionally registers a check-run
-        as ``queued`` or ``in_progress`` and never publishes a terminal
-        state. WATCH would otherwise poll forever; instead we track the
-        first-seen-PENDING timestamp per ``head_sha`` in Redis and, once
-        ``daemon.ci_pending_max_min`` minutes have elapsed on the same
-        SHA, rewrite the in-memory ``ci_status`` to FAILURE so the
-        existing FAILURE branch routes through ``handle_fix``. The raw
-        REST classifier is left untouched — only the daemon-side view
-        of CI is affected.
-        """
+        """Report a long pending interval without claiming a code failure."""
+        if getattr(found, "ci_status", None) != CIStatus.PENDING:
+            return
         head_sha = getattr(found, "head_sha", "") or ""
         if not head_sha:
             return
@@ -889,8 +886,9 @@ class WatchMixin:
         canonical_status = gh_checks._classify_ci_retrieval(
             retrieval,
             empty_is_success=self.repo_config.allow_merge_without_checks,
+            required_contexts=self.repo_config.required_checks,
         )
-        reclassified, reason = await gh_checks.classify_ci_status_with_age(
+        _, reason = await gh_checks.classify_ci_status_with_age(
             self.owner_repo,
             found.number,
             head_sha,
@@ -902,15 +900,17 @@ class WatchMixin:
             fetch_ok=retrieval.evidence.sources_complete,
             canonical_status=canonical_status,
         )
-        if reason != "stuck_pending":
+        if reason != "pending_overdue":
+            return
+        marker = f"ci_pending_overdue:{self.owner_repo}:{found.number}:{head_sha}"
+        if not await self.redis.set(marker, "1", nx=True, ex=7 * 24 * 60 * 60):
             return
         age_min = pending_max_seconds // 60
         sha_short = head_sha[:7]
         self.log_event(
-            f"[WATCH] PR #{found.number} CI reclassified PENDING -> FAILURE "
-            f"(stuck_pending: {age_min}min on sha {sha_short})."
+            f"[WATCH] PR #{found.number} CI still pending after "
+            f"{age_min}min on sha {sha_short}; awaiting terminal evidence."
         )
-        found.ci_status = reclassified
 
     def _observe_watch_event_signature(self, found: object) -> None:
         """Update ``_watch_last_event_at`` when polled PR signature changes.
@@ -1111,6 +1111,57 @@ class WatchMixin:
             return True, True
         elapsed = time.time() - marker_ts
         return True, elapsed >= _INFRA_RETRY_GRACE_SECONDS
+
+    async def _infra_retry_has_new_failed_attempt(self, pr_number: int, head_sha: str) -> bool:
+        """Require a newly started terminal check after the bounded rerun."""
+        if self.redis is None:
+            return False
+        raw = await self.redis.get(ci_infra_retried(self.owner_repo, pr_number, head_sha))
+        try:
+            retry_at = float(raw)
+        except (TypeError, ValueError):
+            return False
+        if retry_at < 1_000_000_000:
+            return False
+        retrieval = gh_checks._retrieve_ci_status_evidence(
+            self.owner_repo, head_sha, fresh=True,
+        )
+        if not retrieval.evidence.sources_complete or not retrieval.status_source.sha_matches:
+            return False
+        statuses = retrieval.status_payload.get("statuses", [])
+        if not isinstance(statuses, list) or any(not isinstance(item, dict) for item in statuses):
+            return False
+        evidence = evaluate_ci_evidence(
+            repo=self.owner_repo, pr_number=pr_number, sha=head_sha,
+            check_runs=retrieval.check_runs,
+            statuses=statuses,
+            check_runs_complete=retrieval.check_runs_source.complete,
+            statuses_complete=retrieval.status_source.complete,
+            required_contexts=self.repo_config.required_checks,
+            empty_is_success=self.repo_config.allow_merge_without_checks,
+        )
+        if evidence.policy_result != CIStatus.FAILURE:
+            return False
+        failures = [
+            ctx for producers in _latest(evidence.contexts).values()
+            for ctx in producers.values() if ctx.state == "failure"
+        ]
+        for ctx in failures:
+            if ctx.run_id is None or ctx.run_id[0] != "check":
+                return False
+            run = next(
+                (item for item in retrieval.check_runs if item.get("id") == ctx.run_id[1]),
+                None,
+            )
+            if not run.get("started_at"):
+                return False
+            try:
+                started = datetime.fromisoformat(str(run["started_at"]).replace("Z", "+00:00"))
+            except ValueError:
+                return False
+            if started.timestamp() <= retry_at:
+                return False
+        return True
 
     async def _handle_external_pr_resolution(
         self,

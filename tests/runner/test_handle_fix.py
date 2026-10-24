@@ -47,6 +47,21 @@ from tests.runner import _helpers as h
 claude_cli = claude_plugin_module.claude_cli
 
 
+def _admit_ci_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Supply a bound failure to tests focused on FIX prompt composition."""
+    monkeypatch.setattr(
+        fix_module, "_current_ci_failure",
+        lambda repo, number, sha, required, empty: {
+            "repo": repo, "pr_number": number, "head_sha": sha,
+            "contexts": [{
+                "name": "unit", "producer": "app:1", "source": "check",
+                "check_id": 1, "attempt": 1, "state": "failure",
+                "workflow_run_id": 2, "job_id": 3,
+            }],
+        },
+    )
+
+
 def test_ordinary_fix_prelaunch_recovers_without_approval() -> None:
     from src.models import InvocationSnapshot
 
@@ -409,6 +424,7 @@ def test_handle_fix_injects_ci_logs_when_ci_failed(
 ) -> None:
     """ci_status=FAILURE: handle_fix passes CI logs into the FIX prompt."""
     h._patch_subprocess(monkeypatch)
+    _admit_ci_failure(monkeypatch)
     monkeypatch.setattr(
         fix_module,
         "_fetch_failed_ci_logs",
@@ -435,6 +451,7 @@ def test_handle_fix_keeps_ci_diagnostic_when_logs_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
+    _admit_ci_failure(monkeypatch)
     monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda *_: None)
     captured = h._capture_fix_kwargs(monkeypatch)
     runner = h._make_runner()
@@ -443,7 +460,7 @@ def test_handle_fix_keeps_ci_diagnostic_when_logs_unavailable(
         review_status=ReviewStatus.PENDING,
     )
     asyncio.run(runner.handle_fix())
-    assert "CI failed for PR #77 on pr-019" in captured["kwargs"]["extra_context"]
+    assert "Confirmed current CI failure:" in captured["kwargs"]["extra_context"]
 
 
 def test_handle_fix_injects_review_feedback_when_changes_requested(
@@ -548,6 +565,7 @@ def test_handle_fix_injects_both_ci_logs_and_review_feedback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
+    _admit_ci_failure(monkeypatch)
     monkeypatch.setattr(
         fix_module,
         "_fetch_failed_ci_logs",
@@ -596,6 +614,7 @@ def test_ci_fix_drops_stale_review_findings_but_keeps_ci_logs(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
+    _admit_ci_failure(monkeypatch)
     monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda *_: "ci-boom")
     monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": "new-head"})
     captured = h._capture_fix_kwargs(monkeypatch)
@@ -619,6 +638,7 @@ def test_ci_fix_rejects_review_evidence_from_changed_poll_identity(
     changed: str,
 ) -> None:
     h._patch_subprocess(monkeypatch)
+    _admit_ci_failure(monkeypatch)
     monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda *_: "ci-boom")
     monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": "head"})
     captured = h._capture_fix_kwargs(monkeypatch)
@@ -652,6 +672,7 @@ def test_ci_fix_keeps_review_evidence_during_other_repo_poll(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
+    _admit_ci_failure(monkeypatch)
     monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda *_: "ci-boom")
     monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": "head"})
     captured = h._capture_fix_kwargs(monkeypatch)
@@ -3301,6 +3322,7 @@ def test_handle_fix_uses_codex_cli_when_coder_is_codex(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
+    _admit_ci_failure(monkeypatch)
     captured_module: list[str] = []
 
     async def fake_fix_review(path: str, **kwargs: object) -> tuple:
@@ -3888,115 +3910,375 @@ def test_handle_fix_normal_exit_fails_open_when_verification_fetch_fails(
 # ---------------------------------------------------------------------------
 
 
-def test_fetch_failed_ci_logs_truncates_to_last_5000_chars(
-    monkeypatch: pytest.MonkeyPatch,
+def _bound_ci_failure() -> dict:
+    return {
+        "repo": "octo/demo", "pr_number": 19, "head_sha": "a" * 40,
+        "contexts": [{
+            "name": "unit", "producer": "app:1", "source": "check",
+            "check_id": 41, "attempt": 2, "state": "failure",
+            "workflow_run_id": 12345, "job_id": 55,
+        }],
+    }
+
+
+@pytest.mark.parametrize(
+    ("latest", "complete", "live_head", "expected"),
+    [
+        ("failure", True, "a" * 40, True),
+        ("success", True, "a" * 40, False),
+        ("pending", True, "a" * 40, False),
+        ("failure", False, "a" * 40, False),
+        ("failure", True, "b" * 40, False),
+    ],
+)
+def test_current_ci_failure_uses_live_head_and_latest_complete_check(
+    monkeypatch: pytest.MonkeyPatch, latest: str, complete: bool,
+    live_head: str, expected: bool,
 ) -> None:
-    """_fetch_failed_ci_logs returns last 5000 chars prefixed with [truncated]."""
-    long_log = "X" * 6000
+    from src.github import checks as gh_checks
 
-    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
-        if args[:2] == ["run", "list"]:
-            return [{"databaseId": 12345}]
-        if args[:2] == ["run", "view"]:
-            return long_log
-        raise AssertionError(f"unexpected gh call: {args}")
-
-    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
-
-    out = fix_module._fetch_failed_ci_logs("octo/demo", "pr-019")
-
-    assert out is not None
-    assert out.startswith("[truncated]\n")
-    assert out.endswith("X" * 5000)
-    assert len(out) == len("[truncated]\n") + 5000
-
-
-def test_fetch_failed_ci_logs_short_log_returned_as_is(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    short_log = "tiny failure trace"
-
-    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
-        if args[:2] == ["run", "list"]:
-            return [{"databaseId": 12345}]
-        if args[:2] == ["run", "view"]:
-            return short_log
-        raise AssertionError(f"unexpected gh call: {args}")
-
-    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
-
-    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") == short_log
-
-
-def test_fetch_failed_ci_logs_returns_none_when_no_failed_run(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr("src.github.gh_runner.run_gh", lambda args, **kwargs: [])
-    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
-
-
-def test_fetch_failed_ci_logs_returns_none_on_non_list_runs(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(
-        "src.github.gh_runner.run_gh",
-        lambda args, **kwargs: "not a list",
+    sha = "a" * 40
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": live_head})
+    runs = [
+        {
+            "id": 41, "name": "unit", "head_sha": sha, "app": {"id": 1},
+            "status": "completed", "conclusion": "failure", "run_attempt": 1,
+            "started_at": "2026-10-24T00:00:00Z",
+            "details_url": "https://github.com/octo/demo/actions/runs/12345/job/55",
+        },
+        {
+            "id": 42, "name": "unit", "head_sha": sha, "app": {"id": 1},
+            "status": "in_progress" if latest == "pending" else "completed",
+            "conclusion": None if latest == "pending" else latest,
+            "run_attempt": 2, "started_at": "2026-10-24T00:10:00Z",
+            "details_url": "https://github.com/octo/demo/actions/runs/12345/job/56",
+        },
+    ]
+    source = gh_checks._CiSourceResult(complete, False)
+    status_source = gh_checks._CiSourceResult(True, True)
+    retrieval = gh_checks._make_ci_retrieval(
+        "octo/demo", sha, 0.0, runs,
+        {"sha": sha, "state": "pending", "statuses": []},
+        source, status_source,
     )
-    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
-
-
-def test_fetch_failed_ci_logs_returns_none_when_first_entry_not_dict(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
     monkeypatch.setattr(
-        "src.github.gh_runner.run_gh",
-        lambda args, **kwargs: ["unexpected-string"],
+        gh_checks, "_retrieve_ci_status_evidence",
+        lambda repo, head, *, fresh: retrieval if fresh else None,
     )
-    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+    result = fix_module._current_ci_failure("octo/demo", 19, sha, ("unit",), False)
+    assert (result is not None) is expected
+    if expected:
+        assert result["contexts"][0]["check_id"] == 42
+        assert result["contexts"][0]["attempt"] == 2
 
 
-def test_fetch_failed_ci_logs_returns_none_when_database_id_missing(
+def test_current_ci_failure_rejects_malformed_status_history(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from src.github import checks as gh_checks
+
+    sha = "a" * 40
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": sha})
+    retrieval = gh_checks._make_ci_retrieval(
+        "octo/demo", sha, 0.0,
+        [{"id": 1, "name": "unit", "head_sha": sha,
+          "app": {"id": 1}, "conclusion": "failure"}],
+        {"sha": sha, "state": "failure", "statuses": "malformed"},
+        gh_checks._CiSourceResult(True, False), gh_checks._CiSourceResult(True, False),
+    )
+    monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
+    assert fix_module._current_ci_failure("octo/demo", 19, sha, ("unit",), False) is None
+
+
+@pytest.mark.parametrize("case", ["obsolete", "wrong_binding", "head_changed", "incomplete"])
+def test_ci_only_obsolescence_requires_bound_complete_live_evidence(
+    monkeypatch: pytest.MonkeyPatch, case: str,
+) -> None:
+    from src.github import checks as gh_checks
+    from src.models import InvocationSnapshot
+
+    runner = h._make_runner()
+    sha = "a" * 40
+    runner.state.current_pr = PRInfo(number=19, branch="pr-019", head_sha=sha)
+    ci = {"repo": runner.owner_repo, "pr_number": 19, "head_sha": sha, "contexts": []}
+    if case == "wrong_binding":
+        ci["head_sha"] = "b" * 40
+    runner.state.active_invocation = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="run-19", attempt_index=1, phase="fix",
+        fix_trigger={"ci": ci, "review": False},
+    )
     monkeypatch.setattr(
-        "src.github.gh_runner.run_gh",
-        lambda args, **kwargs: [{"databaseId": None}],
+        fix_module.gh_prs, "get_pr_metadata",
+        lambda *a: {"head_sha": "b" * 40 if case == "head_changed" else sha},
     )
-    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+    retrieval = gh_checks._make_ci_retrieval(
+        runner.owner_repo, sha, 0.0,
+        [{"id": 1, "name": "unit", "head_sha": sha,
+          "app": {"id": 1}, "conclusion": "success"}],
+        {"sha": sha, "state": "pending", "statuses": []},
+        gh_checks._CiSourceResult(case != "incomplete", False),
+        gh_checks._CiSourceResult(True, True),
+    )
+    monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
+    assert asyncio.run(runner._ci_only_trigger_obsolete()) is (case == "obsolete")
 
 
-def test_fetch_failed_ci_logs_returns_none_when_run_view_empty(
+def test_ci_only_fix_exits_without_no_push_penalty_when_failure_resolves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
+    _admit_ci_failure(monkeypatch)
+    runner = h._make_runner()
+    monkeypatch.setattr(runner, "_ci_only_trigger_obsolete", AsyncMock(return_value=True))
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.no_push_fix_count == 0
+    assert runner.state.current_pr.fix_iteration_count == 0
+
+
+def test_obsolete_ci_no_push_releases_publication_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
+    _admit_ci_failure(monkeypatch)
+    runner = h._make_runner()
+    monkeypatch.setattr(runner, "_ci_only_trigger_obsolete", AsyncMock(return_value=True))
+    runner.state.current_task = QueueTask(
+        pr_id="PR-019", title="t", status=TaskStatus.DOING,
+        branch="pr-019", task_file="tasks/PR-019.md",
+    )
+    runner.state.current_pr = PRInfo(
+        number=19, pr_id="PR-019", branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.publication_attempt is not None
+    assert not runner.state.publication_attempt.pending
+
+
+def test_obsolete_ci_no_push_honors_stop_before_resuming_watch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_no_push_fix(monkeypatch, head_seq=lambda: "abc123")
+    _admit_ci_failure(monkeypatch)
+    runner = h._make_runner()
+
+    monkeypatch.setattr(runner, "_ci_only_trigger_obsolete", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner, "_pop_stop_request", AsyncMock(return_value=True))
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.PAUSED
+
+
+def test_obsolete_ci_failure_before_launch_does_not_dispatch_or_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(fix_module, "_current_ci_failure", lambda *args: None)
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == PipelineState.WATCH
+    assert "kwargs" not in captured
+    assert runner.state.active_invocation is None
+
+
+def test_stale_ci_failure_can_yield_to_current_review_findings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(fix_module, "_current_ci_failure", lambda *args: None)
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *args: {"head_sha": "a" * 40})
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE, review_status=ReviewStatus.CHANGES_REQUESTED,
+    )
+    runner._fix_review_feedback = "P1: current review finding"
+    runner._fix_review_head = "a" * 40
+    asyncio.run(runner.handle_fix())
+    assert "P1: current review finding" in captured["kwargs"]["extra_context"]
+    assert "Confirmed current CI failure" not in captured["kwargs"]["extra_context"]
+
+
+def test_ci_failure_superseded_after_context_fetch_skips_coder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    _admit_ci_failure(monkeypatch)
+    admitted = fix_module._current_ci_failure
+    calls = 0
+
+    def changes_after_admission(*args: object) -> dict | None:
+        nonlocal calls
+        calls += 1
+        return admitted(*args) if calls == 1 else None
+
+    monkeypatch.setattr(fix_module, "_current_ci_failure", changes_after_admission)
+    monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda *args: None)
+    captured = h._capture_fix_kwargs(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    assert calls == 2
+    assert "kwargs" not in captured
+    assert runner.state.active_invocation is None
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_guardrail_approval_without_run_accounting_defers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    runner.state.current_task = QueueTask(
+        pr_id="PR-019", title="t", status=TaskStatus.DOING,
+        branch="pr-019", task_file="tasks/PR-019.md",
+    )
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE,
+    )
+    monkeypatch.setattr(runner, "_current_approval", lambda pr: object())
+    monkeypatch.setattr(runner._metrics_store, "recent", AsyncMock(return_value=[]))
+    captured = h._capture_fix_kwargs(monkeypatch)
+    asyncio.run(runner.handle_fix())
+    assert "kwargs" not in captured
+    assert runner.state.state == PipelineState.WATCH
+
+
+@pytest.mark.parametrize(
+    ("stop_requested", "with_task"), [(False, False), (True, False), (False, True)],
+)
+def test_exact_obsolete_ci_marker_resumes_without_escalating(
+    monkeypatch: pytest.MonkeyPatch, stop_requested: bool, with_task: bool,
+) -> None:
+    posted, gh_calls = h._patch_fix_with_stdout(
+        monkeypatch, stdout="ESCALATE: OBSOLETE_CI_EVIDENCE\n",
+    )
+    _admit_ci_failure(monkeypatch)
+    runner = h._make_runner()
+    monkeypatch.setattr(runner, "_ci_only_trigger_obsolete", AsyncMock(return_value=True))
+    if with_task:
+        runner.state.current_task = QueueTask(
+            pr_id="PR-019", title="t", status=TaskStatus.DOING,
+            branch="pr-019", task_file="tasks/PR-019.md",
+        )
+    if stop_requested:
+        monkeypatch.setattr(runner, "_pop_stop_request", AsyncMock(return_value=True))
+    runner.state.current_pr = PRInfo(
+        number=19, branch="pr-019", head_sha="a" * 40,
+        ci_status=CIStatus.FAILURE,
+    )
+    asyncio.run(runner.handle_fix())
+    assert runner.state.state == (PipelineState.PAUSED if stop_requested else PipelineState.WATCH)
+    assert not runner.state.current_pr.is_escalated
+    if with_task:
+        assert runner.state.publication_attempt is not None
+        assert not runner.state.publication_attempt.pending
+    assert posted == []
+    assert not any(args[:2] == ["pr", "edit"] for args in gh_calls)
+
+
+@pytest.mark.parametrize("log", ["tiny failure trace", "X" * 6000])
+@pytest.mark.parametrize("check_attempt", [None, 2])
+def test_fetch_failed_ci_logs_only_from_bound_attempt(
+    monkeypatch: pytest.MonkeyPatch, log: str, check_attempt: int | None,
+) -> None:
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        calls.append(args)
+        if "--json" in args:
+            return {
+                "databaseId": 12345, "headSha": "a" * 40, "attempt": 2,
+                "status": "completed", "conclusion": "failure",
+                "jobs": [{"databaseId": 55, "name": "unit", "conclusion": "failure"}],
+            }
+        return log
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    failure = _bound_ci_failure()
+    failure["contexts"][0]["attempt"] = check_attempt
+    out = fix_module._fetch_failed_ci_logs("octo/demo", failure)
+    assert out == ("[truncated]\n" + "X" * 5000 if len(log) > 5000 else log)
+    assert calls[-1] == [
+        "run", "view", "12345", "--attempt", "2", "--job", "55", "--log-failed",
+    ]
+    assert all(args[:2] != ["run", "list"] for args in calls)
+
+
+@pytest.mark.parametrize("changed", ["sha", "attempt", "job", "outcome", "run"])
+def test_fetch_failed_ci_logs_rejects_obsolete_or_unrelated_run(
+    monkeypatch: pytest.MonkeyPatch, changed: str,
+) -> None:
+    metadata = {
+        "databaseId": 12345, "headSha": "a" * 40, "attempt": 2,
+        "status": "completed", "conclusion": "failure",
+        "jobs": [{"databaseId": 55, "name": "unit", "conclusion": "failure"}],
+    }
+    if changed == "sha":
+        metadata["headSha"] = "b" * 40
+    elif changed == "attempt":
+        metadata["attempt"] = 1
+    elif changed == "job":
+        metadata["jobs"][0]["databaseId"] = 56
+    elif changed == "outcome":
+        metadata["conclusion"] = "success"
+    else:
+        metadata["databaseId"] = 12346
+    calls: list[list[str]] = []
+
+    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
+        calls.append(args)
+        return metadata
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+    assert fix_module._fetch_failed_ci_logs("octo/demo", _bound_ci_failure()) is None
+    assert len(calls) == 1
+
+
+def test_fetch_failed_ci_logs_unavailable_for_bound_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unavailable(*args: object, **kwargs: object) -> None:
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", unavailable)
+    assert fix_module._fetch_failed_ci_logs("octo/demo", _bound_ci_failure()) is None
+
+
+def test_fetch_failed_ci_logs_handles_unavailable_bound_attempt_log(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fake_run_gh(args: list[str], **kwargs: Any) -> object:
-        if args[:2] == ["run", "list"]:
-            return [{"databaseId": 9}]
-        return ""
+        if "--json" in args:
+            return {
+                "databaseId": 12345, "headSha": "a" * 40, "attempt": 2,
+                "status": "completed", "conclusion": "failure",
+                "jobs": [{"databaseId": 55, "name": "unit", "conclusion": "failure"}],
+            }
+        raise RuntimeError("logs temporarily unavailable")
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
-    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
-
-
-def test_fetch_failed_ci_logs_returns_none_on_run_list_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
-        raise RuntimeError("api blew up")
-
-    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
-    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
-
-
-def test_fetch_failed_ci_logs_returns_none_on_run_view_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_run_gh(args: list[str], **kwargs: Any) -> object:
-        if args[:2] == ["run", "list"]:
-            return [{"databaseId": 9}]
-        raise RuntimeError("log fetch blew up")
-
-    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
-    assert fix_module._fetch_failed_ci_logs("octo/demo", "pr-019") is None
+    assert fix_module._fetch_failed_ci_logs("octo/demo", _bound_ci_failure()) is None
 
 
 @pytest.mark.parametrize(

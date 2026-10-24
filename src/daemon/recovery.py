@@ -8,6 +8,7 @@ Mixin methods:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -26,14 +27,20 @@ from src.cancellation import (
     safe_record_cancellation_cause,
     task_spec_content_hash,
 )
+from src.cancellation.storage import delete_cancellation_cause
 from src.daemon import git_ops
+from src.daemon.approval_commands import checkout_process_blocker
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
 from src.daemon.quarantine import (
     blocking_quarantine_labels,
 )
+from src.github import checks as gh_checks
+from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.keyspace import pipeline_state, recovery_backup_branch
+from src.inhibitor import is_work_inhibited
+from src.keyspace import control_stop, pipeline_state, recovery_backup_branch
 from src.models import (
+    CIStatus,
     PipelineState,
     PRInfo,
     PublicationMigration,
@@ -89,6 +96,126 @@ def _task_pr_sort_key(pr_id: str) -> tuple[int, int | str, str]:
 
 class RecoveryMixin:
     """State recovery on daemon startup."""
+
+    async def _recover_obsolete_ci_error(
+        self, tasks: list[QueueTask], prs: list[PRInfo],
+    ) -> bool:
+        """Resume only a proven CI-only, exact-marker escalation."""
+        saved = getattr(self, "_persisted_fix_recovery", None)
+        if saved is None and self.state.state == PipelineState.ERROR:
+            saved = self.state
+        if (
+            saved is None or saved.state != PipelineState.ERROR
+            or saved.name != self.name or saved.url != self.repo_config.url
+            or saved.current_task is None or saved.current_pr is None
+            or saved.active_invocation is None
+            or saved.user_paused or self.state.user_paused or not self.repo_config.active
+            or await self.redis.get(control_stop(self.name))
+            or checkout_process_blocker(self.repo_path)
+            or is_work_inhibited(saved, coder=None)[0]
+        ):
+            return False
+        snapshot = saved.active_invocation
+        trigger = snapshot.fix_trigger
+        task = next((t for t in tasks if t.pr_id == saved.current_task.pr_id), None)
+        if (
+            task is None or task.status not in {TaskStatus.ERROR, TaskStatus.DOING}
+            or task.branch != saved.current_task.branch
+            or task.task_file != saved.current_task.task_file
+            or not isinstance(trigger, dict) or trigger.get("review") is not False
+            or not isinstance(trigger.get("ci"), dict)
+            or snapshot.phase != "fix" or snapshot.run_id is None
+        ):
+            return False
+        pr = find_matching_open_pr(task.pr_id, task.branch, prs)
+        ci = trigger["ci"]
+        if (
+            pr is None or pr.number != saved.current_pr.number
+            or pr.head_sha != saved.current_pr.head_sha
+            or pr.is_cross_repository or pr.quarantine_labels
+            or ci.get("repo") != self.owner_repo
+            or ci.get("pr_number") != pr.number
+            or ci.get("head_sha") != pr.head_sha
+            or len(pr.head_sha) != 40
+        ):
+            return False
+        try:
+            cause = await get_cancellation_cause(
+                self.redis, self.name, task.pr_id, refresh_ttl=False,
+            )
+            run = await self._metrics_store.get(snapshot.run_id)
+            task_bytes = (Path(self.repo_path) / task.task_file).read_bytes()
+            task_hash = task_spec_content_hash(task_bytes.decode("utf-8"))
+            metadata = gh_prs.get_pr_metadata(self.owner_repo, pr.number)
+            retrieval = gh_checks._retrieve_ci_status_evidence(
+                self.owner_repo, pr.head_sha, fresh=True,
+            )
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Obsolete CI evidence unavailable: {exc}.")
+            return False
+        claim = cause.payload.get("obsolete_ci_trigger") if cause is not None else None
+        if (
+            cause is None or cause.payload.get("subsource") != "coder_escalate"
+            or cause.payload.get("reason_text") != "OBSOLETE_CI_EVIDENCE"
+            or not isinstance(claim, dict) or claim.get("ci") != ci
+            or claim.get("task_id") != task.pr_id
+            or claim.get("branch") != task.branch
+            or claim.get("run_id") != snapshot.run_id
+            or claim.get("attempt_index") != snapshot.attempt_index
+            or claim.get("fix_iteration") != snapshot.fix_iteration
+            or claim.get("task_spec_hash") != task_hash
+            or run is None or run.task_id != task.pr_id or run.repo_name != self.name
+            or run.run_id != snapshot.run_id or not run.invocations
+            or run.invocations[-1] != snapshot or run.ended_at is None
+            or run.cause_subsource != "coder_escalate"
+            or metadata.get("head_sha") != pr.head_sha
+            or not retrieval.evidence.sources_complete
+            or not retrieval.status_source.sha_matches
+        ):
+            return False
+        ci_status = gh_checks._classify_ci_retrieval(
+            retrieval,
+            required_contexts=self.repo_config.required_checks,
+            empty_is_success=self.repo_config.allow_merge_without_checks,
+        )
+        if ci_status not in {CIStatus.SUCCESS, CIStatus.PENDING}:
+            return False
+        suppression = await self._suppression_record_for_task(task.pr_id)
+        if suppression is not None and suppression.reason != SuppressionReason.CODER_ESCALATE:
+            return False
+        try:
+            self._current_run_record = run
+            if cause.payload.get("label_applied") and pr.is_escalated:
+                gh_runner.run_gh(
+                    ["pr", "edit", str(pr.number), "--remove-label", "escalated"],
+                    repo=self.owner_repo,
+                )
+            if task.status == TaskStatus.ERROR and not await self._commit_task_status_change(
+                task, "DOING", "obsolete CI-only failure recovered",
+                expected_task_sha256=hashlib.sha256(task_bytes).hexdigest(),
+            ):
+                return False
+            # Keep the exact cause until every earlier cleanup step succeeds.
+            # A restart can then finish cleanup after the header became DOING.
+            if suppression is not None:
+                await self._clear_task_suppression(task.pr_id)
+            else:
+                await delete_cancellation_cause(self.redis, self.name, task.pr_id)
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Obsolete CI cleanup deferred: {exc}.")
+            return False
+        resumed = task.model_copy(update={"status": TaskStatus.DOING})
+        tasks[tasks.index(task)] = resumed
+        pr.is_escalated = False
+        self.state.current_task = resumed
+        self.state.current_pr = pr
+        self.state.active_invocation = snapshot
+        self.state.state = PipelineState.WATCH
+        self.state.error_message = None
+        self._current_run_record = run
+        self._rehydrate_last_push_at(pr)
+        self.log_event(f"[RECOVERY] Obsolete CI-only condition cleared for PR #{pr.number}; resuming WATCH.")
+        return True
 
     async def _consume_publication_migration_command(self) -> bool:
         """Apply one exact operator trust anchor; never authorize merge itself."""
@@ -657,6 +784,7 @@ class RecoveryMixin:
                     and (
                         persisted.state == PipelineState.FIX
                         or (persisted.error_message or "").startswith("FIX idle timeout")
+                        or persisted.active_invocation.fix_trigger is not None
                     )
                 )
             )
@@ -1013,6 +1141,23 @@ class RecoveryMixin:
                 # Preserve the published PR even if Redis is temporarily
                 # unavailable. Admission still requires its timeout cause.
                 return task, pr
+            saved = getattr(self, "_persisted_fix_recovery", None)
+            if (
+                pr is not None and saved is not None
+                and saved.state == PipelineState.ERROR
+                and saved.current_task is not None
+                and saved.current_task.pr_id == task.pr_id
+                and saved.active_invocation is not None
+                and isinstance(saved.active_invocation.fix_trigger, dict)
+                and isinstance(saved.active_invocation.fix_trigger.get("ci"), dict)
+                and (cause := await get_cancellation_cause(
+                    self.redis, self.name, task.pr_id, refresh_ttl=False,
+                )) is not None
+                and cause.payload.get("subsource") == "coder_escalate"
+                and cause.payload.get("reason_text") == "OBSOLETE_CI_EVIDENCE"
+                and isinstance(cause.payload.get("obsolete_ci_trigger"), dict)
+            ):
+                return task, pr
             if pr is not None and (
                 header.blocked_reason in {
                     SuppressionReason.GUARDRAIL.value,
@@ -1067,6 +1212,8 @@ class RecoveryMixin:
             sum(1 for t in tasks if t.status == TaskStatus.DONE),
             len(tasks),
         )
+        if await self._recover_obsolete_ci_error(tasks, prs):
+            return
         await self._rehydrate_quarantines_from_labels(prs)
 
         if self.repo_config.feature_flags.use_single_error_exit:
@@ -1086,6 +1233,21 @@ class RecoveryMixin:
                     # The completion receipt is checked against the bound
                     # run and remote header below. Do not add a new CRASH
                     # suppression that would defeat its pending TODO retry.
+                    continue
+                if (
+                    saved_fix is not None and saved_fix.state == PipelineState.ERROR
+                    and saved_fix.current_task is not None
+                    and saved_fix.current_task.pr_id == queued.pr_id
+                    and saved_fix.active_invocation is not None
+                    and isinstance(saved_fix.active_invocation.fix_trigger, dict)
+                    and isinstance(saved_fix.active_invocation.fix_trigger.get("ci"), dict)
+                    and (saved_cause := await get_cancellation_cause(
+                        self.redis, self.name, queued.pr_id, refresh_ttl=False,
+                    )) is not None
+                    and saved_cause.payload.get("subsource") == "coder_escalate"
+                    and saved_cause.payload.get("reason_text") == "OBSOLETE_CI_EVIDENCE"
+                    and isinstance(saved_cause.payload.get("obsolete_ci_trigger"), dict)
+                ):
                     continue
                 record = await self._suppression_record_for_task(queued.pr_id)
                 if record is None:
@@ -1494,6 +1656,15 @@ class RecoveryMixin:
                     and header is not None
                     and header.blocked_reason == SuppressionReason.REVIEW_TIMEOUT.value
                     else "Published task failure unresolved; operator Retry or revised approval required."
+                ),
+                "active_invocation": (
+                    self._persisted_fix_recovery.active_invocation
+                    if (
+                        getattr(self, "_persisted_fix_recovery", None) is not None
+                        and self._persisted_fix_recovery.current_task is not None
+                        and self._persisted_fix_recovery.current_task.pr_id == task.pr_id
+                    )
+                    else self.state.active_invocation
                 ),
             })
             if (

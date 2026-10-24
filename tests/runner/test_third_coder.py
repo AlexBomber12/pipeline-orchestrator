@@ -48,6 +48,17 @@ from src.usage import UsageSnapshot
 from tests.runner import _helpers as h
 
 
+def _admit_test_ci(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.daemon.handlers.fix._current_ci_failure",
+        lambda repo, number, sha, required, empty: {
+            "repo": repo, "pr_number": number, "head_sha": sha,
+            "contexts": [{"name": "unit", "check_id": 1, "attempt": 1,
+                          "state": "failure", "workflow_run_id": None, "job_id": None}],
+        },
+    )
+
+
 class FakeCoderPlugin:
     """Third coder implementing the full ``CoderPlugin`` Protocol.
 
@@ -237,6 +248,7 @@ def test_handle_fix_dispatches_to_fake_plugin(
     applicable). No breach kwargs from the Claude path may leak.
     """
     h._patch_subprocess(monkeypatch)
+    _admit_test_ci(monkeypatch)
     fake = FakeCoderPlugin()
     monkeypatch.setattr(
         "src.github.comments.post_comment",
@@ -285,6 +297,7 @@ def test_configured_plugin_reaches_normal_coding_and_fix_dispatch(
 ) -> None:
     """A module:factory plugin is selected without patching runner selection."""
     h._patch_subprocess(monkeypatch)
+    _admit_test_ci(monkeypatch)
     opened_pr = PRInfo(
         number=42,
         branch="pr-901",
@@ -792,6 +805,7 @@ def test_handle_fix_handler_keys_override_plugin_kwargs(
     a plugin that emits the same key cannot be allowed to overwrite it.
     """
     h._patch_subprocess(monkeypatch)
+    _admit_test_ci(monkeypatch)
     fake = _OverridingPlugin()
     monkeypatch.setattr(
         "src.github.comments.post_comment",

@@ -91,6 +91,14 @@ async def _published_coding_runner(
 
 async def _watch_requires_fix(runner, pr, monkeypatch: pytest.MonkeyPatch) -> None:
     pr.ci_status = CIStatus.FAILURE
+    monkeypatch.setattr(
+        "src.daemon.handlers.fix._current_ci_failure",
+        lambda repo, number, sha, required, empty: {
+            "repo": repo, "pr_number": number, "head_sha": sha,
+            "contexts": [{"name": "unit", "check_id": 1, "attempt": 1,
+                          "state": "failure", "workflow_run_id": None, "job_id": None}],
+        },
+    )
     monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_a, **_k: [pr])
     monkeypatch.setattr(gh_prs, "get_pr_state", lambda *_a: "OPEN")
     monkeypatch.setattr(runner, "_approval_filtered_pr", lambda found: found)

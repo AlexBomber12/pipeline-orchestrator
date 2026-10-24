@@ -634,6 +634,7 @@ def test_capture_invocation_snapshot_is_allowlisted_and_immutable() -> None:
         "attempt_index",
         "phase",
         "fix_iteration",
+            "fix_trigger",
     }
 
     fix = runner._capture_invocation_snapshot(

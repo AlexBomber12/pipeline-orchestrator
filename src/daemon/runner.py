@@ -1345,6 +1345,7 @@ class PipelineRunner(
         *,
         phase: Literal["coding", "fix"],
         fix_iteration: int | None = None,
+        fix_trigger: dict | None = None,
     ) -> InvocationSnapshot:
         """Capture the allowlisted settings passed to a primary invocation."""
         record = self._current_run_record
@@ -1360,6 +1361,7 @@ class PipelineRunner(
             attempt_index=record.attempt_index if record is not None else None,
             phase=phase,
             fix_iteration=fix_iteration,
+            fix_trigger=fix_trigger,
         )
         self.state.active_invocation = snapshot
         if record is not None:
@@ -2459,6 +2461,32 @@ class PipelineRunner(
 
     async def _handle_single_error_exit(self) -> None:
         """Feature-flagged ERROR dispatcher with one visible exit per cycle."""
+        task = self.state.current_task
+        snapshot = self.state.active_invocation
+        if (
+            task is not None and snapshot is not None
+            and isinstance(snapshot.fix_trigger, dict)
+            and isinstance(snapshot.fix_trigger.get("ci"), dict)
+        ):
+            try:
+                cause = await get_cancellation_cause(
+                    self.redis, self.name, task.pr_id, refresh_ttl=False,
+                )
+                if (
+                    cause is not None
+                    and cause.payload.get("subsource") == "coder_escalate"
+                    and cause.payload.get("reason_text") == "OBSOLETE_CI_EVIDENCE"
+                    and isinstance(cause.payload.get("obsolete_ci_trigger"), dict)
+                ):
+                    tasks = self._parse_tasks_from_headers()
+                    prs = gh_prs.get_open_prs(
+                        self.owner_repo,
+                        allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                    )
+                    if tasks is not None and await self._recover_obsolete_ci_error(tasks, prs):
+                        return
+            except Exception as exc:
+                self.log_event(f"[RECOVERY] Obsolete CI observation deferred: {exc}.")
         if self.state.rate_limited_until is not None:
             self.state.state = PipelineState.PAUSED
             self.log_event(

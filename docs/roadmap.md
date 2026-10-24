@@ -307,7 +307,7 @@ Sprint 13/13.5/14 implementation verified and closed 2026-05-04. Below items tra
 - OBS-BJ (DONE list reverse chronological sort): **STILL OPEN** — Sprint 15b polish bucket.
 - OBS-BK (WATCH→FIX trigger logic short-circuits when CI is PENDING): **CLOSED 2026-05-04** — PR-248 shipped: CHANGES_REQUESTED elif moved before PENDING in watch.py elif chain.
 - OBS-BL (WATCH↔HUNG escalation loop without circuit breaker): **CLOSED 2026-05-04** — PR-249 shipped: watch_retrigger_cap default 3 in config + hung.py implementation.
-- OBS-BM (long CI PENDING duration without classification): **CLOSED 2026-05-04** — PR-250 shipped: ci_pending_max_min default 30 in config + watch.py reclassification logic.
+- OBS-BM (long CI PENDING duration without classification): PR-250 introduced a 30-minute age threshold. The later CI waiting repair uses that threshold only for an overdue observation; queued, waiting, and running checks remain PENDING until GitHub reports a terminal result. Elapsed time cannot send work to FIX.
 - OBS-BN (duplicate @codex review post on PR creation, same-second timestamp race): **CLOSED 2026-05-04** — PR-239 shipped: comments.py uses strict-less-than instead of strict-less-or-equal for timestamp comparison; same-second comments now correctly counted in dedup window.
 
 ### New OBS items (added 2026-05-04 from production session)
