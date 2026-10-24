@@ -279,7 +279,7 @@ a `payload.subsource` field carrying forensic detail:
 | `crash` | Daemon process died mid-operation |
 | `coder_escalate` | Coder stdout contained explicit ESCALATE: marker |
 | `guardrail` | Tier 1/2 guardrail violation in coder stdout or PR diff |
-| `review_timeout` | WATCH cycle exceeded review_timeout_min without new Codex feedback |
+| `review_timeout` | Legacy WATCH timeout failure; retained records can resume when fresh, bound Codex results arrive |
 | `fix_idle_timeout` | FIX cycle exceeded fix_idle_timeout_sec without push |
 | `fix_iteration_cap` | FIX cycle exceeded fix_iteration_cap iterations |
 | `no_push_deadlock` | Coder claimed fix without git push |

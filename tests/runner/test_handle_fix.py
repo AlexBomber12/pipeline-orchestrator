@@ -5227,45 +5227,10 @@ def test_terminate_current_coder_uses_configured_grace(
     assert runner._current_coder_supervised_process is None
 
 
-def test_maybe_retrigger_stale_review_returns_without_current_pr() -> None:
-    runner = h._make_runner()
-
-    asyncio.run(runner._maybe_retrigger_stale_review(42))
-
-    assert runner.state.last_stale_retrigger_at is None
 
 
-def test_maybe_retrigger_stale_review_returns_for_non_changes_requested() -> None:
-    runner = h._make_runner()
-    runner.state.current_pr = PRInfo(
-        number=42,
-        branch="pr-042-fix",
-        review_status=ReviewStatus.APPROVED,
-    )
-
-    asyncio.run(runner._maybe_retrigger_stale_review(42))
-
-    assert runner.state.last_stale_retrigger_at is None
 
 
-def test_maybe_retrigger_stale_review_returns_for_missing_push_age(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = h._make_runner()
-    runner.state.current_pr = PRInfo(
-        number=42,
-        branch="pr-042-fix",
-        review_status=ReviewStatus.CHANGES_REQUESTED,
-    )
-
-    monkeypatch.setattr(
-        "src.github.prs.get_last_push_age_seconds",
-        lambda repo, number: None,
-    )
-
-    asyncio.run(runner._maybe_retrigger_stale_review(42))
-
-    assert runner.state.last_stale_retrigger_at is None
 
 
 def test_rehydrate_last_push_at_from_publication(

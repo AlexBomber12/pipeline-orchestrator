@@ -308,10 +308,10 @@ def test_infra_failure_detector_writes_infra_failure_subsource() -> None:
     assert "infra_failure" in DOCUMENTED_SUBSOURCES
 
 
-def test_review_timeout_detector_writes_review_timeout_subsource(
+def test_review_wait_no_longer_writes_review_timeout_subsource(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The WATCH review-timeout path emits ``subsource="review_timeout"``."""
+    """Elapsed review waiting retains publication ownership in WATCH."""
     captured = _captured_safe_record(monkeypatch)
     stale = datetime.now(timezone.utc) - timedelta(minutes=90)
     pr = PRInfo(
@@ -338,9 +338,8 @@ def test_review_timeout_detector_writes_review_timeout_subsource(
     review_writes = [
         c for c in captured if c.payload.get("subsource") == "review_timeout"
     ]
-    assert len(review_writes) == 1
-    assert review_writes[0].category == "ERROR"
-    assert review_writes[0].payload["previous_state"] == "WATCH"
+    assert review_writes == []
+    assert runner.state.state == PipelineState.WATCH
     assert "review_timeout" in DOCUMENTED_SUBSOURCES
 
 

@@ -72,15 +72,27 @@ respond in the first minutes, so fast polling there wastes GitHub quota);
 past the window, `watch_fast_poll_interval_sec` takes over because a verdict
 may arrive at any second.
 
-### Stale review re-trigger
+### Review reminders
 
-WATCH can detect that a review request has gone unanswered too long. When
-`review_status` is `CHANGES_REQUESTED` and no new Codex feedback has appeared
-within `stale_review_threshold_min` of the last push, or `review_status` is
-`EYES` and `stale_review_threshold_eyes_min` has elapsed,
-`_maybe_retrigger_stale_review` re-posts `@codex review` on the PR. This is a
-silent, dedup-aware operation; the daemon stays in `WATCH` and the dashboard
-continues to show `WATCH`.
+WATCH uses `review_timeout_min` for one review-specific reminder interval
+(10 minutes by default). A repository override takes precedence over the
+daemon value. The clock starts at an explicit `@codex review` request for the
+current publication or a fresh trusted Codex EYES receipt. PR `updatedAt`,
+CI activity, and commit dates do not move the clock. EYES is receipt, not
+approval. A valid approval needs no reminder while CI continues.
+
+Automatic attempts share the persisted PR, HEAD, and task-generation identity,
+cooldown, and `watch_retrigger_cap` budget (default 3). A transport failure
+consumes an attempt conservatively; the next poll reconciles GitHub comments
+before another attempt. After the budget is exhausted, WATCH reports the
+overdue condition once and keeps observing. Late approval or fresh actionable
+feedback proceeds through the ordinary merge or FIX gates.
+
+`stale_review_threshold_min`, `stale_review_threshold_eyes_min`, and
+`hung_fallback_codex_review` remain parseable for older configuration files but
+no longer schedule requests. Existing installations with an explicit
+`review_timeout_min: 20` continue to use 20 minutes; change that value to 10
+to adopt the new default. No Redis reset is needed at deployment.
 
 ## ERROR state details
 

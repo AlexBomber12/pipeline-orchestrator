@@ -49,7 +49,7 @@
                 <span class="text-xs text-gray-500">FIX time budget, reset on each successful push.</span>
             </label>
             <label class="flex flex-col gap-1 text-sm cursor-pointer">
-                <span class="text-gray-400">Default review timeout (minutes)</span>
+                <span class="text-gray-400">Review reminder interval (minutes)</span>
                 <input type="number"
                        name="review_timeout_min"
                        value="{{ daemon.review_timeout_min }}"
@@ -59,7 +59,7 @@
                        hx-trigger="change"
                        hx-target="#settings-daemon"
                        hx-swap="innerHTML">
-                <span class="text-xs text-gray-500">Minutes to wait for review before the PR moves to HUNG.</span>
+                <span class="text-xs text-gray-500">Minutes between automatic review requests. The daemon keeps observing after the reminder budget is exhausted.</span>
             </label>
         </div>
     </section>
@@ -84,22 +84,6 @@
                 <span>
                     <span class="text-gray-200">Auto fallback across eligible coders</span>
                     <span class="block text-xs text-gray-500">Switch to another eligible coder when the preferred one is unavailable.</span>
-                </span>
-            </label>
-            <label class="flex items-start gap-3 text-sm cursor-pointer">
-                <input type="checkbox"
-                       name="hung_fallback_codex_review"
-                       value="true"
-                       {% if daemon.hung_fallback_codex_review %}checked{% endif %}
-                       class="accent-accent mt-1"
-                       hx-put="/settings/daemon"
-                       hx-trigger="change"
-                       hx-target="#settings-daemon"
-                       hx-swap="innerHTML"
-                       hx-vals='{"hung_fallback_codex_review": "{{ "false" if daemon.hung_fallback_codex_review else "true" }}"}'>
-                <span>
-                    <span class="text-gray-200">HUNG fallback: post <span class="font-mono">@codex review</span></span>
-                    <span class="block text-xs text-gray-500">Re-post the review trigger when a PR times out waiting for Codex.</span>
                 </span>
             </label>
             <label class="flex items-start gap-3 text-sm cursor-pointer">
