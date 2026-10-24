@@ -2205,6 +2205,26 @@ def test_watch_recovery_restores_current_head_reminder_budget(
     assert runner.state.review_post_attempted_at == saved.review_post_attempted_at
 
 
+@pytest.mark.parametrize("change", ["changed_generation", "missing_task_file"])
+def test_watch_recovery_rejects_unverified_task_generation(
+    tmp_path: Path, change: str,
+) -> None:
+    runner = h._make_runner()
+    task, pr, saved = _saved_review_state(runner, tmp_path, error=False)
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
+    task_path = tmp_path / "tasks/PR-405.md"
+    if change == "changed_generation":
+        task_path.write_text("# PR-405 changed\nBranch: pr-405\n", encoding="utf-8")
+    else:
+        task_path.unlink()
+    runner._recovery_task_headers = {}
+    runner._rehydrate_last_push_at = lambda *_args: None
+    assert asyncio.run(runner._hydrate_current_task_from_persisted_state()) is True
+    asyncio.run(runner._apply_recovery_decisions([task], [pr]))
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.review_reminder_count == 0
+
+
 @pytest.mark.parametrize("single_error_exit", [False, True])
 def test_legacy_review_timeout_recovery_keeps_bound_pr(
     tmp_path: Path, single_error_exit: bool,
