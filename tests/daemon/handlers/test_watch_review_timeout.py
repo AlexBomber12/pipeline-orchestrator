@@ -381,6 +381,68 @@ def test_unconfirmed_initial_attempt_waits_for_history_and_cap(
     assert runner.state.review_reminder_count == runner.app_config.daemon.watch_retrigger_cap
 
 
+@pytest.mark.parametrize(
+    "history", ["publication_missing", "unavailable", "confirmed", "absent"]
+)
+def test_post_helper_reconciles_ambiguous_initial_delivery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, history: str,
+) -> None:
+    from src.daemon.handlers import hung as hung_module
+
+    runner = _runner(tmp_path, monkeypatch)
+    monkeypatch.setattr(hung_module, "datetime", FrozenDateTime)
+    runner.state.review_request_pr = 5
+    runner.state.review_request_head = HEAD
+    runner.state.review_post_attempted_at = NOW - timedelta(minutes=20)
+    monkeypatch.setattr(hung_module.git_ops, "_git", lambda *_a: SimpleNamespace(stdout=HEAD))
+    monkeypatch.setattr(hung_module.gh_prs, "get_pr_metadata", lambda *_a: {"author": "author"})
+    monkeypatch.setattr(hung_module.gh_prs, "get_pr_head_publication", lambda *_a, **_k: (
+        SimpleNamespace(published_at=NOW - timedelta(minutes=30), unknown_reason=None)
+    ))
+    runner._validate_publication_observation = lambda *_a, **_k: (
+        None if history == "publication_missing" else NOW - timedelta(minutes=30),
+        None,
+    )
+
+    def comments(*_a, **_k):
+        if history == "unavailable":
+            raise RuntimeError("GitHub unavailable")
+        return NOW - timedelta(minutes=5) if history == "confirmed" else None
+
+    monkeypatch.setattr(hung_module.gh_comments, "latest_codex_review_request_time", comments)
+    posted: list[str] = []
+    monkeypatch.setattr(hung_module.gh_comments, "post_comment", lambda _r, _n, body: posted.append(body))
+    result = runner._post_codex_review_result(5, bypass_author_dedup=True)
+    assert result[:2] == (True, history == "absent")
+    assert posted == (["@codex review"] if history == "absent" else [])
+    if history == "confirmed":
+        assert runner.state.review_requested_at == NOW - timedelta(minutes=5)
+    elif history == "absent":
+        assert runner.state.review_requested_at == NOW
+    else:
+        assert runner.state.review_requested_at is None
+
+
+def test_post_helper_handles_missing_task_file_without_inheriting_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.daemon.handlers import hung as hung_module
+
+    runner = _runner(tmp_path, monkeypatch)
+    (tmp_path / "tasks/PR-005.md").unlink()
+    monkeypatch.setattr(hung_module.git_ops, "_git", lambda *_a: SimpleNamespace(stdout=HEAD))
+    monkeypatch.setattr(hung_module.gh_prs, "get_pr_metadata", lambda *_a: {})
+    monkeypatch.setattr(hung_module.gh_prs, "get_pr_head_publication", lambda *_a, **_k: (
+        SimpleNamespace(published_at=None, unknown_reason="unavailable")
+    ))
+    runner._validate_publication_observation = lambda *_a, **_k: (None, "unavailable")
+    posted: list[str] = []
+    monkeypatch.setattr(hung_module.gh_comments, "post_comment", lambda _r, _n, body: posted.append(body))
+    assert runner._post_codex_review_result(5, bypass_author_dedup=True)[:2] == (True, True)
+    assert runner.state.review_request_generation == ""
+    assert posted == ["@codex review"]
+
+
 @pytest.mark.parametrize("single_error_exit", [False, True])
 def test_legacy_timeout_resumes_for_late_approval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, single_error_exit: bool,
