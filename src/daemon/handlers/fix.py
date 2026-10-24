@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import subprocess
 import uuid
 from datetime import datetime, timezone
@@ -28,6 +27,13 @@ from src.daemon.approval_commands import (
     bound_checkout_work_blocker_for_ref,
     checkout_process_blocker,
 )
+from src.daemon.ci_attempts import (
+    actions_job_identity,
+    attempt_scope,
+    canonical_ci_incident,
+    matching_failed_job,
+    read_actions_run,
+)
 from src.daemon.guardrails import scan_stdout
 from src.daemon.handlers.breach import BreachMixin
 from src.daemon.quarantine import (
@@ -50,7 +56,6 @@ logger = logging.getLogger(__name__)
 
 _FIX_CI_LOG_TRUNCATE_CHARS = 5000
 _GITHUB_ACTIONS_APP_ID = 15368
-_FAILED_ACTIONS_OUTCOMES = {"failure", "timed_out", "action_required", "cancelled"}
 
 
 def _current_ci_failure(
@@ -134,19 +139,14 @@ def _current_ci_failure(
     for ctx in failures:
         source, identity = ctx.run_id or (None, None)
         run = next((r for r in retrieval.check_runs if source == "check" and r.get("id") == identity), None)
-        url = str(run.get("details_url") or "") if run else ""
-        match = re.fullmatch(
-            rf"https://github\.com/{re.escape(repo)}/actions/runs/(\d+)/job/(\d+)", url,
-        ) if source == "check" else None
-        if source == "check" and (
-            match is None or identity != int(match.group(2))
-        ):
+        job_identity = actions_job_identity(repo, run) if source == "check" and run else None
+        if source == "check" and job_identity is None:
             continue
         context = {
             "name": ctx.name, "producer": ctx.producer, "source": source,
             "check_id": identity, "attempt": ctx.attempt, "state": ctx.state,
-            "workflow_run_id": int(match.group(1)) if match else None,
-            "job_id": int(match.group(2)) if match else None,
+            "workflow_run_id": job_identity[0] if job_identity else None,
+            "job_id": job_identity[1] if job_identity else None,
         }
         if source == "check":
             workflow = _current_failed_actions_job(repo, sha, context, observed_attempts)
@@ -168,41 +168,20 @@ def _current_failed_actions_job(
     job_id = context.get("job_id")
     if not isinstance(run_id, int) or not isinstance(job_id, int):
         return None
-    try:
-        run = gh_runner.run_gh(
-            ["run", "view", str(run_id), "--json", "databaseId,headSha,attempt,status,conclusion,jobs"],
-            repo=repo,
-        )
-    except (RuntimeError, subprocess.TimeoutExpired, OSError):
+    run = read_actions_run(repo, sha, run_id, observed_attempts)
+    if run is None:
         return None
-    if not isinstance(run, dict) or run.get("databaseId") != run_id or run.get("headSha") != sha:
-        return None
-    attempt = run.get("attempt")
-    if not isinstance(attempt, int) or attempt < 1:
-        return None
-    if observed_attempts is not None:
-        observed_attempts[run_id] = max(attempt, observed_attempts.get(run_id, 0))
-        if observed_attempts[run_id] != attempt:
-            return None
+    attempt = run["attempt"]
     if context.get("attempt") is not None and context["attempt"] != attempt:
         return None
-    jobs = run.get("jobs")
-    if (
-        run.get("status") != "completed"
-        or run.get("conclusion") not in _FAILED_ACTIONS_OUTCOMES
-        or not isinstance(jobs, list)
-        or not any(
-            isinstance(job, dict) and job.get("databaseId") == job_id
-            and job.get("name") == context.get("name")
-            and job.get("conclusion") in _FAILED_ACTIONS_OUTCOMES
-            for job in jobs
-        )
-    ):
+    if not matching_failed_job(run, job_id, context.get("name")):
         return None
     return run
 
 
-def _fetch_failed_ci_logs(repo: str, failure: dict) -> str | None:
+def _fetch_failed_ci_logs(
+    repo: str, failure: dict, observed_attempts: dict[str, int] | None = None,
+) -> str | None:
     """Read logs only for a workflow job matching admitted CI evidence."""
     sha = failure.get("head_sha")
     for context in failure.get("contexts", []):
@@ -211,7 +190,7 @@ def _fetch_failed_ci_logs(repo: str, failure: dict) -> str | None:
         if not isinstance(run_id, int) or not isinstance(job_id, int):
             continue
         run = _current_failed_actions_job(
-            repo, sha, context, failure.setdefault("_observed_attempts", {}),
+            repo, sha, context, observed_attempts,
         )
         if run is None:
             continue
@@ -484,6 +463,7 @@ class FixMixin(BreachMixin):
         review_feedback: str | None = None,
         review_limitation: str | None = None,
         ci_failure: dict | None = None,
+        observed_attempts: dict[str, int] | None = None,
     ) -> str | None:
         """Compose CI failure logs + latest review feedback for the FIX prompt.
 
@@ -510,7 +490,7 @@ class FixMixin(BreachMixin):
                     "ESCALATE: OBSOLETE_CI_EVIDENCE."
                 )
             ci_logs = await asyncio.to_thread(
-                _fetch_failed_ci_logs, self.owner_repo, ci_failure
+                _fetch_failed_ci_logs, self.owner_repo, ci_failure, observed_attempts
             )
             if ci_logs:
                 sections.append(
@@ -586,7 +566,18 @@ class FixMixin(BreachMixin):
             self.state.state = PipelineState.WATCH
             return
 
+        state_before_fix = self.state.state
         self.state.state = PipelineState.FIX
+
+        async def persist_attempts() -> None:
+            # Observation reads precede coder ownership. Keep the persisted
+            # phase at its pre-dispatch value until the invocation checkpoint.
+            self.state.state = state_before_fix
+            try:
+                await self.publish_state()
+            finally:
+                self.state.state = PipelineState.FIX
+
         current_pr = self.state.current_pr
         if review_origin is not None and current_pr is not None:
             from src.github import reviews as gh_reviews
@@ -601,6 +592,10 @@ class FixMixin(BreachMixin):
                 review_feedback = None
                 review_limitation = "status-poll review identity changed before dispatch"
         ci_failure = None
+        observed_attempts = (
+            attempt_scope(self.state, self.owner_repo, self.repo_path, current_pr)
+            if current_pr is not None else None
+        )
         approval_candidate = (
             self._current_approval(current_pr) if current_pr is not None else None
         )
@@ -608,12 +603,16 @@ class FixMixin(BreachMixin):
             current_pr is not None and current_pr.ci_status == CIStatus.FAILURE
             and approval_candidate is None
         ):
-            ci_failure = await asyncio.to_thread(
-                _current_ci_failure, self.owner_repo, current_pr.number,
-                current_pr.head_sha, self.repo_config.required_checks,
-                self.repo_config.allow_merge_without_checks,
-                self.repo_config.ci_fix_trusted_statuses,
-            )
+            if self.state.current_task is None or observed_attempts is not None:
+                ci_failure = await asyncio.to_thread(
+                    _current_ci_failure, self.owner_repo, current_pr.number,
+                    current_pr.head_sha, self.repo_config.required_checks,
+                    self.repo_config.allow_merge_without_checks,
+                    self.repo_config.ci_fix_trusted_statuses,
+                    observed_attempts,
+                )
+            if observed_attempts is not None:
+                await persist_attempts()
             if ci_failure is None:
                 if not (review_feedback and review_head == current_pr.head_sha):
                     self.log_event("[FIX] CI failure no longer actionable; returning to WATCH.")
@@ -907,7 +906,10 @@ class FixMixin(BreachMixin):
                 review_feedback=admitted_feedback,
                 review_limitation=review_limitation,
                 ci_failure=ci_failure,
+                observed_attempts=observed_attempts,
             )
+            if ci_failure is not None and observed_attempts is not None:
+                await persist_attempts()
             if extra_context is not None:
                 fix_kwargs["extra_context"] = extra_context
             if review_feedback and self.state.current_pr.ci_status != CIStatus.FAILURE:
@@ -923,18 +925,16 @@ class FixMixin(BreachMixin):
                     self.state.state = PipelineState.WATCH
                     return
             if ci_failure is not None:
-                observed_attempts = ci_failure.get("_observed_attempts", {})
                 latest_failure = await asyncio.to_thread(
                     _current_ci_failure, self.owner_repo, self.state.current_pr.number,
                     self.state.current_pr.head_sha, self.repo_config.required_checks,
                     self.repo_config.allow_merge_without_checks,
                     self.repo_config.ci_fix_trusted_statuses,
-                    *([observed_attempts] if observed_attempts else []),
+                    observed_attempts,
                 )
-                admitted_failure = {
-                    key: value for key, value in ci_failure.items()
-                    if key != "_observed_attempts"
-                }
+                if observed_attempts is not None:
+                    await persist_attempts()
+                admitted_failure = canonical_ci_incident(ci_failure)
                 if latest_failure != admitted_failure:
                     if admitted_feedback:
                         metadata = await asyncio.to_thread(
@@ -1026,7 +1026,10 @@ class FixMixin(BreachMixin):
                     fix_kwargs,
                     phase="fix",
                     fix_iteration=fix_iteration,
-                    fix_trigger={"ci": ci_failure, "review": bool(admitted_feedback)},
+                    fix_trigger={
+                        "ci": canonical_ci_incident(ci_failure) if ci_failure else None,
+                        "review": bool(admitted_feedback),
+                    },
                 )
                 if run_record is not None:
                     await self._checkpoint_current_run_record()
@@ -1425,7 +1428,7 @@ class FixMixin(BreachMixin):
             trigger = snapshot.fix_trigger if snapshot is not None else None
             obsolete_ci_claim = (
                 {
-                    "ci": trigger["ci"],
+                    "ci": canonical_ci_incident(trigger["ci"]),
                     "task_id": self.state.current_task.pr_id,
                     "branch": self.state.current_pr.branch,
                     "run_id": snapshot.run_id,

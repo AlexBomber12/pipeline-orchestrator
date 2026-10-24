@@ -2872,6 +2872,8 @@ def test_header_merge_recovery_prioritizes_unfinished_attempt(
     "case",
     ["success", "success_live", "success_live_stale_startup",
      "success_default_dispatch", "stale_coder_checkout",
+     "legacy_observations", "cause_delete_ack_lost_default_dispatch",
+     "cause_delete_ack_lost_single_dispatch", "cause_delete_ack_lost_restart",
      "suppression_disappeared", "identity_changed",
      "provider_unavailable", "incomplete_evidence", "still_failed",
      "still_failed_default_dispatch", "wrong_run_cause",
@@ -2912,6 +2914,8 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
         "run_id": snapshot.run_id, "attempt_index": 1,
         "fix_iteration": 1, "task_spec_hash": task_hash,
     }
+    if case == "legacy_observations":
+        claim["ci"] = dict(ci, _observed_attempts={"99": 2})
     runner.state.current_task = task
     runner.state.current_pr = pr
     runner.state.active_invocation = snapshot
@@ -3040,6 +3044,18 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
             await original_clear(task_id)
 
         monkeypatch.setattr(runner, "_clear_task_suppression", flaky_clear)
+    elif case.startswith("cause_delete_ack_lost"):
+        original_clear = runner._clear_task_suppression
+        clear_count = 0
+
+        async def lost_ack(task_id: str) -> None:
+            nonlocal clear_count
+            await original_clear(task_id)
+            clear_count += 1
+            if clear_count == 1:
+                raise RuntimeError("clear acknowledgement lost")
+
+        monkeypatch.setattr(runner, "_clear_task_suppression", lost_ack)
     elif case == "continuation_corrupt":
         import uuid
 
@@ -3056,6 +3072,7 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
         )
 
     if case not in {"success", "success_live", "success_live_stale_startup",
+                    "legacy_observations",
                     "success_default_dispatch",
                     "stale_coder_checkout",
                     "suppression_disappeared"}:
@@ -3063,7 +3080,11 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
         assert runner.state.state == (
             PipelineState.WATCH if case == "different_live_hold" else PipelineState.ERROR
         )
-        assert write.await_count == (1 if case in {"status_write_failed", "cleanup_failed"} else 0)
+        assert write.await_count == (1 if case in {
+            "status_write_failed", "cleanup_failed",
+            "cause_delete_ack_lost_default_dispatch", "cause_delete_ack_lost_single_dispatch",
+            "cause_delete_ack_lost_restart",
+        } else 0)
         if case == "cleanup_failed":
             assert asyncio.run(runner._suppression_record_for_task(task.pr_id)) is not None
             resumed = task.model_copy(update={"status": TaskStatus.DOING})
@@ -3071,6 +3092,30 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
             pr.is_escalated = False
             assert asyncio.run(runner._recover_obsolete_ci_error([resumed], [pr]))
             assert runner.state.state == PipelineState.WATCH
+            assert write.await_count == 1
+        if case.startswith("cause_delete_ack_lost"):
+            assert asyncio.run(get_cancellation_cause(
+                runner.redis, runner.name, task.pr_id, refresh_ttl=False,
+            )) is None
+            resumed = task.model_copy(update={"status": TaskStatus.DOING})
+            task_path.write_text(task_path.read_text().replace("status: ERROR", "status: DOING"))
+            pr.is_escalated = False
+            monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [resumed])
+            monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: [pr])
+            if case.endswith("restart"):
+                asyncio.run(runner._apply_recovery_decisions([resumed], [pr]))
+            elif case.endswith("default_dispatch"):
+                runner._recovered = True
+                runner._scaffolded = True
+                monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+                monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+                monkeypatch.setattr(runner, "reload_repo_config_if_dirty", AsyncMock())
+                monkeypatch.setattr(runner, "_maybe_auto_pause_for_error_rate", AsyncMock(return_value=False))
+                asyncio.run(runner.run_cycle())
+            else:
+                asyncio.run(runner._handle_single_error_exit())
+            assert runner.state.state == PipelineState.WATCH
+            assert runner.state.current_task.status == TaskStatus.DOING
             assert write.await_count == 1
         if case == "still_failed":
             runner.repo_config.feature_flags.use_single_error_exit = True

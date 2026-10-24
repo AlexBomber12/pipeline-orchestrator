@@ -273,6 +273,9 @@ class RepoState(BaseModel):
     current_queue: list[QueueTask] | None = None
     current_queue_snapshot_at: datetime | None = None
     current_pr: PRInfo | None = None
+    # Highest verified Actions attempt, scoped to one task generation/PR/HEAD.
+    ci_attempt_scope: str = ""
+    ci_attempts: dict[str, int] = Field(default_factory=dict)
     publication_watermark: PublicationWatermark | None = None
     publication_schema_version: int = 1
     publication_migration: PublicationMigration | None = None

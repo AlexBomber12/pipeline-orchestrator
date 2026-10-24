@@ -2477,6 +2477,13 @@ class PipelineRunner(
                     and cause.payload.get("subsource") == "coder_escalate"
                     and cause.payload.get("reason_text") == "OBSOLETE_CI_EVIDENCE"
                     and isinstance(cause.payload.get("obsolete_ci_trigger"), dict)
+                ) or (
+                    cause is None and snapshot.run_id is not None
+                    and snapshot.fix_trigger.get("review") is False
+                    and await self._metrics_store.get(str(uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"{self.name}:{task.pr_id}:{snapshot.run_id}:obsolete-ci-continuation",
+                    ))) is not None
                 ):
                     tasks = self._parse_tasks_from_headers()
                     prs = gh_prs.get_open_prs(

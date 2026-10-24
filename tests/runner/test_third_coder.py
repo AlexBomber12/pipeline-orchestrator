@@ -51,7 +51,7 @@ from tests.runner import _helpers as h
 def _admit_test_ci(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "src.daemon.handlers.fix._current_ci_failure",
-        lambda repo, number, sha, required, empty, trusted: {
+        lambda repo, number, sha, required, empty, trusted, observations=None: {
             "repo": repo, "pr_number": number, "head_sha": sha,
             "contexts": [{"name": "unit", "source": "check", "check_id": 1, "attempt": 1,
                           "state": "failure", "workflow_run_id": None, "job_id": None}],

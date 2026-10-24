@@ -31,6 +31,7 @@ from src.cancellation import (
 from src.cancellation.storage import delete_cancellation_cause
 from src.daemon import git_ops
 from src.daemon.approval_commands import checkout_process_blocker
+from src.daemon.ci_attempts import canonical_ci_incident
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
 from src.daemon.quarantine import (
     blocking_quarantine_labels,
@@ -195,7 +196,8 @@ class RecoveryMixin:
         exact_cause = (
             cause is not None and cause.payload.get("subsource") == "coder_escalate"
             and cause.payload.get("reason_text") == "OBSOLETE_CI_EVIDENCE"
-            and isinstance(claim, dict) and claim.get("ci") == ci
+            and isinstance(claim, dict) and isinstance(claim.get("ci"), dict)
+            and canonical_ci_incident(claim["ci"]) == canonical_ci_incident(ci)
             and claim.get("task_id") == task.pr_id
             and claim.get("branch") == task.branch
             and claim.get("run_id") == snapshot.run_id
@@ -696,6 +698,9 @@ class RecoveryMixin:
         except Exception:
             self._publication_snapshot_damaged = True
             return True
+        if persisted.name == self.name and persisted.url == self.repo_config.url:
+            self.state.ci_attempt_scope = persisted.ci_attempt_scope
+            self.state.ci_attempts = dict(persisted.ci_attempts)
         if (
             persisted.name == self.name and persisted.url == self.repo_config.url
             and persisted.publication_attempt is not None
