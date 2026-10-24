@@ -2915,7 +2915,7 @@ def _patch_infra_failure_pr(
         check_runs = [
             {
                 "id": 12345, "name": "unit", "head_sha": head_sha,
-                "app": {"id": 15368}, "run_attempt": 1,
+                "app": {"id": 15368},
                 "conclusion": "cancelled",
                 "details_url": (
                     "https://github.com/octo/demo/actions/runs/9876/"
@@ -2924,8 +2924,7 @@ def _patch_infra_failure_pr(
             }
         ]
     check_runs = [
-        {"name": "unit", "head_sha": head_sha, "app": {"id": 15368},
-         "run_attempt": 1, **item}
+        {"name": "unit", "head_sha": head_sha, "app": {"id": 15368}, **item}
         for item in check_runs
     ]
     monkeypatch.setattr(
@@ -2938,7 +2937,9 @@ def _patch_infra_failure_pr(
     # both call this; the cached payload feeds the retry helper too.
     monkeypatch.setattr(
         "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: (list(check_runs), {}, True),
+        lambda repo, sha: (
+            list(check_runs), {"sha": sha, "state": "pending", "statuses": []}, True,
+        ),
     )
     return pr
 
@@ -3029,7 +3030,215 @@ def test_first_infra_failure_retries_workflow(
     assert "infra retry: re-ran failed jobs" in history
 
 
-def test_failed_infra_rerun_issuance_is_bounded(
+def test_missing_check_attempt_reconciles_lost_reply_after_three_watch_cycles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.daemon import ci_attempts
+    from src.keyspace import ci_infra_retried
+
+    sha = "d" * 40
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=78, head_sha=sha)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    monkeypatch.setattr(watch_module, "read_actions_run", ci_attempts.read_actions_run)
+    attempt = 1
+    reruns = []
+
+    def gh(args: list[str], **kwargs: Any) -> object:
+        if args[:2] == ["run", "view"]:
+            return {"databaseId": 9876, "headSha": sha, "attempt": attempt,
+                    "status": "completed" if attempt == 1 else "in_progress",
+                    "conclusion": "cancelled" if attempt == 1 else "",
+                    "jobs": [{"databaseId": 12345, "name": "unit",
+                              "conclusion": "cancelled"}] if attempt == 1 else []}
+        if args[:2] == ["run", "rerun"]:
+            reruns.append(args)
+            raise RuntimeError("response lost after acceptance")
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", gh)
+    key = ci_infra_retried(runner.owner_repo, pr.number, sha)
+    asyncio.run(runner.handle_watch())
+    marker = json.loads(asyncio.run(runner.redis.get(key)))
+    assert marker["intent_runs"] == [9876] and marker["issued"] is False
+    assert marker["request_attempts"] == {"9876": 1}
+    marker["at"] = time.time() - 120
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    asyncio.run(runner.handle_watch())
+    marker = json.loads(asyncio.run(runner.redis.get(key)))
+    assert marker["tries"] == 1 and runner.state.state == PipelineState.WATCH
+    attempt = 2
+    marker["at"] = time.time() - 120
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    asyncio.run(runner.handle_watch())
+    marker = json.loads(asyncio.run(runner.redis.get(key)))
+    assert marker["issued"] is True and marker["issued_runs"] == [9876]
+    assert runner.state.state == PipelineState.WATCH
+    assert reruns == [["run", "rerun", "--failed", "9876"]]
+
+
+def test_completed_newer_failed_attempt_reconciles_even_with_matching_job(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.daemon import ci_attempts
+    from src.github import checks as gh_checks
+    from src.keyspace import ci_infra_retried
+
+    sha = "d" * 40
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=79, head_sha=sha,
+                                 check_runs=[{"id": 12345, "name": "unit",
+                                              "conclusion": "cancelled",
+                                              "details_url": _actions_url(9876, 12345)}])
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    monkeypatch.setattr(watch_module, "read_actions_run", ci_attempts.read_actions_run)
+    attempt = 1
+    reruns = []
+
+    def gh(args: list[str], **kwargs: Any) -> object:
+        if args[:2] == ["run", "view"]:
+            return {"databaseId": 9876, "headSha": sha, "attempt": attempt,
+                    "status": "completed", "conclusion": "cancelled",
+                    "jobs": [{"databaseId": 12345, "name": "unit",
+                              "conclusion": "cancelled"}]}
+        if args[:2] == ["run", "rerun"]:
+            reruns.append(args)
+            raise RuntimeError("response lost after acceptance")
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", gh)
+    checks = [{"id": 12345, "name": "unit", "head_sha": sha,
+               "app": {"id": 15368}, "status": "completed",
+               "conclusion": "cancelled", "details_url": _actions_url(9876, 12345)}]
+    retrieval = gh_checks._make_ci_retrieval(
+        runner.owner_repo, sha, 0.0, checks,
+        {"sha": sha, "state": "pending", "statuses": []},
+        gh_checks._CiSourceResult(True, False), gh_checks._CiSourceResult(True, True),
+    )
+    monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
+    key = ci_infra_retried(runner.owner_repo, pr.number, sha)
+    asyncio.run(runner.handle_watch())
+    marker = json.loads(asyncio.run(runner.redis.get(key)))
+    marker["at"] = time.time() - 120
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    attempt = 2
+    asyncio.run(runner.handle_watch())
+    marker = json.loads(asyncio.run(runner.redis.get(key)))
+    assert marker["issued"] is True
+    assert reruns == [["run", "rerun", "--failed", "9876"]]
+    marker["at"] = time.time() - 120
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    fix = AsyncMock()
+    monkeypatch.setattr(runner, "handle_fix", fix)
+    asyncio.run(runner.handle_watch())
+    assert fix.await_count == 1, [entry["event"] for entry in runner.state.history[-6:]]
+    assert runner.state.current_pr.ci_status == CIStatus.FAILURE
+
+
+def test_exhausted_submission_allowance_still_reconciles_pending_intent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.daemon import ci_attempts
+    from src.keyspace import ci_infra_retried
+
+    sha = "d" * 40
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=80, head_sha=sha)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    monkeypatch.setattr(watch_module, "read_actions_run", ci_attempts.read_actions_run)
+    attempt = 1
+    reruns = []
+
+    def gh(args: list[str], **kwargs: Any) -> object:
+        if args[:2] == ["run", "view"]:
+            return {"databaseId": 9876, "headSha": sha, "attempt": attempt,
+                    "status": "completed" if attempt == 1 else "in_progress",
+                    "conclusion": "cancelled" if attempt == 1 else "",
+                    "jobs": [{"databaseId": 12345, "name": "unit",
+                              "conclusion": "cancelled"}] if attempt == 1 else []}
+        if args[:2] == ["run", "rerun"]:
+            reruns.append(args)
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", gh)
+    key = ci_infra_retried(runner.owner_repo, pr.number, sha)
+    asyncio.run(runner.redis.set(key, json.dumps({
+        "at": time.time() - 120, "issued": False, "tries": 2,
+        "checks": [[12345, None]], "rerunnable_checks": [[12345, None, 9876]],
+        "targets": [9876], "issued_runs": [], "intent_runs": [9876],
+        "request_attempts": {"9876": 1},
+    })))
+    asyncio.run(runner.handle_watch())
+    assert runner.state.state == PipelineState.WATCH
+    assert not any(args[:2] == ["run", "rerun"] for args in reruns)
+    attempt = 2
+    marker = json.loads(asyncio.run(runner.redis.get(key)))
+    marker["at"] = time.time() - 120
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    asyncio.run(runner.handle_watch())
+    marker = json.loads(asyncio.run(runner.redis.get(key)))
+    assert runner.state.state == PipelineState.WATCH
+    assert marker["issued"] is True and marker["tries"] == 2
+    assert reruns == []
+
+
+def test_restart_recovers_confirmed_workflow_after_aggregate_write_interruption(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.daemon import ci_attempts
+    from src.keyspace import ci_infra_retried
+
+    sha = "d" * 40
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=81, head_sha=sha)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    monkeypatch.setattr(watch_module, "read_actions_run", ci_attempts.read_actions_run)
+    reruns = []
+
+    def gh(args: list[str], **kwargs: Any) -> object:
+        if args[:2] == ["run", "view"]:
+            return {"databaseId": 9876, "headSha": sha, "attempt": 1,
+                    "status": "completed", "conclusion": "cancelled",
+                    "jobs": [{"databaseId": 12345, "name": "unit",
+                              "conclusion": "cancelled"}]}
+        if args[:2] == ["run", "rerun"]:
+            reruns.append(args)
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", gh)
+    original_mark = runner._mark_infra_retry_attempted
+
+    async def interrupt_after_progress(number, head, *, issued=True, tries=1):
+        if issued:
+            raise RuntimeError("aggregate write interrupted")
+        await original_mark(number, head, issued=issued, tries=tries)
+
+    monkeypatch.setattr(runner, "_mark_infra_retry_attempted", interrupt_after_progress)
+    with pytest.raises(RuntimeError, match="aggregate write interrupted"):
+        asyncio.run(runner.handle_watch())
+    key = ci_infra_retried(runner.owner_repo, pr.number, sha)
+    marker = json.loads(asyncio.run(runner.redis.get(key)))
+    assert marker["issued_runs"] == [9876] and marker["issued"] is True
+    assert reruns == [["run", "rerun", "--failed", "9876"]]
+    # A marker written by the older version may still have a stale aggregate.
+    marker["issued"] = False
+    marker["tries"] = 2
+    marker["at"] = time.time() - 120
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    restarted = h._make_runner()
+    restarted.redis = runner.redis
+    restarted.state.state = PipelineState.WATCH
+    restarted.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    asyncio.run(restarted.handle_watch())
+    assert restarted.state.state == PipelineState.WATCH
+    assert reruns == [["run", "rerun", "--failed", "9876"]]
+
+
+def test_ambiguous_infra_rerun_does_not_consume_submission_allowance(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from src.keyspace import ci_infra_retried
@@ -3048,19 +3257,46 @@ def test_failed_infra_rerun_issuance_is_bounded(
 
     monkeypatch.setattr(watch_module.gh_runner, "run_gh", unavailable)
     marker_key = ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha)
-    for attempt in (1, 2):
+    for _ in (1, 2):
         asyncio.run(runner.handle_watch())
         marker = json.loads(asyncio.run(runner.redis.get(marker_key)))
         assert marker["issued"] is False
-        assert marker["tries"] == attempt
+        assert marker["tries"] == 1
         marker["at"] = time.time() - 120
         asyncio.run(runner.redis.set(marker_key, json.dumps(marker)))
     asyncio.run(runner.handle_watch())
     # The first response may have been lost after GitHub accepted the request.
     # The durable intent prevents a duplicate while metadata still lags.
     assert len(reruns) == 1
-    assert runner.state.state == PipelineState.ERROR
-    assert "operator Retry required" in runner.state.error_message
+    assert runner.state.state == PipelineState.WATCH
+
+
+def test_confirmed_unissued_workflow_uses_one_remaining_submission(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.keyspace import ci_infra_retried
+
+    sha = "d" * 40
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=82, head_sha=sha)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    key = ci_infra_retried(runner.owner_repo, pr.number, sha)
+    asyncio.run(runner.redis.set(key, json.dumps({
+        "at": time.time() - 120, "issued": False, "tries": 1,
+        "checks": [[12345, None]], "rerunnable_checks": [[12345, None, 9876]],
+        "targets": [9876], "issued_runs": [], "intent_runs": [],
+        "request_attempts": {},
+    })))
+    reruns = []
+    monkeypatch.setattr(
+        watch_module.gh_runner, "run_gh",
+        lambda args, **kwargs: reruns.append(args) if args[:2] == ["run", "rerun"] else "",
+    )
+    asyncio.run(runner.handle_watch())
+    marker = json.loads(asyncio.run(runner.redis.get(key)))
+    assert marker["tries"] == 2 and marker["issued"] is True
+    assert reruns == [["run", "rerun", "--failed", "9876"]]
 
 
 def test_failed_infra_rerun_still_allows_current_review_fix(
@@ -3096,9 +3332,9 @@ def test_partial_infra_rerun_retries_only_unissued_workflow(
     pr = _patch_infra_failure_pr(
         monkeypatch, pr_number=83, head_sha="d" * 40,
         check_runs=[
-            {"id": 101, "run_attempt": 1, "conclusion": "cancelled",
+            {"id": 101, "conclusion": "cancelled",
              "details_url": _actions_url(11, 101)},
-            {"id": 202, "run_attempt": 1, "conclusion": "cancelled",
+            {"id": 202, "conclusion": "cancelled",
              "details_url": _actions_url(22, 202)},
         ],
     )
@@ -3144,6 +3380,28 @@ def test_partial_infra_rerun_retries_only_unissued_workflow(
     assert marker["issued_runs"] == [11, 22]
 
 
+def test_legacy_ambiguous_marker_without_targets_never_replays_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.keyspace import ci_infra_retried
+
+    sha = "d" * 40
+    pr = _patch_infra_failure_pr(monkeypatch, pr_number=86, head_sha=sha)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    key = ci_infra_retried(runner.owner_repo, pr.number, sha)
+    asyncio.run(runner.redis.set(key, json.dumps({
+        "at": time.time() - 120, "issued": False, "tries": 2,
+        "checks": [[12345, None]], "intent_runs": [9876],
+    })))
+    reruns = []
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", lambda args, **kw: reruns.append(args))
+    asyncio.run(runner.handle_watch())
+    assert runner.state.state == PipelineState.WATCH
+    assert not any(args[:2] == ["run", "rerun"] for args in reruns)
+
+
 @pytest.mark.parametrize("missing_actions_check_id", [False, True])
 def test_mixed_infra_failures_bound_unsupported_check_to_operator_recovery(
     monkeypatch: pytest.MonkeyPatch, missing_actions_check_id: bool,
@@ -3180,14 +3438,9 @@ def test_mixed_infra_failures_bound_unsupported_check_to_operator_recovery(
     assert marker["unsupported"] is True
     assert marker["checks"] == ([] if missing_actions_check_id else [[101, 1]])
     assert marker["rerunnable_checks"] == ([] if missing_actions_check_id else [[101, 1, 11]])
-    for tries in (2, 3):
-        marker["at"] = time.time() - 120
-        asyncio.run(runner.redis.set(marker_key, json.dumps(marker)))
-        asyncio.run(runner.handle_watch())
-        if tries == 2:
-            marker = json.loads(asyncio.run(runner.redis.get(marker_key)))
-            assert marker["tries"] == 2
-            assert marker["issued"] is False
+    marker["at"] = time.time() - 120
+    asyncio.run(runner.redis.set(marker_key, json.dumps(marker)))
+    asyncio.run(runner.handle_watch())
     assert reruns == expected_reruns
     assert runner.state.state == PipelineState.ERROR
     assert "operator Retry required" in runner.state.error_message
@@ -3780,7 +4033,6 @@ def _patch_check_runs(
         )
         check.setdefault("name", "unit")
         check.setdefault("app", {"id": 15368})
-        check.setdefault("run_attempt", 1)
         if "id" not in check:
             match = re.search(r"/job/(\d+)$", check["details_url"])
             if match:
@@ -3807,20 +4059,24 @@ def _actions_url(run_id: int, job_id: int = 1) -> str:
 
 @pytest.mark.parametrize(
     ("check_attempt", "workflow_status", "workflow_conclusion", "expected_rerun"),
-    [(1, "in_progress", "", False), (2, "completed", "failure", True)],
+    [(None, "in_progress", "", False), (1, "in_progress", "", False),
+     (2, "completed", "failure", True)],
 )
 def test_infra_retry_reconciles_current_workflow_before_side_effect(
-    monkeypatch: pytest.MonkeyPatch, check_attempt: int,
+    monkeypatch: pytest.MonkeyPatch, check_attempt: int | None,
     workflow_status: str, workflow_conclusion: str, expected_rerun: bool,
 ) -> None:
     from src.daemon import ci_attempts
 
     runner = h._make_runner()
     sha = "a" * 40
-    _patch_check_runs(monkeypatch, [{
+    check = {
         "id": 55, "name": "unit", "run_attempt": check_attempt,
         "conclusion": "failure", "details_url": _actions_url(99, 55),
-    }])
+    }
+    if check_attempt is None:
+        del check["run_attempt"]
+    _patch_check_runs(monkeypatch, [check])
     monkeypatch.setattr(watch_module, "read_actions_run", ci_attempts.read_actions_run)
     calls = []
 
@@ -3912,6 +4168,63 @@ def test_infra_retry_records_intent_before_ambiguous_external_effect(
     assert reruns == [["run", "rerun", "--failed", "99"]]
     marker = json.loads(runner.redis.store[ci_infra_retried(runner.owner_repo, 19, sha)])
     assert marker["intent_runs"] == [] and marker["issued_runs"] == [99]
+
+
+def test_legacy_intent_reconciles_running_attempt_without_optional_check_field(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    sha = "a" * 40
+    _patch_check_runs(monkeypatch, [{
+        "id": 55, "name": "unit", "conclusion": "failure",
+        "details_url": _actions_url(99, 55),
+    }])
+    runner.state.current_pr = PRInfo(number=19, branch="pr-019", head_sha=sha)
+    runner._infra_retry_baseline = [[55, None]]
+    runner._infra_retry_rerunnable_checks = [[55, None, 99]]
+    runner._infra_retry_target_run_ids = [99]
+    runner._infra_retry_issued_run_ids = []
+    runner._infra_retry_intent_run_ids = [99]
+    runner._infra_retry_request_attempts = {}
+    runner._infra_retry_unsupported = False
+    monkeypatch.setattr(watch_module, "read_actions_run", lambda *a: {
+        "databaseId": 99, "headSha": sha, "attempt": 2,
+        "status": "in_progress", "conclusion": "", "jobs": [],
+    })
+    assert asyncio.run(runner._retry_failed_workflow(
+        19, sha, only_run_ids={99}, tries=2, allow_submission=False,
+    ))
+    assert runner._infra_retry_intent_run_ids == []
+    assert runner._infra_retry_issued_run_ids == [99]
+
+
+def test_exhausted_allowance_reads_current_failure_without_resubmitting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    sha = "a" * 40
+    _patch_check_runs(monkeypatch, [{
+        "id": 55, "name": "unit", "conclusion": "failure",
+        "details_url": _actions_url(99, 55),
+    }])
+    runner.state.current_pr = PRInfo(number=19, branch="pr-019", head_sha=sha)
+    runner._infra_retry_baseline = [[55, None]]
+    runner._infra_retry_rerunnable_checks = [[55, None, 99]]
+    runner._infra_retry_target_run_ids = [99]
+    runner._infra_retry_issued_run_ids = []
+    runner._infra_retry_intent_run_ids = []
+    runner._infra_retry_request_attempts = {}
+    runner._infra_retry_unsupported = False
+    reruns = []
+    monkeypatch.setattr(
+        watch_module.gh_runner, "run_gh",
+        lambda args, **kw: reruns.append(args),
+    )
+    assert not asyncio.run(runner._retry_failed_workflow(
+        19, sha, only_run_ids={99}, tries=2, allow_submission=False,
+    ))
+    assert reruns == []
+    assert runner._infra_retry_tries == 2
 
 
 def test_watch_defers_infra_retry_without_task_generation(

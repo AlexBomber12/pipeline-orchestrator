@@ -478,27 +478,39 @@ class WatchMixin:
                             self._fix_feedback_reviewer_policy = reviewer_policy
                             await self.handle_fix()
                             return
-                    if tries < 2:
-                        raw_marker = await self.redis.get(
-                            ci_infra_retried(self.owner_repo, found.number, found.head_sha)
+                    raw_marker = await self.redis.get(
+                        ci_infra_retried(self.owner_repo, found.number, found.head_sha)
+                    )
+                    marker = json.loads(raw_marker)
+                    targets = set(marker.get("targets", []))
+                    issued_runs = set(marker.get("issued_runs", []))
+                    if not targets and marker.get("intent_runs"):
+                        self.log_event(
+                            f"[WATCH] PR #{found.number} rerun intent lacks workflow "
+                            "provenance; awaiting operator reconciliation."
                         )
-                        marker = json.loads(raw_marker)
-                        targets = set(marker.get("targets", []))
-                        issued_runs = set(marker.get("issued_runs", []))
-                        self._infra_retry_baseline = marker.get("checks", [])
-                        self._infra_retry_rerunnable_checks = marker.get("rerunnable_checks", [])
-                        self._infra_retry_target_run_ids = sorted(targets)
-                        self._infra_retry_issued_run_ids = sorted(issued_runs)
-                        self._infra_retry_intent_run_ids = marker.get("intent_runs", [])
-                        self._infra_retry_unsupported = marker.get("unsupported", False)
-                        retried = await self._retry_failed_workflow(
-                            found.number, found.head_sha,
-                            only_run_ids=targets - issued_runs if targets else None,
-                            tries=tries + 1,
-                        )
-                        await self._mark_infra_retry_attempted(
-                            found.number, found.head_sha, issued=retried, tries=tries + 1,
-                        )
+                        return
+                    self._infra_retry_baseline = marker.get("checks", [])
+                    self._infra_retry_rerunnable_checks = marker.get("rerunnable_checks", [])
+                    self._infra_retry_target_run_ids = sorted(targets)
+                    self._infra_retry_issued_run_ids = sorted(issued_runs)
+                    self._infra_retry_intent_run_ids = marker.get("intent_runs", [])
+                    request_attempts = marker.get("request_attempts")
+                    self._infra_retry_request_attempts = (
+                        request_attempts if isinstance(request_attempts, dict) else {}
+                    )
+                    self._infra_retry_unsupported = marker.get("unsupported", False)
+                    retried = await self._retry_failed_workflow(
+                        found.number, found.head_sha,
+                        only_run_ids=targets - issued_runs if targets else None,
+                        tries=tries, allow_submission=tries < 2,
+                    )
+                    await self._mark_infra_retry_attempted(
+                        found.number, found.head_sha, issued=retried,
+                        tries=self._infra_retry_tries,
+                    )
+                    if (retried or self._infra_retry_intent_run_ids
+                            or (tries < 2 and not self._infra_retry_unsupported)):
                         return
                     await self._transition_to_error(
                         "Infrastructure CI rerun could not be issued after two attempts; operator Retry required",
@@ -573,10 +585,12 @@ class WatchMixin:
             self._infra_retry_target_run_ids = []
             self._infra_retry_issued_run_ids = []
             self._infra_retry_intent_run_ids = []
+            self._infra_retry_request_attempts = {}
             self._infra_retry_unsupported = False
             issued = await self._retry_failed_workflow(found.number, found.head_sha)
             await self._mark_infra_retry_attempted(
                 found.number, found.head_sha, issued=issued,
+                tries=self._infra_retry_tries,
             )
             return
         elif review == ReviewStatus.CHANGES_REQUESTED:
@@ -1241,9 +1255,17 @@ class WatchMixin:
                 return False
             run = read_actions_run(self.owner_repo, head_sha, identity[0], observations)
             await self.publish_state()
+            request_attempts = marker.get("request_attempts")
+            request_attempt = (
+                request_attempts.get(str(identity[0]))
+                if isinstance(request_attempts, dict) else None
+            )
             return bool(
                 run is not None and (ctx.attempt is None or run["attempt"] == ctx.attempt)
                 and matching_failed_job(run, identity[1], ctx.name)
+                and ((isinstance(request_attempt, int) and not isinstance(request_attempt, bool)
+                      and request_attempt > 0 and run["attempt"] > request_attempt)
+                     or (ctx.run_id[1], ctx.attempt) not in baseline)
             )
         if "rerunnable_checks" in marker:
             issued_runs = set(marker.get("issued_runs", []))
@@ -1270,9 +1292,7 @@ class WatchMixin:
                     latest_issued[key] = ctx
             relevant = [ctx for ctx in latest_issued.values() if ctx.state == "failure"]
             if relevant:
-                return all(
-                    (ctx.run_id[1], ctx.attempt) not in baseline for ctx in relevant
-                ) and all([await current_failed_check(ctx) for ctx in relevant])
+                return all([await current_failed_check(ctx) for ctx in relevant])
             if any(
                 ctx.run_id is None or ctx.run_id[0] != "check"
                 or run_ids.get(ctx.run_id[1]) not in issued_runs
@@ -1304,7 +1324,16 @@ class WatchMixin:
         try:
             marker = json.loads(raw)
             if isinstance(marker, dict):
-                return marker.get("issued") is not False, max(1, int(marker.get("tries", 1)))
+                targets = set(marker.get("targets", []))
+                confirmed = set(marker.get("issued_runs", []))
+                complete = bool(targets) and targets.issubset(confirmed) and not marker.get("unsupported")
+                if complete and marker.get("issued") is False:
+                    marker["issued"] = True
+                    await self.redis.set(
+                        ci_infra_retried(self.owner_repo, pr_number, head_sha),
+                        json.dumps(marker), ex=_CI_INFRA_RETRIED_TTL_SECONDS,
+                    )
+                return marker.get("issued") is not False or complete, max(0, int(marker.get("tries", 1)))
         except (TypeError, ValueError):
             pass
         return False, 2
@@ -1415,12 +1444,18 @@ class WatchMixin:
         key = ci_infra_retried(self.owner_repo, pr_number, head_sha)
         await self.redis.set(
             key, json.dumps({
-                "at": time.time(), "issued": issued, "tries": tries,
+                "at": time.time(), "issued": issued or (
+                    bool(getattr(self, "_infra_retry_target_run_ids", []))
+                    and set(self._infra_retry_target_run_ids).issubset(
+                        getattr(self, "_infra_retry_issued_run_ids", [])
+                    ) and not getattr(self, "_infra_retry_unsupported", False)
+                ), "tries": tries,
                 "checks": getattr(self, "_infra_retry_baseline", None) or [],
                 "rerunnable_checks": getattr(self, "_infra_retry_rerunnable_checks", None) or [],
                 "targets": getattr(self, "_infra_retry_target_run_ids", None) or [],
                 "issued_runs": getattr(self, "_infra_retry_issued_run_ids", None) or [],
                 "intent_runs": getattr(self, "_infra_retry_intent_run_ids", None) or [],
+                "request_attempts": getattr(self, "_infra_retry_request_attempts", None) or {},
                 "unsupported": getattr(self, "_infra_retry_unsupported", False),
                 "scope": self.state.ci_attempt_scope,
             }), ex=_CI_INFRA_RETRIED_TTL_SECONDS,
@@ -1428,7 +1463,7 @@ class WatchMixin:
 
     async def _retry_failed_workflow(
         self, pr_number: int, head_sha: str, *, only_run_ids: set[int] | None = None,
-        tries: int = 1,
+        tries: int = 0, allow_submission: bool = True,
     ) -> bool:
         """Reconcile each current Actions run before bounded rerun issuance.
 
@@ -1437,6 +1472,7 @@ class WatchMixin:
         """
         if not head_sha or self.state.current_pr is None:
             return False
+        self._infra_retry_tries = tries
         observations = attempt_scope(
             self.state, self.owner_repo, self.repo_path, self.state.current_pr,
         )
@@ -1472,6 +1508,7 @@ class WatchMixin:
             self._infra_retry_target_run_ids = sorted(candidates)
             self._infra_retry_issued_run_ids = []
             self._infra_retry_intent_run_ids = []
+            self._infra_retry_request_attempts = {}
             self._infra_retry_unsupported = unsupported
         if not candidates:
             if not failing_count:
@@ -1495,13 +1532,34 @@ class WatchMixin:
             if run is None:
                 continue
             checks = candidates[run_id]
+            baseline_attempt = self._infra_retry_request_attempts.get(str(run_id))
+            if (isinstance(baseline_attempt, int) and not isinstance(baseline_attempt, bool)
+                    and baseline_attempt > 0
+                    and run["attempt"] > baseline_attempt):
+                if run_id not in self._infra_retry_issued_run_ids:
+                    self._infra_retry_issued_run_ids.append(run_id)
+                if run_id in self._infra_retry_intent_run_ids:
+                    self._infra_retry_intent_run_ids.remove(run_id)
+                await self._mark_infra_retry_attempted(
+                    pr_number, head_sha, issued=False, tries=self._infra_retry_tries,
+                )
+                continue
             current_jobs = [check for check in checks if (
                 check.get("run_attempt") is None
                 or check["run_attempt"] == run["attempt"]
             ) and matching_failed_job(run, check["id"], check.get("name"))]
             if not current_jobs:
-                if any(isinstance(check.get("run_attempt"), int)
-                       and run["attempt"] > check["run_attempt"] for check in checks):
+                jobs = run.get("jobs")
+                if run["attempt"] > 1 and (
+                    run.get("status") != "completed" or (
+                        isinstance(jobs, list) and all(
+                        check["id"] not in {
+                            job.get("databaseId") for job in jobs
+                            if isinstance(job, dict)
+                        } for check in checks
+                    )) or any(isinstance(check.get("run_attempt"), int)
+                             and run["attempt"] > check["run_attempt"] for check in checks)
+                ):
                     # A rerun already happened. It may still be queued, running,
                     # successful, or failed; never issue against the old check.
                     if run_id not in self._infra_retry_issued_run_ids:
@@ -1509,17 +1567,22 @@ class WatchMixin:
                     if run_id in self._infra_retry_intent_run_ids:
                         self._infra_retry_intent_run_ids.remove(run_id)
                     await self._mark_infra_retry_attempted(
-                        pr_number, head_sha, issued=False, tries=tries,
+                        pr_number, head_sha, issued=False, tries=self._infra_retry_tries,
                     )
                 continue
             if run_id in self._infra_retry_intent_run_ids:
                 # The prior request may have been accepted before its response
                 # was lost. Do not submit it again against lagging metadata.
                 continue
+            if not allow_submission:
+                continue
+            if self._infra_retry_tries == tries:
+                self._infra_retry_tries += 1
             if run_id not in self._infra_retry_intent_run_ids:
                 self._infra_retry_intent_run_ids.append(run_id)
+            self._infra_retry_request_attempts[str(run_id)] = run["attempt"]
             await self._mark_infra_retry_attempted(
-                pr_number, head_sha, issued=False, tries=tries,
+                pr_number, head_sha, issued=False, tries=self._infra_retry_tries,
             )
             try:
                 gh_runner.run_gh(
@@ -1536,7 +1599,7 @@ class WatchMixin:
                 self._infra_retry_issued_run_ids.append(run_id)
             self._infra_retry_intent_run_ids.remove(run_id)
             await self._mark_infra_retry_attempted(
-                pr_number, head_sha, issued=False, tries=tries,
+                pr_number, head_sha, issued=False, tries=self._infra_retry_tries,
             )
         if rerun_count:
             self.log_event(
