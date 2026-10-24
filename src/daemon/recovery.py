@@ -102,9 +102,10 @@ class RecoveryMixin:
         self, tasks: list[QueueTask], prs: list[PRInfo],
     ) -> bool:
         """Resume only a proven CI-only, exact-marker escalation."""
-        saved = getattr(self, "_persisted_fix_recovery", None)
-        if saved is None and self.state.state == PipelineState.ERROR:
-            saved = self.state
+        saved = (
+            self.state if self.state.state == PipelineState.ERROR
+            else getattr(self, "_persisted_fix_recovery", None)
+        )
         if (
             saved is None or saved.state != PipelineState.ERROR
             or saved.name != self.name or saved.url != self.repo_config.url

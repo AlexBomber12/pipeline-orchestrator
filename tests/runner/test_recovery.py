@@ -2868,7 +2868,8 @@ def test_header_merge_recovery_prioritizes_unfinished_attempt(
 
 @pytest.mark.parametrize(
     "case",
-    ["success", "success_live", "suppression_disappeared", "identity_changed",
+    ["success", "success_live", "success_live_stale_startup",
+     "suppression_disappeared", "identity_changed",
      "provider_unavailable", "incomplete_evidence", "still_failed", "wrong_run_cause",
      "unrelated_hold", "status_write_failed", "label_cleanup_failed", "cleanup_failed",
      "continuation_corrupt", "continuation_save_failed", "paused"],
@@ -3009,7 +3010,8 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
             AsyncMock(side_effect=RuntimeError("metrics unavailable")),
         )
 
-    if case not in {"success", "success_live", "suppression_disappeared"}:
+    if case not in {"success", "success_live", "success_live_stale_startup",
+                    "suppression_disappeared"}:
         assert not asyncio.run(runner._recover_obsolete_ci_error([task], [pr]))
         assert runner.state.state == PipelineState.ERROR
         assert write.await_count == (1 if case in {"status_write_failed", "cleanup_failed"} else 0)
@@ -3030,8 +3032,11 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
             assert suppression.reason == SuppressionReason.CODER_ESCALATE
         return
 
-    assert asyncio.run(runner._recover_unresolved_error_pr([task], [pr])) == (task, pr)
-    if case == "success_live":
+    if case != "success_live_stale_startup":
+        assert asyncio.run(runner._recover_unresolved_error_pr([task], [pr])) == (task, pr)
+    if case in {"success_live", "success_live_stale_startup"}:
+        if case == "success_live_stale_startup":
+            runner._persisted_fix_recovery.state = PipelineState.WATCH
         monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [task])
         monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: [pr])
         asyncio.run(runner._handle_single_error_exit())
@@ -3060,7 +3065,7 @@ def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
         )
     assert labels[0] == ["pr", "edit", "19", "--remove-label", "escalated"]
     assert run.fix_iterations == 1
-    if case == "success":
+    if case in {"success", "success_live_stale_startup"}:
         assert not asyncio.run(runner._recover_obsolete_ci_error([task], [pr]))
     else:
         resumed = task.model_copy(update={"status": TaskStatus.DOING})
