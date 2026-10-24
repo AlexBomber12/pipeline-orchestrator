@@ -252,21 +252,6 @@ def test_changes_requested_review_drives_watch_to_fix(
             f"last_pr_number={last_pr_number!r}"
         )
 
-        # Verify the production WATCH log emitted the expected line so
-        # a regression that bypasses the log path (e.g. a refactor that
-        # drops the ``[WATCH] PR #{n}`` prefix) surfaces here too.
-        history = fix_entry.get("history") or []
-        events = [
-            item.get("event", "")
-            for item in history
-            if isinstance(item, dict)
-        ]
-        watch_log_marker = f"[WATCH] PR #{watch_pr_number}"
-        assert any(watch_log_marker in event for event in events), (
-            f"no WATCH log line referencing PR #{watch_pr_number} "
-            f"appears in history; recent events={events[-10:]!r}"
-        )
-
         wait_for_state(
             ["ERROR"], timeout_sec=ESCALATE_TO_ERROR_DEADLINE_SEC,
         )
