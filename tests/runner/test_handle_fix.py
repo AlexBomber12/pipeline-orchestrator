@@ -4090,6 +4090,61 @@ def test_current_ci_failure_admits_only_bound_status_producer(
         assert fix_module._fetch_failed_ci_logs("octo/demo", failure) is None
 
 
+@pytest.mark.parametrize(
+    ("history_case", "expected"),
+    [("trusted", True), ("wrong_creator", False),
+     ("wrong_state", False), ("wrong_sha", False),
+     ("duplicate", False), ("incomplete", False)],
+)
+def test_current_ci_failure_binds_combined_status_to_complete_history(
+    monkeypatch: pytest.MonkeyPatch, history_case: str, expected: bool,
+) -> None:
+    from src.github import cache as gh_cache
+    from src.github import checks as gh_checks
+
+    sha = "a" * 40
+    monkeypatch.setattr(fix_module.gh_prs, "get_pr_metadata", lambda *_: {"head_sha": sha})
+    missing_producer = {
+        "id": 41, "context": "e2e/watch-merge-gate", "sha": sha,
+        "state": "failure", "created_at": "2026-10-24T00:00:00Z",
+        "creator": None,
+    }
+    retrieval = gh_checks._make_ci_retrieval(
+        "octo/demo", sha, 0.0, [],
+        {"sha": sha, "state": "failure", "statuses": [
+            missing_producer,
+            {"id": 42, "context": "observer", "sha": sha,
+             "state": "success", "creator": {"login": "observer"}},
+        ]},
+        gh_checks._CiSourceResult(True, False),
+        gh_checks._CiSourceResult(True, False),
+    )
+    monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
+    history = {**missing_producer, "creator": {"login": (
+        "testbed[bot]" if history_case != "wrong_creator" else "attacker"
+    )}}
+    if history_case == "wrong_state":
+        history["state"] = "success"
+    if history_case == "wrong_sha":
+        history["sha"] = "b" * 40
+    monkeypatch.setattr(
+        gh_cache, "_etag_get_paginated_evidence",
+        lambda path: gh_cache.PaginatedEvidence(
+            [history, history] if history_case == "duplicate" else [history],
+            history_case != "incomplete", False,
+        ),
+    )
+
+    failure = fix_module._current_ci_failure(
+        "octo/demo", 19, sha, None, True,
+        {"e2e/watch-merge-gate": ["user:testbed[bot]"]},
+    )
+    assert (failure is not None) is expected
+    if expected:
+        assert failure["contexts"][0]["check_id"] == 41
+        assert failure["contexts"][0]["producer"] == "user:testbed[bot]"
+
+
 @pytest.mark.parametrize("case", ["obsolete", "wrong_binding", "head_changed", "incomplete"])
 def test_ci_only_obsolescence_requires_bound_complete_live_evidence(
     monkeypatch: pytest.MonkeyPatch, case: str,

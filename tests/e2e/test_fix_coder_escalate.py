@@ -74,10 +74,20 @@ def _post_failed_status(head_sha: str) -> None:
             time.sleep(0.5)
     assert observed is not None, f"posted status {payload.get('id')!r} absent from combined status"
     observed_producer = _status_producer(observed)
-    assert observed_producer in configured, (
-        f"combined status producer {observed_producer!r} does not match configured "
-        f"{configured!r}; creator={(observed.get('creator') or {}).get('login')!r}, "
-        f"app_id={observed.get('app_id')!r}"
+    assert observed_producer is None or observed_producer in configured, (
+        f"combined status producer {observed_producer!r} is not configured"
+    )
+    listed_response = subprocess.run(
+        ["gh", "api", f"repos/{TESTBED_REPO}/commits/{head_sha}/statuses?per_page=100"],
+        capture_output=True, text=True, check=True, timeout=30,
+    )
+    listed = next(
+        (item for item in json.loads(listed_response.stdout)
+         if item.get("id") == payload.get("id")), None,
+    )
+    assert listed is not None, f"posted status {payload.get('id')!r} absent from status history"
+    assert _status_producer(listed) in configured, (
+        f"status history producer {_status_producer(listed)!r} does not match configured {configured!r}"
     )
 
 

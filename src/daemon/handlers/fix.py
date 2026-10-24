@@ -35,10 +35,11 @@ from src.daemon.quarantine import (
 )
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.daemon.selector import CoderSelectionUnavailable
+from src.github import cache as gh_cache
 from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.github.ci_evidence import _latest, evaluate_ci_evidence
+from src.github.ci_evidence import _latest, _status_producer, evaluate_ci_evidence
 from src.github.reviewer_policy import ReviewerPolicy
 from src.keyspace import control_stop, pipeline_state
 from src.models import CIStatus, PipelineState, PRInfo, RepoState, ReviewStatus
@@ -65,6 +66,44 @@ def _current_ci_failure(
     raw_statuses = retrieval.status_payload.get("statuses", [])
     if not isinstance(raw_statuses, list) or any(not isinstance(s, dict) for s in raw_statuses):
         return None
+    trusted_statuses = trusted_statuses or {}
+    if any(
+        status.get("context") in trusted_statuses
+        and isinstance(status.get("id"), int) and status["id"] > 0
+        and _status_producer(status) is None
+        for status in raw_statuses
+    ):
+        # The combined-status endpoint can omit both creator and app_id for
+        # App-posted statuses. Bind the producer from the status-history API
+        # only when that complete response contains the same immutable ID,
+        # context, state, and timestamp on this exact commit.
+        history = gh_cache._etag_get_paginated_evidence(
+            f"repos/{repo}/commits/{sha}/statuses?per_page=100"
+        )
+        if history.complete:
+            bound = []
+            for status in raw_statuses:
+                if (
+                    status.get("context") not in trusted_statuses
+                    or not isinstance(status.get("id"), int)
+                    or status["id"] <= 0
+                    or _status_producer(status) is not None
+                ):
+                    bound.append(status)
+                    continue
+                matches = [
+                    item for item in history.items
+                    if item.get("id") == status.get("id")
+                    and item.get("context") == status.get("context")
+                    and item.get("state") == status.get("state")
+                    and item.get("created_at") == status.get("created_at")
+                    and item.get("sha", sha) == sha
+                ]
+                if len(matches) == 1 and _status_producer(matches[0]) is not None:
+                    status = {**status, "app_id": matches[0].get("app_id"),
+                              "creator": matches[0].get("creator")}
+                bound.append(status)
+            raw_statuses = bound
     evidence = evaluate_ci_evidence(
         repo=repo, pr_number=pr_number, sha=sha,
         check_runs=retrieval.check_runs, statuses=raw_statuses,
@@ -79,7 +118,6 @@ def _current_ci_failure(
     # A failing status or third-party check can name itself arbitrarily. Admit
     # only configured Actions jobs or an exact configured status/producer pair.
     required = set(required_checks or ())
-    trusted_statuses = trusted_statuses or {}
     failures = [
         ctx for name, producers in _latest(evidence.contexts).items()
         for ctx in producers.values()

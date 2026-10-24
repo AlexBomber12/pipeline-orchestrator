@@ -279,3 +279,6 @@ for example `{"external/gate": ["app:12345", "user:ci-app[bot]"]}`.
 This policy controls coder admission only; it does not change required
 checks or merge eligibility. Unconfigured status producers remain visible
 as CI failures but do not launch a coder.
+When GitHub's combined-status response omits a configured status producer,
+the daemon binds that status by ID, context, state, and timestamp to the
+complete status-history response for the same commit before admission.
