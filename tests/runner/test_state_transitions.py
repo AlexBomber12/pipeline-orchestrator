@@ -2212,8 +2212,16 @@ def test_handle_merge_sets_error_on_non_conflict_sync_failure(
     assert recent[0].exit_reason == "error"
 
 
+@pytest.mark.parametrize(
+    ("stderr", "expected"),
+    [("claude failed", "Merge conflict resolution failed (coder claude, exit 1, "
+      "classification nonzero_exit); operator Retry required"),
+     ("Timeout after 300s Authorization: Bearer secret",
+      "Merge conflict resolution failed (coder claude, exit 1, "
+      "classification timeout, Timeout after 300s); operator Retry required")],
+)
 def test_handle_merge_aborts_on_unresolvable_conflict(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, stderr: str, expected: str,
 ) -> None:
     """When Claude fails to resolve the conflict, handle_merge aborts
     the merge, sets ERROR, and does not call prs.merge_pr."""
@@ -2238,7 +2246,7 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
         model: str | None = None,
         **kwargs: Any,
     ) -> tuple[int, str, str]:
-        return (1, "", "claude failed")
+        return (1, "", stderr)
 
     monkeypatch.setattr(
         claude_cli,
@@ -2260,7 +2268,11 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.ERROR
-    assert "Merge conflict resolution failed" in (runner.state.error_message or "")
+    assert runner.state.error_message == expected
+    assert any(expected in entry["event"] for entry in runner.state.history)
+    assert all("secret" not in entry["event"] for entry in runner.state.history)
+    assert "claude failed" not in runner.state.error_message
+    assert "Authorization" not in runner.state.error_message
     assert not merge_pr_calls, "merge_pr must not be called on abort"
     assert not any(cmd[:3] == ["git", "merge", "--abort"] for cmd in git_calls)
 
