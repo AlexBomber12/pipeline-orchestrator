@@ -40,9 +40,12 @@ and repetition count. Category is historical event metadata; it does not
 describe the current task or pipeline state. The tool reports source freshness,
 missing/malformed/oversized/unavailable sources, and truncation. It reads at
 most a 256 KiB state snapshot and returns at most 20 events, 500 characters per
-message, and 16 KiB of event data. Common credential forms are redacted before
-return. Retention follows the dashboard's capped history; this is not a live
-process or complete audit stream. Reads do not write, refresh TTLs, or prune.
+message, and 16 KiB of event data. Before redaction, each message is limited to
+4,096 source characters; JSON escapes and supported terminal formatting are
+normalized. Ambiguous or oversized text is omitted, with a recognized timeout
+marker retained when available. Retention follows the dashboard's capped
+history; this is not a live process or complete audit stream. Reads do not
+write, refresh TTLs, or prune.
 
 Raw CLI, CI, artifact, daemon-stdout, and live-stream retrieval is not exposed.
 

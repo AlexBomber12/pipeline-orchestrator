@@ -13,6 +13,7 @@ import json
 import math
 import os
 import re
+import unicodedata
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -50,17 +51,39 @@ _MAX_RUN_BYTES = 64 * 1024
 _MAX_INDEX_MEMBER_BYTES = 512
 _MAX_EVENTS = 20
 _MAX_EVENT_MESSAGE = 500
+_MAX_EVENT_SOURCE_CHARS = 4096
 _MAX_EVENT_RESPONSE_BYTES = 16 * 1024
 
-_CREDENTIAL_PATTERNS = (
-    re.compile(r"(?i)\b(?:Bearer|Basic)\s+\S+"),
-    re.compile(
-        r"(?i)(?<![\w])[\"']?(?:password|passwd|token|api[_-]?key|secret|authorization)"
-        r"[\"']?\s*[:=]\s*(?:\"(?:\\.|[^\"\\])*(?:\"|\Z)|'(?:\\.|[^'\\])*(?:'|\Z)|[^\s,;}\]\"']+)"
-    ),
-    re.compile(r"\b(?:gh[opsu]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{8,})\b"),
-    re.compile(r"(?i)(https?://)[^\s/@]+:[^\s/@]+@"),
-    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"),
+_ANSI_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
+_ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_JSON_CHAR_ESCAPE = re.compile(r"\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))")
+_TIMEOUT_MARKER = re.compile(r"\bTimeout after \d+(?:\.\d+)?s\b")
+_SENSITIVE_HEADER = re.compile(
+    r"(?im)\b(?:set-cookie|cookie|proxy-authorization|authorization)\s*:\s*[^\r\n]*"
+)
+_URL_AUTHORITY = re.compile(r"(?i)\b(https?://)([^\s/?#]+)")
+_AUTH_SCHEME = re.compile(r"(?i)\b(?:Bearer|Basic)\s+\S+")
+_CREDENTIAL_FIELD = re.compile(
+    r"(?i)(?<![\w])[\"']?(?:password|passwd|token|secret|authorization|cookie|"
+    r"set[_-]?cookie|session[_-]?(?:id|key|token)|"
+    r"api[_-]?key|secret[_-]?key|aws[_-]?secret[_-]?access[_-]?key|"
+    r"(?:access|refresh|id)[_-]?token|client[_-]?secret|"
+    r"(?:ssh[_-]?)?private[_-]?key|"
+    r"[a-z][a-z0-9_-]{0,40}[_-](?:token|secret|password|private[_-]?key))"
+    r"[\"']?\s*[:=]\s*(?:\"(?:\\.|[^\"\\])*(?:\"|\Z)|"
+    r"'(?:\\.|[^'\\])*(?:'|\Z)|[^\r\n,;}\]]+)"
+)
+_STANDALONE_TOKEN = re.compile(
+    r"\b(?:gh[opsu]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]+|"
+    r"glpat-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,})\b"
+)
+_PRIVATE_KEY = re.compile(
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?"
+    r"(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
+)
+_LEGACY_EVENT_CATEGORIES = frozenset(
+    {"MERGE", "INFRA", "ERROR", "RATE-LIMIT", "WATCH", "CODING", "FIX",
+     "GUARDRAIL", "CANCEL", "PANIC", "OPERATOR", "STATE"}
 )
 
 _KNOWN_CATEGORIES = frozenset(CATEGORIES)
@@ -876,12 +899,60 @@ def _source_summary(statuses: list[str]) -> str:
 
 
 def _safe_event_message(value: str) -> tuple[str, bool]:
-    message = value
-    for pattern in _CREDENTIAL_PATTERNS[:3]:
-        message = pattern.sub("[REDACTED]", message)
-    message = _CREDENTIAL_PATTERNS[3].sub(r"\1[REDACTED]@", message)
-    message = _CREDENTIAL_PATTERNS[4].sub("[REDACTED]", message)
+    """Normalize bounded producer text, then redact before output truncation."""
+    timeout = _TIMEOUT_MARKER.search(value[:_MAX_EVENT_SOURCE_CHARS])
+    if len(value) > _MAX_EVENT_SOURCE_CHARS:
+        return f"[OMITTED: oversized event text] {timeout.group(0) if timeout else ''}".strip(), True
+    message = unicodedata.normalize("NFKC", value)
+    if len(message) > _MAX_EVENT_SOURCE_CHARS:
+        return f"[OMITTED: oversized event text] {timeout.group(0) if timeout else ''}".strip(), True
+    message = _ANSI_CSI.sub("", _ANSI_OSC.sub("", message))
+    if any((ord(char) < 32 and char not in "\r\n\t") or 127 <= ord(char) < 160
+           for char in message):
+        return f"[OMITTED: ambiguous terminal text] {timeout.group(0) if timeout else ''}".strip(), True
+    message = "".join(char for char in message if unicodedata.category(char) != "Cf")
+    for _ in range(2):
+        previous = message
+        message = message.replace(r"\\u", r"\u").replace(r"\\x", r"\x")
+        message = _JSON_CHAR_ESCAPE.sub(
+            lambda match: chr(int(match.group(1) or match.group(2), 16)), message
+        )
+        if message == previous:
+            break
+    message = unicodedata.normalize("NFKC", message)
+    message = "".join(char for char in message if unicodedata.category(char) != "Cf")
+    if len(message) > _MAX_EVENT_SOURCE_CHARS or r"\u" in message or r"\x" in message or any(
+        (ord(char) < 32 and char not in "\r\n\t")
+        or 127 <= ord(char) < 160
+        or 0xD800 <= ord(char) <= 0xDFFF
+        for char in message
+    ):
+        return f"[OMITTED: ambiguous encoded text] {timeout.group(0) if timeout else ''}".strip(), True
+    # Protect ordinary JSON values before unescaping a surrounding serialized
+    # representation: an escaped quote inside a secret value is not its end.
+    message = _CREDENTIAL_FIELD.sub("[REDACTED]", message)
+    for _ in range(2):
+        previous = message
+        message = message.replace(r'\"', '"').replace(r"\'", "'").replace(r"\/", "/")
+        message = _CREDENTIAL_FIELD.sub("[REDACTED]", message)
+        if message == previous:
+            break
+    message = _PRIVATE_KEY.sub("[REDACTED]", message)
+    message = _SENSITIVE_HEADER.sub("[REDACTED]", message)
+    message = _URL_AUTHORITY.sub(_safe_url_authority, message)
+    message = _AUTH_SCHEME.sub("[REDACTED]", message)
+    message = _STANDALONE_TOKEN.sub("[REDACTED]", message)
     return message[:_MAX_EVENT_MESSAGE], len(message) > _MAX_EVENT_MESSAGE
+
+
+def _safe_url_authority(match: re.Match[str]) -> str:
+    """Keep a host while hiding userinfo, including a truncated authority."""
+    scheme, authority = match.groups()
+    if "@" in authority:
+        return f"{scheme}[REDACTED]@{authority.rsplit('@', 1)[1]}"
+    if ":" in authority and not authority.rsplit(":", 1)[1].isdigit():
+        return f"{scheme}[REDACTED]"
+    return match.group(0)
 
 
 @mcp.tool()
@@ -940,7 +1011,7 @@ async def get_repo_events(repo_slug: str, limit: int = 10) -> dict[str, Any]:
                 category = tier if isinstance(tier, str) and tier in EVENT_TIERS else None
                 if category is None and message.startswith("[") and "] " in message:
                     prefix = message.split("] ", 1)[0][1:]
-                    category = prefix if re.fullmatch(r"[A-Z][A-Z0-9_-]{0,31}", prefix) else None
+                    category = prefix if prefix in _LEGACY_EVENT_CATEGORIES else None
                 safe_kind = _safe_event_message(kind)[0] if isinstance(kind, str) and len(kind) <= 64 else None
                 events.append({
                     "timestamp": timestamp, "last_seen_at": last_seen,

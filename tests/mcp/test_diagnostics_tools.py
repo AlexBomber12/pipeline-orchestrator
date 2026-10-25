@@ -599,6 +599,93 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
     assert len(json.dumps(capped).encode()) <= 600
 
 
+@pytest.mark.parametrize(
+    ("message", "canary", "safe_text"),
+    [
+        (
+            'before {"access_token":"CANARY_ACCESS"} after Timeout after 300s',
+            "CANARY_ACCESS", "after Timeout after 300s",
+        ),
+        ('before {"refresh_token":"CANARY_REFRESH"} after', "CANARY_REFRESH", "after"),
+        ('before {"client_secret":"CANARY_CLIENT"} after', "CANARY_CLIENT", "after"),
+        ('before {"private_key":"CANARY_PRIVATE"} after', "CANARY_PRIVATE", "after"),
+        ('before {"clientSecret":"CANARY_CAMEL"} after', "CANARY_CAMEL", "after"),
+        ('before {"aws_secret_access_key":"CANARY_AWS"} after', "CANARY_AWS", "after"),
+        ('before {"session_id":"CANARY_SESSION"} after', "CANARY_SESSION", "after"),
+        ('before Cookie: sessionid=CANARY_COOKIE; theme=light\nafter', "CANARY_COOKIE", "after"),
+        ('before Set-Cookie: sid=CANARY_SET_COOKIE; Secure\nafter', "CANARY_SET_COOKIE", "after"),
+        ('before Proxy-Authorization: Basic CANARY_PROXY\nafter', "CANARY_PROXY", "after"),
+        (r'before {"pass\u0077ord":"CANARY_ESCAPED"} after', "CANARY_ESCAPED", "after"),
+        (r'before {\"access_token\":\"CANARY_JSON_QUOTES\"} after', "CANARY_JSON_QUOTES", "after"),
+        (r'before {"access_token":"abc\"CANARY_INNER_QUOTE"} after', "CANARY_INNER_QUOTE", "after"),
+        ('before pa\x1b[31mssword=CANARY_ANSI', "CANARY_ANSI", "before"),
+        ('before https://user:CANARY_URL@relay@host/repo after', "CANARY_URL", "/repo after"),
+        ('before https://user:CANARY_URL_TRUNC', "CANARY_URL_TRUNC", "before"),
+        ('before https://host.example:443/health after', "CANARY_NOT_PRESENT", "https://host.example:443/health"),
+        ('before password="CANARY_TRUNCATED', "CANARY_TRUNCATED", "before"),
+        ('before -----BEGIN OPENSSH PRIVATE KEY-----\nCANARY_PEM', "CANARY_PEM", "before"),
+        ('before \x1b]0;CANARY_OSC\x07 after', "CANARY_OSC", "after"),
+        ('Timeout after 300s \x1bX CANARY_UNKNOWN', "CANARY_UNKNOWN", "Timeout after 300s"),
+        ("CANARY_OVERSIZED" + "x" * 4100, "CANARY_OVERSIZED", "OMITTED: oversized"),
+        ("CANARY_NFKC" + "ﬃ" * 2000, "CANARY_NFKC", "OMITTED: oversized"),
+        (r"Timeout after 300s password=\u00ZZ CANARY_BAD_ESCAPE", "CANARY_BAD_ESCAPE", "Timeout after 300s"),
+        (r"Timeout after 300s pass\u001bword=CANARY_ENCODED_ESC", "CANARY_ENCODED_ESC", "Timeout after 300s"),
+        (r'before {"pass\u200bword":"CANARY_ZERO_WIDTH"} after', "CANARY_ZERO_WIDTH", "after"),
+        (
+            '[MERGE] Merge conflict resolution failed (exit 1): access_token=CANARY_MERGE; operator Retry required',
+            "CANARY_MERGE", "Merge conflict resolution failed",
+        ),
+        ('[MERGE] Timeout after 300s; PR #12 remains open', "CANARY_NOT_PRESENT", "PR #12 remains open"),
+    ],
+)
+async def test_repo_events_sanitizes_complete_response(
+    monkeypatch: pytest.MonkeyPatch, message: str, canary: str, safe_text: str,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    state = _state(updated=NOW)
+    state.history = [{"time": NOW.isoformat(), "state": "MERGE", "event": message,
+                      "kind": "client_secret=CANARY_KIND"}]
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+
+    result = await diagnostics.get_repo_events(SLUG)
+
+    serialized = json.dumps(result)
+    assert canary not in serialized
+    assert "CANARY_KIND" not in serialized
+    assert safe_text in result["events"][0]["message"]
+    assert result["source"]["status"] == "fresh"
+    assert redis.closed
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+async def test_repo_events_sanitizes_real_cli_log_producer(
+    monkeypatch: pytest.MonkeyPatch, truncated: bool,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    from tests.runner import _helpers as h
+
+    runner = h._make_runner()
+    value = '"CANARY_PRODUCER' + ("X" * 220 if truncated else '"}')
+    await runner._save_cli_log('{"access_token":' + value, "", "CODER")
+    assert "CANARY_PRODUCER" in runner.state.history[-1]["event"]
+    assert len(runner.state.history[-1]["event"]) <= 216
+
+    runner.state.last_updated = NOW
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    redis.store[pipeline_state(SLUG)] = runner.state.model_dump_json()
+
+    result = await diagnostics.get_repo_events(SLUG)
+
+    assert "CANARY_PRODUCER" not in json.dumps(result)
+    assert "[INFRA] CODER: === STDOUT ===" in result["events"][0]["message"]
+    assert redis.closed
+
+
 async def test_repo_events_source_states_bounds_and_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
     from src.mcp.tools import diagnostics
 
