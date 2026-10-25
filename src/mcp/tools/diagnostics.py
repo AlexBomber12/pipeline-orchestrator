@@ -69,7 +69,8 @@ _CREDENTIAL_FIELD = re.compile(
     r"api[_-]?key|secret[_-]?key|aws[_-]?(?:secret[_-]?)?access[_-]?key(?:[_-]?id)?|"
     r"(?:access|refresh|id)[_-]?token|client[_-]?secret|"
     r"(?:ssh[_-]?)?private[_-]?key|"
-    r"[a-z][a-z0-9_-]{0,40}[_-](?:token|secret|password|private[_-]?key))"
+    r"[a-z][a-z0-9_-]{0,40}[_-](?:token|secret|password|passwd|"
+    r"api[_-]?key|private[_-]?key))"
     r"[\"']?\s*[:=]\s*(?:\"(?:\\.|[^\"\\])*(?:\"|\Z)|"
     r"'(?:\\.|[^'\\])*(?:'|\Z)|[^\r\n,;}\]]+)"
 )

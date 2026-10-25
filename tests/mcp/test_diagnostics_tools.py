@@ -654,6 +654,10 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
         ('before postgresql://dbuser:CANARY_POSTGRES@db.example/app after',
          "CANARY_POSTGRES", "/app after"),
         ('before aws_access_key_id=CANARY_AWS_ID; after', "CANARY_AWS_ID", "after"),
+        ('before GOOGLE_API_KEY=AIzaCANARY_GOOGLE_API after',
+         "CANARY_GOOGLE_API", "before"),
+        ('before OPENAI_API_KEY=CANARY_OPENAI_API after',
+         "CANARY_OPENAI_API", "before"),
         ('before https://user:CANARY_URL_TRUNC', "CANARY_URL_TRUNC", "before"),
         ('before https://host.example:443/health after', "CANARY_NOT_PRESENT", "https://host.example:443/health"),
         ('before password="CANARY_TRUNCATED', "CANARY_TRUNCATED", "before"),
@@ -735,6 +739,8 @@ async def test_repo_events_sanitizes_real_cli_log_producer(
          "CANARY_PRODUCER_FULLWIDTH"),
         (r'password=prefix\u003bCANARY_PRODUCER_DELIMITER',
          "CANARY_PRODUCER_DELIMITER"),
+        ("GOOGLE_API_KEY=AIzaCANARY_PRODUCER_GOOGLE1234567890abcdef",
+         "CANARY_PRODUCER_GOOGLE"),
     ],
 )
 async def test_repo_events_sanitizes_cli_log_boundary_cases(
