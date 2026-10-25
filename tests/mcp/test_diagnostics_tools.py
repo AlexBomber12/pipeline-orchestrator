@@ -570,6 +570,20 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
     assert redis.closed
     assert "merge" in EVENT_TIERS
 
+    # _save_cli_log records only the beginning of CLI output, so the PEM
+    # closing marker may be absent from a retained event.
+    state.history[-1]["event"] = "[INFRA] CLI output: -----BEGIN EC PRIVATE KEY-----\n" + "A" * 160
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    pem = await diagnostics.get_repo_events(SLUG, limit=1)
+    assert "BEGIN EC PRIVATE KEY" not in pem["events"][0]["message"]
+    assert "A" * 40 not in pem["events"][0]["message"]
+    assert "[REDACTED]" in pem["events"][0]["message"]
+
+    state.history[-1]["event"] = '[INFRA] password="correct horse battery'
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    partial_quote = await diagnostics.get_repo_events(SLUG, limit=1)
+    assert "correct horse battery" not in partial_quote["events"][0]["message"]
+
     state.history[-1]["tier"] = None
     state.history[-1]["event"] = "[MERGE] Timeout after 300s"
     redis.store[pipeline_state(SLUG)] = state.model_dump_json()
