@@ -613,9 +613,13 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
         ('before {"aws_secret_access_key":"CANARY_AWS"} after', "CANARY_AWS", "after"),
         ('before {"session_id":"CANARY_SESSION"} after', "CANARY_SESSION", "after"),
         ('before Cookie: sessionid=CANARY_COOKIE; theme=light\nafter', "CANARY_COOKIE", "after"),
+        ('before Cookie: theme=light; sid=CANARY_COOKIE_AFTER_SEMI\nafter',
+         "CANARY_COOKIE_AFTER_SEMI", "after"),
         ('before Set-Cookie: sid=CANARY_SET_COOKIE; Secure\nafter', "CANARY_SET_COOKIE", "after"),
         ('before Proxy-Authorization: Basic CANARY_PROXY\nafter', "CANARY_PROXY", "after"),
         (r'before {"pass\u0077ord":"CANARY_ESCAPED"} after', "CANARY_ESCAPED", "after"),
+        (r'Timeout after 300s {"password":"prefix\u0022CANARY_UNICODE_QUOTE"}',
+         "CANARY_UNICODE_QUOTE", "Timeout after 300s"),
         (r'before {\"access_token\":\"CANARY_JSON_QUOTES\"} after', "CANARY_JSON_QUOTES", "after"),
         (r'before {"access_token":"abc\"CANARY_INNER_QUOTE"} after', "CANARY_INNER_QUOTE", "after"),
         (
@@ -694,6 +698,34 @@ async def test_repo_events_sanitizes_real_cli_log_producer(
 
     assert "CANARY_PRODUCER" not in json.dumps(result)
     assert "[INFRA] CODER: === STDOUT ===" in result["events"][0]["message"]
+    assert redis.closed
+
+
+@pytest.mark.parametrize(
+    ("stdout", "canary"),
+    [
+        ("Cookie: theme=light; sid=CANARY_PRODUCER_COOKIE", "CANARY_PRODUCER_COOKIE"),
+        (r'{"password":"prefix\u0022CANARY_PRODUCER_QUOTE"}', "CANARY_PRODUCER_QUOTE"),
+    ],
+)
+async def test_repo_events_sanitizes_cli_log_boundary_cases(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, canary: str,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    from tests.runner import _helpers as h
+
+    runner = h._make_runner()
+    await runner._save_cli_log(stdout, "", "CODER")
+    assert canary in runner.state.history[-1]["event"]
+    runner.state.last_updated = NOW
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    redis.store[pipeline_state(SLUG)] = runner.state.model_dump_json()
+
+    result = await diagnostics.get_repo_events(SLUG)
+
+    assert canary not in json.dumps(result)
     assert redis.closed
 
 

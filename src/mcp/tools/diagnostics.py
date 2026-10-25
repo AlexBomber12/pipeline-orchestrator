@@ -57,6 +57,7 @@ _MAX_EVENT_RESPONSE_BYTES = 16 * 1024
 _ANSI_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _JSON_CHAR_ESCAPE = re.compile(r"\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))")
+_ENCODED_QUOTE = re.compile(r"\\(?:u00(?:22|27)|x(?:22|27))", re.IGNORECASE)
 _TIMEOUT_MARKER = re.compile(r"\bTimeout after \d+(?:\.\d+)?s\b")
 _SENSITIVE_HEADER = re.compile(
     r"(?im)\b(?:set-cookie|cookie|proxy-authorization|authorization)\s*:\s*[^\r\n]*"
@@ -923,6 +924,8 @@ def _safe_event_message(value: str) -> tuple[str, bool]:
         message = decoded
     for _ in range(2):
         previous = message
+        if _ENCODED_QUOTE.search(message):
+            return f"[OMITTED: ambiguous encoded text] {timeout.group(0) if timeout else ''}".strip(), True
         message = message.replace(r"\\u", r"\u").replace(r"\\x", r"\x")
         message = _JSON_CHAR_ESCAPE.sub(
             lambda match: chr(int(match.group(1) or match.group(2), 16)), message
@@ -939,6 +942,9 @@ def _safe_event_message(value: str) -> tuple[str, bool]:
         for char in message
     )):
         return f"[OMITTED: ambiguous encoded text] {timeout.group(0) if timeout else ''}".strip(), True
+    # Whole headers must be removed before field redaction can erase their name
+    # and leave later Cookie attributes exposed.
+    message = _SENSITIVE_HEADER.sub("[REDACTED]", message)
     # Protect ordinary JSON values before unescaping a surrounding serialized
     # representation: an escaped quote inside a secret value is not its end.
     message = _CREDENTIAL_FIELD.sub("[REDACTED]", message)
