@@ -485,7 +485,7 @@ def test_handle_merge_pauses_when_conflict_resolution_hits_rate_limit(
     assert runner.state.rate_limited_until is not None
     assert not merge_pr_calls, "merge_pr must not be called while paused"
     abort_cmds = [cmd for cmd in git_calls if cmd[:3] == ["git", "merge", "--abort"]]
-    assert abort_cmds, "git merge --abort must be invoked"
+    assert not abort_cmds, "resolver work must survive the rate-limit pause"
     assert any("Rate limit pause active until" in e["event"] for e in runner.state.history)
 
 

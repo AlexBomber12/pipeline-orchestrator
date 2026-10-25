@@ -61,8 +61,47 @@ def test_conflict_commit_requires_finished_merge_of_both_heads(tmp_path: Path) -
         merge_module._validated_conflict_commit(str(repo), "feature", old_head, "main")
 
 
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        ("branch", "checked-out branch"),
+        ("unmerged", "unmerged paths"),
+        ("unchanged", "new commit"),
+        ("ancestor", "does not contain"),
+    ],
+)
+def test_conflict_commit_rejects_unverified_git_states(
+    monkeypatch: pytest.MonkeyPatch, failure: str, expected: str
+) -> None:
+    def fake_git(_repo: str, *args: str, **_kwargs: object):
+        if args[:2] == ("branch", "--show-current"):
+            return h._FakeCompletedProcess(stdout="wrong" if failure == "branch" else "feature")
+        if args[:3] == ("rev-parse", "-q", "--verify"):
+            return h._FakeCompletedProcess(returncode=1)
+        if args[:2] == ("ls-files", "-u"):
+            return h._FakeCompletedProcess(stdout="unmerged" if failure == "unmerged" else "")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return h._FakeCompletedProcess(stdout="a" * 40 if failure == "unchanged" else "b" * 40)
+        if args[:2] == ("merge-base", "--is-ancestor"):
+            return h._FakeCompletedProcess(returncode=1 if failure == "ancestor" else 0)
+        return h._FakeCompletedProcess()
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    with pytest.raises(RuntimeError, match=expected):
+        merge_module._validated_conflict_commit("repo", "feature", "a" * 40, "main")
+
+
+@pytest.mark.parametrize(
+    ("coder_result", "expected"),
+    [
+        ((-1, "", "Timeout after 300s"), "exit -1"),
+        ((0, "finished", ""), "resolution incomplete"),
+    ],
+)
 def test_merge_timeout_preserves_failure_and_does_not_rediagnose(
     monkeypatch: pytest.MonkeyPatch,
+    coder_result: tuple[int, str, str],
+    expected: str,
 ) -> None:
     git_calls: list[tuple[str, ...]] = []
 
@@ -82,7 +121,7 @@ def test_merge_timeout_preserves_failure_and_does_not_rediagnose(
 
     async def timed_out(prompt: str, *_args: object, **_kwargs: object):
         invoked.append(prompt)
-        return -1, "", "Timeout after 300s"
+        return coder_result
 
     async def allow(*_args: object, **_kwargs: object) -> bool:
         return True
@@ -102,8 +141,7 @@ def test_merge_timeout_preserves_failure_and_does_not_rediagnose(
     assert invoked and "Do not push, run CI" in invoked[0]
     assert runner.state.coder == "codex"
     assert runner.state.state == PipelineState.ERROR
-    assert "exit -1" in (runner.state.error_message or "")
-    assert "Timeout after 300s" in (runner.state.error_message or "")
+    assert expected in (runner.state.error_message or "")
     assert not any(args[:2] == ("merge", "--abort") for args in git_calls)
     failure = runner.state.error_message
     for _ in range(2):
@@ -459,6 +497,44 @@ def test_pre_merge_sync_refuses_progress_when_rev_parse_fails(
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.ERROR
+    assert not any(
+        "Bypass-requesting fresh @codex review" in entry.get("event", "")
+        for entry in runner.state.history
+    )
+
+
+def test_pre_merge_sync_rejects_remote_head_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rev_parse_calls = 0
+    pushed: list[bool] = []
+
+    def fake_git(_repo: str, *args: str, **_kwargs: object):
+        nonlocal rev_parse_calls
+        if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls += 1
+            return h._FakeCompletedProcess(
+                stdout=("a" if rev_parse_calls == 1 else "b") * 40
+            )
+        if args[:2] == ("merge", "origin/main"):
+            return h._FakeCompletedProcess(stdout="Merge made by the 'ort' strategy")
+        if args[:2] == ("push", "origin"):
+            pushed.append(True)
+        if args[:2] == ("ls-remote", "origin"):
+            return h._FakeCompletedProcess(stdout=f"{'a' * 40}\trefs/heads/pr-007\n")
+        return h._FakeCompletedProcess()
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(merge_module, "retry_transient", lambda op, **_: op())
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=7, branch="pr-007")
+    runner.state.state = PipelineState.WATCH
+
+    asyncio.run(runner.handle_merge())
+
+    assert pushed
+    assert runner.state.state == PipelineState.ERROR
+    assert "remote HEAD does not match" in (runner.state.error_message or "")
     assert not any(
         "Bypass-requesting fresh @codex review" in entry.get("event", "")
         for entry in runner.state.history
