@@ -653,7 +653,13 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
          "CANARY_REDISS", "/0 after"),
         ('before postgresql://dbuser:CANARY_POSTGRES@db.example/app after',
          "CANARY_POSTGRES", "/app after"),
-        ('before aws_access_key_id=CANARY_AWS_ID; after', "CANARY_AWS_ID", "after"),
+        ('before aws_access_key_id=CANARY_AWS_ID; after', "CANARY_AWS_ID", "before"),
+        ('before PASSWORD=prefix,CANARY_LITERAL_SUFFIX Timeout after 300s',
+         "CANARY_LITERAL_SUFFIX", "Timeout after 300s"),
+        ('before PASSWORD=prefix;CANARY_LITERAL_SEMICOLON\nafter',
+         "CANARY_LITERAL_SEMICOLON", "before"),
+        ('before PASSWORD=prefix\nCANARY_MULTILINE_SUFFIX\nTimeout after 300s',
+         "CANARY_MULTILINE_SUFFIX", "Timeout after 300s"),
         ('before GOOGLE_API_KEY=AIzaCANARY_GOOGLE_API after',
          "CANARY_GOOGLE_API", "before"),
         ('before OPENAI_API_KEY=CANARY_OPENAI_API after',
@@ -663,7 +669,7 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
         ('before password="CANARY_TRUNCATED', "CANARY_TRUNCATED", "before"),
         ('before -----BEGIN OPENSSH PRIVATE KEY-----\nCANARY_PEM', "CANARY_PEM", "before"),
         ('before private_key=-----BEGIN EC PRIVATE KEY-----\nCANARY_PEM_BODY\n'
-         '-----END EC PRIVATE KEY-----\nafter', "CANARY_PEM_BODY", "after"),
+         '-----END EC PRIVATE KEY-----\nafter', "CANARY_PEM_BODY", "before"),
         ('before \x1b]0;CANARY_OSC\x07 after', "CANARY_OSC", "after"),
         ('Timeout after 300s \x1bX CANARY_UNKNOWN', "CANARY_UNKNOWN", "Timeout after 300s"),
         ("CANARY_OVERSIZED" + "x" * 4100, "CANARY_OVERSIZED", "OMITTED: oversized"),
@@ -741,6 +747,8 @@ async def test_repo_events_sanitizes_real_cli_log_producer(
          "CANARY_PRODUCER_DELIMITER"),
         ("GOOGLE_API_KEY=AIzaCANARY_PRODUCER_GOOGLE1234567890abcdef",
          "CANARY_PRODUCER_GOOGLE"),
+        ("PASSWORD=prefix,CANARY_PRODUCER_LITERAL_SUFFIX",
+         "CANARY_PRODUCER_LITERAL_SUFFIX"),
     ],
 )
 async def test_repo_events_sanitizes_cli_log_boundary_cases(

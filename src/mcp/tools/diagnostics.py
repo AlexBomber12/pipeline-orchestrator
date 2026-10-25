@@ -72,7 +72,7 @@ _CREDENTIAL_FIELD = re.compile(
     r"[a-z][a-z0-9_-]{0,40}[_-](?:token|secret|password|passwd|"
     r"api[_-]?key|private[_-]?key))"
     r"[\"']?\s*[:=]\s*(?:\"(?:\\.|[^\"\\])*(?:\"|\Z)|"
-    r"'(?:\\.|[^'\\])*(?:'|\Z)|[^\r\n,;}\]]+)"
+    r"'(?:\\.|[^'\\])*(?:'|\Z)|[\s\S]+)"
 )
 _STANDALONE_TOKEN = re.compile(
     r"\b(?:gh[opsu]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]+|"
@@ -968,7 +968,11 @@ def _safe_event_message(value: str) -> tuple[str, bool]:
     message = _URL_AUTHORITY.sub(_safe_url_authority, message)
     message = _AUTH_SCHEME.sub("[REDACTED]", message)
     message = _STANDALONE_TOKEN.sub("[REDACTED]", message)
-    return message[:_MAX_EVENT_MESSAGE], len(message) > _MAX_EVENT_MESSAGE
+    shortened = len(message) > _MAX_EVENT_MESSAGE
+    if timeout and timeout.group(0) not in message:
+        marker = timeout.group(0)
+        message = f"{message[:_MAX_EVENT_MESSAGE - len(marker) - 1]} {marker}"
+    return message[:_MAX_EVENT_MESSAGE], shortened or len(message) > _MAX_EVENT_MESSAGE
 
 
 def _safe_url_authority(match: re.Match[str]) -> str:
