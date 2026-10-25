@@ -537,6 +537,8 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
          "event": "[MERGE] older", "count": 1},
         {"time": (NOW - timedelta(minutes=1)).isoformat(), "last_seen_at": NOW.isoformat(),
          "state": "ERROR", "event": "Timeout after 300s Authorization: Bearer abc123 password=hunter2 "
+         "{\"api_key\": \"abcdefgh12345678\"} password=\"correct horse battery staple\" "
+         "Authorization: Basic YWJjOnNlY3JldA== "
          "ghp_1234567890abcdef https://alice:secret@example.com", "tier": "merge",
          "kind": "conflict", "count": 3},
     ]
@@ -558,6 +560,9 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
     assert "Timeout after 300s" in event["message"]
     assert "abc123" not in json.dumps(result)
     assert "hunter2" not in json.dumps(result)
+    assert "abcdefgh12345678" not in json.dumps(result)
+    assert "correct horse battery staple" not in json.dumps(result)
+    assert "YWJjOnNlY3JldA" not in json.dumps(result)
     assert "ghp_" not in json.dumps(result)
     assert "alice" not in json.dumps(result)
     assert (redis.store, redis.lists, redis.ttls) == before

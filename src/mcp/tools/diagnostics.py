@@ -53,8 +53,11 @@ _MAX_EVENT_MESSAGE = 500
 _MAX_EVENT_RESPONSE_BYTES = 16 * 1024
 
 _CREDENTIAL_PATTERNS = (
-    re.compile(r"(?i)\bBearer\s+\S+"),
-    re.compile(r"(?i)\b(?:password|passwd|token|api[_-]?key|secret|authorization)\s*[:=]\s*[^\s,;]+"),
+    re.compile(r"(?i)\b(?:Bearer|Basic)\s+\S+"),
+    re.compile(
+        r"(?i)(?<![\w])[\"']?(?:password|passwd|token|api[_-]?key|secret|authorization)"
+        r"[\"']?\s*[:=]\s*(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;}\]]+)"
+    ),
     re.compile(r"\b(?:gh[opsu]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{8,})\b"),
     re.compile(r"(?i)(https?://)[^\s/@]+:[^\s/@]+@"),
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
