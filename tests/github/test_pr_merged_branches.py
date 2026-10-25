@@ -3,7 +3,6 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-
 from src.github import GhPrMergedBranchesUnavailable, gh_pr_get_merged_branches
 
 
@@ -277,25 +276,24 @@ def test_subprocess_invocation_does_not_pass_R_flag_to_gh_api(
     path mocked at the subprocess boundary rather than at the wrapper to assert
     the executed argv does not contain -R.
     """
-    import subprocess
+    from unittest.mock import MagicMock
 
     captured_argv: list[str] = []
 
-    def fake_subprocess_run(
+    def fake_subprocess_start(
         cmd: list[str],
         **kwargs: Any,
-    ) -> subprocess.CompletedProcess[str]:
+    ) -> object:
         captured_argv.extend(cmd)
-        return subprocess.CompletedProcess(
-            args=cmd,
-            returncode=0,
-            stdout='{"data": {"repository": {}}}',
-            stderr="",
-        )
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.returncode = 0
+        process.communicate.return_value = ('{"data": {"repository": {}}}', "")
+        return process
 
     monkeypatch.setattr(
-        "src.github.gh_runner.subprocess.run",
-        fake_subprocess_run,
+        "src.github.gh_runner.subprocess.Popen",
+        fake_subprocess_start,
     )
 
     gh_pr_get_merged_branches("owner/name", ["feat-a"])

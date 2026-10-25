@@ -193,6 +193,8 @@ class InvocationSnapshot:
     attempt_index: int | None
     phase: Literal["coding", "fix"]
     fix_iteration: int | None = None
+    # Structured dispatch cause. Older records have no proof of a CI-only fix.
+    fix_trigger: dict | None = None
 
 
 class PublicationAttempt(BaseModel):
@@ -271,6 +273,9 @@ class RepoState(BaseModel):
     current_queue: list[QueueTask] | None = None
     current_queue_snapshot_at: datetime | None = None
     current_pr: PRInfo | None = None
+    # Highest verified Actions attempt, scoped to one task generation/PR/HEAD.
+    ci_attempt_scope: str = ""
+    ci_attempts: dict[str, int] = Field(default_factory=dict)
     publication_watermark: PublicationWatermark | None = None
     publication_schema_version: int = 1
     publication_migration: PublicationMigration | None = None

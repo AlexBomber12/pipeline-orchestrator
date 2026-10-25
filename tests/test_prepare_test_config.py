@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 import yaml
 from scripts.prepare_test_config import prepare_test_config
+from src.config import load_config
 
 
 def test_installs_reviewer_prepared_config_in_shared_directory(tmp_path: Path) -> None:
@@ -42,6 +43,69 @@ def test_replaces_old_disposable_config_without_changing_source(tmp_path: Path) 
 
     assert destination.read_bytes() == original
     assert source.read_bytes() == original
+
+
+def test_installs_trusted_testbed_status_producer(tmp_path: Path) -> None:
+    source = tmp_path / "config.test.yml"
+    source.write_text(
+        "repositories:\n  - url: https://github.com/example/testbed.git\n"
+        "daemon:\n  trusted_reviewer_identities:\n    - user_id: 1\n",
+        encoding="utf-8",
+    )
+    destination = tmp_path / "shared.yml"
+
+    prepare_test_config(
+        source, destination, status_app_slug="testbed-app", status_app_id="12345",
+    )
+
+    installed = yaml.safe_load(destination.read_text(encoding="utf-8"))
+    assert installed["repositories"][0]["ci_fix_trusted_statuses"] == {
+        "e2e/watch-merge-gate": ["app:12345", "user:testbed-app[bot]"],
+    }
+    assert load_config(str(destination)).repositories[0].ci_fix_trusted_statuses == {
+        "e2e/watch-merge-gate": ["app:12345", "user:testbed-app[bot]"],
+    }
+    assert "ci_fix_trusted_statuses" not in source.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("slug", ["", "bad slug"])
+def test_rejects_invalid_testbed_status_app_slug(tmp_path: Path, slug: str) -> None:
+    source = tmp_path / "config.test.yml"
+    source.write_text(
+        "daemon:\n  trusted_reviewer_identities:\n    - user_id: 1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="status App slug"):
+        prepare_test_config(
+            source, tmp_path / "shared.yml", status_app_slug=slug, status_app_id="12345",
+        )
+
+
+@pytest.mark.parametrize("app_id", [None, "0", "not-an-id"])
+def test_rejects_invalid_testbed_status_app_id(tmp_path: Path, app_id: str | None) -> None:
+    source = tmp_path / "config.test.yml"
+    source.write_text(
+        "daemon:\n  trusted_reviewer_identities:\n    - user_id: 1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="status App ID"):
+        prepare_test_config(
+            source, tmp_path / "shared.yml",
+            status_app_slug="testbed-app", status_app_id=app_id,
+        )
+
+
+def test_requires_one_repository_for_testbed_status_policy(tmp_path: Path) -> None:
+    source = tmp_path / "config.test.yml"
+    source.write_text(
+        "daemon:\n  trusted_reviewer_identities:\n    - user_id: 1\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="one testbed repository"):
+        prepare_test_config(
+            source, tmp_path / "shared.yml",
+            status_app_slug="testbed-app", status_app_id="12345",
+        )
 
 
 @pytest.mark.parametrize("content", ["null\n", "daemon: {}\n"])

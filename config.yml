@@ -77,6 +77,7 @@ daemon:
   watch_slow_poll_interval_sec: 300
   watch_fast_poll_interval_sec: 45
   watch_retrigger_cap: 3
+  # Report CI still pending after this many minutes; this never fails a check.
   ci_pending_max_min: 30
   error_rate_threshold: 5
   error_rate_window_min: 60

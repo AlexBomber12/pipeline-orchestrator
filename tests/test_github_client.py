@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import subprocess
@@ -9,6 +10,7 @@ from datetime import datetime, timedelta
 from datetime import timezone as _tz
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 from src.config import TrustedReviewerIdentity
@@ -26,6 +28,7 @@ from src.github.comments import (
     post_comment,
 )
 from src.github.gh_runner import (
+    GhNotStartedError,
     _extract_commit_date,
     _parse_iso,
     get_repo_full_name,
@@ -123,6 +126,15 @@ class _FakeCompletedProcess:
         self.stderr = stderr
         self.returncode = returncode
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def communicate(self, **kwargs):
+        return self.stdout, self.stderr
+
 
 @pytest.fixture(autouse=True)
 def _clear_ci_status_cache_between_tests() -> None:
@@ -197,7 +209,7 @@ def test_run_gh_raises_on_nonzero_exit(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stderr="boom", returncode=1)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     with pytest.raises(RuntimeError, match="boom"):
         run_gh(["pr", "list"])
@@ -210,7 +222,7 @@ def test_run_gh_parses_json(monkeypatch: pytest.MonkeyPatch) -> None:
         captured["cmd"] = cmd
         return _FakeCompletedProcess(stdout='[{"number": 7}]')
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     result = run_gh(["pr", "list", "--json", "number"], repo="owner/name")
 
@@ -226,15 +238,59 @@ def test_run_gh_parses_json(monkeypatch: pytest.MonkeyPatch) -> None:
     ]
 
 
+@pytest.mark.parametrize("output", ["ok\n", ""])
 def test_run_gh_returns_raw_string_when_not_json(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, output: str,
 ) -> None:
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
-        return _FakeCompletedProcess(stdout="ok\n")
+        return _FakeCompletedProcess(stdout=output)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
-    assert run_gh(["auth", "status"]) == "ok"
+    assert run_gh(["auth", "status"]) == output.strip()
+
+
+@pytest.mark.parametrize("failure", [
+    BlockingIOError(errno.EAGAIN, "resource unavailable"),
+    FileNotFoundError(errno.ENOENT, "missing executable"),
+    PermissionError(errno.EACCES, "permission denied"),
+])
+def test_run_gh_preserves_confirmed_nonexecution(monkeypatch, failure) -> None:
+    spawn = MagicMock(side_effect=failure)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    with pytest.raises(GhNotStartedError) as caught:
+        run_gh(["run", "rerun", "1"])
+    assert caught.value.__cause__ is failure
+    assert spawn.call_count == 1
+
+
+@pytest.mark.parametrize("after_start", [False, True])
+def test_run_gh_does_not_classify_arbitrary_oserror_as_nonexecution(
+    monkeypatch, after_start,
+) -> None:
+    failure = OSError(errno.EIO, "transport unavailable")
+    process = MagicMock()
+    process.__enter__.return_value = process
+    process.communicate.side_effect = failure
+    spawn = MagicMock(return_value=process, side_effect=None if after_start else failure)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    with pytest.raises(OSError) as caught:
+        run_gh(["run", "rerun", "1"])
+    assert caught.value is failure
+
+
+def test_run_gh_timeout_retains_uncertain_outcome_and_reaps_process(monkeypatch) -> None:
+    failure = subprocess.TimeoutExpired(["gh"], 1)
+    process = MagicMock()
+    process.__enter__.return_value = process
+    process.communicate.side_effect = failure
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **kw: process)
+    with pytest.raises(subprocess.TimeoutExpired) as caught:
+        run_gh(["run", "rerun", "1"], timeout=1)
+    assert caught.value is failure
+    process.kill.assert_called_once_with()
+    assert process.communicate.call_count == 1
+    process.__exit__.assert_called_once()
 
 
 def test_get_merged_prs_paginates_closed_prs_without_fixed_limit(
@@ -617,7 +673,7 @@ def test_get_pr_review_status_approved_via_pr_body_reaction(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert (
         get_pr_review_status(
@@ -670,7 +726,7 @@ def test_get_pr_review_status_approved_via_first_author_comment_reaction(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert (
         get_pr_review_status(
@@ -717,7 +773,7 @@ def test_review_api_without_reaction_stays_pending(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.PENDING
 
@@ -753,7 +809,7 @@ def test_review_api_approved_requires_matching_head_sha(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.PENDING
 
@@ -802,7 +858,7 @@ def test_review_api_approval_does_not_override_post_anchor_codex_comment(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert (
         get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222")
@@ -854,7 +910,7 @@ def test_review_api_approved_beats_older_post_anchor_codex_comment(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert (
         get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222")
@@ -899,7 +955,7 @@ def test_latest_codex_review_state_overrides_older_approval(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.PENDING
 
@@ -934,7 +990,7 @@ def test_review_api_errors_do_not_block_reaction_fallback(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.APPROVED
 
@@ -970,7 +1026,7 @@ def test_review_api_approved_does_not_trust_unknown_head_commit_time(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.PENDING
 
@@ -1012,7 +1068,7 @@ def test_get_pr_review_status_skips_teammate_comment(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert (
         get_pr_review_status(
@@ -1059,7 +1115,7 @@ def test_get_pr_review_status_ignores_non_trigger_author_comment(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert (
         get_pr_review_status(
@@ -1083,7 +1139,7 @@ def test_get_pr_review_status_pending_when_no_codex_reaction(
             return _FakeCompletedProcess(stdout=_json.dumps([]))
         return _FakeCompletedProcess(stdout=_json.dumps([[{"id": 1, "user": {"login": "author"}, "body": "hi"}]]))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
 
@@ -1123,7 +1179,7 @@ def test_get_pr_review_status_changes_requested_on_p1(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.CHANGES_REQUESTED
 
@@ -1163,7 +1219,7 @@ def test_get_pr_review_status_ignores_stale_p1(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
 
@@ -1205,7 +1261,7 @@ def test_get_pr_review_status_uses_latest_author_comment(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
 
@@ -1245,7 +1301,7 @@ def test_review_status_changes_requested_without_p1_p2_tags(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.CHANGES_REQUESTED
 
@@ -1284,7 +1340,7 @@ def test_review_status_ignores_codex_onboarding_comment(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
 
@@ -1318,7 +1374,7 @@ def test_review_status_pending_when_no_codex_activity(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
 
@@ -1362,7 +1418,7 @@ def test_review_status_approved_wins_over_codex_comment(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert (
         get_pr_review_status(
@@ -1407,7 +1463,7 @@ def test_review_status_eyes_wins_over_codex_comment(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
 
@@ -1446,7 +1502,7 @@ def test_anchor_plus_one_wins_over_body_eyes(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
     monkeypatch.setattr(reviews, "_get_pr_push_time", lambda *_: datetime(2026, 1, 1, tzinfo=_tz.utc))
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="head") == ReviewStatus.APPROVED
@@ -1486,7 +1542,7 @@ def test_body_plus_one_wins_over_anchor_eyes(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
     monkeypatch.setattr(reviews, "_get_pr_push_time", lambda *_: datetime(2026, 1, 1, tzinfo=_tz.utc))
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="head") == ReviewStatus.APPROVED
@@ -1532,7 +1588,7 @@ def test_review_api_with_body_eyes_stays_eyes(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.EYES
 
@@ -1579,7 +1635,7 @@ def test_review_api_with_anchor_eyes_stays_eyes(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.EYES
 
@@ -1593,7 +1649,7 @@ def test_get_pr_review_status_handles_404(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stderr="HTTP 404", returncode=1)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42) == ReviewStatus.PENDING
 
@@ -1607,7 +1663,7 @@ def test_get_pr_review_status_propagates_non_404_error(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stderr="HTTP 403 rate limit exceeded", returncode=1)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     with pytest.raises(RuntimeError, match="403"):
         get_pr_review_status("owner/name", 42)
@@ -1622,7 +1678,7 @@ def test_get_pr_review_status_propagates_error_on_pr_404(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stderr="HTTP 403 rate limit exceeded", returncode=1)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     with pytest.raises(RuntimeError, match="403"):
         get_pr_review_status("owner/name", 404)
@@ -1772,7 +1828,7 @@ def test_body_plus_one_before_latest_push_is_stale_even_if_commit_is_older(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="bbbbbb2222") == ReviewStatus.PENDING
 
@@ -1801,7 +1857,7 @@ def test_body_plus_one_after_latest_push_approves(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="aabbcc112233") == ReviewStatus.APPROVED
 
@@ -1835,7 +1891,7 @@ def test_body_plus_one_no_push_time_stays_pending(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="deadbeef") == ReviewStatus.PENDING
 
@@ -1865,7 +1921,7 @@ def test_body_plus_one_missing_or_malformed_reaction_time_stays_pending(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert (
         get_pr_review_status(
@@ -1918,7 +1974,7 @@ def test_no_plus_one_does_not_fetch_latest_push_time(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="deadbeef") == ReviewStatus.PENDING
 
@@ -1943,7 +1999,7 @@ def test_body_eyes_without_conflicting_comments_stays_eyes(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.EYES
 
@@ -2000,7 +2056,7 @@ def test_approval_without_head_sha_stays_pending(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author") == ReviewStatus.PENDING
 
@@ -2015,7 +2071,7 @@ def test_merge_pr_uses_squash_and_expected_head(
         captured["cmd"] = cmd
         return _FakeCompletedProcess(stdout="")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     merge_pr("owner/name", 42, expected)
 
@@ -2051,7 +2107,7 @@ def test_merge_pr_classifies_expected_head_mismatch(
             returncode=1,
         )
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     with pytest.raises(ExpectedHeadMismatch):
         merge_pr("owner/name", 42, expected)
@@ -2068,7 +2124,7 @@ def test_merge_pr_reraises_non_head_mismatch_failure(
             returncode=1,
         )
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     with pytest.raises(RuntimeError, match="authentication failed"):
         merge_pr("owner/name", 42, expected)
@@ -2098,7 +2154,7 @@ def test_has_recent_codex_review_request_true(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=_json.dumps(pages))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert has_recent_codex_review_request("owner/name", 42, pr_author="author", within_minutes=5) is True
 
@@ -2122,7 +2178,7 @@ def test_has_recent_codex_review_request_false_too_old(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=_json.dumps(pages))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert has_recent_codex_review_request("owner/name", 42, pr_author="author", within_minutes=5) is False
 
@@ -2152,7 +2208,7 @@ def test_has_recent_codex_review_request_false_no_comment(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=_json.dumps(pages))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert has_recent_codex_review_request("owner/name", 42, pr_author="author", within_minutes=5) is False
 
@@ -2169,7 +2225,7 @@ def test_get_pr_author_returns_login(monkeypatch: pytest.MonkeyPatch) -> None:
         stdout = f'HTTP/2.0 200 OK\r\nETag: W/"abc"\r\n\r\n{body}'
         return _FakeCompletedProcess(stdout=stdout)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
     cache.clear_etag_cache()
 
     assert get_pr_author("owner/name", 42) == "claude-cli-bot"
@@ -2187,7 +2243,7 @@ def test_get_pr_author_returns_empty_on_error(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout="", stderr="not found", returncode=1)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_author("owner/name", 42) == ""
 
@@ -2205,7 +2261,7 @@ def test_get_pr_author_returns_empty_on_timeout(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         raise subprocess.TimeoutExpired(cmd=cmd, timeout=30)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_author("owner/name", 42) == ""
 
@@ -2218,7 +2274,7 @@ def test_get_pr_author_returns_empty_on_oserror(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         raise FileNotFoundError("gh: command not found")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_author("owner/name", 42) == ""
 
@@ -2245,7 +2301,7 @@ def test_has_recent_codex_review_request_respects_after_iso(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=_json.dumps(pages))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     just_now = (datetime.now(_tz.utc) - timedelta(seconds=10)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -2286,7 +2342,7 @@ def test_has_recent_codex_review_request_counts_same_second(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=_json.dumps(pages))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert (
         has_recent_codex_review_request(
@@ -2341,7 +2397,7 @@ def test_get_pr_head_commit_iso_returns_committer_date(
             return _FakeCompletedProcess(stdout="2026-04-14T13:37:00Z")
         return _FakeCompletedProcess(stdout="")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_head_commit_iso("owner/name", 42) == "2026-04-14T13:37:00Z"
     assert any("repos/owner/name/pulls/42" in a for a in invocations[0])
@@ -2358,7 +2414,7 @@ def test_get_pr_head_commit_iso_returns_empty_on_error(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout="", stderr="boom", returncode=1)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_head_commit_iso("owner/name", 42) == ""
 
@@ -2400,7 +2456,7 @@ def test_body_plus_one_stale_after_force_push_to_old_commit(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="oldSha5678") == ReviewStatus.PENDING
 
@@ -2444,7 +2500,7 @@ def test_body_plus_one_review_on_head_still_requires_fresh_reaction(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="currentHead") == ReviewStatus.PENDING
 
@@ -2487,7 +2543,7 @@ def test_body_plus_one_review_on_head_approves_when_reaction_is_fresh(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="currentHead") == ReviewStatus.APPROVED
 
@@ -2530,7 +2586,7 @@ def test_body_plus_one_review_on_head_no_push_time_stays_pending(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="currentHead") == ReviewStatus.PENDING
 
@@ -2584,7 +2640,7 @@ def test_unverifiable_body_plus_one_still_surfaces_current_findings(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert (
         get_pr_review_status(
@@ -2737,7 +2793,7 @@ def test_body_plus_one_same_actor_current_review_with_findings_stays_requested(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert (
         get_pr_review_status(
@@ -2811,7 +2867,7 @@ def test_body_plus_one_review_sha_must_match_reacting_actor(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert (
         get_pr_review_status(
@@ -2856,7 +2912,7 @@ def test_body_plus_one_same_second_as_latest_push_approves(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_review_status("owner/name", 42, pr_author="author", head_sha="abc") == ReviewStatus.APPROVED
 
@@ -2890,7 +2946,7 @@ def test_review_status_cached(monkeypatch: pytest.MonkeyPatch) -> None:
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     result1 = get_pr_review_status("owner/name", 42, pr_author="author", head_sha="sha123")
     calls_after_first = call_count
@@ -2932,7 +2988,7 @@ def test_review_status_cache_is_scoped_to_reviewer_policy(
             data = []
         return _FakeCompletedProcess(stdout=_json.dumps(data))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     trusted_policy = ReviewerPolicy(
         [TrustedReviewerIdentity(user_id=TRUSTED_REVIEWER_ID, login="codex")]
@@ -2978,7 +3034,7 @@ def test_get_pr_metadata_single_call(monkeypatch: pytest.MonkeyPatch) -> None:
             return _FakeCompletedProcess(stdout="2026-04-15T12:00:00Z")
         return _FakeCompletedProcess(stdout="")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     result = get_pr_metadata("owner/name", 42)
     assert result["author"] == "alice"
@@ -2995,7 +3051,7 @@ def test_get_pr_metadata_returns_empty_on_error(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stderr="boom", returncode=1)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     result = get_pr_metadata("owner/name", 42)
     assert result == {"author": "", "head_sha": "", "head_commit_date": ""}
@@ -3292,7 +3348,7 @@ def test_gh_api_paginated_retries_on_503(monkeypatch: pytest.MonkeyPatch) -> Non
             returncode=0,
         )
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
     result = _gh_api_paginated("repos/test/owner/issues/1/comments")
@@ -3307,7 +3363,7 @@ def test_gh_api_paginated_fails_after_retries(monkeypatch: pytest.MonkeyPatch) -
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         raise subprocess.CalledProcessError(1, cmd, stderr="503 Service Unavailable")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
     monkeypatch.setattr("src.retry.time.sleep", lambda _: None)
 
     with pytest.raises(RuntimeError, match="failed after 3 attempts"):
@@ -7060,7 +7116,7 @@ def test_etag_get_first_call_populates_cache(
         captured.append(cmd)
         return _FakeCompletedProcess(stdout=_build_include_response('{"merged": true}', etag='W/"abc"'))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     payload = cache._etag_get("repos/owner/name/pulls/42")
 
@@ -7089,7 +7145,7 @@ def test_etag_get_second_call_sends_if_none_match(
         captured.append(cmd)
         return _FakeCompletedProcess(stdout=next(responses))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     cache._etag_get("repos/owner/name/pulls/7")
     cache._etag_get("repos/owner/name/pulls/7")
@@ -7111,7 +7167,7 @@ def test_etag_get_304_returns_cached_payload(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=next(responses))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     first = cache._etag_get("repos/owner/name/pulls/9")
     second = cache._etag_get("repos/owner/name/pulls/9")
@@ -7134,7 +7190,7 @@ def test_etag_get_200_with_new_etag_replaces_cache(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=next(responses))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     first = cache._etag_get("repos/owner/name/commits/abc")
     second = cache._etag_get("repos/owner/name/commits/abc")
@@ -7158,7 +7214,7 @@ def test_etag_get_evicts_oldest_when_max_entries_exceeded(
         body = f'{{"i": {counter["i"]}}}'
         return _FakeCompletedProcess(stdout=_build_include_response(body, etag=f'W/"e{counter["i"]}"'))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     cache._etag_get("repos/x/y/pulls/1")
     cache._etag_get("repos/x/y/pulls/2")
@@ -7181,7 +7237,7 @@ def test_etag_get_returns_none_on_unparseable_body(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=_build_include_response("{not-json", etag='W/"v1"'))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert cache._etag_get("repos/owner/name/pulls/1") is None
     assert "repos/owner/name/pulls/1" not in cache._etag_cache
@@ -7203,7 +7259,7 @@ def test_etag_get_304_without_cache_retries_without_if_none_match(
         captured.append(cmd)
         return _FakeCompletedProcess(stdout=next(responses))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     payload = cache._etag_get("repos/owner/name/pulls/3")
 
@@ -7229,7 +7285,7 @@ def test_etag_get_304_no_cache_retry_returns_none_on_non_2xx(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=next(responses))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert cache._etag_get("repos/owner/name/pulls/3") is None
     assert "repos/owner/name/pulls/3" not in cache._etag_cache
@@ -7249,7 +7305,7 @@ def test_etag_get_304_no_cache_retry_returns_none_on_empty_body(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=next(responses))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert cache._etag_get("repos/owner/name/pulls/3") is None
 
@@ -7268,7 +7324,7 @@ def test_etag_get_304_no_cache_retry_returns_none_on_unparseable_body(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=next(responses))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert cache._etag_get("repos/owner/name/pulls/3") is None
     assert "repos/owner/name/pulls/3" not in cache._etag_cache
@@ -7318,7 +7374,7 @@ def test_etag_get_returns_none_on_5xx(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=_build_include_response("server error", status=500, etag=None))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert cache._etag_get("repos/owner/name/pulls/8") is None
     assert "repos/owner/name/pulls/8" not in cache._etag_cache
@@ -7332,7 +7388,7 @@ def test_etag_get_empty_200_body_returns_none(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=_build_include_response("", status=200, etag='W/"v1"'))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert cache._etag_get("repos/owner/name/pulls/9") is None
 
@@ -7360,7 +7416,7 @@ def test_etag_get_paginated_walks_pages_and_caches_each(
         captured.append(cmd)
         return _FakeCompletedProcess(stdout=next(responses))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     items = cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100")
 
@@ -7391,7 +7447,7 @@ def test_etag_get_paginated_304_returns_cached_pages(
         captured.append(cmd)
         return _FakeCompletedProcess(stdout=next(responses))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     base = "repos/owner/name/pulls?state=open&per_page=100"
     first = cache._etag_get_paginated(base)
@@ -7414,7 +7470,7 @@ def test_etag_get_paginated_stops_when_short_page(
         captured.append(cmd)
         return _FakeCompletedProcess(stdout=_build_include_response('[{"n": 1}]', etag='W/"only"'))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     items = cache._etag_get_paginated("repos/owner/name/pulls?state=closed&per_page=100")
 
@@ -7442,7 +7498,7 @@ def test_etag_get_paginated_walks_past_legacy_100_page_cap(
         body = full_body if state["calls"] <= full_pages else short_body
         return _FakeCompletedProcess(stdout=_build_include_response(body, etag=f'W/"p{state["calls"]}"'))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     items = cache._etag_get_paginated("repos/owner/name/pulls?state=closed&per_page=2")
 
@@ -7460,7 +7516,7 @@ def test_etag_get_paginated_uses_default_per_page_when_unspecified(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=_build_include_response(body, etag='W/"single"'))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     items = cache._etag_get_paginated("repos/owner/name/pulls")
 
@@ -7475,7 +7531,7 @@ def test_etag_get_paginated_first_page_none_returns_none(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=_build_include_response("server error", status=500, etag=None))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100") is None
 
@@ -7488,7 +7544,7 @@ def test_etag_get_paginated_first_page_non_list_returns_none(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=_build_include_response('{"unexpected": true}', etag='W/"v1"'))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100") is None
 
@@ -7508,7 +7564,7 @@ def test_etag_get_paginated_later_page_none_surfaces_partial(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=next(responses))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     items = cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100")
     assert items == [{"n": i} for i in range(100)]
@@ -7529,7 +7585,7 @@ def test_etag_get_paginated_later_page_non_list_breaks(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout=next(responses))
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     items = cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100")
     assert items == [{"n": i} for i in range(100)]
@@ -7543,7 +7599,7 @@ def test_etag_get_paginated_first_page_runtime_error_propagates(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stderr="boom", returncode=1)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     with pytest.raises(RuntimeError, match="boom"):
         cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100")
@@ -7562,7 +7618,7 @@ def test_etag_get_paginated_later_page_runtime_error_breaks(
             return _FakeCompletedProcess(stdout=_build_include_response(page1_body, etag='W/"p1"'))
         return _FakeCompletedProcess(stderr="transient", returncode=1)
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
     monkeypatch.setattr("src.retry.is_transient_error", lambda exc: False)
 
     items = cache._etag_get_paginated("repos/owner/name/pulls?state=open&per_page=100")
@@ -7660,7 +7716,7 @@ def test_merge_pr_invalidates_pulls_cache(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         return _FakeCompletedProcess(stdout="")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     prs.merge_pr("owner/name", 42, "c" * 40)
 
@@ -7682,7 +7738,7 @@ def test_get_pr_metadata_extracts_nested_user_and_head(
             return _FakeCompletedProcess(stdout=_build_include_response(commit_body, etag='W/"c1"'))
         return _FakeCompletedProcess(stdout="")
 
-    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", fake_run)
 
     assert get_pr_metadata("owner/name", 42) == {
         "author": "alice",
@@ -7720,3 +7776,61 @@ def test_etag_pagination_compatibility_filters_entirely_malformed_page(
 ) -> None:
     monkeypatch.setattr(cache, "_etag_get", lambda url: ["malformed"])
     assert cache._etag_get_paginated("repos/owner/name/pulls") == []
+
+
+@pytest.mark.parametrize("errno_value", [2, 11, 13])
+def test_gh_process_boundary_creation_failure_is_definitely_not_started(monkeypatch, errno_value):
+    from src.github.gh_runner import GhNotStartedError
+
+    failure = OSError(errno_value, "cannot create process")
+
+    def spawn(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    with pytest.raises(GhNotStartedError) as raised:
+        run_gh(["run", "rerun", "--failed", "12"], repo="octo/demo")
+    assert raised.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("failure", [
+    subprocess.TimeoutExpired("gh", 30), OSError(5, "pipe failed"), KeyboardInterrupt(),
+])
+def test_gh_process_boundary_after_start_failure_remains_ambiguous_and_reaps_child(monkeypatch, failure):
+    from unittest.mock import MagicMock
+
+    from src.github.gh_runner import GhNotStartedError
+
+    process = MagicMock()
+    process.communicate.side_effect = failure
+    spawn = MagicMock(return_value=process)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    with pytest.raises(type(failure)) as raised:
+        run_gh(["run", "rerun", "--failed", "12"])
+    assert not isinstance(raised.value, GhNotStartedError)
+    process.kill.assert_called_once_with()
+    process.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize(("stdout", "exit_code", "expected"), [
+    ('{"ok":true}', 0, {"ok": True}), ("accepted\n", 0, "accepted"), ("", 0, ""), ("", 1, None),
+])
+def test_gh_process_boundary_uses_real_process_and_shared_output_contract(monkeypatch, tmp_path, stdout, exit_code, expected):
+    import sys
+
+    program = tmp_path / "gh_script.py"
+    program.write_text(f"import sys\nsys.stdout.write({stdout!r})\nsys.stderr.write('rejected')\nsys.exit({exit_code})\n")
+    spawn = subprocess.Popen
+    observed = []
+
+    def substitute_executable(cmd, **kwargs):
+        observed.append(cmd)
+        return spawn([sys.executable, str(program)], **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", substitute_executable)
+    if exit_code:
+        with pytest.raises(RuntimeError, match="rejected"):
+            run_gh(["run", "rerun", "--failed", "12"], repo="octo/demo")
+    else:
+        assert run_gh(["run", "rerun", "--failed", "12"], repo="octo/demo") == expected
+    assert observed == [["gh", "run", "rerun", "--failed", "12", "-R", "octo/demo"]]

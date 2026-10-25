@@ -38,6 +38,25 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
     assert cfg.coder_plugins == config_module.DEFAULT_CODER_PLUGINS
 
 
+@pytest.mark.parametrize(
+    "statuses",
+    [[], {"": ["user:bot"]}, {"unit": []}, {"unit": ["user:"]},
+     {"unit": ["app:0"]}, {"unit": ["other:bot"]},
+     {"unit": ["user:ci[bot]", "user:ci[bot]"]}],
+)
+def test_ci_fix_trusted_statuses_rejects_invalid_policy(statuses: object) -> None:
+    with pytest.raises(ValueError, match="ci_fix_trusted_statuses"):
+        RepoConfig(url="https://github.com/example/repo.git", ci_fix_trusted_statuses=statuses)
+
+
+def test_ci_fix_trusted_statuses_accepts_configured_producers() -> None:
+    repo = RepoConfig(
+        url="https://github.com/example/repo.git",
+        ci_fix_trusted_statuses={"gate": ["user:ci-app[bot]", "app:15368"]},
+    )
+    assert repo.ci_fix_trusted_statuses["gate"] == ["user:ci-app[bot]", "app:15368"]
+
+
 def test_load_config_missing_file_applies_env_overrides(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

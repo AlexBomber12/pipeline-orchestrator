@@ -45,6 +45,7 @@ _REPO_FIELDS = {
     "poll_interval_sec",
     "allow_merge_without_checks",
     "required_checks",
+    "ci_fix_trusted_statuses",
     "allow_merge_without_review",
     "coder",
     "disabled_coders",
@@ -181,6 +182,7 @@ class RepoConfig(BaseModel):
     poll_interval_sec: int = 60
     allow_merge_without_checks: bool = False
     required_checks: list[str] | None = None
+    ci_fix_trusted_statuses: dict[str, list[str]] = Field(default_factory=dict)
     allow_merge_without_review: bool = False
     coder: str | None = None
     disabled_coders: list[str] | None = None
@@ -228,6 +230,24 @@ class RepoConfig(BaseModel):
                 )
             seen.add(item)
         return v
+
+    @field_validator("ci_fix_trusted_statuses", mode="before")
+    @classmethod
+    def _trusted_status_producers_valid(cls, value: Any) -> dict[str, list[str]]:
+        if not isinstance(value, dict):
+            raise ValueError("ci_fix_trusted_statuses must map context names to producers")
+        for name, producers in value.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("ci_fix_trusted_statuses requires nonblank context names")
+            if not isinstance(producers, list) or not producers or any(
+                not isinstance(producer, str) or not (
+                    producer.startswith("user:") and producer[5:].strip()
+                    or producer.startswith("app:") and producer[4:].isdecimal()
+                    and int(producer[4:]) > 0
+                ) for producer in producers
+            ) or len(producers) != len(set(producers)):
+                raise ValueError("ci_fix_trusted_statuses requires user or App producers")
+        return value
 
 
 class DaemonConfig(BaseModel):
