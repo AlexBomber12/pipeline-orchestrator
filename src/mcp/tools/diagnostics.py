@@ -954,6 +954,8 @@ def _safe_event_message(value: str) -> tuple[str, bool]:
     # and leave later Cookie attributes or PEM body lines exposed.
     message = _PRIVATE_KEY.sub("[REDACTED]", message)
     message = _SENSITIVE_HEADER.sub("[REDACTED]", message)
+    if _CREDENTIAL_FIELD.search(message) and re.search(r"['\"]{2,}", message):
+        return f"[OMITTED: ambiguous quoted credential] {timeout.group(0) if timeout else ''}".strip(), True
     # Protect ordinary JSON values before unescaping a surrounding serialized
     # representation: an escaped quote inside a secret value is not its end.
     message = _CREDENTIAL_FIELD.sub("[REDACTED]", message)
