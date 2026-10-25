@@ -57,7 +57,6 @@ _MAX_EVENT_RESPONSE_BYTES = 16 * 1024
 _ANSI_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _JSON_CHAR_ESCAPE = re.compile(r"\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))")
-_ENCODED_QUOTE = re.compile(r"\\(?:u00(?:22|27)|x(?:22|27))", re.IGNORECASE)
 _TIMEOUT_MARKER = re.compile(r"\bTimeout after \d+(?:\.\d+)?s\b")
 _SENSITIVE_HEADER = re.compile(
     r"(?im)\b(?:set-cookie|cookie|proxy-authorization|authorization)\s*:\s*[^\r\n]*"
@@ -904,6 +903,8 @@ def _safe_event_message(value: str) -> tuple[str, bool]:
     timeout = _TIMEOUT_MARKER.search(value[:_MAX_EVENT_SOURCE_CHARS])
     if len(value) > _MAX_EVENT_SOURCE_CHARS:
         return f"[OMITTED: oversized event text] {timeout.group(0) if timeout else ''}".strip(), True
+    if _ambiguous_compatibility(value):
+        return f"[OMITTED: ambiguous encoded text] {timeout.group(0) if timeout else ''}".strip(), True
     message = unicodedata.normalize("NFKC", value)
     if len(message) > _MAX_EVENT_SOURCE_CHARS:
         return f"[OMITTED: oversized event text] {timeout.group(0) if timeout else ''}".strip(), True
@@ -924,7 +925,11 @@ def _safe_event_message(value: str) -> tuple[str, bool]:
         message = decoded
     for _ in range(2):
         previous = message
-        if _ENCODED_QUOTE.search(message):
+        if any(
+            (decoded := chr(int(match.group(1) or match.group(2), 16))).isascii()
+            and not decoded.isalnum()
+            for match in _JSON_CHAR_ESCAPE.finditer(message)
+        ):
             return f"[OMITTED: ambiguous encoded text] {timeout.group(0) if timeout else ''}".strip(), True
         message = message.replace(r"\\u", r"\u").replace(r"\\x", r"\x")
         message = _JSON_CHAR_ESCAPE.sub(
@@ -932,6 +937,8 @@ def _safe_event_message(value: str) -> tuple[str, bool]:
         )
         if message == previous:
             break
+    if _ambiguous_compatibility(message):
+        return f"[OMITTED: ambiguous encoded text] {timeout.group(0) if timeout else ''}".strip(), True
     message = unicodedata.normalize("NFKC", message)
     message = "".join(char for char in message if unicodedata.category(char) != "Cf")
     if (len(message) > _MAX_EVENT_SOURCE_CHARS or r"\u" in message or r"\x" in message
@@ -971,6 +978,15 @@ def _safe_url_authority(match: re.Match[str]) -> str:
     if ":" in authority and not authority.rsplit(":", 1)[1].isdigit():
         return f"{scheme}[REDACTED]"
     return match.group(0)
+
+
+def _ambiguous_compatibility(value: str) -> bool:
+    """Reject compatibility folds that can create text delimiters."""
+    for char in value:
+        mapped = unicodedata.normalize("NFKC", char)
+        if mapped != char and any(ord(part) < 128 and not part.isalnum() for part in mapped):
+            return True
+    return False
 
 
 @mcp.tool()
