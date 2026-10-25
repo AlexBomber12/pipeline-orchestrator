@@ -618,6 +618,17 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
         (r'before {"pass\u0077ord":"CANARY_ESCAPED"} after', "CANARY_ESCAPED", "after"),
         (r'before {\"access_token\":\"CANARY_JSON_QUOTES\"} after', "CANARY_JSON_QUOTES", "after"),
         (r'before {"access_token":"abc\"CANARY_INNER_QUOTE"} after', "CANARY_INNER_QUOTE", "after"),
+        (
+            json.dumps(json.dumps({"password": 'prefix"CANARY_DOUBLE_JSON',
+                                   "detail": "Timeout after 300s"})),
+            "CANARY_DOUBLE_JSON", "Timeout after 300s",
+        ),
+        (
+            "before " + json.dumps(json.dumps({"password": 'prefix"CANARY_EMBEDDED_JSON'}))
+            + " after Timeout after 300s",
+            "CANARY_EMBEDDED_JSON", "Timeout after 300s",
+        ),
+        ('"Timeout after 300s\\q"', "CANARY_NOT_PRESENT", "Timeout after 300s"),
         ('before pa\x1b[31mssword=CANARY_ANSI', "CANARY_ANSI", "before"),
         ('before https://user:CANARY_URL@relay@host/repo after', "CANARY_URL", "/repo after"),
         ('before https://user:CANARY_URL_TRUNC', "CANARY_URL_TRUNC", "before"),

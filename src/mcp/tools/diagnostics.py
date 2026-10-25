@@ -911,6 +911,16 @@ def _safe_event_message(value: str) -> tuple[str, bool]:
            for char in message):
         return f"[OMITTED: ambiguous terminal text] {timeout.group(0) if timeout else ''}".strip(), True
     message = "".join(char for char in message if unicodedata.category(char) != "Cf")
+    # A complete JSON string may itself contain serialized JSON. Decode its
+    # layers while quotes still have their escape-aware boundaries.
+    for _ in range(2):
+        if not (message.startswith('"') and message.endswith('"')):
+            break
+        try:
+            decoded = json.loads(message)
+        except json.JSONDecodeError:
+            break
+        message = decoded
     for _ in range(2):
         previous = message
         message = message.replace(r"\\u", r"\u").replace(r"\\x", r"\x")
@@ -921,12 +931,13 @@ def _safe_event_message(value: str) -> tuple[str, bool]:
             break
     message = unicodedata.normalize("NFKC", message)
     message = "".join(char for char in message if unicodedata.category(char) != "Cf")
-    if len(message) > _MAX_EVENT_SOURCE_CHARS or r"\u" in message or r"\x" in message or any(
+    if (len(message) > _MAX_EVENT_SOURCE_CHARS or r"\u" in message or r"\x" in message
+        or re.search(r'\\{2,}["\']', message) or any(
         (ord(char) < 32 and char not in "\r\n\t")
         or 127 <= ord(char) < 160
         or 0xD800 <= ord(char) <= 0xDFFF
         for char in message
-    ):
+    )):
         return f"[OMITTED: ambiguous encoded text] {timeout.group(0) if timeout else ''}".strip(), True
     # Protect ordinary JSON values before unescaping a surrounding serialized
     # representation: an escaped quote inside a secret value is not its end.
