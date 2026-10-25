@@ -62,6 +62,14 @@ def test_conflict_commit_requires_finished_merge_of_both_heads(tmp_path: Path) -
         merge_module._validated_conflict_commit(str(repo), "feature", old_head, "main")
 
 
+def test_bound_pr_checkout_rejects_mismatched_task_branch() -> None:
+    runner = h._make_runner()
+    task = QueueTask(pr_id="PR-404", title="conflict", branch="other",
+                     status=TaskStatus.ERROR)
+    pr = PRInfo(number=636, branch="feature")
+    assert runner._bound_pr_has_unpublished_work(task, pr) is False
+
+
 @pytest.mark.parametrize(
     ("failure", "expected"),
     [
@@ -291,7 +299,8 @@ def test_non_ai_merge_error_repairs_failed_status_before_remote_read(
 
 
 @pytest.mark.parametrize(
-    "scenario", ["timeout", "rate_limit", "operator_stop", "fetch_timeout"],
+    "scenario", ["timeout", "rate_limit", "operator_stop", "fetch_timeout",
+                 "fetch_lost_message"],
 )
 def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scenario: str,
@@ -331,6 +340,8 @@ def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
         "Merge conflict resolution interrupted by operator Stop; "
         "unpublished work retained; operator Retry required"
         if scenario == "operator_stop" else
+        "Prior failure detail unavailable"
+        if scenario == "fetch_lost_message" else
         "Merge conflict resolution failed (exit -1): "
         + ("Error: 429 Too Many Requests" if scenario == "rate_limit"
            else "Timeout after 300s")
@@ -358,7 +369,7 @@ def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
     ):
         monkeypatch.setattr(runner, method, AsyncMock(return_value=False))
     monkeypatch.setattr(runner, "_consume_retry_command", AsyncMock(return_value=RetryDispatch.NONE))
-    if scenario == "fetch_timeout":
+    if scenario in {"fetch_timeout", "fetch_lost_message"}:
         calls = 0
 
         async def fetch_once_fails() -> None:
@@ -383,16 +394,18 @@ def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
         )
         assert runner.state.state == expected_state
         assert {"timeout": "Timeout after 300s", "rate_limit": "429",
-                "operator_stop": "operator Stop", "fetch_timeout": "Timeout after 300s"}[scenario] in (
+                "operator_stop": "operator Stop", "fetch_timeout": "Timeout after 300s",
+                "fetch_lost_message": "Merge conflict resolution incomplete"}[scenario] in (
             runner.state.error_message or ""
         )
-        if scenario == "fetch_timeout":
+        if scenario in {"fetch_timeout", "fetch_lost_message"}:
             assert any("git fetch timed out" in event["event"]
                        for event in runner.state.history)
         assert runner._error_diagnose_count == 2
         assert runner._consecutive_dirty_cycles == (
             2 if scenario == "operator_stop"
-            or (scenario == "fetch_timeout" and cycle == 0) else 0
+            or (scenario in {"fetch_timeout", "fetch_lost_message"}
+                and cycle == 0) else 0
         )
         assert git("rev-parse", "HEAD").stdout.strip() == feature_head
         assert (repo / "example.txt").read_text() == unpublished
