@@ -1770,8 +1770,8 @@ class RecoveryMixin:
                     and header is not None
                     and header.blocked_reason == SuppressionReason.REVIEW_TIMEOUT.value
                     else (
-                        "Merge conflict resolution incomplete: published ERROR task "
-                        "has unpublished checkout work; operator Retry required"
+                        "Published task failure unresolved; unpublished checkout "
+                        "retained; operator Retry required"
                         if retained_checkout else
                         "Published task failure unresolved; operator Retry or revised approval required."
                     )

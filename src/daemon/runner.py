@@ -2545,7 +2545,7 @@ class PipelineRunner(
             return
         if merge_sync_error:
             self.log_event(
-                "[RECOVERY] Merge sync failure remains ERROR until "
+                "[RECOVERY] Retained checkout failure remains ERROR until "
                 "operator Retry or a task update."
             )
             return
@@ -3884,8 +3884,8 @@ class PipelineRunner(
                 )
                 if not is_retained_merge_error(self.state.error_message):
                     await self._transition_to_error(
-                        "Merge conflict resolution incomplete: unpublished PR "
-                        f"checkout retained after {exc}; operator Retry required",
+                        "Published task failure unresolved; unpublished checkout "
+                        "retained; operator Retry required",
                         save_run_record_as=None,
                         publish=False,
                         log_prefix="[RECOVERY]",

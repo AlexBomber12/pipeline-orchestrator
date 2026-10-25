@@ -33,11 +33,12 @@ _RETAINED_MERGE_ERROR_PREFIXES = (
     "Merge conflict resolution incomplete",
     "Merge conflict resolution interrupted",
     "Pre-merge sync failed:",
+    "Published task failure unresolved; unpublished checkout retained",
 )
 
 
 def is_retained_merge_error(context: str | None) -> bool:
-    """Identify merge failures parked until explicit operator action."""
+    """Identify failures retaining unpublished checkout work until operator action."""
     return bool(context and context.startswith(_RETAINED_MERGE_ERROR_PREFIXES))
 
 INFRA_ERROR_PATTERNS: tuple[str, ...] = (
@@ -225,7 +226,7 @@ class ErrorMixin:
 
         if is_retained_merge_error(context):
             self.log_event(
-                "[RECOVERY] Merge sync failure remains parked with its "
+                "[RECOVERY] Unpublished checkout failure remains parked with its "
                 "original evidence for operator Retry."
             )
             return

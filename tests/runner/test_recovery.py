@@ -2425,7 +2425,9 @@ def test_restart_without_snapshot_retains_dirty_error_pr_checkout(
         monkeypatch.setattr(git_ops_module, "_git", original_git)
 
     assert runner.state.state == PipelineState.ERROR
-    assert runner.state.error_message.startswith("Merge conflict resolution incomplete")
+    assert runner.state.error_message.startswith(
+        "Published task failure unresolved; unpublished checkout retained"
+    )
     runner._recovered = True
     runner._consecutive_dirty_cycles = 2
     for method in (

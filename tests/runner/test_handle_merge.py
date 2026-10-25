@@ -453,7 +453,7 @@ def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
         assert runner.state.state == expected_state
         assert {"timeout": "Timeout after 300s", "rate_limit": "429",
                 "operator_stop": "operator Stop", "fetch_timeout": "Timeout after 300s",
-                "fetch_lost_message": "Merge conflict resolution incomplete"}[scenario] in (
+                "fetch_lost_message": "Published task failure unresolved"}[scenario] in (
             runner.state.error_message or ""
         )
         if scenario in {"fetch_timeout", "fetch_lost_message"}:
