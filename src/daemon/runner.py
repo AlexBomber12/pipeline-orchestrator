@@ -99,6 +99,7 @@ from src.daemon.handlers.error import (  # noqa: F401 — re-exported for tests
     ErrorMixin,
     _classify_error,
     _is_infra_error,
+    is_retained_merge_error,
 )
 from src.daemon.handlers.fix import FixMixin
 from src.daemon.handlers.hung import HungMixin
@@ -2533,12 +2534,7 @@ class PipelineRunner(
             )
             return
 
-        merge_sync_error = (self.state.error_message or "").startswith((
-            "No eligible coder available for merge conflict resolution",
-            "Merge conflict resolution failed",
-            "Merge conflict resolution incomplete",
-            "Pre-merge sync failed:",
-        ))
+        merge_sync_error = is_retained_merge_error(self.state.error_message)
         if merge_sync_error and task_id in self._status_write_failed_task_pr_ids:
             # The ordinary ERROR handler owns durable status-write repair.
             # Run it even when AI diagnosis is disabled and the remote

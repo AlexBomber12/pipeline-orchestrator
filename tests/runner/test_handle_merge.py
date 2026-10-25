@@ -248,6 +248,75 @@ def test_non_ai_merge_error_repairs_failed_status_before_remote_read(
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message.startswith("Merge conflict resolution incomplete")
 
+
+def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=check, text=True,
+            capture_output=True,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    (repo / "example.txt").write_text("base\n")
+    git("add", "example.txt")
+    git("commit", "-qm", "base")
+    git("checkout", "-qb", "feature")
+    (repo / "example.txt").write_text("feature\n")
+    git("commit", "-qam", "feature")
+    feature_head = git("rev-parse", "HEAD").stdout.strip()
+    git("checkout", "main")
+    (repo / "example.txt").write_text("main\n")
+    git("commit", "-qam", "main")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("checkout", "feature")
+    assert git("merge", "origin/main", check=False).returncode != 0
+    unpublished = (repo / "example.txt").read_text()
+
+    runner = h._make_runner()
+    runner.repo_path = str(repo)
+    runner._recovered = True
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "Merge conflict resolution failed (exit -1): Timeout after 300s; "
+        "operator Retry required"
+    )
+    runner.state.current_pr = PRInfo(
+        number=636, branch="feature", head_sha=feature_head
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-404", title="conflict", status=TaskStatus.DOING,
+        branch="feature",
+    )
+    runner._error_diagnose_count = 2
+    runner._consecutive_dirty_cycles = 2
+    for method in (
+        "_hold_for_coder_cleanup", "_consume_approval_command",
+        "_consume_publication_migration_command", "_maybe_resume_review_timeout",
+    ):
+        monkeypatch.setattr(runner, method, AsyncMock(return_value=False))
+    monkeypatch.setattr(runner, "_consume_retry_command", AsyncMock(return_value=RetryDispatch.NONE))
+    monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+    monkeypatch.setattr(runner, "_refresh_user_paused_from_redis", AsyncMock())
+    monkeypatch.setattr(runner, "_check_github_api_budget", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner, "_maybe_resume_obsolete_ci_error", AsyncMock(return_value=None))
+
+    for _ in range(4):
+        asyncio.run(runner._run_cycle_body())
+        assert runner.state.state == PipelineState.ERROR
+        assert "Timeout after 300s" in (runner.state.error_message or "")
+        assert runner._error_diagnose_count == 2
+        assert runner._consecutive_dirty_cycles == 0
+        assert git("rev-parse", "HEAD").stdout.strip() == feature_head
+        assert (repo / "example.txt").read_text() == unpublished
+        assert git("ls-files", "-u").stdout
+
 _CONFIRM_REMOTE_MERGE = merge_module.MergeMixin._confirm_remote_merge
 
 

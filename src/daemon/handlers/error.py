@@ -27,6 +27,18 @@ from src.subsource_registry import SuppressionReason
 logger = logging.getLogger(__name__)
 _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
 
+_RETAINED_MERGE_ERROR_PREFIXES = (
+    "No eligible coder available for merge conflict resolution",
+    "Merge conflict resolution failed",
+    "Merge conflict resolution incomplete",
+    "Pre-merge sync failed:",
+)
+
+
+def is_retained_merge_error(context: str | None) -> bool:
+    """Identify merge failures parked until explicit operator action."""
+    return bool(context and context.startswith(_RETAINED_MERGE_ERROR_PREFIXES))
+
 INFRA_ERROR_PATTERNS: tuple[str, ...] = (
     "git fetch origin",
     "ensure_repo_cloned",
@@ -210,12 +222,7 @@ class ErrorMixin:
             self.log_event("[RECOVERY] Uncertain FIX invocation remains parked for operator Retry.")
             return
 
-        if context.startswith((
-            "No eligible coder available for merge conflict resolution",
-            "Merge conflict resolution failed",
-            "Merge conflict resolution incomplete",
-            "Pre-merge sync failed:",
-        )):
+        if is_retained_merge_error(context):
             self.log_event(
                 "[RECOVERY] Merge sync failure remains parked with its "
                 "original evidence for operator Retry."

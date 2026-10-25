@@ -12,6 +12,7 @@ import subprocess
 
 from src.branch_context import BranchContext
 from src.daemon import git_ops
+from src.daemon.handlers.error import is_retained_merge_error
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.models import PipelineState
 
@@ -38,6 +39,14 @@ class PreflightMixin:
 
     async def preflight(self) -> bool:
         """Return ``True`` iff the working tree is clean."""
+        if (
+            self.state.state == PipelineState.ERROR
+            and is_retained_merge_error(self.state.error_message)
+        ):
+            # This checkout may contain the resolver's unpublished work.
+            # ERROR dispatch can repair the task status without mutating it.
+            self._build_dirty_tree_policy().reset(self)
+            return True
         try:
             result = git_ops._git(self.repo_path, "status", "--porcelain")
         except (

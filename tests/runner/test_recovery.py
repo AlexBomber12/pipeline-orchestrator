@@ -2307,6 +2307,41 @@ def test_legacy_review_timeout_recovery_keeps_bound_pr(
     assert task.pr_id not in runner._crashed_task_pr_ids
 
 
+@pytest.mark.parametrize("status_write_pending", [False, True])
+def test_restart_restores_bound_merge_failure_and_timeout_evidence(
+    tmp_path: Path, status_write_pending: bool,
+) -> None:
+    original = h._make_runner()
+    task, pr, saved = _saved_review_state(
+        original, tmp_path, error=not status_write_pending
+    )
+    saved.error_message = (
+        "Merge conflict resolution failed (exit -1): Timeout after 300s; "
+        "operator Retry required"
+    )
+    asyncio.run(original.redis.set(pipeline_state(original.name), saved.model_dump_json()))
+
+    fresh = h._make_runner()
+    fresh.redis = original.redis
+    fresh.repo_path = str(tmp_path)
+    fresh._recovery_task_headers = {
+        task.pr_id: types.SimpleNamespace(
+            frontmatter_status="doing" if status_write_pending else "error",
+            blocked_reason=SuppressionReason.CRASH.value,
+        )
+    }
+    assert asyncio.run(fresh._hydrate_current_task_from_persisted_state()) is True
+    if status_write_pending:
+        fresh._status_write_failed_task_pr_ids.add(task.pr_id)
+
+    asyncio.run(fresh._apply_recovery_decisions([task], [pr]))
+
+    assert fresh.state.state == PipelineState.ERROR
+    assert fresh.state.current_task.pr_id == task.pr_id
+    assert fresh.state.current_pr.number == pr.number
+    assert fresh.state.error_message == saved.error_message
+
+
 # ---------------------------------------------------------------------------
 # PR-224b moved from tests/test_runner.py — recovery group
 # ---------------------------------------------------------------------------
