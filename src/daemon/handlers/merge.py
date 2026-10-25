@@ -262,11 +262,16 @@ class MergeMixin:
                         if code != 0:
                             self._detect_rate_limit(_stderr, coder_name=coder_name)
                             if self.state.rate_limited_until is not None:
-                                self.state.state = PipelineState.PAUSED
-                                await self._clear_error_message_on_recovery(
+                                await self._transition_to_error(
+                                    f"Merge conflict resolution failed (exit {code}): "
+                                    f"{_stderr.strip() or _stdout.strip() or 'no output'}; "
+                                    "operator Retry required",
+                                    save_run_record_as=None,
+                                    publish=False,
                                     log_prefix="[MERGE]",
-                                    reason="rate-limit pause during merge conflict resolution",
+                                    commit_task_status=True,
                                 )
+                                self.state.state = PipelineState.PAUSED
                                 await self._save_current_run_record("rate_limit")
                                 self.log_event(
                                     f"[RATE-LIMIT] Rate limit pause "

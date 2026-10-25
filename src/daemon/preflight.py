@@ -40,7 +40,7 @@ class PreflightMixin:
     async def preflight(self) -> bool:
         """Return ``True`` iff the working tree is clean."""
         if (
-            self.state.state == PipelineState.ERROR
+            self.state.state in {PipelineState.ERROR, PipelineState.PAUSED}
             and is_retained_merge_error(self.state.error_message)
         ):
             # This checkout may contain the resolver's unpublished work.

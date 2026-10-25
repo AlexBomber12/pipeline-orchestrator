@@ -481,7 +481,7 @@ def test_handle_merge_pauses_when_conflict_resolution_hits_rate_limit(
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.error_message is None
+    assert "429 Too Many Requests" in (runner.state.error_message or "")
     assert runner.state.rate_limited_until is not None
     assert not merge_pr_calls, "merge_pr must not be called while paused"
     abort_cmds = [cmd for cmd in git_calls if cmd[:3] == ["git", "merge", "--abort"]]

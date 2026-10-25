@@ -2521,6 +2521,12 @@ class PipelineRunner(
         )
         if frontmatter_status == "error" and (reason is None or from_frontmatter):
             reason, from_frontmatter = _blocked, True
+        merge_sync_error = is_retained_merge_error(self.state.error_message)
+        if merge_sync_error and task_id in self._status_write_failed_task_pr_ids:
+            # A failed status write leaves TODO on the confirmed base. It is
+            # not evidence of an operator Retry; repair it before reading TODO.
+            await self.handle_error()
+            return
         if frontmatter_status == "todo":
             self.state.skip_ai_error_diagnose = False
             self.state.error_message = None
@@ -2534,13 +2540,6 @@ class PipelineRunner(
             )
             return
 
-        merge_sync_error = is_retained_merge_error(self.state.error_message)
-        if merge_sync_error and task_id in self._status_write_failed_task_pr_ids:
-            # The ordinary ERROR handler owns durable status-write repair.
-            # Run it even when AI diagnosis is disabled and the remote
-            # frontmatter could not yet be read as ERROR.
-            await self.handle_error()
-            return
         if task is not None and frontmatter_status is None:
             self.log_event("[RECOVERY] Remote ERROR task status unavailable; staying ERROR.")
             return

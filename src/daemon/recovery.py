@@ -866,7 +866,7 @@ class RecoveryMixin:
         if (
             persisted.name == self.name
             and persisted.url == self.repo_config.url
-            and persisted.state == PipelineState.ERROR
+            and persisted.state in {PipelineState.ERROR, PipelineState.PAUSED}
             and persisted.current_task is not None
             and persisted.current_pr is not None
             and persisted.current_task.branch == persisted.current_pr.branch

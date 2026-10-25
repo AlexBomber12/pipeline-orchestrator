@@ -2308,8 +2308,9 @@ def test_legacy_review_timeout_recovery_keeps_bound_pr(
 
 
 @pytest.mark.parametrize("status_write_pending", [False, True])
+@pytest.mark.parametrize("paused", [False, True])
 def test_restart_restores_bound_merge_failure_and_timeout_evidence(
-    tmp_path: Path, status_write_pending: bool,
+    tmp_path: Path, status_write_pending: bool, paused: bool,
 ) -> None:
     original = h._make_runner()
     task, pr, saved = _saved_review_state(
@@ -2319,6 +2320,8 @@ def test_restart_restores_bound_merge_failure_and_timeout_evidence(
         "Merge conflict resolution failed (exit -1): Timeout after 300s; "
         "operator Retry required"
     )
+    if paused:
+        saved.state = PipelineState.PAUSED
     asyncio.run(original.redis.set(pipeline_state(original.name), saved.model_dump_json()))
 
     fresh = h._make_runner()

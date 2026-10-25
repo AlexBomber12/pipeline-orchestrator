@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -213,8 +213,9 @@ def test_merge_error_repairs_failed_status_write_before_parking(
     assert runner._error_diagnose_count == 2
 
 
+@pytest.mark.parametrize("remote_status", [None, "todo"])
 def test_non_ai_merge_error_repairs_failed_status_before_remote_read(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, remote_status: str | None,
 ) -> None:
     runner = h._make_runner()
     runner.state.state = PipelineState.ERROR
@@ -236,7 +237,7 @@ def test_non_ai_merge_error_repairs_failed_status_before_remote_read(
     monkeypatch.setattr(runner, "_error_suppression_reason", no_suppression)
     monkeypatch.setattr(
         runner, "_remote_frontmatter_error_status_for_current_task",
-        lambda: (None, None, None),
+        lambda: (remote_status, None, None),
     )
     write = AsyncMock(return_value=True)
     monkeypatch.setattr(runner, "_commit_task_status_change", write)
@@ -249,8 +250,9 @@ def test_non_ai_merge_error_repairs_failed_status_before_remote_read(
     assert runner.state.error_message.startswith("Merge conflict resolution incomplete")
 
 
+@pytest.mark.parametrize("rate_limited", [False, True])
 def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rate_limited: bool,
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -284,9 +286,15 @@ def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
     runner._recovered = True
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = (
-        "Merge conflict resolution failed (exit -1): Timeout after 300s; "
+        "Merge conflict resolution failed (exit -1): "
+        + ("Error: 429 Too Many Requests" if rate_limited else "Timeout after 300s")
+        + "; "
         "operator Retry required"
     )
+    if rate_limited:
+        runner.state.state = PipelineState.PAUSED
+        runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(hours=1)
+        runner.state.rate_limit_reactive_coder = "claude"
     runner.state.current_pr = PRInfo(
         number=636, branch="feature", head_sha=feature_head
     )
@@ -306,16 +314,26 @@ def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
     monkeypatch.setattr(runner, "_refresh_user_paused_from_redis", AsyncMock())
     monkeypatch.setattr(runner, "_check_github_api_budget", AsyncMock(return_value=True))
     monkeypatch.setattr(runner, "_maybe_resume_obsolete_ci_error", AsyncMock(return_value=None))
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", AsyncMock())
 
     for _ in range(4):
         asyncio.run(runner._run_cycle_body())
-        assert runner.state.state == PipelineState.ERROR
-        assert "Timeout after 300s" in (runner.state.error_message or "")
+        assert runner.state.state == (
+            PipelineState.PAUSED if rate_limited else PipelineState.ERROR
+        )
+        assert ("429" if rate_limited else "Timeout after 300s") in (
+            runner.state.error_message or ""
+        )
         assert runner._error_diagnose_count == 2
         assert runner._consecutive_dirty_cycles == 0
         assert git("rev-parse", "HEAD").stdout.strip() == feature_head
         assert (repo / "example.txt").read_text() == unpublished
         assert git("ls-files", "-u").stdout
+    if rate_limited:
+        runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+        asyncio.run(runner.handle_paused())
+        assert runner.state.state == PipelineState.ERROR
+        assert "429" in (runner.state.error_message or "")
 
 _CONFIRM_REMOTE_MERGE = merge_module.MergeMixin._confirm_remote_merge
 
