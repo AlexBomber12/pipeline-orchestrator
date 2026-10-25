@@ -2345,6 +2345,60 @@ def test_restart_restores_bound_merge_failure_and_timeout_evidence(
     assert fresh.state.error_message == saved.error_message
 
 
+def test_restart_without_snapshot_retains_dirty_error_pr_checkout(
+    tmp_path: Path,
+) -> None:
+    def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, check=check, text=True,
+            capture_output=True,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    (tmp_path / "example.txt").write_text("base\n")
+    git("add", "example.txt")
+    git("commit", "-qm", "base")
+    git("checkout", "-qb", "feature")
+    (tmp_path / "example.txt").write_text("feature\n")
+    git("commit", "-qam", "feature")
+    feature_head = git("rev-parse", "HEAD").stdout.strip()
+    git("checkout", "main")
+    (tmp_path / "example.txt").write_text("main\n")
+    git("commit", "-qam", "main")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("checkout", "feature")
+    assert git("merge", "origin/main", check=False).returncode != 0
+    unpublished = (tmp_path / "example.txt").read_text()
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    task = QueueTask(
+        pr_id="PR-404", title="conflict", status=TaskStatus.ERROR,
+        branch="feature", task_file="tasks/PR-404.md",
+    )
+    pr = PRInfo(number=636, branch="feature", pr_id=task.pr_id,
+                head_sha=feature_head)
+    runner._recovery_task_headers = {
+        task.pr_id: types.SimpleNamespace(
+            frontmatter_status="error",
+            blocked_reason=SuppressionReason.CRASH.value,
+        )
+    }
+
+    asyncio.run(runner._apply_recovery_decisions([task], [pr]))
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message.startswith("Merge conflict resolution incomplete")
+    for _ in range(4):
+        assert asyncio.run(runner.preflight()) is True
+        assert runner.state.state == PipelineState.ERROR
+        assert git("rev-parse", "HEAD").stdout.strip() == feature_head
+        assert (tmp_path / "example.txt").read_text() == unpublished
+        assert git("ls-files", "-u").stdout
+
+
 # ---------------------------------------------------------------------------
 # PR-224b moved from tests/test_runner.py — recovery group
 # ---------------------------------------------------------------------------

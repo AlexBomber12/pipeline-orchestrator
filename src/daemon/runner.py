@@ -3872,6 +3872,26 @@ class PipelineRunner(
         try:
             await self.ensure_repo_cloned()
         except RuntimeError as exc:
+            task, pr = self.state.current_task, self.state.current_pr
+            if (
+                self.state.state in {PipelineState.ERROR, PipelineState.PAUSED}
+                and task is not None and pr is not None
+                and self._bound_pr_has_unpublished_work(task, pr)
+            ):
+                self.log_event(
+                    f"[INFRA] ensure_repo_cloned failed: {exc}; "
+                    "retaining unpublished PR checkout and failure."
+                )
+                if not is_retained_merge_error(self.state.error_message):
+                    await self._transition_to_error(
+                        "Merge conflict resolution incomplete: unpublished PR "
+                        f"checkout retained after {exc}; operator Retry required",
+                        save_run_record_as=None,
+                        publish=False,
+                        log_prefix="[RECOVERY]",
+                    )
+                await self.publish_state()
+                return
             await self._transition_to_error(
                 str(exc),
                 log_prefix="[INFRA]",

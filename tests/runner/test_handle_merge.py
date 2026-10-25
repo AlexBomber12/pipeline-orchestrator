@@ -290,7 +290,9 @@ def test_non_ai_merge_error_repairs_failed_status_before_remote_read(
     assert runner.state.error_message.startswith("Merge conflict resolution incomplete")
 
 
-@pytest.mark.parametrize("scenario", ["timeout", "rate_limit", "operator_stop"])
+@pytest.mark.parametrize(
+    "scenario", ["timeout", "rate_limit", "operator_stop", "fetch_timeout"],
+)
 def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scenario: str,
 ) -> None:
@@ -334,7 +336,7 @@ def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
            else "Timeout after 300s")
         + "; operator Retry required"
     )
-    if scenario != "timeout":
+    if scenario in {"rate_limit", "operator_stop"}:
         runner.state.state = PipelineState.PAUSED
         if scenario == "rate_limit":
             runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(hours=1)
@@ -356,29 +358,46 @@ def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
     ):
         monkeypatch.setattr(runner, method, AsyncMock(return_value=False))
     monkeypatch.setattr(runner, "_consume_retry_command", AsyncMock(return_value=RetryDispatch.NONE))
-    monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+    if scenario == "fetch_timeout":
+        calls = 0
+
+        async def fetch_once_fails() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("git fetch timed out")
+
+        monkeypatch.setattr(runner, "ensure_repo_cloned", fetch_once_fails)
+    else:
+        monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
     monkeypatch.setattr(runner, "_refresh_user_paused_from_redis", AsyncMock())
     monkeypatch.setattr(runner, "_check_github_api_budget", AsyncMock(return_value=True))
     monkeypatch.setattr(runner, "_maybe_resume_obsolete_ci_error", AsyncMock(return_value=None))
     monkeypatch.setattr(runner, "_refresh_auth_status_cache", AsyncMock())
 
-    for _ in range(4):
+    for cycle in range(4):
         asyncio.run(runner._run_cycle_body())
-        assert runner.state.state == (
-            PipelineState.ERROR if scenario == "timeout" else PipelineState.PAUSED
+        expected_state = (
+            PipelineState.PAUSED if scenario in {"rate_limit", "operator_stop"}
+            else PipelineState.ERROR
         )
+        assert runner.state.state == expected_state
         assert {"timeout": "Timeout after 300s", "rate_limit": "429",
-                "operator_stop": "operator Stop"}[scenario] in (
+                "operator_stop": "operator Stop", "fetch_timeout": "Timeout after 300s"}[scenario] in (
             runner.state.error_message or ""
         )
+        if scenario == "fetch_timeout":
+            assert any("git fetch timed out" in event["event"]
+                       for event in runner.state.history)
         assert runner._error_diagnose_count == 2
         assert runner._consecutive_dirty_cycles == (
-            2 if scenario == "operator_stop" else 0
+            2 if scenario == "operator_stop"
+            or (scenario == "fetch_timeout" and cycle == 0) else 0
         )
         assert git("rev-parse", "HEAD").stdout.strip() == feature_head
         assert (repo / "example.txt").read_text() == unpublished
         assert git("ls-files", "-u").stdout
-    if scenario != "timeout":
+    if scenario in {"rate_limit", "operator_stop"}:
         if scenario == "rate_limit":
             runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(seconds=1)
         else:

@@ -14,7 +14,7 @@ from src.branch_context import BranchContext
 from src.daemon import git_ops
 from src.daemon.handlers.error import is_retained_merge_error
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
-from src.models import PipelineState
+from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +28,30 @@ _DIRTY_CYCLES_BEFORE_AUTO_RESET = 3
 class PreflightMixin:
     """Preflight checks and dirty-tree auto-recovery."""
 
+    def _bound_pr_has_unpublished_work(self, task: QueueTask, pr: PRInfo) -> bool:
+        """Use task and Git evidence when an in-memory failure was replaced."""
+        if not task.branch or task.branch != pr.branch:
+            return False
+        try:
+            branch = git_ops._git(
+                self.repo_path, "rev-parse", "--abbrev-ref", "HEAD",
+            ).stdout.strip()
+            if branch != pr.branch:
+                return False
+            dirty = git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip()
+            if dirty and task.status == TaskStatus.ERROR:
+                return True
+            merge_head = git_ops._git(
+                self.repo_path, "rev-parse", "-q", "--verify", "MERGE_HEAD",
+                check=False,
+            ).stdout.strip()
+            if merge_head:
+                return True
+            head = git_ops._git(self.repo_path, "rev-parse", "HEAD").stdout.strip()
+            return bool(head and pr.head_sha and head != pr.head_sha)
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
+            return False
+
     def _build_dirty_tree_policy(self) -> BoundedRecoveryPolicy["PreflightMixin"]:
         return BoundedRecoveryPolicy(
             name="dirty_tree_auto_reset",
@@ -39,9 +63,11 @@ class PreflightMixin:
 
     async def preflight(self) -> bool:
         """Return ``True`` iff the working tree is clean."""
-        if (
-            self.state.state in {PipelineState.ERROR, PipelineState.PAUSED}
-            and is_retained_merge_error(self.state.error_message)
+        task, pr = self.state.current_task, self.state.current_pr
+        if self.state.state in {PipelineState.ERROR, PipelineState.PAUSED} and (
+            is_retained_merge_error(self.state.error_message)
+            or (task is not None and pr is not None
+                and self._bound_pr_has_unpublished_work(task, pr))
         ):
             # This checkout may contain the resolver's unpublished work.
             # ERROR dispatch can repair the task status without mutating it.

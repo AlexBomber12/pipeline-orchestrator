@@ -1759,6 +1759,7 @@ class RecoveryMixin:
             task, pr = unresolved_error_pr
             header = self._recovery_task_headers.get(task.pr_id)
             saved_timeout = getattr(self, "_persisted_review_timeout_recovery", None)
+            retained_checkout = self._bound_pr_has_unpublished_work(task, pr)
             self.state = self.state.model_copy(update={
                 "current_task": task,
                 "current_pr": pr,
@@ -1768,7 +1769,12 @@ class RecoveryMixin:
                     if saved_timeout is not None
                     and header is not None
                     and header.blocked_reason == SuppressionReason.REVIEW_TIMEOUT.value
-                    else "Published task failure unresolved; operator Retry or revised approval required."
+                    else (
+                        "Merge conflict resolution incomplete: published ERROR task "
+                        "has unpublished checkout work; operator Retry required"
+                        if retained_checkout else
+                        "Published task failure unresolved; operator Retry or revised approval required."
+                    )
                 ),
                 "active_invocation": (
                     self._persisted_fix_recovery.active_invocation
