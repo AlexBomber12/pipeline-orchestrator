@@ -99,6 +99,7 @@ from src.daemon.handlers.error import (  # noqa: F401 — re-exported for tests
     ErrorMixin,
     _classify_error,
     _is_infra_error,
+    is_retained_merge_error,
 )
 from src.daemon.handlers.fix import FixMixin
 from src.daemon.handlers.hung import HungMixin
@@ -2518,11 +2519,14 @@ class PipelineRunner(
         frontmatter_status, _blocked, _revision = (
             self._remote_frontmatter_error_status_for_current_task()
         )
-        if task is not None and frontmatter_status is None:
-            self.log_event("[RECOVERY] Remote ERROR task status unavailable; staying ERROR.")
-            return
         if frontmatter_status == "error" and (reason is None or from_frontmatter):
             reason, from_frontmatter = _blocked, True
+        merge_sync_error = is_retained_merge_error(self.state.error_message)
+        if merge_sync_error and task_id in self._status_write_failed_task_pr_ids:
+            # A failed status write leaves TODO on the confirmed base. It is
+            # not evidence of an operator Retry; repair it before reading TODO.
+            await self.handle_error()
+            return
         if frontmatter_status == "todo":
             self.state.skip_ai_error_diagnose = False
             self.state.error_message = None
@@ -2533,6 +2537,16 @@ class PipelineRunner(
             self.log_event(
                 "[ESCALATE] operator-cleared ERROR task frontmatter "
                 "-> IDLE."
+            )
+            return
+
+        if task is not None and frontmatter_status is None:
+            self.log_event("[RECOVERY] Remote ERROR task status unavailable; staying ERROR.")
+            return
+        if merge_sync_error:
+            self.log_event(
+                "[RECOVERY] Retained checkout failure remains ERROR until "
+                "operator Retry or a task update."
             )
             return
 
@@ -3858,6 +3872,26 @@ class PipelineRunner(
         try:
             await self.ensure_repo_cloned()
         except RuntimeError as exc:
+            task, pr = self.state.current_task, self.state.current_pr
+            if (
+                self.state.state in {PipelineState.ERROR, PipelineState.PAUSED}
+                and task is not None and pr is not None
+                and self._bound_pr_has_unpublished_work(task, pr)
+            ):
+                self.log_event(
+                    f"[INFRA] ensure_repo_cloned failed: {exc}; "
+                    "retaining unpublished PR checkout and failure."
+                )
+                if not is_retained_merge_error(self.state.error_message):
+                    await self._transition_to_error(
+                        "Published task failure unresolved; unpublished checkout "
+                        "retained; operator Retry required",
+                        save_run_record_as=None,
+                        publish=False,
+                        log_prefix="[RECOVERY]",
+                    )
+                await self.publish_state()
+                return
             await self._transition_to_error(
                 str(exc),
                 log_prefix="[INFRA]",

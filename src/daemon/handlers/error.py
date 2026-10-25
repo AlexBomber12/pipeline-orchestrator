@@ -27,6 +27,20 @@ from src.subsource_registry import SuppressionReason
 logger = logging.getLogger(__name__)
 _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
 
+_RETAINED_MERGE_ERROR_PREFIXES = (
+    "No eligible coder available for merge conflict resolution",
+    "Merge conflict resolution failed",
+    "Merge conflict resolution incomplete",
+    "Merge conflict resolution interrupted",
+    "Pre-merge sync failed:",
+    "Published task failure unresolved; unpublished checkout retained",
+)
+
+
+def is_retained_merge_error(context: str | None) -> bool:
+    """Identify failures retaining unpublished checkout work until operator action."""
+    return bool(context and context.startswith(_RETAINED_MERGE_ERROR_PREFIXES))
+
 INFRA_ERROR_PATTERNS: tuple[str, ...] = (
     "git fetch origin",
     "ensure_repo_cloned",
@@ -208,6 +222,13 @@ class ErrorMixin:
             return
         if context.startswith("Persisted FIX invocation ownership is uncertain; operator Retry required"):
             self.log_event("[RECOVERY] Uncertain FIX invocation remains parked for operator Retry.")
+            return
+
+        if is_retained_merge_error(context):
+            self.log_event(
+                "[RECOVERY] Unpublished checkout failure remains parked with its "
+                "original evidence for operator Retry."
+            )
             return
 
         async def _clear_cause_for_retry() -> None:
