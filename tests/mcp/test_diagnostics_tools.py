@@ -673,6 +673,7 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
         ("PASSWORD='prefix'CANARY_SINGLE_SUFFIX", "CANARY_SINGLE_SUFFIX", ""),
         ('passphrase="CANARY_PASSPHRASE"', "CANARY_PASSPHRASE", ""),
         ('Server=db;User ID=sa;Pwd=CANARY_CONNECTION', "CANARY_CONNECTION", ""),
+        ('Command failed: client --password CANARY_CLI_VALUE', "CANARY_CLI_VALUE", ""),
         ('before PASSWORD=prefix;CANARY_LITERAL_SEMICOLON\nafter',
          "CANARY_LITERAL_SEMICOLON", "before"),
         ('before PASSWORD=prefix\nCANARY_MULTILINE_SUFFIX\nTimeout after 300s',
@@ -701,6 +702,8 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
             "CANARY_MERGE", "Merge conflict resolution failed",
         ),
         ('[MERGE] Timeout after 300s; PR #12 remains open', "CANARY_NOT_PRESENT", "PR #12 remains open"),
+        ('Command failed: client --verbose; Timeout after 300s',
+         "CANARY_NOT_PRESENT", "--verbose; Timeout after 300s"),
     ],
 )
 async def test_repo_events_sanitizes_complete_response(
@@ -745,6 +748,7 @@ async def test_repo_events_sanitizes_complete_response(
         ('pa\x1b[31mssword=CANARY_KIND_ANSI', "CANARY_KIND_ANSI"),
         ('Cookie: sid=CANARY_KIND_COOKIE', "CANARY_KIND_COOKIE"),
         ('https://user:CANARY_KIND_URL@relay@host', "CANARY_KIND_URL"),
+        ('--password CANARY_KIND_CLI', "CANARY_KIND_CLI"),
     ],
 )
 async def test_repo_events_omits_sensitive_kind_but_keeps_safe_event(
@@ -816,6 +820,14 @@ async def test_repo_events_sanitizes_real_cli_log_producer(
         ('passphrase="CANARY_PRODUCER_PASSPHRASE"', "CANARY_PRODUCER_PASSPHRASE"),
         ('Server=db;User ID=sa;Pwd=CANARY_PRODUCER_CONNECTION',
          "CANARY_PRODUCER_CONNECTION"),
+        ('Command failed: client --password CANARY_PRODUCER_CLI',
+         "CANARY_PRODUCER_CLI"),
+        ('Command failed: client --passphrase CANARY_PRODUCER_PASSPHRASE_OPTION',
+         "CANARY_PRODUCER_PASSPHRASE_OPTION"),
+        ('Command failed: client --client-secret CANARY_PRODUCER_CLIENT_OPTION',
+         "CANARY_PRODUCER_CLIENT_OPTION"),
+        ('Command failed: client --google-api-key CANARY_PRODUCER_API_OPTION',
+         "CANARY_PRODUCER_API_OPTION"),
     ],
 )
 async def test_repo_events_sanitizes_cli_log_boundary_cases(

@@ -75,6 +75,12 @@ _CREDENTIAL_FIELD = re.compile(
     r"(?:ssh[_-]?)?private[_-]?key)"
     r"[\"']?\s*[:=]"
 )
+_CREDENTIAL_OPTION = re.compile(
+    r"(?i)(?<![\w-])--(?:[a-z][a-z0-9_-]{0,40}[-_])?"
+    r"(?:password|passwd|passphrase|passcode|pass|pwd|token|secret|"
+    r"api[-_]?key|private[-_]?key|credential(?:s)?)"
+    r"(?=$|[\s=])"
+)
 _STANDALONE_TOKEN = re.compile(
     r"\b(?:gh[opsu]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]+|"
     r"glpat-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,})\b"
@@ -953,7 +959,8 @@ def _safe_event_message(value: str) -> tuple[str, bool]:
         ))
         for _, authority in _URL_AUTHORITY.findall(candidate)
     )
-    if (credential_url or _CREDENTIAL_FIELD.search(candidate) or _SENSITIVE_HEADER.search(candidate)
+    if (credential_url or _CREDENTIAL_FIELD.search(candidate) or _CREDENTIAL_OPTION.search(candidate)
+            or _SENSITIVE_HEADER.search(candidate)
             or _AUTH_SCHEME.search(candidate) or _STANDALONE_TOKEN.search(candidate)
             or _PRIVATE_KEY.search(candidate)):
         return f"[OMITTED: credential-bearing event]{marker}", True
