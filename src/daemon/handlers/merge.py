@@ -266,6 +266,7 @@ class MergeMixin:
                                     log_prefix="[MERGE]",
                                     commit_task_status=True,
                                 )
+                                self.state.user_paused = True
                                 self.state.state = PipelineState.PAUSED
                             return
                         code, _stdout, _stderr = auxiliary_result
