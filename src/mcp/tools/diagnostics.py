@@ -57,34 +57,34 @@ _MAX_EVENT_RESPONSE_BYTES = 16 * 1024
 _ANSI_OSC = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _ANSI_CSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _JSON_CHAR_ESCAPE = re.compile(r"\\(?:u([0-9a-fA-F]{4})|x([0-9a-fA-F]{2}))")
-_TIMEOUT_MARKER = re.compile(r"\bTimeout after \d+(?:\.\d+)?s\b")
+_TIMEOUT_MARKER = re.compile(r"\bTimeout after \d{1,6}(?:\.\d{1,3})?s\b")
 _SENSITIVE_HEADER = re.compile(
-    r"(?im)\b(?:set-cookie|cookie|proxy-authorization|authorization)\s*:\s*[^\r\n]*"
+    r"(?i)\b(?:set-cookie|cookie|proxy-authorization|authorization)\s*:"
 )
 _URL_AUTHORITY = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/?#]+)")
 _AUTH_SCHEME = re.compile(r"(?i)\b(?:Bearer|Basic)\s+\S+")
 _CREDENTIAL_FIELD = re.compile(
-    r"(?i)(?<![\w])[\"']?(?:password|passwd|token|secret|authorization|cookie|"
+    r"(?i)(?<![\w])[\"']?(?:"
+    r"(?:[a-z][a-z0-9_-]{0,40}[_-])?"
+    r"(?:password|passwd|passphrase|passcode|pass|pwd|token|secret|"
+    r"api[_-]?key|private[_-]?key|credential(?:s)?)|"
+    r"authorization|cookie|"
     r"set[_-]?cookie|session[_-]?(?:id|key|token)|"
-    r"api[_-]?key|secret[_-]?key|aws[_-]?(?:secret[_-]?)?access[_-]?key(?:[_-]?id)?|"
+    r"secret[_-]?key|aws[_-]?(?:secret[_-]?)?access[_-]?key(?:[_-]?id)?|"
     r"(?:access|refresh|id)[_-]?token|client[_-]?secret|"
-    r"(?:ssh[_-]?)?private[_-]?key|"
-    r"[a-z][a-z0-9_-]{0,40}[_-](?:token|secret|password|passwd|"
-    r"api[_-]?key|private[_-]?key))"
-    r"[\"']?\s*[:=]\s*(?:\"(?:\\.|[^\"\\])*(?:\"|\Z)|"
-    r"'(?:\\.|[^'\\])*(?:'|\Z)|[\s\S]+)"
+    r"(?:ssh[_-]?)?private[_-]?key)"
+    r"[\"']?\s*[:=]"
 )
 _STANDALONE_TOKEN = re.compile(
     r"\b(?:gh[opsu]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]+|"
     r"glpat-[A-Za-z0-9_-]{8,}|sk-[A-Za-z0-9_-]{8,})\b"
 )
 _PRIVATE_KEY = re.compile(
-    r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?"
-    r"(?:-----END [A-Z ]*PRIVATE KEY-----|\Z)"
+    r"-----BEGIN [A-Z ]*PRIVATE KEY-----"
 )
 _LEGACY_EVENT_CATEGORIES = frozenset(
     {"MERGE", "INFRA", "ERROR", "RATE-LIMIT", "WATCH", "CODING", "FIX",
-     "GUARDRAIL", "CANCEL", "PANIC", "OPERATOR", "STATE"}
+     "GUARDRAIL", "CANCEL", "PANIC", "OPERATOR", "STATE", "RECOVERY"}
 )
 
 _KNOWN_CATEGORIES = frozenset(CATEGORIES)
@@ -900,19 +900,17 @@ def _source_summary(statuses: list[str]) -> str:
 
 
 def _safe_event_message(value: str) -> tuple[str, bool]:
-    """Normalize bounded producer text, then redact before output truncation."""
+    """Omit credential-bearing producer text before output truncation."""
     timeout = _TIMEOUT_MARKER.search(value[:_MAX_EVENT_SOURCE_CHARS])
+    marker = f" {timeout.group(0)}" if timeout else ""
     if len(value) > _MAX_EVENT_SOURCE_CHARS:
-        return f"[OMITTED: oversized event text] {timeout.group(0) if timeout else ''}".strip(), True
-    if _ambiguous_compatibility(value):
-        return f"[OMITTED: ambiguous encoded text] {timeout.group(0) if timeout else ''}".strip(), True
+        return f"[OMITTED: oversized event text]{marker}", True
     message = unicodedata.normalize("NFKC", value)
     if len(message) > _MAX_EVENT_SOURCE_CHARS:
-        return f"[OMITTED: oversized event text] {timeout.group(0) if timeout else ''}".strip(), True
+        return f"[OMITTED: oversized event text]{marker}", True
     message = _ANSI_CSI.sub("", _ANSI_OSC.sub("", message))
-    if any((ord(char) < 32 and char not in "\r\n\t") or 127 <= ord(char) < 160
-           for char in message):
-        return f"[OMITTED: ambiguous terminal text] {timeout.group(0) if timeout else ''}".strip(), True
+    if any((ord(char) < 32 and char not in "\r\n\t") or 127 <= ord(char) < 160 for char in message):
+        return f"[OMITTED: ambiguous terminal text]{marker}", True
     message = "".join(char for char in message if unicodedata.category(char) != "Cf")
     # A complete JSON string may itself contain serialized JSON. Decode its
     # layers while quotes still have their escape-aware boundaries.
@@ -926,74 +924,40 @@ def _safe_event_message(value: str) -> tuple[str, bool]:
         message = decoded
     for _ in range(2):
         previous = message
-        if any(
-            (decoded := chr(int(match.group(1) or match.group(2), 16))).isascii()
-            and not decoded.isalnum()
-            for match in _JSON_CHAR_ESCAPE.finditer(message)
-        ):
-            return f"[OMITTED: ambiguous encoded text] {timeout.group(0) if timeout else ''}".strip(), True
         message = message.replace(r"\\u", r"\u").replace(r"\\x", r"\x")
         message = _JSON_CHAR_ESCAPE.sub(
             lambda match: chr(int(match.group(1) or match.group(2), 16)), message
         )
         if message == previous:
             break
-    if _ambiguous_compatibility(message):
-        return f"[OMITTED: ambiguous encoded text] {timeout.group(0) if timeout else ''}".strip(), True
     message = unicodedata.normalize("NFKC", message)
     message = "".join(char for char in message if unicodedata.category(char) != "Cf")
     if (len(message) > _MAX_EVENT_SOURCE_CHARS or r"\u" in message or r"\x" in message
-        or re.search(r'\\{2,}["\']', message) or any(
+        or any(
         (ord(char) < 32 and char not in "\r\n\t")
         or 127 <= ord(char) < 160
         or 0xD800 <= ord(char) <= 0xDFFF
         for char in message
     )):
-        return f"[OMITTED: ambiguous encoded text] {timeout.group(0) if timeout else ''}".strip(), True
-    # Remove complete structures before field redaction can erase their markers
-    # and leave later Cookie attributes or PEM body lines exposed.
-    message = _PRIVATE_KEY.sub("[REDACTED]", message)
-    message = _SENSITIVE_HEADER.sub("[REDACTED]", message)
-    if _CREDENTIAL_FIELD.search(message) and re.search(r"['\"]{2,}", message):
-        return f"[OMITTED: ambiguous quoted credential] {timeout.group(0) if timeout else ''}".strip(), True
-    # Protect ordinary JSON values before unescaping a surrounding serialized
-    # representation: an escaped quote inside a secret value is not its end.
-    message = _CREDENTIAL_FIELD.sub("[REDACTED]", message)
+        return f"[OMITTED: ambiguous encoded text]{marker}", True
+    # Unescape only for classification. No credential value boundaries are parsed.
+    candidate = message
     for _ in range(2):
-        previous = message
-        message = message.replace(r'\"', '"').replace(r"\'", "'").replace(r"\/", "/")
-        message = _CREDENTIAL_FIELD.sub("[REDACTED]", message)
-        if message == previous:
+        unescaped = candidate.replace(r'\"', '"').replace(r"\'", "'").replace(r"\/", "/")
+        if unescaped == candidate:
             break
-    message = _PRIVATE_KEY.sub("[REDACTED]", message)
-    message = _SENSITIVE_HEADER.sub("[REDACTED]", message)
-    message = _URL_AUTHORITY.sub(_safe_url_authority, message)
-    message = _AUTH_SCHEME.sub("[REDACTED]", message)
-    message = _STANDALONE_TOKEN.sub("[REDACTED]", message)
-    shortened = len(message) > _MAX_EVENT_MESSAGE
-    if timeout and timeout.group(0) not in message:
-        marker = timeout.group(0)
-        message = f"{message[:_MAX_EVENT_MESSAGE - len(marker) - 1]} {marker}"
-    return message[:_MAX_EVENT_MESSAGE], shortened or len(message) > _MAX_EVENT_MESSAGE
-
-
-def _safe_url_authority(match: re.Match[str]) -> str:
-    """Keep a host while hiding userinfo, including a truncated authority."""
-    scheme, authority = match.groups()
-    if "@" in authority:
-        return f"{scheme}[REDACTED]@{authority.rsplit('@', 1)[1]}"
-    if ":" in authority and not authority.rsplit(":", 1)[1].isdigit():
-        return f"{scheme}[REDACTED]"
-    return match.group(0)
-
-
-def _ambiguous_compatibility(value: str) -> bool:
-    """Reject compatibility folds that can create text delimiters."""
-    for char in value:
-        mapped = unicodedata.normalize("NFKC", char)
-        if mapped != char and any(ord(part) < 128 and not part.isalnum() for part in mapped):
-            return True
-    return False
+        candidate = unescaped
+    credential_url = any(
+        "@" in authority or (":" in authority and not (
+            "." in authority.rsplit(":", 1)[0] and authority.rsplit(":", 1)[1].isdigit()
+        ))
+        for _, authority in _URL_AUTHORITY.findall(candidate)
+    )
+    if (credential_url or _CREDENTIAL_FIELD.search(candidate) or _SENSITIVE_HEADER.search(candidate)
+            or _AUTH_SCHEME.search(candidate) or _STANDALONE_TOKEN.search(candidate)
+            or _PRIVATE_KEY.search(candidate)):
+        return f"[OMITTED: credential-bearing event]{marker}", True
+    return message[:_MAX_EVENT_MESSAGE], len(message) > _MAX_EVENT_MESSAGE
 
 
 @mcp.tool()

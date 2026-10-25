@@ -578,7 +578,7 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
     pem = await diagnostics.get_repo_events(SLUG, limit=1)
     assert "BEGIN EC PRIVATE KEY" not in pem["events"][0]["message"]
     assert "A" * 40 not in pem["events"][0]["message"]
-    assert "[REDACTED]" in pem["events"][0]["message"]
+    assert pem["events"][0]["message"] == "[OMITTED: credential-bearing event]"
 
     state.history[-1]["event"] = '[INFRA] password="correct horse battery'
     redis.store[pipeline_state(SLUG)] = state.model_dump_json()
@@ -590,6 +590,17 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
     redis.store[pipeline_state(SLUG)] = state.model_dump_json()
     legacy = await diagnostics.get_repo_events(SLUG, limit=1)
     assert legacy["events"][0]["category"] == "MERGE"
+
+    state.history[-1]["event"] = "[RECOVERY] Applied Retry"
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    recovery = await diagnostics.get_repo_events(SLUG, limit=1)
+    assert recovery["events"][0]["category"] == "RECOVERY"
+    assert recovery["events"][0]["message"] == "[RECOVERY] Applied Retry"
+
+    state.history[-1]["event"] = "[UNKNOWN] Applied Retry"
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    unknown = await diagnostics.get_repo_events(SLUG, limit=1)
+    assert unknown["events"][0]["category"] is None
 
     monkeypatch.setattr(diagnostics, "_MAX_EVENT_RESPONSE_BYTES", 600)
     state.history[-1]["event"] = "x" * 1000
@@ -657,6 +668,11 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
         ('before aws_access_key_id=CANARY_AWS_ID; after', "CANARY_AWS_ID", "before"),
         ('before PASSWORD=prefix,CANARY_LITERAL_SUFFIX Timeout after 300s',
          "CANARY_LITERAL_SUFFIX", "Timeout after 300s"),
+        ('PASSWORD="prefix"CANARY_QUOTED_SUFFIX Timeout after 300s',
+         "CANARY_QUOTED_SUFFIX", "Timeout after 300s"),
+        ("PASSWORD='prefix'CANARY_SINGLE_SUFFIX", "CANARY_SINGLE_SUFFIX", ""),
+        ('passphrase="CANARY_PASSPHRASE"', "CANARY_PASSPHRASE", ""),
+        ('Server=db;User ID=sa;Pwd=CANARY_CONNECTION', "CANARY_CONNECTION", ""),
         ('before PASSWORD=prefix;CANARY_LITERAL_SEMICOLON\nafter',
          "CANARY_LITERAL_SEMICOLON", "before"),
         ('before PASSWORD=prefix\nCANARY_MULTILINE_SUFFIX\nTimeout after 300s',
@@ -704,9 +720,50 @@ async def test_repo_events_sanitizes_complete_response(
     serialized = json.dumps(result)
     assert canary not in serialized
     assert "CANARY_KIND" not in serialized
-    assert safe_text in result["events"][0]["message"]
+    if canary == "CANARY_NOT_PRESENT" or canary == "CANARY_OSC":
+        assert safe_text in result["events"][0]["message"]
+    elif canary in {"CANARY_OVERSIZED", "CANARY_NFKC", "CANARY_UNKNOWN",
+                    "CANARY_BAD_ESCAPE", "CANARY_ENCODED_ESC"}:
+        assert result["events"][0]["message"].startswith("[OMITTED:")
+    else:
+        assert result["events"][0]["message"].startswith("[OMITTED: credential-bearing event]")
+        if "Timeout after" in safe_text:
+            assert "Timeout after 300s" in result["events"][0]["message"]
+    assert result["events"][0]["kind"] == "[OMITTED: credential-bearing event]"
     assert result["source"]["status"] == "fresh"
     assert redis.closed
+
+
+@pytest.mark.parametrize(
+    ("kind", "canary"),
+    [
+        ('PASSWORD="prefix"CANARY_KIND_DOUBLE', "CANARY_KIND_DOUBLE"),
+        ("PASSWORD='prefix'CANARY_KIND_SINGLE", "CANARY_KIND_SINGLE"),
+        ('passphrase="CANARY_KIND_PASSPHRASE"', "CANARY_KIND_PASSPHRASE"),
+        ('Server=db;User ID=sa;Pwd=CANARY_KIND_CONNECTION', "CANARY_KIND_CONNECTION"),
+        (r'{"pass\u0077ord":"CANARY_KIND_ESCAPED"}', "CANARY_KIND_ESCAPED"),
+        ('pa\x1b[31mssword=CANARY_KIND_ANSI', "CANARY_KIND_ANSI"),
+        ('Cookie: sid=CANARY_KIND_COOKIE', "CANARY_KIND_COOKIE"),
+        ('https://user:CANARY_KIND_URL@relay@host', "CANARY_KIND_URL"),
+    ],
+)
+async def test_repo_events_omits_sensitive_kind_but_keeps_safe_event(
+    monkeypatch: pytest.MonkeyPatch, kind: str, canary: str,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    state = _state(updated=NOW)
+    state.history = [{"time": NOW.isoformat(), "state": "MERGE",
+                      "event": "[MERGE] Timeout after 300s; PR #12 remains open", "kind": kind}]
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+
+    result = await diagnostics.get_repo_events(SLUG)
+
+    assert canary not in json.dumps(result)
+    assert result["events"][0]["kind"] == "[OMITTED: credential-bearing event]"
+    assert result["events"][0]["message"] == "[MERGE] Timeout after 300s; PR #12 remains open"
 
 
 @pytest.mark.parametrize("truncated", [False, True])
@@ -731,7 +788,7 @@ async def test_repo_events_sanitizes_real_cli_log_producer(
     result = await diagnostics.get_repo_events(SLUG)
 
     assert "CANARY_PRODUCER" not in json.dumps(result)
-    assert "[INFRA] CODER: === STDOUT ===" in result["events"][0]["message"]
+    assert result["events"][0]["message"] == "[OMITTED: credential-bearing event]"
     assert redis.closed
 
 
@@ -754,6 +811,11 @@ async def test_repo_events_sanitizes_real_cli_log_producer(
          "CANARY_PRODUCER_LITERAL_SUFFIX"),
         ("PASSWORD=" + shlex.quote("prefix'CANARY_PRODUCER_SHELL"),
          "CANARY_PRODUCER_SHELL"),
+        ('PASSWORD="prefix"CANARY_PRODUCER_QUOTED', "CANARY_PRODUCER_QUOTED"),
+        ("PASSWORD='prefix'CANARY_PRODUCER_SINGLE", "CANARY_PRODUCER_SINGLE"),
+        ('passphrase="CANARY_PRODUCER_PASSPHRASE"', "CANARY_PRODUCER_PASSPHRASE"),
+        ('Server=db;User ID=sa;Pwd=CANARY_PRODUCER_CONNECTION',
+         "CANARY_PRODUCER_CONNECTION"),
     ],
 )
 async def test_repo_events_sanitizes_cli_log_boundary_cases(
@@ -774,6 +836,7 @@ async def test_repo_events_sanitizes_cli_log_boundary_cases(
     result = await diagnostics.get_repo_events(SLUG)
 
     assert canary not in json.dumps(result)
+    assert result["events"][0]["message"] == "[OMITTED: credential-bearing event]"
     assert redis.closed
 
 
