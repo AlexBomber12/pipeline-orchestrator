@@ -1465,11 +1465,11 @@ class WatchMixin:
         self, pr_number: int, head_sha: str, *, only_run_ids: set[int] | None = None,
         tries: int = 0, allow_submission: bool = True,
     ) -> bool:
-        """Observe durable Actions targets independently of new failure discovery.
+        """Reconcile saved Actions operations before admitting new submissions.
 
         Intent is written to the existing marker before each GitHub side effect.
         A lost response stays ambiguous until a later workflow read resolves it.
-        Only confirmed non-execution clears intent for another bounded request.
+        Current checks authorize submission, not observation of saved targets.
         """
         if not head_sha or self.state.current_pr is None:
             return False
@@ -1511,7 +1511,7 @@ class WatchMixin:
             self._infra_retry_intent_run_ids = []
             self._infra_retry_request_attempts = {}
             self._infra_retry_unsupported = unsupported
-        if not candidates and only_run_ids is None:
+        if not candidates and not only_run_ids:
             if not failing_count:
                 self.log_event(
                     f"[WATCH] PR #{pr_number} infra retry skipped — no "
@@ -1523,8 +1523,6 @@ class WatchMixin:
                     f"check-runs on sha {head_sha[:7]} have no Actions workflow run ID in details_url."
                 )
             return False
-        # Durable targets came from validated Actions identities. Observe them
-        # independently of the current failure list, which can lag or disappear.
         target_ids = sorted(candidates if only_run_ids is None else only_run_ids)
         rerun_count = 0
         for run_id in target_ids:
@@ -1533,7 +1531,7 @@ class WatchMixin:
             await self.publish_state()
             if run is None:
                 continue
-            checks = candidates.get(run_id, []) if complete else []
+            checks = candidates.get(run_id, [])
             baseline_attempt = self._infra_retry_request_attempts.get(str(run_id))
             if (isinstance(baseline_attempt, int) and not isinstance(baseline_attempt, bool)
                     and baseline_attempt > 0
@@ -1546,25 +1544,28 @@ class WatchMixin:
                     pr_number, head_sha, issued=False, tries=self._infra_retry_tries,
                 )
                 continue
-            if not checks:
-                # Missing/successful checks cannot confirm an effect on their
-                # own or authorize a new submission. Retain unresolved intent.
+            if run_id in self._infra_retry_intent_run_ids:
                 continue
             current_jobs = [check for check in checks if (
                 check.get("run_attempt") is None
                 or check["run_attempt"] == run["attempt"]
             ) and matching_failed_job(run, check["id"], check.get("name"))]
             if not current_jobs:
+                observed_checks = checks or [
+                    {"id": check_id, "run_attempt": attempt}
+                    for check_id, attempt, saved_run_id in self._infra_retry_rerunnable_checks
+                    if saved_run_id == run_id
+                ]
                 jobs = run.get("jobs")
-                if run["attempt"] > 1 and (
+                if observed_checks and run["attempt"] > 1 and (
                     run.get("status") != "completed" or (
                         isinstance(jobs, list) and all(
                         check["id"] not in {
                             job.get("databaseId") for job in jobs
                             if isinstance(job, dict)
-                        } for check in checks
+                        } for check in observed_checks
                     )) or any(isinstance(check.get("run_attempt"), int)
-                             and run["attempt"] > check["run_attempt"] for check in checks)
+                             and run["attempt"] > check["run_attempt"] for check in observed_checks)
                 ):
                     # A rerun already happened. It may still be queued, running,
                     # successful, or failed; never issue against the old check.
@@ -1576,11 +1577,7 @@ class WatchMixin:
                         pr_number, head_sha, issued=False, tries=self._infra_retry_tries,
                     )
                 continue
-            if run_id in self._infra_retry_intent_run_ids:
-                # The prior request may have been accepted before its response
-                # was lost. Do not submit it again against lagging metadata.
-                continue
-            if not allow_submission:
+            if not complete or not allow_submission:
                 continue
             if self._infra_retry_tries == tries:
                 self._infra_retry_tries += 1
@@ -1596,12 +1593,12 @@ class WatchMixin:
                 )
             except gh_runner.GhNotStartedError as exc:
                 self._infra_retry_intent_run_ids.remove(run_id)
-                del self._infra_retry_request_attempts[str(run_id)]
+                self._infra_retry_request_attempts.pop(str(run_id))
                 await self._mark_infra_retry_attempted(
                     pr_number, head_sha, issued=False, tries=self._infra_retry_tries,
                 )
                 self.log_event(
-                    f"[WATCH] PR #{pr_number} infra retry not submitted "
+                    f"[WATCH] PR #{pr_number} infra retry process did not start "
                     f"for run {run_id}: {exc}."
                 )
                 continue

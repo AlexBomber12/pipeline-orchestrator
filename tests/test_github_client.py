@@ -7776,3 +7776,61 @@ def test_etag_pagination_compatibility_filters_entirely_malformed_page(
 ) -> None:
     monkeypatch.setattr(cache, "_etag_get", lambda url: ["malformed"])
     assert cache._etag_get_paginated("repos/owner/name/pulls") == []
+
+
+@pytest.mark.parametrize("errno_value", [2, 11, 13])
+def test_gh_process_boundary_creation_failure_is_definitely_not_started(monkeypatch, errno_value):
+    from src.github.gh_runner import GhNotStartedError
+
+    failure = OSError(errno_value, "cannot create process")
+
+    def spawn(*args, **kwargs):
+        raise failure
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    with pytest.raises(GhNotStartedError) as raised:
+        run_gh(["run", "rerun", "--failed", "12"], repo="octo/demo")
+    assert raised.value.__cause__ is failure
+
+
+@pytest.mark.parametrize("failure", [
+    subprocess.TimeoutExpired("gh", 30), OSError(5, "pipe failed"), KeyboardInterrupt(),
+])
+def test_gh_process_boundary_after_start_failure_remains_ambiguous_and_reaps_child(monkeypatch, failure):
+    from unittest.mock import MagicMock
+
+    from src.github.gh_runner import GhNotStartedError
+
+    process = MagicMock()
+    process.communicate.side_effect = failure
+    spawn = MagicMock(return_value=process)
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    with pytest.raises(type(failure)) as raised:
+        run_gh(["run", "rerun", "--failed", "12"])
+    assert not isinstance(raised.value, GhNotStartedError)
+    process.kill.assert_called_once_with()
+    process.__exit__.assert_called_once()
+
+
+@pytest.mark.parametrize(("stdout", "exit_code", "expected"), [
+    ('{"ok":true}', 0, {"ok": True}), ("accepted\n", 0, "accepted"), ("", 0, ""), ("", 1, None),
+])
+def test_gh_process_boundary_uses_real_process_and_shared_output_contract(monkeypatch, tmp_path, stdout, exit_code, expected):
+    import sys
+
+    program = tmp_path / "gh_script.py"
+    program.write_text(f"import sys\nsys.stdout.write({stdout!r})\nsys.stderr.write('rejected')\nsys.exit({exit_code})\n")
+    spawn = subprocess.Popen
+    observed = []
+
+    def substitute_executable(cmd, **kwargs):
+        observed.append(cmd)
+        return spawn([sys.executable, str(program)], **kwargs)
+
+    monkeypatch.setattr(subprocess, "Popen", substitute_executable)
+    if exit_code:
+        with pytest.raises(RuntimeError, match="rejected"):
+            run_gh(["run", "rerun", "--failed", "12"], repo="octo/demo")
+    else:
+        assert run_gh(["run", "rerun", "--failed", "12"], repo="octo/demo") == expected
+    assert observed == [["gh", "run", "rerun", "--failed", "12", "-R", "octo/demo"]]
