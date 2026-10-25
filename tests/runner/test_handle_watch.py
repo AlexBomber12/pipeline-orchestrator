@@ -7,14 +7,16 @@ tests/test_runner.py and are referenced via the ``h`` alias.
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import re
+import subprocess
 import time
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from redis.exceptions import ConnectionError as RedisConnectionError
@@ -3322,6 +3324,223 @@ def test_failed_infra_rerun_still_allows_current_review_fix(
     monkeypatch.setattr(runner, "handle_fix", fix)
     asyncio.run(runner.handle_watch())
     fix.assert_awaited_once()
+
+
+@pytest.mark.parametrize("check_view", ["stale", "fresh", "running", "missing", "incomplete"])
+@pytest.mark.parametrize("restart,reverse", [(False, False), (True, False), (True, True)])
+def test_successful_pending_rerun_reconciles_independently_of_failed_checks(
+    monkeypatch: pytest.MonkeyPatch, check_view: str, restart: bool, reverse: bool,
+) -> None:
+    from src.daemon import ci_attempts
+    from src.github import checks as gh_checks
+    from src.github.gh_runner import run_gh
+    from src.keyspace import ci_infra_retried
+
+    sha = "d" * 40
+    a, b = (22, 11) if reverse else (11, 22)
+
+    def check(run_id, job_id, conclusion):
+        return {"id": job_id, "name": f"job-{run_id}", "head_sha": sha,
+                "app": {"id": 15368}, "status": "completed",
+                "conclusion": conclusion, "details_url": _actions_url(run_id, job_id)}
+
+    initial = [check(a, 101, "cancelled"), check(b, 202, "cancelled")]
+    fresh = [check(a, 103, "success"), check(b, 204, "cancelled")]
+    visible = list(initial)
+    complete = True
+    pr = _patch_infra_failure_pr(monkeypatch, head_sha=sha, check_runs=initial)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    monkeypatch.setattr(watch_module, "read_actions_run", ci_attempts.read_actions_run)
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", run_gh)
+    monkeypatch.setattr(gh_checks, "_fetch_ci_status_rest", lambda *args: (
+        list(visible), {"sha": sha, "statuses": []}, complete,
+    ))
+    reruns, reads = [], []
+    advanced = False
+
+    def spawn(cmd, **kwargs):
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.returncode = 0
+        process.poll.return_value = 0
+        if cmd[1:3] == ["pr", "diff"]:
+            process.communicate.return_value = ("", "")
+            return process
+        if cmd[1:3] == ["run", "view"]:
+            run_id = int(cmd[3])
+            reads.append(run_id)
+            current = next(c for c in (fresh if advanced else initial)
+                           if f"/runs/{run_id}/" in c["details_url"])
+            payload = {"databaseId": run_id, "headSha": sha,
+                       "attempt": 2 if advanced else 1,
+                       "status": "completed", "conclusion": current["conclusion"],
+                       "jobs": [{"databaseId": current["id"], "name": current["name"],
+                                 "conclusion": current["conclusion"]}]}
+            process.communicate.return_value = (json.dumps(payload), "")
+        else:
+            assert cmd[1:4] == ["run", "rerun", "--failed"]
+            run_id = int(cmd[4])
+            reruns.append(run_id)
+            # A request reaches GitHub, but the response is lost.
+            process.returncode = 1 if run_id == a else 0
+            process.communicate.return_value = ("", "lost acknowledgement")
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    key = ci_infra_retried(runner.owner_repo, pr.number, sha)
+    asyncio.run(runner.handle_watch())
+    marker = json.loads(asyncio.run(runner.redis.get(key)))
+    assert marker["intent_runs"] == [a] and marker["issued_runs"] == [b]
+    assert marker["request_attempts"] == {str(a): 1, str(b): 1}
+    assert sorted(reruns) == [11, 22]
+    if restart:
+        recovered = h._make_runner()
+        recovered.redis = runner.redis
+        recovered.state = RepoState.model_validate_json(runner.state.model_dump_json())
+        runner = recovered
+    marker["at"] = time.time() - 120
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    advanced = True
+    visible = {
+        "stale": initial, "fresh": fresh,
+        "running": [{**fresh[0], "conclusion": None, "status": "in_progress"}, fresh[1]],
+        "missing": [fresh[1]], "incomplete": [],
+    }[check_view]
+    complete = check_view != "incomplete"
+    reads.clear()
+    asyncio.run(runner.handle_watch())
+    marker = json.loads(asyncio.run(runner.redis.get(key)))
+    assert a in reads  # Actually observe A; absence from failures proves nothing.
+    assert marker["intent_runs"] == []
+    assert sorted(marker["issued_runs"]) == [11, 22] and marker["issued"] is True
+    assert sorted(reruns) == [11, 22]
+    # Fresh B failure reaches FIX, including after a stale/missing-check pass.
+    visible, complete = fresh, True
+    retrieval = gh_checks._make_ci_retrieval(
+        runner.owner_repo, sha, 0.0, fresh, {"sha": sha, "statuses": []},
+        gh_checks._CiSourceResult(True, False), gh_checks._CiSourceResult(True, True),
+    )
+    monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
+    marker["at"] = time.time() - 120
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    fix = AsyncMock()
+    monkeypatch.setattr(runner, "handle_fix", fix)
+    asyncio.run(runner.handle_watch())
+    fix.assert_awaited_once()
+    assert runner.state.current_pr.ci_status == CIStatus.FAILURE
+    assert sorted(reruns) == [11, 22]
+
+
+@pytest.mark.parametrize("provenance", ["current", "legacy"])
+def test_absent_checks_do_not_resolve_pending_effect_without_new_attempt(
+    monkeypatch: pytest.MonkeyPatch, provenance: str,
+) -> None:
+    from src.daemon import ci_attempts
+    from src.keyspace import ci_infra_retried
+
+    sha = "d" * 40
+    runner = h._make_runner()
+    runner.state.current_pr = PRInfo(number=77, branch="pr-077", head_sha=sha)
+    runner._infra_retry_baseline = [[101, None]]
+    runner._infra_retry_rerunnable_checks = [[101, None, 11]]
+    runner._infra_retry_target_run_ids = [11]
+    runner._infra_retry_issued_run_ids = []
+    runner._infra_retry_intent_run_ids = [11]
+    runner._infra_retry_request_attempts = {"11": 1} if provenance == "current" else {}
+    runner._infra_retry_unsupported = False
+    monkeypatch.setattr(watch_module, "read_actions_run", ci_attempts.read_actions_run)
+    reads = []
+
+    def transport(args, **kwargs):
+        assert args[:3] == ["run", "view", "11"]
+        reads.append(args)
+        return {"databaseId": 11, "headSha": sha, "attempt": 1,
+                "status": "completed", "conclusion": "success", "jobs": []}
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", transport)
+    monkeypatch.setattr("src.github.checks._fetch_ci_status_rest", lambda *a: ([], {}, True))
+    assert not asyncio.run(runner._retry_failed_workflow(
+        77, sha, only_run_ids={11}, tries=1,
+    ))
+    assert len(reads) == 1 and runner._infra_retry_intent_run_ids == [11]
+    assert runner._infra_retry_issued_run_ids == []
+    assert asyncio.run(runner.redis.get(ci_infra_retried(runner.owner_repo, 77, sha))) is None
+
+
+@pytest.mark.parametrize("outcome", ["transient_spawn", "repeated_spawn", "timeout", "oserror"])
+def test_rerun_process_outcome_controls_bounded_retry(
+    monkeypatch: pytest.MonkeyPatch, outcome: str,
+) -> None:
+    from src.github import checks as gh_checks
+    from src.github.gh_runner import run_gh
+    from src.keyspace import ci_infra_retried
+
+    sha = "d" * 40
+    pr = _patch_infra_failure_pr(monkeypatch, head_sha=sha)
+    runner = h._make_runner()
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", run_gh)
+    checks = [{"id": 12345, "name": "unit", "head_sha": sha, "app": {"id": 15368},
+               "status": "completed", "conclusion": "cancelled",
+               "details_url": _actions_url(9876, 12345)}]
+    retrieval = gh_checks._make_ci_retrieval(
+        runner.owner_repo, sha, 0.0, checks, {"sha": sha, "statuses": []},
+        gh_checks._CiSourceResult(True, False), gh_checks._CiSourceResult(True, True),
+    )
+    monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
+    launches, submitted = [], []
+
+    def spawn(cmd, **kwargs):
+        if cmd[1:3] == ["pr", "diff"]:
+            process = MagicMock()
+            process.__enter__.return_value = process
+            process.returncode = 0
+            process.poll.return_value = 0
+            process.communicate.return_value = ("", "")
+            return process
+        assert cmd[1:5] == ["run", "rerun", "--failed", "9876"]
+        launches.append(cmd)
+        if outcome == "repeated_spawn" or (outcome == "transient_spawn" and len(launches) == 1):
+            raise BlockingIOError(errno.EAGAIN, "resource unavailable")
+        submitted.append(cmd)
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.returncode = 0
+        if outcome == "timeout":
+            process.communicate.side_effect = [subprocess.TimeoutExpired(cmd, 30), ("", "")]
+        elif outcome == "oserror":
+            process.communicate.side_effect = OSError(errno.EIO, "remote outcome unknown")
+        else:
+            process.communicate.return_value = ("", "")
+        return process
+
+    monkeypatch.setattr(subprocess, "Popen", spawn)
+    key = ci_infra_retried(runner.owner_repo, pr.number, sha)
+    for _ in range(5):
+        asyncio.run(runner.handle_watch())
+        marker = json.loads(asyncio.run(runner.redis.get(key)))
+        marker["at"] = time.time() - 120
+        asyncio.run(runner.redis.set(key, json.dumps(marker)))
+        if runner.state.state == PipelineState.ERROR:
+            break
+    if outcome == "transient_spawn":
+        assert len(launches) == 2 and len(submitted) == 1
+        assert marker["issued"] is True and marker["tries"] == 2
+        assert marker["intent_runs"] == [] and marker["request_attempts"] == {"9876": 1}
+        assert runner.state.state == PipelineState.WATCH
+    elif outcome == "repeated_spawn":
+        assert len(launches) == 2 and submitted == []
+        assert marker["intent_runs"] == [] and marker["request_attempts"] == {}
+        assert marker["tries"] == 2 and runner.state.state == PipelineState.ERROR
+        assert "operator Retry required" in runner.state.error_message
+    else:
+        assert len(launches) == 1 and len(submitted) == 1
+        assert marker["issued"] is False and marker["tries"] == 1
+        assert marker["intent_runs"] == [9876] and marker["request_attempts"] == {"9876": 1}
+        assert runner.state.state == PipelineState.WATCH
 
 
 def test_partial_infra_rerun_retries_only_unissued_workflow(

@@ -1465,10 +1465,11 @@ class WatchMixin:
         self, pr_number: int, head_sha: str, *, only_run_ids: set[int] | None = None,
         tries: int = 0, allow_submission: bool = True,
     ) -> bool:
-        """Reconcile each current Actions run before bounded rerun issuance.
+        """Observe durable Actions targets independently of new failure discovery.
 
         Intent is written to the existing marker before each GitHub side effect.
         A lost response stays ambiguous until a later workflow read resolves it.
+        Only confirmed non-execution clears intent for another bounded request.
         """
         if not head_sha or self.state.current_pr is None:
             return False
@@ -1481,7 +1482,7 @@ class WatchMixin:
         check_runs, _statuses, complete = gh_checks._fetch_ci_status_rest(
             self.owner_repo, head_sha,
         )
-        if not complete:
+        if not complete and only_run_ids is None:
             return False
         candidates: dict[int, list[dict]] = {}
         rerunnable_checks: list[list[int | None]] = []
@@ -1510,7 +1511,7 @@ class WatchMixin:
             self._infra_retry_intent_run_ids = []
             self._infra_retry_request_attempts = {}
             self._infra_retry_unsupported = unsupported
-        if not candidates:
+        if not candidates and only_run_ids is None:
             if not failing_count:
                 self.log_event(
                     f"[WATCH] PR #{pr_number} infra retry skipped — no "
@@ -1522,8 +1523,9 @@ class WatchMixin:
                     f"check-runs on sha {head_sha[:7]} have no Actions workflow run ID in details_url."
                 )
             return False
-        target_ids = [run_id for run_id in sorted(candidates)
-                      if only_run_ids is None or run_id in only_run_ids]
+        # Durable targets came from validated Actions identities. Observe them
+        # independently of the current failure list, which can lag or disappear.
+        target_ids = sorted(candidates if only_run_ids is None else only_run_ids)
         rerun_count = 0
         for run_id in target_ids:
             run = read_actions_run(self.owner_repo, head_sha, run_id, observations)
@@ -1531,7 +1533,7 @@ class WatchMixin:
             await self.publish_state()
             if run is None:
                 continue
-            checks = candidates[run_id]
+            checks = candidates.get(run_id, []) if complete else []
             baseline_attempt = self._infra_retry_request_attempts.get(str(run_id))
             if (isinstance(baseline_attempt, int) and not isinstance(baseline_attempt, bool)
                     and baseline_attempt > 0
@@ -1543,6 +1545,10 @@ class WatchMixin:
                 await self._mark_infra_retry_attempted(
                     pr_number, head_sha, issued=False, tries=self._infra_retry_tries,
                 )
+                continue
+            if not checks:
+                # Missing/successful checks cannot confirm an effect on their
+                # own or authorize a new submission. Retain unresolved intent.
                 continue
             current_jobs = [check for check in checks if (
                 check.get("run_attempt") is None
@@ -1588,6 +1594,17 @@ class WatchMixin:
                 gh_runner.run_gh(
                     ["run", "rerun", "--failed", str(run_id)], repo=self.owner_repo,
                 )
+            except gh_runner.GhNotStartedError as exc:
+                self._infra_retry_intent_run_ids.remove(run_id)
+                del self._infra_retry_request_attempts[str(run_id)]
+                await self._mark_infra_retry_attempted(
+                    pr_number, head_sha, issued=False, tries=self._infra_retry_tries,
+                )
+                self.log_event(
+                    f"[WATCH] PR #{pr_number} infra retry not submitted "
+                    f"for run {run_id}: {exc}."
+                )
+                continue
             except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
                 self.log_event(
                     f"[WATCH] PR #{pr_number} infra retry rerun failed (outcome unknown) "
