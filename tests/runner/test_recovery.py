@@ -1956,11 +1956,17 @@ def test_dirty_tree_auto_recovery_preserves_watch_with_open_pr(
     def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         if cmd[:3] == ["git", "status", "--porcelain"]:
             return h._FakeCompletedProcess(args=cmd, stdout=" M src/foo.py\n", returncode=0)
+        if cmd[1:4] == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            return h._FakeCompletedProcess(args=cmd, stdout="pr-099-wip\n")
+        if cmd[1:5] == ["rev-parse", "-q", "--verify", "MERGE_HEAD"]:
+            return h._FakeCompletedProcess(args=cmd, returncode=1)
+        if cmd[1:3] == ["rev-parse", "HEAD"]:
+            return h._FakeCompletedProcess(args=cmd, stdout="a" * 40)
         return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     runner = h._make_runner()
-    runner.state.current_pr = PRInfo(number=99, branch="pr-099-wip")
+    runner.state.current_pr = PRInfo(number=99, branch="pr-099-wip", head_sha="a" * 40)
     runner.state.current_task = QueueTask(pr_id="PR-099", title="wip", status=TaskStatus.DOING, branch="pr-099-wip")
 
     asyncio.run(runner.preflight())
@@ -2345,9 +2351,17 @@ def test_restart_restores_bound_merge_failure_and_timeout_evidence(
     assert fresh.state.error_message == saved.error_message
 
 
+@pytest.mark.parametrize(
+    "checkout", ["feature", "detached", "other", "status_error", "branch_error"],
+)
 def test_restart_without_snapshot_retains_dirty_error_pr_checkout(
-    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, checkout: str,
 ) -> None:
+    from unittest.mock import AsyncMock
+
+    from src.daemon import git_ops as git_ops_module
+    from src.daemon.retry_commands import RetryDispatch
+
     def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             ["git", *args], cwd=tmp_path, check=check, text=True,
@@ -2368,8 +2382,15 @@ def test_restart_without_snapshot_retains_dirty_error_pr_checkout(
     (tmp_path / "example.txt").write_text("main\n")
     git("commit", "-qam", "main")
     git("update-ref", "refs/remotes/origin/main", "HEAD")
-    git("checkout", "feature")
-    assert git("merge", "origin/main", check=False).returncode != 0
+    if checkout == "detached":
+        git("checkout", "--detach", "feature")
+    elif checkout == "other":
+        git("checkout", "-qb", "other")
+    else:
+        git("checkout", "feature")
+    checkout_head = git("rev-parse", "HEAD").stdout.strip()
+    (tmp_path / "example.txt").write_text("unpublished resolution\n")
+    (tmp_path / "notes.txt").write_text("untracked resolver notes\n")
     unpublished = (tmp_path / "example.txt").read_text()
 
     runner = h._make_runner()
@@ -2387,16 +2408,47 @@ def test_restart_without_snapshot_retains_dirty_error_pr_checkout(
         )
     }
 
+    assert asyncio.run(runner._hydrate_current_task_from_persisted_state()) is True
+    assert runner._publication_snapshot_absent is True
+    if checkout.endswith("_error"):
+        original_git = git_ops_module._git
+        failed_probe = "status" if checkout == "status_error" else "rev-parse"
+
+        def unavailable(repo_path: str, *args: str, **kwargs: Any):
+            if args[0] == failed_probe:
+                raise subprocess.TimeoutExpired(["git", *args], 30)
+            return original_git(repo_path, *args, **kwargs)
+
+        monkeypatch.setattr(git_ops_module, "_git", unavailable)
     asyncio.run(runner._apply_recovery_decisions([task], [pr]))
+    if checkout.endswith("_error"):
+        monkeypatch.setattr(git_ops_module, "_git", original_git)
 
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.error_message.startswith("Merge conflict resolution incomplete")
+    runner._recovered = True
+    runner._consecutive_dirty_cycles = 2
+    for method in (
+        "_hold_for_coder_cleanup", "_consume_approval_command",
+        "_consume_publication_migration_command", "_maybe_resume_review_timeout",
+    ):
+        monkeypatch.setattr(runner, method, AsyncMock(return_value=False))
+    monkeypatch.setattr(runner, "_consume_retry_command", AsyncMock(return_value=RetryDispatch.NONE))
+    monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+    monkeypatch.setattr(runner, "_refresh_user_paused_from_redis", AsyncMock())
+    monkeypatch.setattr(runner, "_check_github_api_budget", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner, "_maybe_resume_obsolete_ci_error", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task",
+        lambda: ("error", SuppressionReason.CRASH.value, "revision"),
+    )
     for _ in range(4):
-        assert asyncio.run(runner.preflight()) is True
+        asyncio.run(runner._run_cycle_body())
         assert runner.state.state == PipelineState.ERROR
-        assert git("rev-parse", "HEAD").stdout.strip() == feature_head
+        assert runner._consecutive_dirty_cycles == 0
+        assert git("rev-parse", "HEAD").stdout.strip() == checkout_head
         assert (tmp_path / "example.txt").read_text() == unpublished
-        assert git("ls-files", "-u").stdout
+        assert (tmp_path / "notes.txt").read_text() == "untracked resolver notes\n"
 
 
 # ---------------------------------------------------------------------------

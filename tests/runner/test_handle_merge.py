@@ -70,6 +70,42 @@ def test_bound_pr_checkout_rejects_mismatched_task_branch() -> None:
     assert runner._bound_pr_has_unpublished_work(task, pr) is False
 
 
+@pytest.mark.parametrize("uncertainty", ["merge_probe", "head_probe", "remote_head"])
+def test_bound_pr_checkout_preserves_uncertain_git_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, uncertainty: str,
+) -> None:
+    def git(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(["git", *args], cwd=tmp_path, check=True,
+                              text=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    (tmp_path / "example.txt").write_text("clean\n")
+    git("add", "example.txt")
+    git("commit", "-qm", "base")
+    head = git("rev-parse", "HEAD").stdout.strip()
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    task = QueueTask(pr_id="PR-404", title="conflict", branch="main",
+                     status=TaskStatus.DOING)
+    pr = PRInfo(number=636, branch="main", pr_id=task.pr_id,
+                head_sha="" if uncertainty == "remote_head" else head)
+    original_git = git_ops_module._git
+
+    def uncertain(repo_path: str, *args: str, **kwargs: object):
+        if uncertainty == "merge_probe" and args == (
+            "rev-parse", "-q", "--verify", "MERGE_HEAD",
+        ):
+            return subprocess.CompletedProcess(args, 2, "", "")
+        if uncertainty == "head_probe" and args == ("rev-parse", "HEAD"):
+            return subprocess.CompletedProcess(args, 0, "", "")
+        return original_git(repo_path, *args, **kwargs)
+
+    monkeypatch.setattr(git_ops_module, "_git", uncertain)
+    assert runner._bound_pr_has_unpublished_work(task, pr) is True
+
+
 @pytest.mark.parametrize(
     ("failure", "expected"),
     [
@@ -105,6 +141,7 @@ def test_conflict_commit_rejects_unverified_git_states(
     [
         ((-1, "", "Timeout after 300s"), "exit -1"),
         ((0, "finished", ""), "resolution incomplete"),
+        ((17, "", "Bearer synthetic-credential-canary " + "x" * 600_000), "classification nonzero_exit"),
     ],
 )
 def test_merge_timeout_preserves_failure_and_does_not_rediagnose(
@@ -151,6 +188,9 @@ def test_merge_timeout_preserves_failure_and_does_not_rediagnose(
     assert runner.state.coder == "codex"
     assert runner.state.state == PipelineState.ERROR
     assert expected in (runner.state.error_message or "")
+    assert "synthetic-credential-canary" not in (runner.state.error_message or "")
+    assert "synthetic-credential-canary" not in str(runner.state.history)
+    assert len(runner.state.model_dump_json().encode()) < 20_000
     assert not any(args[:2] == ("merge", "--abort") for args in git_calls)
     failure = runner.state.error_message
     for _ in range(2):
@@ -160,6 +200,24 @@ def test_merge_timeout_preserves_failure_and_does_not_rediagnose(
         assert runner._error_diagnose_count == 2
     assert len(invoked) == 1
     assert not any(args[:1] == ("push",) for args in git_calls)
+
+
+def test_resolver_failure_diagnostic_uses_only_recognized_fields() -> None:
+    message = merge_module._resolver_failure_message(
+        "invalid credential-like coder name!", 10**100,
+        "Bearer synthetic-credential-canary Timeout after 300s", "",
+        rate_limited=False,
+    )
+    assert "coder configured" in message
+    assert "exit unknown" in message
+    assert "classification timeout" in message
+    assert "Timeout after 300s" in message
+    assert "synthetic-credential-canary" not in message
+    assert len(message) < 200
+    no_output = merge_module._resolver_failure_message(
+        "codex", -1, "", "", rate_limited=False,
+    )
+    assert "classification timeout" in no_output
 
 
 def test_operator_stopped_merge_retains_failure_until_play(

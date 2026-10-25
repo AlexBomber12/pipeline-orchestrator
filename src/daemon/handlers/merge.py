@@ -10,6 +10,7 @@ Mixin methods:
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from datetime import datetime, timezone
 
@@ -31,6 +32,32 @@ from src.subsource_registry import SuppressionReason
 _QUEUE_SYNC_MAX_WAIT_SEC = 3600
 
 logger = logging.getLogger(__name__)
+
+_RESOLVER_TIMEOUT = re.compile(
+    r"\b(?:Timeout|timed out) after (\d{1,4}(?:\.\d{1,3})?)s\b",
+    re.IGNORECASE,
+)
+
+
+def _resolver_failure_message(
+    coder_name: str, code: int, stdout: str, stderr: str, *, rate_limited: bool,
+) -> str:
+    """Keep CLI output outside the durable error and event history."""
+    coder = (
+        coder_name if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}", coder_name)
+        else "configured"
+    )
+    exit_code = str(code) if isinstance(code, int) and abs(code) <= 999999 else "unknown"
+    timeout = _RESOLVER_TIMEOUT.search(stderr) or _RESOLVER_TIMEOUT.search(stdout)
+    classification = (
+        "rate_limit" if rate_limited else "timeout"
+        if timeout or code in {-1, 124} else "nonzero_exit"
+    )
+    timeout_detail = f", Timeout after {timeout.group(1)}s" if timeout else ""
+    return (
+        f"Merge conflict resolution failed (coder {coder}, exit {exit_code}, "
+        f"classification {classification}{timeout_detail}); operator Retry required"
+    )
 
 
 def _validated_conflict_commit(
@@ -272,11 +299,13 @@ class MergeMixin:
                         code, _stdout, _stderr = auxiliary_result
                         if code != 0:
                             self._detect_rate_limit(_stderr, coder_name=coder_name)
+                            failure = _resolver_failure_message(
+                                coder_name, code, _stdout, _stderr,
+                                rate_limited=self.state.rate_limited_until is not None,
+                            )
                             if self.state.rate_limited_until is not None:
                                 await self._transition_to_error(
-                                    f"Merge conflict resolution failed (exit {code}): "
-                                    f"{_stderr.strip() or _stdout.strip() or 'no output'}; "
-                                    "operator Retry required",
+                                    failure,
                                     save_run_record_as=None,
                                     publish=False,
                                     log_prefix="[MERGE]",
@@ -291,9 +320,7 @@ class MergeMixin:
                                 )
                                 return
                             await self._transition_to_error(
-                                f"Merge conflict resolution failed (exit {code}): "
-                                f"{_stderr.strip() or _stdout.strip() or 'no output'}; "
-                                "operator Retry required",
+                                failure,
                                 publish=False,
                                 log_prefix="[MERGE]",
                                 commit_task_status=True,

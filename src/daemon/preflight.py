@@ -30,27 +30,33 @@ class PreflightMixin:
 
     def _bound_pr_has_unpublished_work(self, task: QueueTask, pr: PRInfo) -> bool:
         """Use task and Git evidence when an in-memory failure was replaced."""
-        if not task.branch or task.branch != pr.branch:
+        if (
+            not task.branch or task.branch != pr.branch or pr.number <= 0
+            or pr.pr_id not in (None, task.pr_id)
+        ):
             return False
         try:
+            dirty = git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip()
             branch = git_ops._git(
                 self.repo_path, "rev-parse", "--abbrev-ref", "HEAD",
             ).stdout.strip()
-            if branch != pr.branch:
-                return False
-            dirty = git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip()
-            if dirty and task.status == TaskStatus.ERROR:
+            if dirty and (task.status == TaskStatus.ERROR or branch != pr.branch):
                 return True
             merge_head = git_ops._git(
                 self.repo_path, "rev-parse", "-q", "--verify", "MERGE_HEAD",
                 check=False,
-            ).stdout.strip()
-            if merge_head:
+            )
+            if merge_head.returncode == 0:
+                return True
+            if merge_head.returncode != 1:
                 return True
             head = git_ops._git(self.repo_path, "rev-parse", "HEAD").stdout.strip()
-            return bool(head and pr.head_sha and head != pr.head_sha)
+            if not head or not pr.head_sha:
+                return True
+            return head != pr.head_sha
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
-            return False
+            # A failed probe cannot prove that reset/clean would be safe.
+            return True
 
     def _build_dirty_tree_policy(self) -> BoundedRecoveryPolicy["PreflightMixin"]:
         return BoundedRecoveryPolicy(
