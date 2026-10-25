@@ -1,14 +1,3 @@
-{% import "components/_repo_state_styles.html" as repo_state %}
-{% set tier_styles = {
-    'infra': 'bg-info/10 text-info border-info/30',
-    'coder': 'bg-purple-500/10 text-purple-300 border-purple-500/30',
-    'state': 'bg-gray-500/10 text-gray-300 border-gray-500/30',
-    'guardrail': 'bg-fail/10 text-fail border-fail/30',
-    'cancel': 'bg-warn/10 text-warn border-warn/30',
-    'merge': 'bg-ok/10 text-ok border-ok/30',
-    'panic': 'bg-fail/20 text-fail border-fail/40',
-    'operator': 'bg-cyan-500/10 text-cyan-300 border-cyan-500/30',
-} %}
 {# When served from /partials/repo/{name}/events (oob=True), emit the
    count span as an hx-swap-oob target so HTMX refreshes the header's
    "N events" label alongside the list innerHTML swap. Rendered inline
@@ -21,31 +10,25 @@
 {% if events %}
 <ul class="divide-y divide-white/5 font-mono text-xs">
     {% for entry in events|reverse %}
-    {% set entry_state = entry.get('state', 'IDLE') %}
-    {% set entry_style = repo_state.state_styles.get(entry_state, repo_state.state_styles['IDLE']) %}
     {% set entry_count = entry.get('count', 1) %}
     {% set first_seen = entry.get('time', '') %}
     {% set last_seen = entry.get('last_seen_at', first_seen) %}
     {% set event_text = entry.get('message', entry.get('event', '')) %}
     {% set tier = entry.get('tier') %}
     {% set kind = entry.get('kind') %}
-    {% set legacy_prefix = entry_state %}
+    {% set legacy_prefix = '' %}
     {% set legacy_text = event_text %}
     {% if not tier and event_text.startswith('[') and '] ' in event_text %}
         {% set legacy_prefix = event_text.split('] ', 1)[0][1:] %}
         {% set legacy_text = event_text.split('] ', 1)[1] %}
     {% endif %}
+    {% set category = tier or legacy_prefix %}
     <li class="flex flex-col gap-1 px-1 py-2.5 sm:flex-row sm:items-start sm:gap-2 sm:px-0 sm:py-2">
         <div class="flex items-center gap-2 text-xs">
-            {% if tier %}
-            <span class="text-[10px] font-medium min-w-[4.5rem] text-center px-1.5 py-0.5 rounded border {{ tier_styles.get(tier, tier_styles['state']) }} shrink-0">
-                {{ tier }}
+            <span class="text-[10px] font-medium min-w-[4.5rem] inline-flex max-w-full items-center justify-center rounded border border-gray-500/30 bg-gray-500/10 px-1.5 py-0.5 uppercase tracking-wide text-gray-300 break-words"
+                  data-event-category="{{ category }}">
+                Event{% if category %} · {{ category | upper }}{% endif %}
             </span>
-            {% else %}
-            <span class="text-[10px] font-medium min-w-[4.5rem] text-center px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0">
-                {{ legacy_prefix }}
-            </span>
-            {% endif %}
             {% if entry_count > 1 %}
             <span class="w-24 text-gray-500 shrink-0 whitespace-nowrap"
                   data-ts="{{ last_seen }}"
