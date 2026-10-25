@@ -639,6 +639,8 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
         ('before https://host.example:443/health after', "CANARY_NOT_PRESENT", "https://host.example:443/health"),
         ('before password="CANARY_TRUNCATED', "CANARY_TRUNCATED", "before"),
         ('before -----BEGIN OPENSSH PRIVATE KEY-----\nCANARY_PEM', "CANARY_PEM", "before"),
+        ('before private_key=-----BEGIN EC PRIVATE KEY-----\nCANARY_PEM_BODY\n'
+         '-----END EC PRIVATE KEY-----\nafter', "CANARY_PEM_BODY", "after"),
         ('before \x1b]0;CANARY_OSC\x07 after', "CANARY_OSC", "after"),
         ('Timeout after 300s \x1bX CANARY_UNKNOWN', "CANARY_UNKNOWN", "Timeout after 300s"),
         ("CANARY_OVERSIZED" + "x" * 4100, "CANARY_OVERSIZED", "OMITTED: oversized"),
@@ -706,6 +708,8 @@ async def test_repo_events_sanitizes_real_cli_log_producer(
     [
         ("Cookie: theme=light; sid=CANARY_PRODUCER_COOKIE", "CANARY_PRODUCER_COOKIE"),
         (r'{"password":"prefix\u0022CANARY_PRODUCER_QUOTE"}', "CANARY_PRODUCER_QUOTE"),
+        ('private_key=-----BEGIN EC PRIVATE KEY-----\nCANARY_PRODUCER_PEM\n'
+         '-----END EC PRIVATE KEY-----', "CANARY_PRODUCER_PEM"),
     ],
 )
 async def test_repo_events_sanitizes_cli_log_boundary_cases(

@@ -942,8 +942,9 @@ def _safe_event_message(value: str) -> tuple[str, bool]:
         for char in message
     )):
         return f"[OMITTED: ambiguous encoded text] {timeout.group(0) if timeout else ''}".strip(), True
-    # Whole headers must be removed before field redaction can erase their name
-    # and leave later Cookie attributes exposed.
+    # Remove complete structures before field redaction can erase their markers
+    # and leave later Cookie attributes or PEM body lines exposed.
+    message = _PRIVATE_KEY.sub("[REDACTED]", message)
     message = _SENSITIVE_HEADER.sub("[REDACTED]", message)
     # Protect ordinary JSON values before unescaping a surrounding serialized
     # representation: an escaped quote inside a secret value is not its end.
