@@ -1136,17 +1136,25 @@ async def _build_tasks_panel_context(
     redis_client: aioredis.Redis | None,
     retry_cap: int,
 ) -> dict[str, object]:
-    # The queue snapshot may lag a terminal WATCH failure. Bind the visible
-    # Retry row to the authoritative failed task and cancellation record.
+    # Recovery may park before publishing a queue. Keep the failed task's
+    # existing Retry action available independently of that projection.
     if redis_client is not None:
         state = await _repo_state_for_retry(redis_client, name)
+        if (
+            state is not None and state.state != PipelineState.ERROR
+            and state.current_task is not None
+            and not any(item.pr_id == state.current_task.pr_id for item in tasks)
+        ):
+            tasks.append(state.current_task)
         if (
             state is not None
             and state.state == PipelineState.ERROR
             and state.current_task is not None
-            and state.current_pr is not None
-            and state.current_task.branch == state.current_pr.branch
-            and state.current_pr.head_sha
+            and (
+                state.current_pr is None
+                or (state.current_task.branch == state.current_pr.branch
+                    and state.current_pr.head_sha)
+            )
         ):
             failed = state.current_task
             try:
@@ -1157,7 +1165,7 @@ async def _build_tasks_panel_context(
                 cause = None
             if (
                 cause is not None
-                and cause.payload.get("subsource") == "review_timeout"
+                and cause.category == "ERROR"
             ):
                 replacement = failed.model_copy(update={"status": TaskStatus.ERROR})
                 tasks = [
@@ -1817,7 +1825,13 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
             status_code=404,
         )
     tasks, _snapshot_at = await _load_current_queue_snapshot(name)
-    if tasks is None:
+    context = await _build_tasks_panel_context(
+        name,
+        tasks or [],
+        redis_client=getattr(request.app.state, "redis", None),
+        retry_cap=cfg.daemon.retry_button_cap,
+    )
+    if tasks is None and not context["tasks_total"]:
         return HTMLResponse(
             _QUEUE_NOT_READY_FRAGMENT,
             status_code=503,
@@ -1825,12 +1839,7 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
     return _app.templates.TemplateResponse(
         request,
         "components/tasks_panel.html",
-        await _build_tasks_panel_context(
-            name,
-            tasks,
-            redis_client=getattr(request.app.state, "redis", None),
-            retry_cap=cfg.daemon.retry_button_cap,
-        ),
+        context,
     )
 
 
