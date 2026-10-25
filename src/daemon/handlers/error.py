@@ -156,18 +156,6 @@ class ErrorMixin:
             self.log_event("[RECOVERY] Size FIX remains parked for operator Retry.")
             return
 
-        if context.startswith((
-            "No eligible coder available for merge conflict resolution",
-            "Merge conflict resolution failed",
-            "Merge conflict resolution incomplete",
-            "Pre-merge sync failed:",
-        )):
-            self.log_event(
-                "[RECOVERY] Merge sync failure remains parked with its "
-                "original evidence for operator Retry."
-            )
-            return
-
         if "status:ERROR write failed; operator Retry required" in context:
             reason_text = context.partition(":")[0]
             try:
@@ -220,6 +208,18 @@ class ErrorMixin:
             return
         if context.startswith("Persisted FIX invocation ownership is uncertain; operator Retry required"):
             self.log_event("[RECOVERY] Uncertain FIX invocation remains parked for operator Retry.")
+            return
+
+        if context.startswith((
+            "No eligible coder available for merge conflict resolution",
+            "Merge conflict resolution failed",
+            "Merge conflict resolution incomplete",
+            "Pre-merge sync failed:",
+        )):
+            self.log_event(
+                "[RECOVERY] Merge sync failure remains parked with its "
+                "original evidence for operator Retry."
+            )
             return
 
         async def _clear_cause_for_retry() -> None:

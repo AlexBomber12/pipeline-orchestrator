@@ -7,6 +7,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from src.cancellation import retry_count_key, task_spec_hash_key
@@ -182,6 +183,70 @@ def test_merge_failure_park_survives_non_ai_error_dispatch(
     asyncio.run(runner._handle_single_error_exit())
     assert runner.state.state == PipelineState.ERROR
     assert "Timeout after 300s" in (runner.state.error_message or "")
+
+
+def test_merge_error_repairs_failed_status_write_before_parking(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "Merge conflict resolution failed (exit -1): Timeout after 300s; "
+        "operator Retry required"
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-404", title="conflict", status=TaskStatus.DOING,
+        task_file="tasks/PR-404.md",
+    )
+    runner._status_write_failed_task_pr_ids.add("PR-404")
+    runner._error_diagnose_count = 2
+    write = AsyncMock(side_effect=[False, True])
+    monkeypatch.setattr(runner, "_commit_task_status_change", write)
+
+    asyncio.run(runner.handle_error())
+    assert runner._status_write_failed_task_pr_ids == {"PR-404"}
+    assert runner.state.state == PipelineState.ERROR
+    asyncio.run(runner.handle_error())
+    assert write.await_count == 2
+    assert runner._status_write_failed_task_pr_ids == set()
+    assert runner.state.error_message.startswith("Merge conflict resolution failed")
+    assert runner._error_diagnose_count == 2
+
+
+def test_non_ai_merge_error_repairs_failed_status_before_remote_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Merge conflict resolution incomplete: unmerged paths; operator Retry required"
+    runner.state.current_task = QueueTask(
+        pr_id="PR-404", title="conflict", status=TaskStatus.DOING,
+        task_file="tasks/PR-404.md",
+    )
+    runner._status_write_failed_task_pr_ids.add("PR-404")
+    runner.app_config.daemon.error_handler_use_ai = False
+
+    async def no_obsolete() -> None:
+        return None
+
+    async def no_suppression() -> tuple[None, bool]:
+        return None, False
+
+    monkeypatch.setattr(runner, "_maybe_resume_obsolete_ci_error", no_obsolete)
+    monkeypatch.setattr(runner, "_error_suppression_reason", no_suppression)
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task",
+        lambda: (None, None, None),
+    )
+    write = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, "_commit_task_status_change", write)
+
+    asyncio.run(runner._handle_single_error_exit())
+
+    write.assert_awaited_once()
+    assert runner._status_write_failed_task_pr_ids == set()
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message.startswith("Merge conflict resolution incomplete")
 
 _CONFIRM_REMOTE_MERGE = merge_module.MergeMixin._confirm_remote_merge
 

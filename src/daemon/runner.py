@@ -2518,9 +2518,6 @@ class PipelineRunner(
         frontmatter_status, _blocked, _revision = (
             self._remote_frontmatter_error_status_for_current_task()
         )
-        if task is not None and frontmatter_status is None:
-            self.log_event("[RECOVERY] Remote ERROR task status unavailable; staying ERROR.")
-            return
         if frontmatter_status == "error" and (reason is None or from_frontmatter):
             reason, from_frontmatter = _blocked, True
         if frontmatter_status == "todo":
@@ -2536,12 +2533,22 @@ class PipelineRunner(
             )
             return
 
-        if (self.state.error_message or "").startswith((
+        merge_sync_error = (self.state.error_message or "").startswith((
             "No eligible coder available for merge conflict resolution",
             "Merge conflict resolution failed",
             "Merge conflict resolution incomplete",
             "Pre-merge sync failed:",
-        )):
+        ))
+        if merge_sync_error and task_id in self._status_write_failed_task_pr_ids:
+            # The ordinary ERROR handler owns durable status-write repair.
+            # Run it even when AI diagnosis is disabled and the remote
+            # frontmatter could not yet be read as ERROR.
+            await self.handle_error()
+            return
+        if task is not None and frontmatter_status is None:
+            self.log_event("[RECOVERY] Remote ERROR task status unavailable; staying ERROR.")
+            return
+        if merge_sync_error:
             self.log_event(
                 "[RECOVERY] Merge sync failure remains ERROR until "
                 "operator Retry or a task update."
