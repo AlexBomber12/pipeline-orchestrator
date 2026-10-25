@@ -134,8 +134,10 @@ def test_renders_retry_button_when_below_cap(
     assert "disabled" not in body
 
 
+@pytest.mark.parametrize("subsource", ["review_timeout", "coder_escalate"])
 def test_stale_todo_snapshot_shows_retry_for_bound_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    subsource: str,
 ) -> None:
     _setup_panel(tmp_path, monkeypatch, retry_count=0, task_status=TaskStatus.TODO)
     redis_client = web_app.aioredis.from_url("unused")
@@ -149,7 +151,7 @@ def test_stale_todo_snapshot_shows_retry_for_bound_failure(
     redis_client.store[key] = state.model_dump_json()
     redis_client.store[cause_key("example__alpha", "PR-283")] = (
         CancellationCause(
-            category="ERROR", payload={"subsource": "review_timeout"}
+            category="ERROR", payload={"subsource": subsource}
         ).to_redis()
     )
     with TestClient(app) as client:
@@ -159,8 +161,12 @@ def test_stale_todo_snapshot_shows_retry_for_bound_failure(
     assert response.text.index("PR-283") < response.text.index("Retry")
 
 
+@pytest.mark.parametrize("queue_missing", [False, True])
+@pytest.mark.parametrize("subsource", ["review_timeout", "coder_escalate", "crash"])
+@pytest.mark.parametrize("with_pr", [False, True])
 def test_missing_snapshot_row_uses_bound_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    queue_missing: bool, subsource: str, with_pr: bool,
 ) -> None:
     _setup_panel(tmp_path, monkeypatch, retry_count=0, task_status=TaskStatus.TODO)
     redis_client = web_app.aioredis.from_url("unused")
@@ -168,19 +174,25 @@ def test_missing_snapshot_row_uses_bound_failure(
     state = RepoState.model_validate_json(redis_client.store[key])
     state.state = PipelineState.ERROR
     state.current_task = state.current_queue[0]
-    state.current_queue = []
-    state.current_pr = PRInfo(number=635, branch="pr-283", head_sha="a" * 40)
+    state.current_queue = None if queue_missing else []
+    state.current_pr = (
+        PRInfo(number=635, branch="pr-283", head_sha="a" * 40) if with_pr else None
+    )
     redis_client.store[key] = state.model_dump_json()
     redis_client.store[cause_key("example__alpha", "PR-283")] = (
-        CancellationCause(category="ERROR", payload={"subsource": "review_timeout"}).to_redis()
+        CancellationCause(category="ERROR", payload={"subsource": subsource}).to_redis()
     )
     with TestClient(app) as client:
         response = client.get("/repos/example__alpha/tasks")
+    assert response.status_code == 200
     assert 'hx-post="/repos/example__alpha/tasks/PR-283/retry"' in response.text
+    assert RepoState.model_validate_json(redis_client.store[key]).current_queue == state.current_queue
 
 
+@pytest.mark.parametrize("queue_missing", [False, True])
 def test_failed_cause_read_does_not_invent_error_row(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    queue_missing: bool,
 ) -> None:
     _setup_panel(tmp_path, monkeypatch, retry_count=0, task_status=TaskStatus.TODO)
     redis_client = web_app.aioredis.from_url("unused")
@@ -188,6 +200,8 @@ def test_failed_cause_read_does_not_invent_error_row(
     state = RepoState.model_validate_json(redis_client.store[key])
     state.state = PipelineState.ERROR
     state.current_task = state.current_queue[0]
+    if queue_missing:
+        state.current_queue = None
     state.current_pr = PRInfo(number=635, branch="pr-283", head_sha="a" * 40)
     redis_client.store[key] = state.model_dump_json()
     original_get = redis_client.get
@@ -200,7 +214,7 @@ def test_failed_cause_read_does_not_invent_error_row(
     redis_client.get = get
     with TestClient(app) as client:
         response = client.get("/repos/example__alpha/tasks")
-    assert response.status_code == 200
+    assert response.status_code == (503 if queue_missing else 200)
     assert 'hx-post="/repos/example__alpha/tasks/PR-283/retry"' not in response.text
 
 

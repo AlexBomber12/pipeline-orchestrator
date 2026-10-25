@@ -13,6 +13,8 @@ from src.cancellation.storage import CancellationCause, cause_key
 from src.daemon import retry_commands as daemon_retry
 from src.keyspace import (
     pipeline_state as pipeline_state_key,
+)
+from src.keyspace import (
     retry_command,
     retry_command_dedupe,
     retry_command_pending,
@@ -275,9 +277,13 @@ def test_web_command_reaches_parked_daemon_and_dispatches_once(
     assert published.current_task.status == TaskStatus.DOING
 
 
+@pytest.mark.parametrize("queue_missing", [False, True])
+@pytest.mark.parametrize("subsource", ["coder_escalate", "coder_crash"])
 def test_retry_binds_failure_and_relevant_pr(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    queue_missing: bool,
+    subsource: str,
 ) -> None:
     pr = PRInfo(
         number=531,
@@ -286,12 +292,17 @@ def test_retry_binds_failure_and_relevant_pr(
         pr_id="PR-283",
     )
     _, redis_client = _setup_retry(tmp_path, monkeypatch, current_pr=pr)
+    if queue_missing:
+        state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+        state.current_task.status = TaskStatus.DOING
+        state.current_queue = None
+        redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
     redis_client.store[cause_key("example__alpha", "PR-283")] = CancellationCause(
         category="ERROR",
         created_at="2026-01-01T00:00:00+00:00",
         task_id="PR-283",
         repo_slug="example__alpha",
-        payload={"subsource": "coder_crash"},
+        payload={"subsource": subsource},
     ).to_redis()
 
     with TestClient(app) as client:
@@ -309,7 +320,7 @@ def test_retry_binds_failure_and_relevant_pr(
     assert command.bound_pr_number == 531
     assert command.bound_pr_branch == "fix/pr-283"
     assert command.bound_pr_head_sha == "abc123"
-    assert command.failure_subsource == "coder_crash"
+    assert command.failure_subsource == subsource
     assert command.failure_created_at == "2026-01-01T00:00:00+00:00"
     assert cause_key("example__alpha", "PR-283") in redis_client.store
 
@@ -537,11 +548,20 @@ def test_retry_requires_redis_and_tolerates_wake_failure(
     assert accepted.status_code == 202
 
 
+@pytest.mark.parametrize("queue_missing", [False, True])
 def test_task_panel_renders_command_lifecycle_and_polling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    queue_missing: bool,
 ) -> None:
     _, redis_client = _setup_retry(tmp_path, monkeypatch)
+    if queue_missing:
+        state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+        state.current_queue = None
+        redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
+        redis_client.store[cause_key("example__alpha", "PR-283")] = (
+            CancellationCause(category="ERROR", payload={"subsource": "coder_escalate"}).to_redis()
+        )
     with TestClient(app) as client:
         binding = _rendered_binding(client)
         client.post(
@@ -567,11 +587,17 @@ def test_task_panel_renders_command_lifecycle_and_polling(
         command.outcome_reason = f"{status.value} reason"
         if status == RetryCommandStatus.APPLIED:
             command.execution_state = RetryExecutionState.UNCERTAIN
+            if queue_missing:
+                state.state = PipelineState.WATCH
+                state.current_task.status = TaskStatus.DOING
+                redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
+                redis_client.store.pop(cause_key("example__alpha", "PR-283"))
         redis_client.store[raw_key] = command.model_dump_json()
         if not pending:
             redis_client.zsets[retry_command_pending("example__alpha")].clear()
         with TestClient(app) as client:
             rendered = client.get("/repos/example__alpha/tasks")
+        assert rendered.status_code == 200
         assert phrase in rendered.text
 
 
