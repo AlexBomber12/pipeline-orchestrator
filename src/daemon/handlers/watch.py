@@ -1571,8 +1571,6 @@ class WatchMixin:
                     # successful, or failed; never issue against the old check.
                     if run_id not in self._infra_retry_issued_run_ids:
                         self._infra_retry_issued_run_ids.append(run_id)
-                    if run_id in self._infra_retry_intent_run_ids:
-                        self._infra_retry_intent_run_ids.remove(run_id)
                     await self._mark_infra_retry_attempted(
                         pr_number, head_sha, issued=False, tries=self._infra_retry_tries,
                     )
