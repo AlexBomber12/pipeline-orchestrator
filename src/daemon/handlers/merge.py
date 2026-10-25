@@ -10,6 +10,7 @@ Mixin methods:
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from datetime import datetime, timezone
 
@@ -248,8 +249,14 @@ class MergeMixin:
                                     f"{self.state.rate_limited_until.isoformat()}."
                                 )
                                 return
+                            # Retain only the CLI's bounded timeout marker, never
+                            # arbitrary stderr, in the dashboard event history.
+                            timeout_match = re.search(r"Timeout after \d+(?:\.\d+)?s", _stderr)
+                            explanation = (
+                                f" ({timeout_match.group(0)})" if timeout_match else ""
+                            )
                             await self._transition_to_error(
-                                "Merge conflict resolution failed",
+                                f"Merge conflict resolution failed{explanation}",
                                 publish=False,
                                 log_prefix="[MERGE]",
                             )

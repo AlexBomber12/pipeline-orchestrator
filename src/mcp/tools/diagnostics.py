@@ -1,9 +1,9 @@
 """Bounded, read-only structured runtime diagnostics for the MCP service.
 
-This module reads producer-owned Redis records directly.  It intentionally
+This module reads producer-owned Redis records directly. It intentionally
 does not call helpers that refresh TTLs, prune indexes, or otherwise mutate
-orchestrator state.  Every returned field is selected explicitly; free-form
-producer text and arbitrary payload mappings are never returned.
+orchestrator state. Status fields are explicitly allowlisted; the separate
+event-history tool redacts and bounds its producer messages.
 """
 
 from __future__ import annotations
@@ -24,10 +24,11 @@ from src.cancellation import SUBSOURCE_VOCABULARY
 from src.cancellation.storage import CATEGORIES, cause_key
 from src.coder_ids import validate_coder_plugin_id
 from src.config import AppConfig, RepoConfig, load_config
+from src.events.publisher import EVENT_TIERS
 from src.keyspace import pipeline_state, retry_command, retry_command_pending
 from src.mcp.server import mcp
 from src.metrics import MetricsStore, RunRecord
-from src.models import RepoState
+from src.models import PipelineState, RepoState
 from src.queue_parser import _PR_ID_RE
 from src.retry_commands import RetryCommand
 from src.utils import repo_slug_from_url
@@ -47,6 +48,17 @@ _MAX_RETRY_BYTES = 64 * 1024
 _MAX_CANCELLATION_BYTES = 64 * 1024
 _MAX_RUN_BYTES = 64 * 1024
 _MAX_INDEX_MEMBER_BYTES = 512
+_MAX_EVENTS = 20
+_MAX_EVENT_MESSAGE = 500
+_MAX_EVENT_RESPONSE_BYTES = 16 * 1024
+
+_CREDENTIAL_PATTERNS = (
+    re.compile(r"(?i)\bBearer\s+\S+"),
+    re.compile(r"(?i)\b(?:password|passwd|token|api[_-]?key|secret|authorization)\s*[:=]\s*[^\s,;]+"),
+    re.compile(r"\b(?:gh[opsu]_[A-Za-z0-9_]{8,}|github_pat_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]{8,})\b"),
+    re.compile(r"(?i)(https?://)[^\s/@]+:[^\s/@]+@"),
+    re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----"),
+)
 
 _KNOWN_CATEGORIES = frozenset(CATEGORIES)
 _KNOWN_SUBSOURCES = frozenset(SUBSOURCE_VOCABULARY)
@@ -858,6 +870,93 @@ def _source_summary(statuses: list[str]) -> str:
     if failed == len(statuses):
         return "unavailable"
     return "partially_available"
+
+
+def _safe_event_message(value: str) -> tuple[str, bool]:
+    message = value
+    for pattern in _CREDENTIAL_PATTERNS[:3]:
+        message = pattern.sub("[REDACTED]", message)
+    message = _CREDENTIAL_PATTERNS[3].sub(r"\1[REDACTED]@", message)
+    message = _CREDENTIAL_PATTERNS[4].sub("[REDACTED]", message)
+    return message[:_MAX_EVENT_MESSAGE], len(message) > _MAX_EVENT_MESSAGE
+
+
+@mcp.tool()
+async def get_repo_events(repo_slug: str, limit: int = 10) -> dict[str, Any]:
+    """Read bounded dashboard Event log history for one configured repository.
+
+    Event category describes a historical log entry, not current pipeline or
+    task status. Snapshot freshness does not establish process liveness.
+    """
+    limit = _validate_limit(limit, name="limit", maximum=_MAX_EVENTS)
+    if not isinstance(repo_slug, str) or not _REPO_SLUG.fullmatch(repo_slug):
+        raise ValueError("repo_slug must be a canonical owner__repo slug")
+    observed_at = _utc_now()
+    try:
+        config, repositories = _configured_repositories()
+    except Exception:
+        return {"schema_version": 1, "repo_slug": repo_slug, "source":
+                {"status": "unavailable", "code": "configuration_invalid"}, "events": [], "truncated": False}
+    if repo_slug not in repositories:
+        raise ValueError("repo_slug is not configured")
+
+    client: Any | None = None
+    try:
+        try:
+            client = _new_redis_client()
+            raw, size, oversized = await asyncio.wait_for(
+                _read_bounded_string(client, pipeline_state(repo_slug), _MAX_STATE_BYTES),
+                timeout=_REDIS_TIMEOUT_SECONDS,
+            )
+        except Exception:
+            source, state = _snapshot_unavailable("unavailable", "redis_read_failed"), None
+        else:
+            source, state = _snapshot_result(
+                raw, size_bytes=size, oversized=oversized, slug=repo_slug,
+                repo=repositories[repo_slug], config=config, observed_at=observed_at,
+            )
+        events: list[dict[str, Any]] = []
+        total = len(state.history) if state is not None else None
+        truncated = total is not None and total > limit
+        if state is not None:
+            for entry in reversed(state.history[-limit:]):
+                timestamp = _timestamp_text(entry.get("time"))
+                last_seen = _timestamp_text(entry.get("last_seen_at", entry.get("time")))
+                message = entry.get("event")
+                count = entry.get("count", 1)
+                recorded_state = entry.get("state")
+                if (timestamp is None or last_seen is None or not isinstance(message, str)
+                        or not isinstance(count, int) or isinstance(count, bool) or count < 1
+                        or recorded_state not in {state.value for state in PipelineState}):
+                    source = {**source, "status": "malformed", "code": "event_history_invalid"}
+                    events = []
+                    break
+                safe_message, shortened = _safe_event_message(message)
+                tier = entry.get("tier")
+                kind = entry.get("kind")
+                category = tier if isinstance(tier, str) and tier in EVENT_TIERS else None
+                if category is None and message.startswith("[") and "] " in message:
+                    prefix = message.split("] ", 1)[0][1:]
+                    category = prefix if re.fullmatch(r"[A-Z][A-Z0-9_-]{0,31}", prefix) else None
+                safe_kind = _safe_event_message(kind)[0] if isinstance(kind, str) and len(kind) <= 64 else None
+                events.append({
+                    "timestamp": timestamp, "last_seen_at": last_seen,
+                    "category": category, "kind": safe_kind,
+                    "recorded_state": recorded_state, "message": safe_message,
+                    "message_truncated": shortened, "count": count,
+                })
+        result = {
+            "schema_version": 1, "repo_slug": repo_slug, "observed_at": _iso_z(observed_at),
+            "source": source, "events": events, "retained_count": total,
+            "limit": limit, "truncated": truncated,
+            "response_bound_bytes": _MAX_EVENT_RESPONSE_BYTES, "read_only": True,
+        }
+        while events and len(json.dumps(result).encode()) > _MAX_EVENT_RESPONSE_BYTES:
+            events.pop()
+            result["truncated"] = True
+        return result
+    finally:
+        await _close_redis(client)
 
 
 @mcp.tool()

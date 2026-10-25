@@ -33,9 +33,18 @@ sets `MCP_RUNTIME_DIAGNOSTICS=1` for the localhost-published listener. Operators
 starting `python -m src.mcp` outside Compose must explicitly set that variable
 and retain an equivalent loopback-only or authenticated access boundary.
 
-Raw CLI, CI, event, artifact, daemon-stdout, and live-stream retrieval is not
-exposed. Persistent capture and a separately reviewed safe log-export contract
-remain follow-up work.
+`get_repo_events` reads the same retained `RepoState.history` entries shown in
+the dashboard Event log for one configured `owner__repo` slug. It returns the
+newest entries first, with event category, recorded state, timestamp, message,
+and repetition count. Category is historical event metadata; it does not
+describe the current task or pipeline state. The tool reports source freshness,
+missing/malformed/oversized/unavailable sources, and truncation. It reads at
+most a 256 KiB state snapshot and returns at most 20 events, 500 characters per
+message, and 16 KiB of event data. Common credential forms are redacted before
+return. Retention follows the dashboard's capped history; this is not a live
+process or complete audit stream. Reads do not write, refresh TTLs, or prune.
+
+Raw CLI, CI, artifact, daemon-stdout, and live-stream retrieval is not exposed.
 
 ### Protected remote diagnostics with Cloudflare Access
 
@@ -120,9 +129,9 @@ After deployment, verify these separately:
   data. A previously issued MCP session ID must fail in the same way without a
   fresh assertion.
 - An allowed operator can initialize the streamable-HTTP connection, discover
-  only the existing allowlisted tools, and call `get_orchestrator_status`.
-  Confirm that no log, artifact, event, credential, arbitrary-file, or mutation
-  tool appears.
+  only the existing allowlisted tools, and call `get_orchestrator_status` and
+  `get_repo_events` for a configured repository. Confirm that no raw log,
+  artifact, credential, arbitrary-file, or mutation tool appears.
 - A denied identity cannot complete the Access policy. Rotate the Access
   signing key in a test application, reconnect, and confirm the origin accepts
   the new key after its bounded refresh without accepting the old application

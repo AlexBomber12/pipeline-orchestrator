@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from src.cancellation.storage import cause_key
 from src.config import AppConfig, CoderType, RepoConfig
+from src.events.publisher import EVENT_TIERS
 from src.inhibitor import InhibitorType, WorkInhibitor
 from src.keyspace import pipeline_state, retry_command, retry_command_pending
 from src.metrics import MetricsStore, RunRecord
@@ -521,6 +522,131 @@ async def test_redis_cleanup_preserves_results_and_propagates_cancellation(
 
     with pytest.raises(asyncio.CancelledError):
         await diagnostics._close_redis(CancelledCloseRedis())
+
+
+async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    state = _state(updated=NOW)
+    state.history = [
+        {"time": (NOW - timedelta(minutes=2)).isoformat(), "state": "MERGE",
+         "event": "[MERGE] older", "count": 1},
+        {"time": (NOW - timedelta(minutes=1)).isoformat(), "last_seen_at": NOW.isoformat(),
+         "state": "ERROR", "event": "Timeout after 300s Authorization: Bearer abc123 password=hunter2 "
+         "ghp_1234567890abcdef https://alice:secret@example.com", "tier": "merge",
+         "kind": "conflict", "count": 3},
+    ]
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    before = copy.deepcopy((redis.store, redis.lists, redis.ttls))
+
+    result = await diagnostics.get_repo_events(SLUG, limit=1)
+
+    assert result["source"]["status"] == "fresh"
+    assert result["retained_count"] == 2
+    assert result["truncated"] is True
+    assert len(result["events"]) == 1
+    event = result["events"][0]
+    assert event["recorded_state"] == "ERROR"
+    assert event["category"] == "merge"
+    assert event["kind"] == "conflict"
+    assert event["count"] == 3
+    assert event["last_seen_at"] == NOW.isoformat().replace("+00:00", "Z")
+    assert "Timeout after 300s" in event["message"]
+    assert "abc123" not in json.dumps(result)
+    assert "hunter2" not in json.dumps(result)
+    assert "ghp_" not in json.dumps(result)
+    assert "alice" not in json.dumps(result)
+    assert (redis.store, redis.lists, redis.ttls) == before
+    assert {operation for operation, _ in redis.calls} <= {"strlen", "getrange", "exists", "aclose"}
+    assert redis.closed
+    assert "merge" in EVENT_TIERS
+
+    state.history[-1]["tier"] = None
+    state.history[-1]["event"] = "[MERGE] Timeout after 300s"
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    legacy = await diagnostics.get_repo_events(SLUG, limit=1)
+    assert legacy["events"][0]["category"] == "MERGE"
+
+    monkeypatch.setattr(diagnostics, "_MAX_EVENT_RESPONSE_BYTES", 600)
+    state.history[-1]["event"] = "x" * 1000
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    capped = await diagnostics.get_repo_events(SLUG, limit=1)
+    assert capped["events"] == []
+    assert capped["truncated"] is True
+    assert len(json.dumps(capped).encode()) <= 600
+
+
+async def test_repo_events_source_states_bounds_and_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    monkeypatch.setattr(
+        diagnostics, "_configured_repositories",
+        lambda: (_ for _ in ()).throw(ValueError("password=hidden")),
+    )
+    bad_config = await diagnostics.get_repo_events(SLUG)
+    assert bad_config["source"]["code"] == "configuration_invalid"
+    assert "hidden" not in json.dumps(bad_config)
+    _patch_runtime(monkeypatch, redis)
+    with pytest.raises(ValueError, match="canonical"):
+        await diagnostics.get_repo_events("../secrets")
+    with pytest.raises(ValueError, match="not configured"):
+        await diagnostics.get_repo_events(OTHER_SLUG)
+    with pytest.raises(ValueError, match="limit"):
+        await diagnostics.get_repo_events(SLUG, limit=21)
+    assert (await diagnostics.get_repo_events(SLUG))["source"]["status"] == "missing"
+
+    redis.store[pipeline_state(SLUG)] = "broken JSON"
+    assert (await diagnostics.get_repo_events(SLUG))["source"]["status"] == "malformed"
+    redis.store[pipeline_state(SLUG)] = _state().model_dump_json()
+    assert (await diagnostics.get_repo_events(SLUG))["source"]["status"] == "stale"
+    state = _state(updated=NOW)
+    state.history = [{"time": NOW.isoformat(), "state": "WATCH", "event": "x" * 2000}]
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    shortened = await diagnostics.get_repo_events(SLUG)
+    assert len(shortened["events"][0]["message"]) == diagnostics._MAX_EVENT_MESSAGE
+    assert shortened["events"][0]["message_truncated"] is True
+    assert len(json.dumps(shortened).encode()) <= diagnostics._MAX_EVENT_RESPONSE_BYTES
+    state.history = [{"time": "not-a-time", "state": "WATCH", "event": "bad"}]
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    malformed = await diagnostics.get_repo_events(SLUG)
+    assert malformed["source"]["status"] == "malformed"
+    assert malformed["events"] == []
+    redis.store[pipeline_state(SLUG)] = "x" * (diagnostics._MAX_STATE_BYTES + 1)
+    oversized = await diagnostics.get_repo_events(SLUG)
+    assert oversized["source"]["status"] == "oversized"
+    assert oversized["events"] == []
+    redis.fail.add(("strlen", pipeline_state(SLUG)))
+    assert (await diagnostics.get_repo_events(SLUG))["source"]["status"] == "unavailable"
+
+    started = asyncio.Event()
+
+    class BlockingRedis(FakeRedis):
+        async def strlen(self, key: str) -> int:
+            started.set()
+            await asyncio.Event().wait()
+            return 0
+
+    blocking = BlockingRedis()
+    _patch_runtime(monkeypatch, blocking)
+    request = asyncio.create_task(diagnostics.get_repo_events(SLUG))
+    await started.wait()
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert blocking.closed
+
+    timed_out = BlockingRedis()
+    _patch_runtime(monkeypatch, timed_out)
+    monkeypatch.setattr(diagnostics, "_REDIS_TIMEOUT_SECONDS", 0.01)
+    result = await diagnostics.get_repo_events(SLUG)
+    assert result["source"]["status"] == "unavailable"
+    assert timed_out.closed
 
 
 def test_scalar_validation_and_configured_repo_guards(monkeypatch: pytest.MonkeyPatch) -> None:
