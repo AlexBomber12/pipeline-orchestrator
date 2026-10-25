@@ -62,12 +62,12 @@ _TIMEOUT_MARKER = re.compile(r"\bTimeout after \d+(?:\.\d+)?s\b")
 _SENSITIVE_HEADER = re.compile(
     r"(?im)\b(?:set-cookie|cookie|proxy-authorization|authorization)\s*:\s*[^\r\n]*"
 )
-_URL_AUTHORITY = re.compile(r"(?i)\b(https?://)([^\s/?#]+)")
+_URL_AUTHORITY = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)([^\s/?#]+)")
 _AUTH_SCHEME = re.compile(r"(?i)\b(?:Bearer|Basic)\s+\S+")
 _CREDENTIAL_FIELD = re.compile(
     r"(?i)(?<![\w])[\"']?(?:password|passwd|token|secret|authorization|cookie|"
     r"set[_-]?cookie|session[_-]?(?:id|key|token)|"
-    r"api[_-]?key|secret[_-]?key|aws[_-]?secret[_-]?access[_-]?key|"
+    r"api[_-]?key|secret[_-]?key|aws[_-]?(?:secret[_-]?)?access[_-]?key(?:[_-]?id)?|"
     r"(?:access|refresh|id)[_-]?token|client[_-]?secret|"
     r"(?:ssh[_-]?)?private[_-]?key|"
     r"[a-z][a-z0-9_-]{0,40}[_-](?:token|secret|password|private[_-]?key))"

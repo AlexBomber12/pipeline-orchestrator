@@ -635,6 +635,13 @@ async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
         ('"Timeout after 300s\\q"', "CANARY_NOT_PRESENT", "Timeout after 300s"),
         ('before pa\x1b[31mssword=CANARY_ANSI', "CANARY_ANSI", "before"),
         ('before https://user:CANARY_URL@relay@host/repo after', "CANARY_URL", "/repo after"),
+        ('before redis://default:CANARY_REDIS@cache.example:6379/0 after',
+         "CANARY_REDIS", "/0 after"),
+        ('before rediss://default:CANARY_REDISS@cache.example:6379/0 after',
+         "CANARY_REDISS", "/0 after"),
+        ('before postgresql://dbuser:CANARY_POSTGRES@db.example/app after',
+         "CANARY_POSTGRES", "/app after"),
+        ('before aws_access_key_id=CANARY_AWS_ID; after', "CANARY_AWS_ID", "after"),
         ('before https://user:CANARY_URL_TRUNC', "CANARY_URL_TRUNC", "before"),
         ('before https://host.example:443/health after', "CANARY_NOT_PRESENT", "https://host.example:443/health"),
         ('before password="CANARY_TRUNCATED', "CANARY_TRUNCATED", "before"),
@@ -710,6 +717,8 @@ async def test_repo_events_sanitizes_real_cli_log_producer(
         (r'{"password":"prefix\u0022CANARY_PRODUCER_QUOTE"}', "CANARY_PRODUCER_QUOTE"),
         ('private_key=-----BEGIN EC PRIVATE KEY-----\nCANARY_PRODUCER_PEM\n'
          '-----END EC PRIVATE KEY-----', "CANARY_PRODUCER_PEM"),
+        ("Connection failed: redis://default:CANARY_PRODUCER_REDIS@cache.example:6379/0",
+         "CANARY_PRODUCER_REDIS"),
     ],
 )
 async def test_repo_events_sanitizes_cli_log_boundary_cases(
