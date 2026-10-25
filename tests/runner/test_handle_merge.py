@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +17,133 @@ from src.daemon.retry_commands import RetryDispatch
 from src.models import PipelineState, PRInfo, QueueTask, ReviewStatus, TaskStatus
 
 from tests.runner import _helpers as h
+
+
+def test_conflict_commit_requires_finished_merge_of_both_heads(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args], cwd=repo, check=check, text=True,
+            capture_output=True,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    (repo / "example.txt").write_text("base\n")
+    git("add", "example.txt")
+    git("commit", "-qm", "base")
+    git("checkout", "-qb", "feature")
+    (repo / "example.txt").write_text("feature\n")
+    git("commit", "-qam", "feature")
+    old_head = git("rev-parse", "HEAD").stdout.strip()
+    git("checkout", "main")
+    (repo / "example.txt").write_text("main\n")
+    git("commit", "-qam", "main")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    git("checkout", "feature")
+    assert git("merge", "origin/main", check=False).returncode != 0
+
+    with pytest.raises(RuntimeError, match="merge in progress"):
+        merge_module._validated_conflict_commit(str(repo), "feature", old_head, "main")
+
+    (repo / "example.txt").write_text("feature and main\n")
+    git("add", "example.txt")
+    git("commit", "-qm", "resolve conflict")
+    new_head = git("rev-parse", "HEAD").stdout.strip()
+    assert merge_module._validated_conflict_commit(
+        str(repo), "feature", old_head, "main"
+    ) == new_head
+    (repo / "example.txt").write_text("unpublished edit\n")
+    with pytest.raises(RuntimeError, match="unpublished"):
+        merge_module._validated_conflict_commit(str(repo), "feature", old_head, "main")
+
+
+def test_merge_timeout_preserves_failure_and_does_not_rediagnose(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    git_calls: list[tuple[str, ...]] = []
+
+    def fake_git(_repo: str, *args: str, **_kwargs: object):
+        git_calls.append(args)
+        if args[:2] == ("merge", "origin/main"):
+            return h._FakeCompletedProcess(
+                returncode=1, stdout="CONFLICT (content): example.txt"
+            )
+        if args[:2] == ("rev-parse", "HEAD"):
+            return h._FakeCompletedProcess(stdout="a" * 40)
+        return h._FakeCompletedProcess()
+
+    runner = h._make_runner(coder="codex")
+    plugin = runner._registry.get("codex")
+    invoked: list[str] = []
+
+    async def timed_out(prompt: str, *_args: object, **_kwargs: object):
+        invoked.append(prompt)
+        return -1, "", "Timeout after 300s"
+
+    async def allow(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", allow)
+    monkeypatch.setattr(runner, "usage_gate", allow)
+    monkeypatch.setattr(plugin, "run_prompt", timed_out)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=636, branch="pr-404", head_sha="a" * 40)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-404", title="conflict", status=TaskStatus.DOING
+    )
+    runner._error_diagnose_count = 2
+
+    asyncio.run(runner.handle_merge())
+    assert invoked and "Do not push, run CI" in invoked[0]
+    assert runner.state.coder == "codex"
+    assert runner.state.state == PipelineState.ERROR
+    assert "exit -1" in (runner.state.error_message or "")
+    assert "Timeout after 300s" in (runner.state.error_message or "")
+    assert not any(args[:2] == ("merge", "--abort") for args in git_calls)
+    failure = runner.state.error_message
+    for _ in range(2):
+        asyncio.run(runner.handle_error())
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.error_message == failure
+        assert runner._error_diagnose_count == 2
+    assert len(invoked) == 1
+    assert not any(args[:1] == ("push",) for args in git_calls)
+
+
+def test_merge_failure_park_survives_non_ai_error_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = (
+        "Merge conflict resolution failed (exit -1): Timeout after 300s; "
+        "operator Retry required"
+    )
+    runner.state.current_task = QueueTask(
+        pr_id="PR-404", title="conflict", status=TaskStatus.ERROR
+    )
+
+    async def no_obsolete() -> None:
+        return None
+
+    async def no_suppression() -> tuple[None, bool]:
+        return None, False
+
+    monkeypatch.setattr(runner, "_maybe_resume_obsolete_ci_error", no_obsolete)
+    monkeypatch.setattr(runner, "_error_suppression_reason", no_suppression)
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task",
+        lambda: ("error", None, "revision"),
+    )
+    runner.app_config.daemon.error_handler_use_ai = False
+    asyncio.run(runner._handle_single_error_exit())
+    assert runner.state.state == PipelineState.ERROR
+    assert "Timeout after 300s" in (runner.state.error_message or "")
 
 _CONFIRM_REMOTE_MERGE = merge_module.MergeMixin._confirm_remote_merge
 
@@ -251,6 +380,7 @@ def test_pre_merge_sync_path_passes_bypass_author_dedup_true(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured_kwargs: list[dict[str, object]] = []
+    rev_parse_calls = {"n": 0}
 
     def fake_git(repo_path: str, *args: str, **kwargs: object):
         if args[:1] == ("merge",) and len(args) > 1 and str(args[1]).startswith("origin/"):
@@ -259,9 +389,13 @@ def test_pre_merge_sync_path_passes_bypass_author_dedup_true(
                 returncode=0,
             )
         if args[:2] == ("rev-parse", "HEAD"):
+            rev_parse_calls["n"] += 1
             return h._FakeCompletedProcess(
-                stdout="deadbeefcafe\n", returncode=0,
+                stdout=("a" if rev_parse_calls["n"] == 1 else "b") * 40,
+                returncode=0,
             )
+        if args[:2] == ("ls-remote", "origin"):
+            return h._FakeCompletedProcess(stdout=f"{'b' * 40}\trefs/heads/pr-007\n")
         return h._FakeCompletedProcess(stdout="", returncode=0)
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
@@ -294,7 +428,7 @@ def test_pre_merge_sync_path_passes_bypass_author_dedup_true(
     )
 
 
-def test_pre_merge_sync_logs_unknown_head_when_rev_parse_fails(
+def test_pre_merge_sync_refuses_progress_when_rev_parse_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     rev_parse_calls = {"n": 0}
@@ -324,9 +458,9 @@ def test_pre_merge_sync_logs_unknown_head_when_rev_parse_fails(
 
     asyncio.run(runner.handle_merge())
 
-    assert any(
-        "[MERGE] Bypass-requesting fresh @codex review on new head <unknown>"
-        in entry.get("event", "")
+    assert runner.state.state == PipelineState.ERROR
+    assert not any(
+        "Bypass-requesting fresh @codex review" in entry.get("event", "")
         for entry in runner.state.history
     )
 

@@ -33,6 +33,37 @@ _QUEUE_SYNC_MAX_WAIT_SEC = 3600
 logger = logging.getLogger(__name__)
 
 
+def _validated_conflict_commit(
+    repo_path: str, branch: str, previous_head: str, base: str
+) -> str:
+    """Require a finished, clean merge incorporating both observed inputs."""
+    def output(*args: str) -> str:
+        return git_ops._git(repo_path, *args).stdout.strip()
+
+    if output("branch", "--show-current") != branch:
+        raise RuntimeError("conflict resolver changed the checked-out branch")
+    if git_ops._git(
+        repo_path, "rev-parse", "-q", "--verify", "MERGE_HEAD",
+        check=False,
+    ).returncode == 0:
+        raise RuntimeError("conflict resolver left a merge in progress")
+    if output("ls-files", "-u"):
+        raise RuntimeError("conflict resolver left unmerged paths")
+    if output("status", "--porcelain"):
+        raise RuntimeError("conflict resolver left unpublished working-tree changes")
+    head = output("rev-parse", "HEAD")
+    if not head or head == previous_head:
+        raise RuntimeError("conflict resolver did not create a new commit")
+    for ancestor in (previous_head, f"origin/{base}"):
+        result = git_ops._git(
+            repo_path, "merge-base", "--is-ancestor", ancestor, head,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"conflict commit does not contain {ancestor}")
+    return head
+
+
 class MergeMixin:
     """Merge the current PR and return to IDLE."""
 
@@ -124,6 +155,9 @@ class MergeMixin:
                     self.repo_path,
                     "reset", "--hard", f"origin/{pr_branch}",
                 )
+                previous_head = git_ops._git(
+                    self.repo_path, "rev-parse", "HEAD"
+                ).stdout.strip()
                 merge_result = git_ops._git(
                     self.repo_path,
                     "merge", f"origin/{base}", "--no-edit",
@@ -135,7 +169,7 @@ class MergeMixin:
                         merge_result.stdout + merge_result.stderr
                     ):
                         await self._refresh_auth_status_cache()
-                        selected = self._get_auxiliary_coder()
+                        selected = self._select_coder(allow_exploration=False)
                         if selected is None:
                             git_ops._git(
                                 self.repo_path,
@@ -149,9 +183,11 @@ class MergeMixin:
                                 ),
                                 publish=False,
                                 log_prefix="[MERGE]",
+                                commit_task_status=True,
                             )
                             return
                         coder_name, plugin = selected
+                        self.state.coder = coder_name
                         if not await self.usage_gate(
                             proactive_coder=coder_name
                         ):
@@ -178,9 +214,10 @@ class MergeMixin:
                         if self._current_run_record is not None:
                             self._current_run_record.had_merge_conflict = True
                         prompt = (
-                            "Resolve all merge conflicts in the working "
-                            "tree. Keep both sides where possible. "
-                            "Run scripts/ci.sh to verify."
+                            "Resolve the current merge conflicts, stage the "
+                            "resolution, and create one local merge commit. "
+                            "Keep both sides where possible. Do not push, run "
+                            "CI, or request review; the daemon owns those gates."
                         )
                         plugin_run_kwargs = plugin.build_run_kwargs(
                             daemon_config=self.app_config.daemon
@@ -220,21 +257,10 @@ class MergeMixin:
                             credential_reservation_held=True,
                         )
                         if auxiliary_result is None:
-                            if self.state.state == PipelineState.PAUSED:
-                                git_ops._git(
-                                    self.repo_path,
-                                    "merge", "--abort",
-                                    check=False,
-                                )
                             return
                         code, _stdout, _stderr = auxiliary_result
                         if code != 0:
                             self._detect_rate_limit(_stderr, coder_name=coder_name)
-                            git_ops._git(
-                                self.repo_path,
-                                "merge", "--abort",
-                                check=False,
-                            )
                             if self.state.rate_limited_until is not None:
                                 self.state.state = PipelineState.PAUSED
                                 await self._clear_error_message_on_recovery(
@@ -249,9 +275,26 @@ class MergeMixin:
                                 )
                                 return
                             await self._transition_to_error(
-                                "Merge conflict resolution failed",
+                                f"Merge conflict resolution failed (exit {code}): "
+                                f"{_stderr.strip() or _stdout.strip() or 'no output'}; "
+                                "operator Retry required",
                                 publish=False,
                                 log_prefix="[MERGE]",
+                                commit_task_status=True,
+                            )
+                            return
+                        try:
+                            _validated_conflict_commit(
+                                self.repo_path, pr_branch, previous_head, base
+                            )
+                        except (subprocess.CalledProcessError,
+                                subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
+                            await self._transition_to_error(
+                                f"Merge conflict resolution incomplete: {exc}; "
+                                "operator Retry required",
+                                publish=False,
+                                log_prefix="[MERGE]",
+                                commit_task_status=True,
                             )
                             return
                         sync_produced_commit = True
@@ -271,6 +314,11 @@ class MergeMixin:
                     )
 
                 if sync_produced_commit:
+                    new_head_sha = git_ops._git(
+                        self.repo_path, "rev-parse", "HEAD"
+                    ).stdout.strip()
+                    if not new_head_sha or new_head_sha == previous_head:
+                        raise RuntimeError("pre-merge sync did not change HEAD")
                     retry_transient(
                         lambda: git_ops._git(
                             self.repo_path,
@@ -279,6 +327,14 @@ class MergeMixin:
                         ),
                         operation_name=f"git push origin {pr_branch}",
                     )
+                    remote = git_ops._git(
+                        self.repo_path, "ls-remote", "origin",
+                        f"refs/heads/{pr_branch}", timeout=60,
+                    ).stdout.split()
+                    if not remote or remote[0] != new_head_sha:
+                        raise RuntimeError(
+                            "pre-merge sync remote HEAD does not match local HEAD"
+                        )
                     # Pre-merge sync just rewrote the PR's head SHA;
                     # the cached ``repos/{repo}/pulls`` pages still hold
                     # the prior ``updated_at`` and ``head.sha`` values,
@@ -292,12 +348,6 @@ class MergeMixin:
                         f"#{number}; returning to WATCH to re-verify "
                         f"gates."
                     )
-                    try:
-                        new_head_sha = git_ops._git(
-                            self.repo_path, "rev-parse", "HEAD"
-                        ).stdout.strip()
-                    except Exception:
-                        new_head_sha = ""
                     self.log_event(
                         f"[MERGE] Bypass-requesting fresh @codex review on "
                         f"new head "
@@ -326,6 +376,7 @@ class MergeMixin:
                     f"Pre-merge sync failed: {exc}",
                     publish=False,
                     log_prefix="[MERGE]",
+                    commit_task_status=True,
                 )
                 return
 

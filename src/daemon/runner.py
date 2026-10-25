@@ -2536,6 +2536,18 @@ class PipelineRunner(
             )
             return
 
+        if (self.state.error_message or "").startswith((
+            "No eligible coder available for merge conflict resolution",
+            "Merge conflict resolution failed",
+            "Merge conflict resolution incomplete",
+            "Pre-merge sync failed:",
+        )):
+            self.log_event(
+                "[RECOVERY] Merge sync failure remains ERROR until "
+                "operator Retry or a task update."
+            )
+            return
+
         if self.state.skip_ai_error_diagnose:
             if await self._review_timeout_park_cleared():
                 self.state.skip_ai_error_diagnose = False
