@@ -154,6 +154,46 @@ def test_merge_timeout_preserves_failure_and_does_not_rediagnose(
     assert not any(args[:1] == ("push",) for args in git_calls)
 
 
+def test_operator_stopped_merge_retains_failure_until_play(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_git(_repo: str, *args: str, **_kwargs: object):
+        if args[:2] == ("merge", "origin/main"):
+            return h._FakeCompletedProcess(returncode=1, stdout="CONFLICT")
+        if args[:2] == ("rev-parse", "HEAD"):
+            return h._FakeCompletedProcess(stdout="a" * 40)
+        return h._FakeCompletedProcess()
+
+    runner = h._make_runner(coder="codex")
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=636, branch="pr-404", head_sha="a" * 40)
+    runner.state.current_task = QueueTask(
+        pr_id="PR-404", title="conflict", status=TaskStatus.DOING,
+    )
+
+    async def allow(*_args: object, **_kwargs: object) -> bool:
+        return True
+
+    async def stopped(invocation: object, **_kwargs: object) -> None:
+        invocation.close()  # type: ignore[attr-defined]
+        runner._stop_requested = True
+        runner.state.user_paused = True
+        runner.state.state = PipelineState.PAUSED
+
+    monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", allow)
+    monkeypatch.setattr(runner, "usage_gate", allow)
+    monkeypatch.setattr(runner, "_await_auxiliary_coder", stopped)
+
+    asyncio.run(runner.handle_merge())
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.error_message.startswith("Merge conflict resolution interrupted")
+    runner.state.user_paused = False
+    asyncio.run(runner.handle_paused())
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message.startswith("Merge conflict resolution interrupted")
+
+
 def test_merge_failure_park_survives_non_ai_error_dispatch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -250,9 +290,9 @@ def test_non_ai_merge_error_repairs_failed_status_before_remote_read(
     assert runner.state.error_message.startswith("Merge conflict resolution incomplete")
 
 
-@pytest.mark.parametrize("rate_limited", [False, True])
+@pytest.mark.parametrize("scenario", ["timeout", "rate_limit", "operator_stop"])
 def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, rate_limited: bool,
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, scenario: str,
 ) -> None:
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -286,15 +326,21 @@ def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
     runner._recovered = True
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = (
+        "Merge conflict resolution interrupted by operator Stop; "
+        "unpublished work retained; operator Retry required"
+        if scenario == "operator_stop" else
         "Merge conflict resolution failed (exit -1): "
-        + ("Error: 429 Too Many Requests" if rate_limited else "Timeout after 300s")
-        + "; "
-        "operator Retry required"
+        + ("Error: 429 Too Many Requests" if scenario == "rate_limit"
+           else "Timeout after 300s")
+        + "; operator Retry required"
     )
-    if rate_limited:
+    if scenario != "timeout":
         runner.state.state = PipelineState.PAUSED
-        runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(hours=1)
-        runner.state.rate_limit_reactive_coder = "claude"
+        if scenario == "rate_limit":
+            runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(hours=1)
+            runner.state.rate_limit_reactive_coder = "claude"
+        else:
+            runner.state.user_paused = True
     runner.state.current_pr = PRInfo(
         number=636, branch="feature", head_sha=feature_head
     )
@@ -319,21 +365,33 @@ def test_dirty_merge_failure_survives_repeated_full_daemon_cycles(
     for _ in range(4):
         asyncio.run(runner._run_cycle_body())
         assert runner.state.state == (
-            PipelineState.PAUSED if rate_limited else PipelineState.ERROR
+            PipelineState.ERROR if scenario == "timeout" else PipelineState.PAUSED
         )
-        assert ("429" if rate_limited else "Timeout after 300s") in (
+        assert {"timeout": "Timeout after 300s", "rate_limit": "429",
+                "operator_stop": "operator Stop"}[scenario] in (
             runner.state.error_message or ""
         )
         assert runner._error_diagnose_count == 2
-        assert runner._consecutive_dirty_cycles == 0
+        assert runner._consecutive_dirty_cycles == (
+            2 if scenario == "operator_stop" else 0
+        )
         assert git("rev-parse", "HEAD").stdout.strip() == feature_head
         assert (repo / "example.txt").read_text() == unpublished
         assert git("ls-files", "-u").stdout
-    if rate_limited:
-        runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+    if scenario != "timeout":
+        if scenario == "rate_limit":
+            runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(seconds=1)
+        else:
+            runner.state.user_paused = False
         asyncio.run(runner.handle_paused())
         assert runner.state.state == PipelineState.ERROR
-        assert "429" in (runner.state.error_message or "")
+        assert ("429" if scenario == "rate_limit" else "operator Stop") in (
+            runner.state.error_message or ""
+        )
+        asyncio.run(runner._run_cycle_body())
+        assert runner.state.state == PipelineState.ERROR
+        assert runner._consecutive_dirty_cycles == 0
+        assert (repo / "example.txt").read_text() == unpublished
 
 _CONFIRM_REMOTE_MERGE = merge_module.MergeMixin._confirm_remote_merge
 

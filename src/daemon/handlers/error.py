@@ -31,6 +31,7 @@ _RETAINED_MERGE_ERROR_PREFIXES = (
     "No eligible coder available for merge conflict resolution",
     "Merge conflict resolution failed",
     "Merge conflict resolution incomplete",
+    "Merge conflict resolution interrupted",
     "Pre-merge sync failed:",
 )
 

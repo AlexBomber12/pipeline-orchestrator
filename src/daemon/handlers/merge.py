@@ -257,6 +257,16 @@ class MergeMixin:
                             credential_reservation_held=True,
                         )
                         if auxiliary_result is None:
+                            if self._stop_requested and self.state.state == PipelineState.PAUSED:
+                                await self._transition_to_error(
+                                    "Merge conflict resolution interrupted by operator Stop; "
+                                    "unpublished work retained; operator Retry required",
+                                    save_run_record_as=None,
+                                    publish=False,
+                                    log_prefix="[MERGE]",
+                                    commit_task_status=True,
+                                )
+                                self.state.state = PipelineState.PAUSED
                             return
                         code, _stdout, _stderr = auxiliary_result
                         if code != 0:

@@ -1260,6 +1260,11 @@ class IdleMixin:
                 self._user_pause_logged = True
             return
         if self.state.rate_limited_until is None:
+            if is_retained_merge_error(self.state.error_message):
+                await self._resolve_rate_limit_error_state(
+                    log_prefix="[MERGE]", label="Operator pause cleared",
+                )
+                return
             self.log_event(
                 "[INFRA] PAUSED without rate_limited_until -> IDLE."
             )
