@@ -69,6 +69,21 @@ from src.models import (
 
 from tests.runner import _helpers as h
 
+
+def _completed_merge_git(cmd: list[str], calls: list[list[str]]) -> h._FakeCompletedProcess | None:
+    """Model a resolved merge and a remote ref updated by the push."""
+    old, new = "a" * 40, "b" * 40
+    if cmd[1:3] == ["rev-parse", "HEAD"]:
+        count = sum(c[1:3] == ["rev-parse", "HEAD"] for c in calls)
+        return h._FakeCompletedProcess(args=cmd, stdout=old if count == 1 else new)
+    if cmd[1:3] == ["ls-remote", "origin"]:
+        return h._FakeCompletedProcess(args=cmd, stdout=f"{new}\trefs/heads/pr-001\n")
+    if cmd[1:3] == ["branch", "--show-current"]:
+        return h._FakeCompletedProcess(args=cmd, stdout="pr-001\n")
+    if cmd[1:4] == ["rev-parse", "-q", "--verify"]:
+        return h._FakeCompletedProcess(args=cmd, returncode=1)
+    return None
+
 claude_cli = claude_plugin_module.claude_cli
 
 
@@ -780,7 +795,7 @@ def test_merge_transitions_error_on_no_eligible_coder(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     runner = h._make_runner()
     # Force the auxiliary coder selector to report none eligible.
-    runner._get_auxiliary_coder = lambda: None  # type: ignore[method-assign]
+    runner._select_coder = lambda **kw: None  # type: ignore[method-assign]
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=70, branch=pr_branch)
     runner.state.current_task = QueueTask(
@@ -1667,6 +1682,9 @@ def test_handle_merge_returns_to_watch_after_sync_push(
 
     def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         git_calls.append(cmd)
+        scripted = _completed_merge_git(cmd, git_calls)
+        if scripted is not None:
+            return scripted
         if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
             return h._FakeCompletedProcess(
                 args=cmd,
@@ -1713,7 +1731,13 @@ def test_handle_merge_errors_when_codex_post_fails_after_sync_push(
     HEAD, the prior anchor +1 keeps the PR APPROVED and a subsequent
     handle_watch cycle would merge on stale approval."""
 
+    git_calls: list[list[str]] = []
+
     def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        git_calls.append(cmd)
+        scripted = _completed_merge_git(cmd, git_calls)
+        if scripted is not None:
+            return scripted
         if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
             return h._FakeCompletedProcess(
                 args=cmd,
@@ -1751,6 +1775,9 @@ def test_handle_merge_resolves_conflict(
 
     def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         git_calls.append(cmd)
+        scripted = _completed_merge_git(cmd, git_calls)
+        if scripted is not None:
+            return scripted
         if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
             return h._FakeCompletedProcess(
                 args=cmd,
@@ -1813,6 +1840,9 @@ def test_handle_merge_falls_back_to_codex_for_conflict_resolution(
         **kwargs: Any,
     ) -> h._FakeCompletedProcess:
         git_calls.append(args)
+        scripted = _completed_merge_git(["git", *args], [["git", *call] for call in git_calls])
+        if scripted is not None:
+            return scripted
         if args[:2] == ("merge", "origin/main"):
             return h._FakeCompletedProcess(
                 args=["git", *args],
@@ -1846,8 +1876,8 @@ def test_handle_merge_falls_back_to_codex_for_conflict_resolution(
     monkeypatch.setattr(runner_module.PipelineRunner, "_check_rate_limit", fake_check_rate_limit)
     monkeypatch.setattr(
         runner_module.PipelineRunner,
-        "_select_auxiliary_coder",
-        lambda self: ("codex", self._registry.get("codex")),
+        "_select_coder",
+        lambda self, **kw: ("codex", self._registry.get("codex")),
     )
     monkeypatch.setattr(codex_cli, "run_codex_async", fake_codex)
     monkeypatch.setattr(
@@ -1907,8 +1937,8 @@ def test_handle_merge_aborts_conflict_when_device_login_defers_resolver(
     assert reservations.reserve_login(location) is True
     monkeypatch.setattr(
         runner,
-        "_get_auxiliary_coder",
-        lambda: ("codex", plugin),
+        "_select_coder",
+        lambda **kw: ("codex", plugin),
     )
 
     async def allow_usage_gate(*_args: object, **_kwargs: object) -> bool:
@@ -1936,7 +1966,7 @@ def test_handle_merge_aborts_conflict_when_device_login_defers_resolver(
     ("terminal_state", "expects_abort"),
     [
         (PipelineState.ERROR, False),
-        (PipelineState.PAUSED, True),
+        (PipelineState.PAUSED, False),
     ],
 )
 def test_handle_merge_aborts_after_auxiliary_stop_only_when_cleanup_confirmed(
@@ -1975,7 +2005,7 @@ def test_handle_merge_aborts_after_auxiliary_stop_only_when_cleanup_confirmed(
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(runner, "_refresh_auth_status_cache", lambda: asyncio.sleep(0))
-    monkeypatch.setattr(runner, "_get_auxiliary_coder", lambda: ("codex", plugin))
+    monkeypatch.setattr(runner, "_select_coder", lambda **kw: ("codex", plugin))
     monkeypatch.setattr(runner, "usage_gate", allow_usage_gate)
     monkeypatch.setattr(runner, "_await_auxiliary_coder", stop_auxiliary)
     runner.state.state = PipelineState.WATCH
@@ -2014,8 +2044,8 @@ def test_handle_merge_sets_error_when_no_auxiliary_coder_is_eligible(
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
     monkeypatch.setattr(
         runner_module.PipelineRunner,
-        "_select_auxiliary_coder",
-        lambda self: None,
+        "_select_coder",
+        lambda self, **kw: None,
     )
     monkeypatch.setattr(
         claude_cli,
@@ -2184,8 +2214,11 @@ def test_handle_merge_sets_error_on_non_conflict_sync_failure(
 
 @pytest.mark.parametrize(
     ("stderr", "expected"),
-    [("claude failed", "Merge conflict resolution failed"),
-     ("Timeout after 300s Authorization: Bearer secret", "Merge conflict resolution failed (Timeout after 300s)")],
+    [("claude failed", "Merge conflict resolution failed (coder claude, exit 1, "
+      "classification nonzero_exit); operator Retry required"),
+     ("Timeout after 300s Authorization: Bearer secret",
+      "Merge conflict resolution failed (coder claude, exit 1, "
+      "classification timeout, Timeout after 300s); operator Retry required")],
 )
 def test_handle_merge_aborts_on_unresolvable_conflict(
     monkeypatch: pytest.MonkeyPatch, stderr: str, expected: str,
@@ -2238,9 +2271,10 @@ def test_handle_merge_aborts_on_unresolvable_conflict(
     assert runner.state.error_message == expected
     assert any(expected in entry["event"] for entry in runner.state.history)
     assert all("secret" not in entry["event"] for entry in runner.state.history)
+    assert "claude failed" not in runner.state.error_message
+    assert "Authorization" not in runner.state.error_message
     assert not merge_pr_calls, "merge_pr must not be called on abort"
-    abort_cmds = [cmd for cmd in git_calls if cmd[:3] == ["git", "merge", "--abort"]]
-    assert abort_cmds, "git merge --abort must be invoked"
+    assert not any(cmd[:3] == ["git", "merge", "--abort"] for cmd in git_calls)
 
 
 def test_handle_merge_sets_error_when_pre_sync_raises(

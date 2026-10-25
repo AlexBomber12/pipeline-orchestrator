@@ -33,6 +33,7 @@ from src.daemon import git_ops
 from src.daemon.approval_commands import checkout_process_blocker
 from src.daemon.ci_attempts import canonical_ci_incident
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
+from src.daemon.handlers.error import is_retained_merge_error
 from src.daemon.quarantine import (
     blocking_quarantine_labels,
 )
@@ -683,6 +684,7 @@ class RecoveryMixin:
         """
         self._persisted_fix_recovery = None
         self._persisted_merge_recovery = None
+        self._persisted_merge_error_recovery = None
         self._persisted_review_timeout_recovery = None
         try:
             raw = await self.redis.get(pipeline_state(self.name))
@@ -864,7 +866,7 @@ class RecoveryMixin:
         if (
             persisted.name == self.name
             and persisted.url == self.repo_config.url
-            and persisted.state == PipelineState.ERROR
+            and persisted.state in {PipelineState.ERROR, PipelineState.PAUSED}
             and persisted.current_task is not None
             and persisted.current_pr is not None
             and persisted.current_task.branch == persisted.current_pr.branch
@@ -872,6 +874,8 @@ class RecoveryMixin:
             and re.fullmatch(r"[0-9a-fA-F]{40}", persisted.current_pr.head_sha)
         ):
             self._persisted_review_timeout_recovery = persisted
+            if is_retained_merge_error(persisted.error_message):
+                self._persisted_merge_error_recovery = persisted
         if (
             persisted.name == self.name
             and persisted.url == self.repo_config.url
@@ -1385,6 +1389,44 @@ class RecoveryMixin:
                 )
                 return
 
+        saved_merge_error = getattr(self, "_persisted_merge_error_recovery", None)
+        if saved_merge_error is not None:
+            saved_task = saved_merge_error.current_task
+            saved_pr = saved_merge_error.current_pr
+            queued = next(
+                (task for task in tasks
+                 if task.pr_id == saved_task.pr_id
+                 and task.branch == saved_task.branch),
+                None,
+            )
+            live_pr = (
+                find_matching_open_pr(queued.pr_id, queued.branch, prs)
+                if queued is not None else None
+            )
+            if (
+                queued is not None and live_pr is not None
+                and live_pr.number == saved_pr.number
+                and (
+                    queued.status == TaskStatus.ERROR
+                    or (queued.status == TaskStatus.DOING
+                        and queued.pr_id in self._status_write_failed_task_pr_ids)
+                )
+            ):
+                self.state.current_task = queued
+                self.state.current_pr = live_pr
+                await self._restore_current_run_record()
+                await self._transition_to_error(
+                    saved_merge_error.error_message,
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[RECOVERY]",
+                )
+                self.log_event(
+                    f"[RECOVERY] Restored retained merge failure for "
+                    f"{queued.pr_id} PR #{live_pr.number}."
+                )
+                return
+
         saved = getattr(self, "_persisted_fix_recovery", None)
         if saved is not None:
             bound, saved_task = saved.current_pr, saved.current_task
@@ -1717,6 +1759,7 @@ class RecoveryMixin:
             task, pr = unresolved_error_pr
             header = self._recovery_task_headers.get(task.pr_id)
             saved_timeout = getattr(self, "_persisted_review_timeout_recovery", None)
+            retained_checkout = self._bound_pr_has_unpublished_work(task, pr)
             self.state = self.state.model_copy(update={
                 "current_task": task,
                 "current_pr": pr,
@@ -1726,7 +1769,12 @@ class RecoveryMixin:
                     if saved_timeout is not None
                     and header is not None
                     and header.blocked_reason == SuppressionReason.REVIEW_TIMEOUT.value
-                    else "Published task failure unresolved; operator Retry or revised approval required."
+                    else (
+                        "Published task failure unresolved; unpublished checkout "
+                        "retained; operator Retry required"
+                        if retained_checkout else
+                        "Published task failure unresolved; operator Retry or revised approval required."
+                    )
                 ),
                 "active_invocation": (
                     self._persisted_fix_recovery.active_invocation

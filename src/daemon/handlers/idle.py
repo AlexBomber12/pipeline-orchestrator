@@ -17,6 +17,7 @@ from pathlib import Path
 
 from src.daemon import git_ops
 from src.daemon.backups import create_repo_bundle, prune_old_bundles
+from src.daemon.handlers.error import is_retained_merge_error
 from src.daemon.main_commit_audit import (
     audit_main_commit_shas,
     list_recent_main_commit_shas,
@@ -88,6 +89,14 @@ class IdleMixin:
         """Process ``state.error_message`` during rate-limit recovery."""
         if self.state.error_message is None:
             return False
+        if is_retained_merge_error(self.state.error_message):
+            await self._transition_to_error(
+                self.state.error_message,
+                save_run_record_as=None,
+                publish=False,
+                log_prefix=f"{log_prefix} {label} -> ERROR (preserved context):",
+            )
+            return True
         lowered = self.state.error_message.lower()
         is_rate_limit_msg = (
             "rate limit" in lowered or re.search(r"\b429\b", lowered)
@@ -1251,6 +1260,11 @@ class IdleMixin:
                 self._user_pause_logged = True
             return
         if self.state.rate_limited_until is None:
+            if is_retained_merge_error(self.state.error_message):
+                await self._resolve_rate_limit_error_state(
+                    log_prefix="[MERGE]", label="Operator pause cleared",
+                )
+                return
             self.log_event(
                 "[INFRA] PAUSED without rate_limited_until -> IDLE."
             )

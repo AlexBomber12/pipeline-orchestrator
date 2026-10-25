@@ -458,7 +458,8 @@ def test_handle_merge_pauses_when_conflict_resolution_hits_rate_limit(
         model: str | None = None,
         **kwargs: Any,
     ) -> tuple[int, str, str]:
-        return (1, "", "Error: 429 Too Many Requests")
+        return (1, "", "Error: 429 Too Many Requests Bearer "
+                "synthetic-credential-canary " + "x" * 600_000)
 
     monkeypatch.setattr(
         claude_cli,
@@ -481,11 +482,14 @@ def test_handle_merge_pauses_when_conflict_resolution_hits_rate_limit(
     asyncio.run(runner.handle_merge())
 
     assert runner.state.state == PipelineState.PAUSED
-    assert runner.state.error_message is None
+    assert "classification rate_limit" in (runner.state.error_message or "")
+    assert "synthetic-credential-canary" not in (runner.state.error_message or "")
+    assert "synthetic-credential-canary" not in str(runner.state.history)
+    assert len(runner.state.model_dump_json().encode()) < 20_000
     assert runner.state.rate_limited_until is not None
     assert not merge_pr_calls, "merge_pr must not be called while paused"
     abort_cmds = [cmd for cmd in git_calls if cmd[:3] == ["git", "merge", "--abort"]]
-    assert abort_cmds, "git merge --abort must be invoked"
+    assert not abort_cmds, "resolver work must survive the rate-limit pause"
     assert any("Rate limit pause active until" in e["event"] for e in runner.state.history)
 
 
