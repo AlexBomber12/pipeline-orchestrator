@@ -70,6 +70,9 @@ from src.retry_commands import (
     retry_request_binding,
 )
 from src.retry_commands import (
+    is_merge_accounting_retry as _is_merge_accounting_retry,
+)
+from src.retry_commands import (
     relevant_retry_pr as _relevant_retry_pr,
 )
 from src.retry_commands import (
@@ -601,22 +604,6 @@ def _is_retryable_task_status(
         TaskStatus.ERROR,
         TaskStatus.TODO,
     }
-
-
-def _is_merge_accounting_retry(
-    state: RepoState | None, name: str, task_id: str, task_file: str,
-) -> bool:
-    """Admit only a retained, exactly bound failure; daemon proves completion."""
-    return bool(
-        state is not None and state.name == name and state.state == PipelineState.ERROR
-        and (state.error_message or "").startswith("Merge accounting conflict:")
-        and state.current_task is not None and state.current_pr is not None
-        and state.current_task.pr_id == task_id
-        and state.current_task.task_file == task_file == f"tasks/{task_id}.md"
-        and state.current_task.branch == state.current_pr.branch
-        and state.current_pr.pr_id in {None, task_id} and state.current_pr.number > 0
-        and re.fullmatch(r"[0-9a-fA-F]{40}", state.current_pr.head_sha)
-    )
 
 
 def _head_commit_subject(repo_root: Path) -> str:

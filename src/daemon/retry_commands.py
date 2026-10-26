@@ -33,6 +33,7 @@ from src.retry_commands import (
     RetryEffectStage,
     RetryExecutionState,
     claim_retry_command,
+    is_merge_accounting_retry,
     list_pending_retry_commands,
     relevant_retry_pr,
     reserve_retry_attempt,
@@ -466,8 +467,11 @@ class RetryCommandMixin:
         before_cleanup = command.effect_stage in {
             RetryEffectStage.NONE, RetryEffectStage.RETRY_RESERVED,
         }
+        accounting_retry = is_merge_accounting_retry(
+            self.state, self.name, command.task_id, command.task_file,
+        )
         if cause is not None or before_cleanup:
-            bound_task = next(
+            bound_task = task if accounting_retry else next(
                 (item for item in self.state.current_queue or [] if item.pr_id == task.pr_id),
                 task,
             )
@@ -483,6 +487,7 @@ class RetryCommandMixin:
             if (
                 header.frontmatter_status not in {"error", "todo"}
                 and (header.frontmatter_status is not None or not snapshot_error)
+                and not accounting_retry
             ) or (
                 active_task is not None and active_task.pr_id == task.pr_id
                 and self.state.state in _ACTIVE_TASK_STATES
@@ -851,7 +856,6 @@ class RetryCommandMixin:
         self, command: RetryCommand, task: QueueTask, pr: PRInfo,
     ) -> RetryDispatch:
         """Transfer an admitted operator command to restart-safe bookkeeping."""
-        await self._clear_retry_failure_evidence(command)
         self._current_run_record = None
         self.state.active_invocation = None
         self._set_retry_task_snapshot(task)
@@ -860,6 +864,9 @@ class RetryCommandMixin:
         self.state.state = PipelineState.MERGE
         self.state.merge_phase = "post_merge_cleanup"
         await self.publish_state()
+        # Keep the bound cause until the handoff is durable; otherwise a lost
+        # publication would make recovery manufacture a different crash cause.
+        await self._clear_retry_failure_evidence(command)
         return RetryDispatch.MERGE
 
     async def _apply_retry_command(self, command: RetryCommand) -> RetryDispatch:
