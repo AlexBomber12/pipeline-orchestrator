@@ -422,7 +422,13 @@ existing `src/publication_migration.py` command/receipt path, and the dashboard'
 confirmation route/panel. None is removed now; ordinary watermark validation,
 CI gates, trusted review checks and process ownership rules remain required.
 
-Verification: `python -m pytest tests/test_github_client.py -q`. Controlled
+Verification: `python -m pytest tests/test_github_client.py -q`. Before generating
+review artifacts, ensure the checkout has the review base (`origin/main` for
+this repository); fetch it with `git fetch origin main` if needed. After the
+intended commit, run `bash scripts/make-review-artifacts.sh` and confirm that
+`artifacts/ci.log`, `artifacts/structure.txt`, and a nonempty `artifacts/pr.patch`
+exist. A focused test pass alone does not establish a successful full gate.
+Controlled
 transport proves reader behavior only, not real account access, provider delivery
 guarantees, deployment, or restart behavior of a future protocol. Any eventual
 provider smoke requires a separate operator release action; this investigation
