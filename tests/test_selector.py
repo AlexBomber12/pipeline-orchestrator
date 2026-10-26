@@ -478,3 +478,20 @@ def test_candidate_coders_auto_fallback_off_returns_preferred() -> None:
     ctx = _ctx(auto_fallback=False, repo_coder=CoderType.CODEX)
 
     assert candidate_coders(ctx) == ["codex"]
+
+
+def test_unified_resource_blocker_is_binding_on_actual_coder_choice() -> None:
+    from src.inhibitor import InhibitorType, WorkInhibitor
+
+    ctx = _ctx(epsilon=0.0)
+    ctx.repo_config.feature_flags.use_unified_inhibitor_check = True
+    ctx.state.active_inhibitors = [WorkInhibitor(
+        inhibitor_type=InhibitorType.RATE_LIMIT,
+        coder_affected="claude", source_key="test:claude",
+    )]
+    assert select_coder(ctx)[0] == "codex"
+    ctx.task_coder_pin = "claude"
+    assert select_coder(ctx) is None
+    assert ctx.exclusion_reasons == {"claude": "inhibited"}
+    ctx.state.active_inhibitors = []
+    assert select_coder(ctx)[0] == "claude"

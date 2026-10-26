@@ -14,6 +14,7 @@ from enum import Enum
 
 from src.coder_registry import AUTH_FAILURE_REASONS, CoderPlugin, CoderRegistry
 from src.config import AppConfig, RepoConfig
+from src.inhibitor import InhibitorType, is_work_inhibited
 from src.models import RepoState
 
 
@@ -123,6 +124,12 @@ def _coder_runtime_ok(name: str, ctx: SelectionContext) -> bool:
         reason = "rate_limited"
     elif _is_disabled_for_repo(name, ctx.repo_config):
         reason = "disabled"
+    elif ctx.repo_config.feature_flags.use_unified_inhibitor_check and any(
+        inh.inhibitor_type != InhibitorType.GITHUB_BUDGET_SLOWDOWN
+        and (inh.inhibitor_type != InhibitorType.USER_PAUSE or ctx.state.user_paused)
+        for inh in is_work_inhibited(ctx.state, coder=name)[1]
+    ):
+        reason = "inhibited"
     else:
         reason = _auth_failure_reason(name, ctx.registry, ctx.auth_statuses)
     if reason is not None:
