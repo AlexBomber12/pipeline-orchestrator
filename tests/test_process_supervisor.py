@@ -39,6 +39,8 @@ from src.process_supervisor import (
     run_supervised_process,
 )
 
+from tests.runner import _helpers as runner_helpers
+
 SLEEPING_PROCESS = """
 import os
 import signal
@@ -762,6 +764,89 @@ async def test_normal_completion_is_reaped_without_signals(
     assert managed.identity.session_id == managed.process.pid
     assert managed.identity.leader_start_time is not None
     assert managed.identity.process_group_id != os.getpgrp()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["ordinary", "surviving-descendant", "lost-leader"])
+async def test_runner_consumes_live_cleanup_proof_across_leader_exit(
+    process_pool: ProcessPool, boundary: str,
+) -> None:
+    runner = runner_helpers._make_runner()
+    runner.app_config.daemon.coder_terminate_grace_sec = 0.05
+    if boundary == "ordinary":
+        managed = await process_pool.launch("print('complete')")
+        await asyncio.wait_for(managed.process.communicate(), timeout=2)
+        pids = [managed.process.pid]
+    else:
+        # The child announces readiness only after installing TERM immunity.
+        code = EARLY_EXIT_WITH_TERM_IGNORING_CHILD
+        if boundary == "lost-leader":
+            code += "\nimport signal\nwhile True: signal.pause()\n"
+        managed = await process_pool.launch(code)
+        pids = [managed.process.pid, *(await _read_pids(managed.process))]
+        if boundary == "lost-leader":
+            leader_fd = os.pidfd_open(managed.process.pid)
+            try:
+                signal.pidfd_send_signal(leader_fd, signal.SIGKILL)
+            finally:
+                os.close(leader_fd)
+        await _wait_not_live(managed.process.pid)
+        assert _pid_is_live(pids[1])
+        assert managed._witness_is_live()
+
+    runner._track_current_coder_process(managed.process)
+    runner._track_current_coder_supervised_process(managed)
+    async with asyncio.timeout(3):
+        assert await runner._confirm_current_coder_cleanup(boundary)
+    proof = await managed.cleanup()
+
+    assert proof.quiescent
+    assert proof.leader_returncode == (-signal.SIGKILL if boundary == "lost-leader" else 0)
+    assert proof.kill_sent is (boundary != "ordinary")
+    await _wait_not_live(*pids)
+    assert runner._current_coder_process is None
+    assert runner._current_coder_supervised_process is None
+
+
+@pytest.mark.asyncio
+async def test_real_failed_cleanup_retains_runner_owner_after_external_exit(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    release = tmp_path / "release"
+    managed = await process_pool.launch(
+        "import os, time\nfrom pathlib import Path\n"
+        "print(os.getpid(), flush=True)\n"
+        f"while not Path({str(release)!r}).exists(): time.sleep(0.01)\n"
+    )
+    pids = await _read_pids(managed.process)
+    runner = runner_helpers._make_runner()
+    runner._track_current_coder_supervised_process(managed)
+
+    def denied(_pidfd: int, _sig: int) -> None:
+        raise PermissionError("fixture denies signal delivery")
+
+    # Fail the actual delivery boundary, leaving /proc ownership checks real.
+    with monkeypatch.context() as delivery:
+        delivery.setattr(signal, "pidfd_send_signal", denied)
+        async with asyncio.timeout(3):
+            assert not await runner._confirm_current_coder_cleanup("fixture")
+    failure = await managed.cleanup()
+    assert not failure.quiescent
+    assert "fixture denies signal delivery" in (failure.detail or "")
+    assert _pid_is_live(pids[0])
+    assert runner.state.state.value == "ERROR"
+    assert runner._current_coder_supervised_process is managed
+
+    # A cooperative exit is fixture-owned cleanup, not cancellation or a
+    # fabricated successful observation. No second signal is needed.
+    release.touch()
+    await asyncio.wait_for(managed.process.communicate(), timeout=2)
+    await _wait_not_live(*pids)
+    assert (await managed.reconcile_cleanup(observation_grace=0.1)).quiescent
+    assert await managed.cleanup() is failure
+    assert not await runner._confirm_current_coder_cleanup("after exit")
+    assert runner._current_coder_supervised_process is managed
+    assert runner._current_coder_process is managed.process
 
 
 @pytest.mark.asyncio
