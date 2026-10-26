@@ -668,7 +668,9 @@ class RecoveryMixin:
         ``TODO`` rather than ``DOING``.
 
         CODING snapshots retain pre-publication crash identity. Selected
-        WATCH/FIX/ERROR snapshots retain fix ownership. MERGE snapshots in
+        WATCH/FIX/ERROR snapshots retain fix ownership. ERROR snapshots without
+        a PR retain fallback failure context when the parsed ERROR task matches.
+        MERGE snapshots in
         ``merging`` or ``post_merge_cleanup`` retain an attempted merge:
         an already merged PR disappears from the open PR list, but its
         status write or run-record save may still need reconciliation.
@@ -686,6 +688,7 @@ class RecoveryMixin:
         still overwrites ``current_task`` from parsed headers, and the
         invocation is used only when its task and unfinished run record match.
         """
+        self._persisted_error_without_pr = None
         self._persisted_fix_recovery = None
         self._persisted_merge_recovery = None
         self._persisted_merge_error_recovery = None
@@ -894,6 +897,13 @@ class RecoveryMixin:
             and persisted.current_pr.pr_id in {None, persisted.current_task.pr_id}
         ):
             self._persisted_merge_recovery = persisted
+        if (
+            persisted.name == self.name and persisted.url == self.repo_config.url
+            and persisted.state == PipelineState.ERROR
+            and persisted.current_task is not None
+            and persisted.current_pr is None
+        ):
+            self._persisted_error_without_pr = persisted
         if persisted.state != PipelineState.CODING:
             return True
         if self.state.current_task is None and persisted.current_task is not None:
@@ -1311,9 +1321,24 @@ class RecoveryMixin:
             return
         await self._rehydrate_quarantines_from_labels(prs)
 
+        # A completed failure is not a new crash. Keep its fallback Retry
+        # identity only while headers and GitHub still confirm the same failure.
+        saved_error = getattr(self, "_persisted_error_without_pr", None)
+        retained_error = next((
+            task for task in tasks
+            if saved_error is not None
+            and task.pr_id == saved_error.current_task.pr_id
+            and task.task_file == saved_error.current_task.task_file
+            and task.branch == saved_error.current_task.branch
+            and task.status == TaskStatus.ERROR
+            and find_matching_open_pr(task.pr_id, task.branch, prs) is None
+        ), None)
+        if any(task.status == TaskStatus.DOING for task in tasks):
+            retained_error = None
+
         if self.repo_config.feature_flags.use_single_error_exit:
             for queued in tasks:
-                if queued.status != TaskStatus.ERROR:
+                if queued.status != TaskStatus.ERROR or queued is retained_error:
                     continue
                 if unresolved_error_pr is not None and queued.pr_id == unresolved_error_pr[0].pr_id and (
                     self._recovery_task_headers[queued.pr_id].blocked_reason
@@ -1355,6 +1380,7 @@ class RecoveryMixin:
             for queued in tasks:
                 if (
                     queued.status == TaskStatus.ERROR
+                    and queued is not retained_error
                     and not (
                         unresolved_error_pr is not None
                         and queued.pr_id == unresolved_error_pr[0].pr_id
@@ -1388,6 +1414,13 @@ class RecoveryMixin:
                 f"[INFRA] Recovered pending queue-sync branch: "
                 f"{pending_sync.branch}."
             )
+
+        if retained_error is not None:
+            self.state.current_task = retained_error
+            self.state.current_pr = None
+            self.state.error_message = saved_error.error_message
+            self.state.state = saved_error.state
+            return
 
         saved_merge = getattr(self, "_persisted_merge_recovery", None)
         if saved_merge is not None:

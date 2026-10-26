@@ -2216,3 +2216,94 @@ async def test_spend_deferred_coding_retry_preserves_failure_and_resumes(
     assert runner.state.error_message is None
     assert runner.state.state == PipelineState.CODING
     assert runner.redis.store[f"metrics:retry_count:{runner.name}:{command.task_id}"] == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("single_error_exit", [False, True])
+@pytest.mark.parametrize("reserved", [False, True])
+@pytest.mark.parametrize("changed_failure", [False, True])
+async def test_fallback_retry_survives_actual_startup_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    single_error_exit: bool, reserved: bool, changed_failure: bool,
+) -> None:
+    from src.task_status import MergedState
+
+    runner, command, task, repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    monkeypatch.setattr(runner, "_select_retry_continuation", _async_value(("coding", None)))
+    monkeypatch.setattr(runner, "_ensure_retry_coder_available", _async_value(("codex", object())))
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(False))
+    if reserved:
+        assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    if changed_failure:
+        runner.state.error_message = "a newer failure"
+    await runner.publish_state()
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "src.daemon.recovery._resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+
+    # Start with a genuinely fresh runner twice: recovery and publication must
+    # retain the fallback evidence, without copying the previous live state.
+    for _ in range(2):
+        restarted = h._make_runner()
+        restarted.repo_config.feature_flags.use_single_error_exit = single_error_exit
+        restarted.redis, restarted.repo_path = runner.redis, str(repo)
+        assert restarted.state.current_task is None
+        assert await restarted.recover_state()
+        assert restarted.state.state == PipelineState.ERROR
+        assert restarted.state.current_task.pr_id == task.pr_id
+        assert restarted.state.error_message == runner.state.error_message
+        assert restarted.state.current_pr is None
+        assert cause_key(runner.name, task.pr_id) not in restarted.redis.store
+        await restarted.publish_state()
+
+    assert (repo / command.task_file).read_text() == _task_text()
+    _allow_validation(monkeypatch, restarted, _task_text())
+    monkeypatch.setattr(restarted, "_select_retry_continuation", _async_value(("coding", None)))
+    monkeypatch.setattr(restarted, "_ensure_retry_coder_available", _async_value(("codex", object())))
+    commits = []
+
+    async def commit(*args):
+        commits.append(args[1])
+        return True
+
+    monkeypatch.setattr(restarted, "_commit_task_status_change", commit)
+    outcome = await restarted._consume_retry_command()
+    stored = await load_retry_command(restarted.redis, restarted.name, command.command_id)
+    assert outcome == (RetryDispatch.HANDLED if changed_failure else RetryDispatch.CODING)
+    assert stored.status == (RetryCommandStatus.FAILED if changed_failure else RetryCommandStatus.APPLIED)
+    assert stored.failure_id == command.failure_id
+    assert stored.request_binding == command.request_binding
+    assert commits == ([] if changed_failure else ["TODO"])
+    count = restarted.redis.store.get(f"metrics:retry_count:{runner.name}:{command.task_id}")
+    assert count == (None if changed_failure and not reserved else "1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mismatch", ["name", "url", "task_file", "branch", "status"])
+async def test_startup_does_not_restore_unbound_fallback_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mismatch: str,
+) -> None:
+    from src.task_status import MergedState
+
+    runner, _command_value, _task_value, repo = await _prepared_runner(tmp_path)
+    if mismatch in {"name", "url"}:
+        setattr(runner.state, mismatch, "other")
+    elif mismatch == "status":
+        runner.state.state = PipelineState.IDLE
+    else:
+        setattr(runner.state.current_task, mismatch, "other")
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "src.daemon.recovery._resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+    restarted = h._make_runner()
+    restarted.redis, restarted.repo_path = runner.redis, str(repo)
+    assert await restarted.recover_state()
+    assert restarted.state.state == PipelineState.IDLE
+    assert restarted.state.current_task is None
+    assert restarted.state.error_message is None
