@@ -597,6 +597,22 @@ def _is_retryable_task_status(
     }
 
 
+def _is_merge_accounting_retry(
+    state: RepoState | None, name: str, task_id: str, task_file: str,
+) -> bool:
+    """Admit only a retained, exactly bound failure; daemon proves completion."""
+    return bool(
+        state is not None and state.name == name and state.state == PipelineState.ERROR
+        and (state.error_message or "").startswith("Merge accounting conflict:")
+        and state.current_task is not None and state.current_pr is not None
+        and state.current_task.pr_id == task_id
+        and state.current_task.task_file == task_file == f"tasks/{task_id}.md"
+        and state.current_task.branch == state.current_pr.branch
+        and state.current_pr.pr_id in {None, task_id} and state.current_pr.number > 0
+        and re.fullmatch(r"[0-9a-fA-F]{40}", state.current_pr.head_sha)
+    )
+
+
 def _head_commit_subject(repo_root: Path) -> str:
     result = _run_retry_git(repo_root, "log", "-1", "--pretty=%s")
     return result.stdout.strip()
@@ -1164,8 +1180,8 @@ async def _build_tasks_panel_context(
             except Exception:
                 cause = None
             if (
-                cause is not None
-                and cause.category == "ERROR"
+                cause is not None and cause.category == "ERROR"
+                or _is_merge_accounting_retry(state, name, failed.pr_id, failed.task_file or "")
             ):
                 replacement = failed.model_copy(update={"status": TaskStatus.ERROR})
                 tasks = [
@@ -1877,8 +1893,11 @@ async def retry_repo_task(
         return HTMLResponse("Failed to read task status", status_code=503)
     snapshot_tasks, _snapshot_at = await _load_current_queue_snapshot(name)
     snapshot_status = _task_status_from_snapshot(snapshot_tasks, pr_id)
-    if not _is_retryable_task_status(current_status, snapshot_status):
-        return HTMLResponse("Task is not in ERROR", status_code=409)
+    state = await _repo_state_for_retry(redis_client, name)
+    accounting_retry = (
+        _is_merge_accounting_retry(state, name, pr_id, task_filename)
+        and state.url == repo_config.url
+    )
     task = next(
         (queued for queued in snapshot_tasks or [] if queued.pr_id == pr_id),
         QueueTask(
@@ -1888,6 +1907,8 @@ async def retry_repo_task(
             task_file=task_filename,
         ),
     )
+    if accounting_retry:
+        task = state.current_task.model_copy(update={"status": TaskStatus.ERROR})
     current_count = await _get_retry_count(redis_client, name, pr_id)
 
     # Replays of the exact browser request are idempotent even if the daemon
@@ -1914,12 +1935,14 @@ async def retry_repo_task(
             status_code=202,
         )
 
+    if not _is_retryable_task_status(current_status, snapshot_status) and not accounting_retry:
+        return HTMLResponse("Task is not in ERROR", status_code=409)
+
     if current_count >= cap:
         return HTMLResponse(
             "Retry cap reached. Edit task spec or delete to proceed.",
             status_code=409,
         )
-    state = await _repo_state_for_retry(redis_client, name)
     try:
         cause = await get_cancellation_cause(
             redis_client, name, pr_id, refresh_ttl=False

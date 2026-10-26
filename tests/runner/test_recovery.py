@@ -2783,7 +2783,7 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(
     assert runner.state.current_task.pr_id == queued.pr_id
     assert runner.state.current_pr.head_sha == "a" * 40
     assert runner.state.current_pr.pr_id == pr_id
-    assert runner._current_run_record is record
+    assert runner._current_run_record is None
 
     # The first cycle after recovery uses the retained identity, even though
     # GitHub's open-PR list is empty and headers may already say DONE. A dirty
@@ -2912,7 +2912,13 @@ def test_header_merge_recovery_uses_complete_bound_github_evidence(
             "task_id_hash": compute_task_id_hash(task.pr_id, runner.name),
         }) + "\n")
     if case == "finished":
+        from src.analytics.outcome_logger import compute_task_id_hash
+
         record.exit_reason = "success_merged"
+        isolate_analytics_dir.mkdir(parents=True, exist_ok=True)
+        (isolate_analytics_dir / "2026-04.jsonl").write_text(json.dumps({
+            "task_id_hash": compute_task_id_hash(task.pr_id, runner.name),
+        }) + "\n")
     if case == "wrong_record":
         records = [replace(record, task_id="PR-999"), replace(record, repo_name="other")]
     if case == "not_done":
@@ -2965,7 +2971,7 @@ def test_header_merge_recovery_uses_complete_bound_github_evidence(
         assert saved.current_pr.number == 629
         assert saved.current_pr.head_sha == "a" * 40
         assert saved.merge_phase == "post_merge_cleanup"
-        assert runner._current_run_record is (None if case in {"pending_header", "wrong_record"} else record)
+        assert runner._current_run_record is None
     else:
         assert saved is None
     if case in {"historical", "finished", "open", "not_done", "no_branch"}:
@@ -3011,7 +3017,7 @@ def test_header_merge_recovery_prioritizes_unfinished_attempt(
     assert saved.current_pr.number == 629
     assert saved.current_pr.head_sha == "a" * 40
     assert saved.merge_phase == "post_merge_cleanup"
-    assert runner._current_run_record is (record if current_evidence == "run" else None)
+    assert runner._current_run_record is None
 
 
 @pytest.mark.parametrize(

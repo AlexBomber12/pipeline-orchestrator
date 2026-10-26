@@ -188,6 +188,71 @@ def test_retry_only_enqueues_and_duplicate_delivery_is_idempotent(
     assert "Retry accepted" in first.text
 
 
+@pytest.mark.parametrize("status", [TaskStatus.DOING, TaskStatus.DONE])
+@pytest.mark.parametrize("queue_missing", [False, True])
+def test_accounting_conflict_retry_preserves_header_and_exact_pr_binding(
+    tmp_path, monkeypatch, status, queue_missing,
+):
+    pr = PRInfo(number=547, branch="fix/pr-283", pr_id="PR-283", head_sha="a" * 40)
+    task_path, redis_client = _setup_retry(tmp_path, monkeypatch, status=status, current_pr=pr)
+    if status == TaskStatus.DOING:
+        # DOING is a derived queue state; repository frontmatter permits
+        # TODO/DONE/ERROR. Keep task-schema validation intact.
+        task_path.write_text(_task_text(status="TODO"))
+    state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    state.error_message = "Merge accounting conflict: operator Retry required"
+    if queue_missing:
+        state.current_queue = None
+    redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
+    original = task_path.read_bytes()
+    monkeypatch.setattr(repo_control, "_load_git_merged_at", lambda *a: None)
+    monkeypatch.setattr(repo_control.subprocess, "run",
+                        lambda *a, **kw: pytest.fail("web Retry must not run Git/coders"))
+    with TestClient(app) as client:
+        binding = _rendered_binding(client)
+        accepted = client.post("/repos/example__alpha/tasks/PR-283/retry", data={"retry_binding": binding})
+        assert accepted.status_code == 202
+        # A lost HTTP response can be replayed after the daemon has handed
+        # ownership to MERGE or completed it, without accepting a new Retry.
+        state.state = PipelineState.IDLE
+        state.error_message = None
+        state.current_task = None
+        redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
+        replay = client.post("/repos/example__alpha/tasks/PR-283/retry", data={"retry_binding": binding})
+        assert replay.status_code == 202
+    command = asyncio.run(load_latest_retry_command(redis_client, "example__alpha", "PR-283"))
+    assert command.status == RetryCommandStatus.QUEUED
+    assert (command.bound_pr_number, command.bound_pr_branch, command.bound_pr_head_sha) == (
+        547, pr.branch, pr.head_sha,
+    )
+    assert task_path.read_bytes() == original
+    assert len(redis_client.zsets[retry_command_pending("example__alpha")]) == 1
+
+
+@pytest.mark.parametrize("drift", ["error", "pipeline", "task", "branch", "pr_id", "head", "url", "name"])
+def test_done_task_retry_requires_a_bound_accounting_conflict(tmp_path, monkeypatch, drift):
+    pr = PRInfo(number=547, branch="fix/pr-283", pr_id="PR-283", head_sha="a" * 40)
+    task_path, redis_client = _setup_retry(tmp_path, monkeypatch, status=TaskStatus.DONE, current_pr=pr)
+    state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+    state.error_message = "Merge accounting conflict: operator Retry required"
+    if drift == "error":
+        state.error_message = "unrelated error"
+    elif drift == "pipeline":
+        state.state = PipelineState.IDLE
+    elif drift == "task":
+        state.current_task.pr_id = "PR-999"
+    elif drift in {"branch", "pr_id", "head"}:
+        setattr(state.current_pr, {"head": "head_sha"}.get(drift, drift), "other")
+    else:
+        setattr(state, drift, "other")
+    redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
+    with TestClient(app) as client:
+        response = client.post("/repos/example__alpha/tasks/PR-283/retry", data={"retry_binding": "a" * 64})
+    assert response.status_code == 409
+    assert asyncio.run(load_latest_retry_command(redis_client, "example__alpha", "PR-283")) is None
+    assert "status: DONE" in task_path.read_text()
+
+
 def test_web_command_reaches_parked_daemon_and_dispatches_once(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
