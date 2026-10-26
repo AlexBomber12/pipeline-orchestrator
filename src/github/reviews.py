@@ -102,7 +102,7 @@ def _structured_summary_state(body: str) -> tuple[str, str | None]:
         if raw_sha is not None and commit_sha is None:
             return "unknown", None
         status = state["status"]
-        if status == "in_progress":
+        if status in ("in_progress", "running"):
             return "summary", commit_sha
         if status != "completed" or commit_sha is None:
             return "unknown", commit_sha

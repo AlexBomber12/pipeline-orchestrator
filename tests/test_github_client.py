@@ -8203,3 +8203,35 @@ def test_success_verdict_does_not_hide_extra_actionable_text(receipt_651, extra)
     receipt["body"] += extra
     receipt_651["issue_comments"] = [receipt]
     assert _receipt_status(receipt_651) != ReviewStatus.APPROVED
+
+
+@pytest.mark.parametrize("summary_status", ["running", "in_progress", "completed"])
+@pytest.mark.parametrize("result", ["approved", "later_finding", "summary_only"])
+def test_repeated_request_summary_does_not_replace_completed_verdict(receipt_651, summary_status, result):
+    """Aggregate activity after a reminder neither approves nor retracts a review."""
+    summary = receipt_651["issue_comments"][0]
+    state = {
+        "code_review": {"commit_sha": receipt_651["head"], "status": summary_status,
+                        "has_any_findings": True if summary_status == "completed" else None,
+                        "has_unresolved_findings": True if summary_status == "completed" else None},
+    }
+    summary["body"] = ('<!-- codex-pull-request-review-summary -->\n'
+                       + '<!-- codex-review-state:v1 ' + json.dumps(state) + ' -->')
+    summary["updated_at"] = "2026-10-26T23:25:00Z"
+    receipt = receipt_651["issue_comments"][-1]
+    receipt_651["issue_comments"] = [summary]
+    if result != "summary_only":
+        receipt_651["issue_comments"].append(receipt)
+    receipt_651["issue_comments"].append({
+        "id": 100, "user": {"login": receipt_651["author"]}, "body": "@codex review",
+        "created_at": "2026-10-26T23:20:00Z",
+    })
+    if result == "later_finding":
+        # This finding predates the new request, which must not hide it.
+        receipt_651["review_comments"].append({
+            "id": 101, "user": receipt["user"], "commit_id": receipt_651["head"],
+            "created_at": "2026-10-26T23:18:00Z", "body": "[P1] New actionable defect",
+        })
+    expected = {"approved": ReviewStatus.APPROVED, "later_finding": ReviewStatus.CHANGES_REQUESTED,
+                "summary_only": ReviewStatus.PENDING}[result]
+    assert _receipt_status(receipt_651) == expected

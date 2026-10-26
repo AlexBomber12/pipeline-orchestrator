@@ -3498,17 +3498,17 @@ def test_recovery_retains_canonical_successful_comment_verdict(monkeypatch, tmp_
 
     recorded = json.loads((Path(__file__).parents[1] / "fixtures/review_receipt_651.json").read_text())
     head = recorded["head"]
-    branch = "pr-395-test"
+    branch = "receipt-recovery-test"
     runner = h._make_runner()
     runner.repo_path = str(tmp_path)
     runner._parse_tasks_from_headers = lambda: [QueueTask(
-        pr_id="PR-395", title="test", status=TaskStatus.DOING, branch=branch, task_file="tasks/PR-395.md",
+        pr_id="PR-001", title="test", status=TaskStatus.DOING, branch=branch, task_file="tasks/PR-001.md",
     )]
     publication = datetime(2026, 10, 26, 22, tzinfo=timezone.utc)
 
     def transport(args, **kwargs):
         if args[:2] == ["pr", "list"]:
-            return [{"number": 651, "title": "PR-395: test", "headRefName": branch,
+            return [{"number": 651, "title": "PR-001: test", "headRefName": branch,
                      "headRefOid": head, "author": {"login": recorded["author"]}}]
         raise AssertionError(args)
 
