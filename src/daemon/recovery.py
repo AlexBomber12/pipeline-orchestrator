@@ -899,7 +899,7 @@ class RecoveryMixin:
             self._persisted_merge_recovery = persisted
         if (
             persisted.name == self.name and persisted.url == self.repo_config.url
-            and persisted.state == PipelineState.ERROR
+            and persisted.state in {PipelineState.ERROR, PipelineState.PAUSED}
             and persisted.current_task is not None
             and persisted.current_pr is None
         ):

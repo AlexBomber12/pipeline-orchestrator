@@ -2157,12 +2157,16 @@ async def test_recovered_retry_publication_preserves_fallback_failure_identity(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("limit_kind", ["session", "weekly"])
+@pytest.mark.parametrize("single_error_exit", [False, True])
 async def test_spend_deferred_coding_retry_preserves_failure_and_resumes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit_kind: str,
+    single_error_exit: bool,
 ) -> None:
+    from src.task_status import MergedState
+
     runner, command, task, repo = await _prepared_runner(tmp_path)
     _allow_validation(monkeypatch, runner, _task_text())
-    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *args: [])
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *args, **kwargs: [])
     monkeypatch.setattr(retry_module.gh_prs, "get_merged_prs", lambda *args, **kw: [])
     monkeypatch.setattr(runner, "_refresh_auth_status_cache", _async_value(None))
     monkeypatch.setattr(retry_module, "resolve_active_coder", lambda *args, **kw:
@@ -2197,6 +2201,40 @@ async def test_spend_deferred_coding_retry_preserves_failure_and_resumes(
         published = RepoState.model_validate_json(runner.redis.store[pipeline_state(runner.name)])
         assert published.error_message == "prior failure"
         assert retry_failure_identity(task, published, None) == command.failure_id
+
+    # Restart from the resource-paused snapshot twice, without copying live
+    # state. Recovery must retain the failure and must not create a new cause.
+    monkeypatch.setattr(
+        "src.daemon.recovery._resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+    for _ in range(2):
+        restarted = h._make_runner()
+        restarted.repo_config.feature_flags.use_single_error_exit = single_error_exit
+        restarted.redis, restarted.repo_path = runner.redis, str(repo)
+        setattr(restarted.app_config.daemon, f"spend_ceiling_{limit_kind}_percent", 50)
+        assert await restarted.recover_state()
+        assert restarted.state.state == PipelineState.PAUSED
+        assert restarted.state.current_task.pr_id == task.pr_id
+        assert restarted.state.current_pr is None
+        assert restarted.state.error_message == "prior failure"
+        assert cause_key(runner.name, task.pr_id) not in restarted.redis.store
+        assert retry_failure_identity(task, restarted.state, None) == command.failure_id
+        _allow_validation(monkeypatch, restarted, _task_text())
+        monkeypatch.setattr(restarted, "_refresh_auth_status_cache", _async_value(None))
+        monkeypatch.setattr(restarted, "_commit_task_status_change", _async_value(True))
+        restarted._codex_usage_provider = h._FakeUsageProvider(snapshot=snapshot)
+        assert await restarted._consume_retry_command() == RetryDispatch.HANDLED
+        stored = await load_retry_command(restarted.redis, restarted.name, command.command_id)
+        assert stored.status == RetryCommandStatus.DEFERRED
+        assert stored.failure_id == command.failure_id
+        assert stored.request_binding == command.request_binding
+        assert stored.retry_count is None
+        assert stored.effect_stage == RetryEffectStage.NONE
+        assert (repo / command.task_file).read_bytes() == original
+        assert restarted.redis.store.get(f"metrics:retry_count:{runner.name}:{task.pr_id}") is None
+        await restarted.publish_state()
+        runner = restarted
 
     # Once the recorded window expires, the same command checks fresh usage
     # and resumes exactly once. No cancellation cause supplies an alternate ID.
@@ -2282,13 +2320,16 @@ async def test_fallback_retry_survives_actual_startup_recovery(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot_state", [PipelineState.ERROR, PipelineState.PAUSED])
 @pytest.mark.parametrize("mismatch", ["name", "url", "task_file", "branch", "status"])
 async def test_startup_does_not_restore_unbound_fallback_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mismatch: str,
+    snapshot_state: PipelineState,
 ) -> None:
     from src.task_status import MergedState
 
     runner, _command_value, _task_value, repo = await _prepared_runner(tmp_path)
+    runner.state.state = snapshot_state
     if mismatch in {"name", "url"}:
         setattr(runner.state, mismatch, "other")
     elif mismatch == "status":
