@@ -23,8 +23,11 @@ from src.models import PipelineState, PRInfo, QueueTask, RepoState, TaskStatus
 from src.retry_commands import (
     RetryCommandStatus,
     RetryExecutionState,
+    claim_retry_command,
     load_latest_retry_command,
     new_retry_command,
+    reserve_retry_attempt,
+    update_retry_command,
 )
 from src.web import app as web_app
 from src.web.app import app
@@ -727,3 +730,74 @@ async def test_non_error_task_view_surfaces_active_retry_pipeline_state(
     redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
     view = await repo_control._task_view(task, "example__alpha", redis_client)
     assert view["retry_pipeline_state"] == "CODING"
+
+
+@pytest.mark.parametrize("applied", [False, True])
+def test_lost_retry_response_replays_before_new_attempt_eligibility(
+    tmp_path, monkeypatch, applied,
+):
+    task_path, redis_client = _setup_retry(tmp_path, monkeypatch, retry_count=2)
+    url = "/repos/example__alpha/tasks/PR-283/retry"
+    with TestClient(app) as client:
+        binding = _rendered_binding(client)
+        # Deliberately discard the first response, as with a broken connection.
+        assert client.post(url, data={"retry_binding": binding}).status_code == 202
+        command = asyncio.run(load_latest_retry_command(redis_client, "example__alpha", "PR-283"))
+        if applied:
+            asyncio.run(claim_retry_command(redis_client, "example__alpha", command.command_id, "runner"))
+            asyncio.run(reserve_retry_attempt(redis_client, "example__alpha", command.command_id, 3))
+            asyncio.run(update_retry_command(
+                redis_client, "example__alpha", command.command_id,
+                lambda current: setattr(current, "status", RetryCommandStatus.APPLIED),
+                keep_pending=False,
+            ))
+            task_path.write_text(_task_text(status="TODO"))
+            state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+            state.state = PipelineState.CODING
+            state.current_task.status = TaskStatus.DOING
+            state.current_queue = [state.current_task]
+            redis_client.store["pipeline:example__alpha"] = state.model_dump_json()
+        before = dict(redis_client.store)
+        pending_before = dict(redis_client.zsets[retry_command_pending("example__alpha")])
+        # Receipt replay must not depend on reading eligibility from frontmatter.
+        with monkeypatch.context() as patch:
+            patch.setattr(repo_control, "_read_task_frontmatter_status",
+                          lambda path: (_ for _ in ()).throw(OSError("eligibility read failed")))
+            replay = client.post(url, data={"retry_binding": binding})
+        assert replay.status_code == 202
+        assert command.command_id in replay.text
+        assert redis_client.store == before
+        assert redis_client.zsets[retry_command_pending("example__alpha")] == pending_before
+        assert client.post(url, data={"retry_binding": "0" * 64}).status_code == 409
+        # A known receipt still fails closed when durable storage is unavailable.
+        original_get = redis_client.get
+
+        async def fail_receipt_read(key):
+            if ":retry:command:" in key:
+                raise RuntimeError("receipt unavailable")
+            return await original_get(key)
+
+        monkeypatch.setattr(redis_client, "get", fail_receipt_read)
+        unavailable = client.post(url, data={"retry_binding": binding})
+        assert unavailable.status_code == 503
+        assert "command store" in unavailable.text
+
+
+@pytest.mark.parametrize("field,value", [
+    ("task_id", "PR-999"),
+    ("repo_slug", "other__repo"),
+    ("task_file", "tasks/renamed.md"),
+    ("request_binding", "0" * 64),
+])
+def test_retry_receipt_requires_exact_stored_target(tmp_path, monkeypatch, field, value):
+    _, redis_client = _setup_retry(tmp_path, monkeypatch)
+    url = "/repos/example__alpha/tasks/PR-283/retry"
+    with TestClient(app) as client:
+        binding = _rendered_binding(client)
+        assert client.post(url, data={"retry_binding": binding}).status_code == 202
+        command = asyncio.run(load_latest_retry_command(redis_client, "example__alpha", "PR-283"))
+        setattr(command, field, value)
+        redis_client.store[retry_command("example__alpha", command.command_id)] = command.model_dump_json()
+        before = dict(redis_client.store)
+        assert client.post(url, data={"retry_binding": binding}).status_code == 409
+        assert redis_client.store == before
