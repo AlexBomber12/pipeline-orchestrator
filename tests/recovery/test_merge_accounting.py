@@ -707,3 +707,39 @@ def test_bookkeeping_retry_rejects_or_defers_unproved_identity(incident, monkeyp
                              else RetryCommandStatus.FAILED)
     assert c.runner.state.state == PipelineState.ERROR and "status: DONE" not in c.remote_task()
     c.preserved()
+
+
+def test_conflict_restart_retains_saved_merge_when_an_open_pr_reuses_its_branch(incident, monkeypatch):
+    c = incident
+    git(c.repo, "checkout", "main")
+    c.path.write_text(c.generation_b + "\nGeneration C\n")
+    git(c.repo, "commit", "-am", "operator task update")
+    git(c.repo, "push", "origin", "main")
+    git(c.repo, "checkout", c.task.branch)
+    asyncio.run(c.runner.handle_merge())
+    assert c.runner.state.state == PipelineState.ERROR
+    reused = PRInfo(number=999, pr_id=c.task.pr_id, branch=c.task.branch, head_sha="c" * 40)
+    monkeypatch.setattr(prs, "get_open_prs", lambda *a, **kw: [c.pending_pr, reused])
+    restarted = c.fresh()
+    c.recover(restarted)
+    assert restarted.state.state == PipelineState.ERROR
+    assert restarted.state.current_pr.number == 547
+    assert restarted.state.current_pr.head_sha == c.head
+    assert restarted.state.current_pr != reused
+    # Once B is repaired, Retry still proves and resumes the saved merge.
+    git(c.repo, "checkout", "main")
+    c.path.write_text(c.generation_b)
+    git(c.repo, "commit", "-am", "operator restores merged generation")
+    git(c.repo, "push", "origin", "main")
+    git(c.repo, "checkout", c.task.branch)
+    command = accounting_retry(c)
+    assert asyncio.run(restarted._select_retry_continuation(command)) == ("merge", restarted.state.current_pr)
+    retained = c.repo / "retained.txt"
+    retained.unlink()  # Operator handles fixture-owned unpublished work before Retry.
+    asyncio.run(enqueue_retry_command(restarted.redis, command))
+    assert asyncio.run(restarted._consume_retry_command()) == RetryDispatch.MERGE
+    asyncio.run(restarted.handle_merge())
+    assert "status: DONE" in c.remote_task()
+    assert reused.number == 999 and reused.head_sha == "c" * 40
+    retained.write_text("unpublished evidence\n")
+    c.preserved()

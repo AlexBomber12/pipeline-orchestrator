@@ -273,6 +273,9 @@ Git, and Redis outages retain MERGE ownership and retry on a later cycle.
 Retry for a retained accounting conflict revalidates its exact PR and task
 generation, then resumes post-merge bookkeeping without dispatching a coder or
 rewriting TODO. Both ERROR dispatchers retain the park until operator action.
+The existing HTTP Retry action admits a bound accounting conflict while retaining
+its header and normal task validation. Recovery preserves the saved merged PR
+identity even if an open PR reuses that task branch.
 Operator pause and Stop controls still apply. Resolving a conflict requires
 reviewing the exact PR and current task generation before using existing Retry
 or task-upload controls; this source change does not deploy or resume a daemon.

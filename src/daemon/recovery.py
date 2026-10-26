@@ -1435,7 +1435,10 @@ class RecoveryMixin:
                 )
             ):
                 self.state.current_task = queued
-                self.state.current_pr = live_pr or saved_pr
+                self.state.current_pr = (
+                    saved_pr if saved_merge_error.error_message.startswith("Merge accounting conflict:")
+                    else live_pr
+                )
                 await self._restore_current_run_record()
                 await self._transition_to_error(
                     saved_merge_error.error_message,
