@@ -207,9 +207,17 @@ async def hold(runner: PipelineRunner) -> bool:
         return True
     runner._rehydrate_last_push_at(pr)
     if not attempt.continuation_saved:
+        if not _run_matches(runner):
+            await runner._restore_current_run_record()
+        if not _run_matches(runner):
+            attempt.incident = "bound run accounting is unavailable"
+            await runner.publish_state()
+            return True
         record = runner._current_run_record
-        if record is not None and record.ended_at is None:
-            await runner._save_current_run_record("coding_complete")
+        if record.ended_at is None:
+            await runner._save_current_run_record(
+                "coding_complete", run_phase=runner.state.active_invocation.phase,
+            )
         attempt.continuation_saved = True
         await runner.publish_state()
     await runner._refresh_user_paused_from_redis()
@@ -244,7 +252,7 @@ async def hold(runner: PipelineRunner) -> bool:
     attempt.pending = False
     attempt.incident = None
     runner.state.state = PipelineState.WATCH
-    runner.log_event("[PUBLICATION] Exact intended PR head confirmed -> WATCH.")
+    runner.log_event("[INFRA] Exact intended PR head confirmed -> WATCH.")
     await runner.publish_state()
     return True
 
@@ -252,7 +260,7 @@ async def hold(runner: PipelineRunner) -> bool:
 async def _park(runner: PipelineRunner, message: str) -> bool:
     if runner.state.error_message != message or runner.state.state != PipelineState.ERROR:
         await runner._transition_to_error(
-            message, save_run_record_as=None, publish=True, log_prefix="[PUBLICATION]",
+            message, save_run_record_as=None, publish=True, log_prefix="[INFRA]",
         )
     return True
 
@@ -269,7 +277,7 @@ async def _exhaust(runner: PipelineRunner) -> bool:
     record = runner._current_run_record
     await runner._transition_to_error(
         message, save_run_record_as="error" if record is not None and record.ended_at is None else None,
-        publish=False, log_prefix="[PUBLICATION]",
+        publish=False, log_prefix="[INFRA]",
         cancellation_cause=CancellationCause(category="ERROR", payload={
             "subsource": "crash", "reason_text": message,
             "publication_attempt": attempt.model_dump(mode="json"),
@@ -280,7 +288,7 @@ async def _exhaust(runner: PipelineRunner) -> bool:
             runner.state.current_task, "ERROR", message, blocked_reason=SuppressionReason.CRASH,
         )
     except Exception as exc:
-        runner.log_event(f"[PUBLICATION] Terminal status write deferred: {exc}")
+        runner.log_event(f"[INFRA] Terminal status write deferred: {exc}")
         written = False
     if not written:
         await runner._mark_status_write_failed_task(
@@ -299,3 +307,11 @@ async def _exhaust(runner: PipelineRunner) -> bool:
     runner.state.state = PipelineState.IDLE
     await runner.publish_state()
     return True
+
+
+def _run_matches(runner: PipelineRunner) -> bool:
+    attempt = runner.state.publication_attempt
+    record = runner._current_run_record
+    return bool(record is not None and (
+        record.repo_name, record.task_id, record.run_id, record.attempt_index,
+    ) == (runner.name, attempt.task_id, attempt.run_id, attempt.attempt_index))

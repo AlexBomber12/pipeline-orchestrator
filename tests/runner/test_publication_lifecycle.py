@@ -35,7 +35,7 @@ def git(path, *args):
 
 
 @pytest.fixture
-def lifecycle(tmp_path, monkeypatch):
+async def lifecycle(tmp_path, monkeypatch):
     remote = tmp_path / 'remote.git'
     repo = tmp_path / 'repo'
     remote.mkdir()
@@ -115,6 +115,7 @@ def lifecycle(tmp_path, monkeypatch):
     runner._capture_invocation_snapshot('claude', {}, phase='fix', fix_iteration=4)
     runner._begin_publication_attempt(started_at=Clock.value)
     runner.state.state = PipelineState.FIX
+    await runner._checkpoint_current_run_record()
     return runner, provider, repo, old, expected, configure
 
 
@@ -163,6 +164,11 @@ async def test_delayed_head_survives_fresh_runner_and_accounts_once(lifecycle):
     assert pr.review_status == ReviewStatus.PENDING
     assert pr.ci_status == CIStatus.PENDING
     assert provider['ci'] == [expected]
+    records = await fresh._metrics_store.recent(task_id='PR-001', repo_name=fresh.name)
+    assert len(records) == 1
+    assert records[0].head_sha == expected
+    assert records[0].run_phase == 'fix'
+    assert records[0].files_touched_count == 1
     assert len(provider['requests']) == 1
     assert git(repo, 'ls-remote', 'origin', 'refs/heads/pr-001').split()[0] == expected
     assert not fresh._merge_gates_satisfied(pr)
@@ -289,7 +295,8 @@ async def test_bounded_uncertainty_preserves_work_and_actionable_evidence(lifecy
     assert provider['requests'] == []
 
 
-async def test_actual_fix_exit_enters_same_durable_continuation(lifecycle, monkeypatch):
+@pytest.mark.parametrize('completion', ['normal', 'merged', 'closed', 'stop'])
+async def test_actual_fix_exit_enters_same_durable_continuation(lifecycle, monkeypatch, completion):
     runner, provider, repo, old, expected, configure = lifecycle
     # Model the actual invocation creating/pushing the repair, rather than
     # calling only its post-exit helpers. All ref mutations are fixture-owned.
@@ -297,11 +304,25 @@ async def test_actual_fix_exit_enters_same_durable_continuation(lifecycle, monke
     git(remote, 'update-ref', 'refs/heads/pr-001', old)
     git(repo, 'reset', '--hard', old)
     runner.state.publication_attempt = None
+    await runner._save_current_run_record('coding_complete')
     runner.state.active_invocation = None
-    runner._current_run_record = None
     runner._refresh_auth_status_cache = AsyncMock()
     runner.usage_gate = AsyncMock(return_value=True)
-    runner._run_coder_with_polling = lambda *a: None
+    external_flag = {}
+    def monitor(_number, _task, flag):
+        nonlocal external_flag
+        external_flag = flag
+        return None
+    runner._run_coder_with_polling = monitor
+    publish = runner.publish_state
+    async def stop_checkpoint():
+        if completion == 'stop' and getattr(runner, '_completed_fix_run_id', None):
+            from src.keyspace import control_stop
+            runner.state.user_paused = True
+            await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+            await runner.redis.set(control_stop(runner.name), '1')
+        await publish()
+    monkeypatch.setattr(runner, 'publish_state', stop_checkpoint)
     runner.state.current_pr.review_status = ReviewStatus.PENDING
     _, plugin = runner._get_coder()
     calls = []
@@ -309,6 +330,9 @@ async def test_actual_fix_exit_enters_same_durable_continuation(lifecycle, monke
         calls.append(kwargs)
         git(repo, 'reset', '--hard', expected)
         git(repo, 'push', 'origin', 'pr-001')
+        if completion in {'merged', 'closed'}:
+            external_flag['state'] = completion.upper()
+            provider['state'] = prs.ExactPRState(completion.upper())
         return 0, 'Implementation complete; branch pushed, PR observation stale.', ''
     monkeypatch.setattr(plugin, 'fix_review', coder)
     await runner.handle_fix()
@@ -317,13 +341,23 @@ async def test_actual_fix_exit_enters_same_durable_continuation(lifecycle, monke
     assert runner.state.publication_attempt.exit_classification == 'success'
     assert runner.state.publication_attempt.cleanup_confirmed
     assert runner.state.publication_attempt.pending
+    if completion == 'stop':
+        assert runner.state.state == PipelineState.PAUSED
+        assert provider['requests'] == []
+        return
     provider['head'] = expected
     fresh = await restart(runner, configure)
+    monkeypatch.setattr(fresh, '_commit_task_status_change', AsyncMock(return_value=True))
     Clock.value += timedelta(seconds=31)
     await fresh._run_cycle_body()
-    assert fresh.state.state == PipelineState.WATCH
-    assert fresh.state.current_pr.fix_iteration_count == 4
-    assert len(provider['requests']) == 1
+    if completion == 'normal':
+        assert fresh.state.state == PipelineState.WATCH
+        assert fresh.state.current_pr.fix_iteration_count == 4
+        assert len(provider['requests']) == 1
+    else:
+        assert fresh.state.state == PipelineState.IDLE
+        assert fresh.state.current_task is None
+        assert provider['requests'] == []
     assert len(calls) == 1
 
 
@@ -570,3 +604,42 @@ async def test_delayed_unchanged_fix_accounts_one_no_push_without_review(lifecyc
     assert fresh.state.current_pr.no_push_fix_count == (runner.app_config.daemon.fix_no_push_cap if at_cap else 1)
     await fresh._hold_unresolved_publication()
     assert cap.await_count == (1 if at_cap else 0)
+
+
+async def test_missing_run_accounting_defers_without_losing_attempt(lifecycle, monkeypatch):
+    runner, provider, _, _, expected, configure = lifecycle
+    await finish(runner)
+    provider['head'] = expected
+    runner._current_run_record = None
+    get = runner._metrics_store.get
+    monkeypatch.setattr(runner._metrics_store, 'get', AsyncMock(side_effect=OSError('metrics unavailable')))
+    await runner._hold_unresolved_publication()
+    assert runner.state.publication_attempt.pending
+    assert not runner.state.publication_attempt.continuation_saved
+    assert provider['requests'] == []
+    monkeypatch.setattr(runner._metrics_store, 'get', get)
+    Clock.value += timedelta(seconds=31)
+    await runner._hold_unresolved_publication()
+    assert runner.state.state == PipelineState.WATCH
+    assert len(provider['requests']) == 1
+
+
+async def test_pending_attempt_blocks_fix_merge_and_exit_zero_no_pr_diagnosis(lifecycle, monkeypatch):
+    runner, provider, _, _, _, _ = lifecycle
+    await finish(runner)
+    await runner.handle_fix()
+    assert runner.state.publication_attempt.pending
+    await runner.handle_merge()
+    assert runner.state.publication_attempt.pending
+    diagnose = AsyncMock()
+    monkeypatch.setattr(runner, '_diagnose_exit_zero_no_pr', diagnose)
+    await runner._post_coder_resolution('claude', 0, '', '', target_branch='pr-001', current_pr_id='PR-001')
+    assert runner.state.publication_attempt.pending
+    diagnose.assert_not_called()
+    assert provider['requests'] == []
+
+
+async def test_header_recovery_defers_if_snapshot_read_is_unavailable(lifecycle, monkeypatch):
+    runner, *_ = lifecycle
+    monkeypatch.setattr(runner, '_hydrate_current_task_from_persisted_state', AsyncMock(return_value=False))
+    assert not await runner._recover_state_headers()

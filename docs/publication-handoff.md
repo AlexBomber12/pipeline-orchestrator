@@ -38,7 +38,9 @@ No new configuration, public state, scheduler, or operator control is required.
 Before releasing the publication hold, the daemon checkpoints push accounting
 and its receipt together. FIX accounting uses the captured initial iteration;
 replaying a checkpoint cannot increment it again. Run records retain their run
-identity and terminal history. Review handoff checkpoints its start before POST;
+identity and terminal history. Unavailable bound run accounting defers handoff;
+terminal metrics use the frozen commit even if the local checkout later moves.
+Review handoff checkpoints its start before POST;
 a restart consults current-head request history before another POST. Unavailable
 history defers confirmation. Existing review request cooldown and WATCH handling
 remain responsible for retries after handoff. Remote POST and Redis cannot form

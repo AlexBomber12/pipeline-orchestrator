@@ -2037,15 +2037,21 @@ class PipelineRunner(
         pr = self.state.current_pr
         # Merge cleanup and fresh-clone recovery can run on the base branch.
         # The retained PR identity supplies the head proved merged by GitHub.
+        attempt = self.state.publication_attempt
+        frozen_head = (
+            attempt.expected_head_sha if attempt is not None and attempt.contract_version == 2
+            and attempt.run_id == record.run_id and self._publication_attempt_matches_dispatch() else None
+        )
         record.head_sha = (
             pr.head_sha if exit_reason == "success_merged" and pr is not None
-            and pr.head_sha else self._git_rev_parse("HEAD")
+            and pr.head_sha else frozen_head or self._git_rev_parse("HEAD")
         )
         if exit_reason in ("success_merged", "coding_complete", "closed_unmerged"):
             resolved_base_branch = base_branch or self.repo_config.branch or "main"
             stats = diff_stats
             if stats is None:
-                stats = self._compute_diff_stats(resolved_base_branch)
+                stats = (self._compute_diff_stats(resolved_base_branch, frozen_head)
+                         if frozen_head else self._compute_diff_stats(resolved_base_branch))
             self._apply_diff_stats(record, stats, resolved_base_branch)
         await self._metrics_store.save(record)
         # SSE notification is best-effort: a Redis pub/sub or list-op

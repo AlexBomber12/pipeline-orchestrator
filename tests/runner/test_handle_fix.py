@@ -4901,6 +4901,10 @@ def test_fix_iterations_survive_recovery_until_merge(
     (tmp_path / "tasks" / "PR-001.md").write_text("# PR-001\n")
 
     def fake_git(repo_path: str, *args: str, **kw: Any) -> Any:
+        if args[:1] == ("ls-remote",):
+            return h._FakeCompletedProcess(
+                args=["git", *args], stdout=f'{"a" * 40} refs/heads/pr-001\n', returncode=0,
+            )
         if args[:2] == ("rev-parse", "HEAD"):
             return h._FakeCompletedProcess(
                 args=["git", "rev-parse", "HEAD"],
@@ -4916,6 +4920,14 @@ def test_fix_iterations_survive_recovery_until_merge(
         return h._FakeCompletedProcess(args=["git", *args], returncode=0)
 
     monkeypatch.setattr(git_ops_module, "_git", fake_git)
+    # Version 2 requires independent branch, PR identity and publication proof.
+    from src.github import prs as gh_prs
+    published_at = datetime(2026, 4, 18, 12, tzinfo=timezone.utc)
+    monkeypatch.setattr(gh_prs, "get_exact_pr_outcome", lambda repo, base, number, sha, **kw:
+        gh_prs.ExactPROutcome(repo, base, number, sha, gh_prs.ExactPRState.OPEN, True))
+    monkeypatch.setattr(gh_prs, "get_pr_head_publication", lambda repo, number, **kw:
+        gh_prs.HeadPublicationEvidence(repo, number, repo, "refs/heads/pr-001", "a" * 40,
+                                      published_at, "github-activity:test"))
     monkeypatch.setattr(
         runner_module.PipelineRunner,
         "_parse_tasks_from_headers",
@@ -4924,7 +4936,11 @@ def test_fix_iterations_survive_recovery_until_merge(
     monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
     monkeypatch.setattr(
         "src.github.prs.get_open_prs",
-        lambda repo, **kw: [PRInfo(number=77, branch="pr-001", head_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")],
+        lambda repo, **kw: [PRInfo(number=77, branch="pr-001", head_sha="a" * 40,
+                                  publication_observed=True, publication_at=published_at,
+                                  publication_repo=repo, publication_head_repo=repo,
+                                  publication_ref="refs/heads/pr-001", publication_head_sha="a" * 40,
+                                  publication_provenance="github-activity:test")],
     )
     monkeypatch.setattr(
         "src.github.prs.get_pr_metadata",
