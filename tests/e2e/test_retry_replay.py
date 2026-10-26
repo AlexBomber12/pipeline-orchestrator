@@ -3,6 +3,7 @@
 import asyncio
 import subprocess
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 
 import redis.asyncio as aioredis
 from src.cancellation import retry_count_key
@@ -86,4 +87,7 @@ def test_retry_replay_is_atomic_before_and_after_apply() -> None:
             await redis.delete(*keys)
             await redis.aclose()
 
-    asyncio.run(exercise())
+    # Playwright's session-scoped sync fixture may already own this thread's loop.
+    # Create and close the Redis client on a separate loop, as in other e2e tests.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(lambda: asyncio.run(exercise())).result(timeout=30)
