@@ -38,6 +38,7 @@ jobs:
     concurrency:
       group: integration-testbed-shared
       cancel-in-progress: false
+      queue: max
     steps:
       - uses: actions/checkout@v4
 
