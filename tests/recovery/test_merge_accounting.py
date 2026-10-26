@@ -574,3 +574,25 @@ def test_legacy_optional_invocation_binding_uses_proved_generation_and_ancestor(
     assert (saved.tokens_in, saved.tokens_out) == (good.tokens_in, good.tokens_out)
     assert "status: DONE" in c.remote_task()
     c.preserved()
+
+
+def test_compatible_legacy_checkpoint_is_recovered_from_shared_recent_index(incident):
+    c = incident
+    good = replace(c.old, run_id="legacy-recent", ended_at=None, exit_reason="",
+                   cause="CRASH", cause_subsource=None, head_sha=c.intermediate,
+                   task_spec_hash=task_spec_content_hash(c.generation_b), invocations=[])
+    # Legacy metrics may predate the per-task index. Newer unrelated entries
+    # in the shared repository index must still pass the same admission rule.
+    c.runner.redis.store[MetricsStore._record_key(good.run_id)] = json.dumps(asdict(good))
+    recent_key = MetricsStore._recent_key(c.task.pr_id, c.runner.name)
+    c.runner.redis.lists[recent_key].append(good.run_id)
+    unrelated = replace(c.old, run_id="unrelated", task_id="PR-999", invocations=[])
+    asyncio.run(c.runner._metrics_store.save(unrelated))
+    c.runner._current_run_record = None
+    c.runner.state.active_invocation = None
+    asyncio.run(c.runner.handle_merge())
+    assert "status: DONE" in c.remote_task()
+    saved = asyncio.run(c.runner._metrics_store.get(good.run_id))
+    assert saved.outcome == "merged" and saved.head_sha == c.head
+    assert (saved.tokens_in, saved.tokens_out) == (good.tokens_in, good.tokens_out)
+    c.preserved()

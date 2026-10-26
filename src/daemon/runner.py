@@ -1945,7 +1945,8 @@ class PipelineRunner(
         # Read all task runs: a newer failed/incompatible run cannot hide an
         # interrupted checkpoint. Also consult a bound key if its index was lost.
         records = sorted(
-            await self._metrics_store.list_task_runs(self.name, task.pr_id),
+            [*await self._metrics_store.list_task_runs(self.name, task.pr_id),
+             *await self._metrics_store.recent(task_id=task.pr_id, limit=200, repo_name=self.name)],
             key=lambda r: (r.started_at, r.run_id), reverse=True,
         )
         invocation = self.state.active_invocation

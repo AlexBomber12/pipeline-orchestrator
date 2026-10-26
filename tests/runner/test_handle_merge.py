@@ -1014,7 +1014,7 @@ def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeyp
     lookup = (AsyncMock(side_effect=RuntimeError("metrics unavailable"))
               if failure == "read" else AsyncMock(return_value=record))
     monkeypatch.setattr(runner._metrics_store, "get", lookup)
-    monkeypatch.setattr(runner._metrics_store, "recent", AsyncMock(side_effect=AssertionError("wrong run fallback")))
+    monkeypatch.setattr(runner._metrics_store, "recent", AsyncMock(return_value=[]))
     save = AsyncMock(side_effect=RuntimeError("checkpoint unavailable") if failure == "checkpoint" else None)
     monkeypatch.setattr(runner._metrics_store, "save", save)
     status = AsyncMock(return_value=True)
@@ -1095,7 +1095,7 @@ def test_confirmed_merge_reconstructs_missing_accounting_before_done(monkeypatch
     assert task.status == TaskStatus.DOING
     status.assert_not_awaited()
     save.assert_awaited_once_with(record)
-    recent.assert_not_awaited()
+    recent.assert_awaited_once_with(task_id=task.pr_id, limit=200, repo_name=runner.name)
     task_runs.assert_awaited_once_with(runner.name, task.pr_id)
 
     save.side_effect = None
