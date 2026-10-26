@@ -464,6 +464,12 @@ def _patch_subprocess(
     *,
     stub_auto_pr_read: bool = True,
 ) -> list[list[str]]:
+    monkeypatch.setattr(
+        "src.daemon.handlers.merge.MergeMixin._read_final_merge_pr",
+        lambda self, policy: self.state.current_pr.model_copy(update={
+            "ci_status": CIStatus.SUCCESS, "review_status": ReviewStatus.APPROVED,
+        }),
+    )
     calls: list[list[str]] = []
     rev_parse_head_calls = {"n": 0}
 

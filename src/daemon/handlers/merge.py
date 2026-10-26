@@ -18,12 +18,16 @@ from src.analytics import log_merged_pr
 from src.analytics.coder_version import detect_coder_extension_version
 from src.branch_context import BranchContext
 from src.cancellation import delete_retry_count, delete_task_spec_hash
+from src.config import load_config
 from src.daemon import git_ops
+from src.daemon.quarantine import blocking_quarantine_labels
 from src.daemon.recovery import MergeIdentityConflict
 from src.github import cache as gh_cache
+from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.models import PipelineState, ReviewStatus, TaskStatus
+from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
+from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus, TaskStatus
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
 
@@ -95,7 +99,44 @@ def _validated_conflict_commit(
 class MergeMixin:
     """Merge the current PR and return to IDLE."""
 
-    async def handle_merge(self) -> None:
+    def _merge_gates_satisfied(self, pr: PRInfo) -> bool:
+        """Apply the same final admission rule in WATCH and MERGE."""
+        return (
+            bool(pr.head_sha)
+            and pr.ci_status == CIStatus.SUCCESS
+            and (
+                pr.review_status == ReviewStatus.APPROVED
+                or self.repo_config.allow_merge_without_review
+                and pr.review_status == ReviewStatus.PENDING
+            )
+            and (not pr.publication_observed or pr.publication_at is not None)
+        )
+
+    def _read_final_merge_pr(self, policy: ReviewerPolicy) -> PRInfo | None:
+        """Reuse canonical CI/review readers with a single actor-policy snapshot."""
+        pr = next((pr for pr in gh_prs.get_open_prs(
+            self.owner_repo,
+            allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+            required_checks=self.repo_config.required_checks,
+            reviewer_policy=policy,
+        ) if pr.number == self.state.current_pr.number), None)
+        if pr is not None:
+            if pr.publication_observed:
+                pr.publication_at, pr.publication_reason = self._validate_publication_observation(
+                    pr.number, pr.head_sha, pr.publication_at, pr.publication_reason,
+                    head_repo=pr.publication_head_repo, ref=pr.publication_ref,
+                    observed_repo=pr.publication_repo,
+                    observed_head_sha=pr.publication_head_sha,
+                    provenance=pr.publication_provenance,
+                )
+            pr.ci_status = gh_checks._classify_ci_retrieval(
+                gh_checks._retrieve_ci_status_evidence(self.owner_repo, pr.head_sha, fresh=True),
+                empty_is_success=self.repo_config.allow_merge_without_checks,
+                required_contexts=self.repo_config.required_checks,
+            )
+        return pr
+
+    async def handle_merge(self, reviewer_policy: ReviewerPolicy | None = None) -> None:
         """Merge the current PR and return to IDLE."""
         if self.state.current_pr is None:
             self.state.state = PipelineState.IDLE
@@ -386,6 +427,10 @@ class MergeMixin:
                     gh_cache._invalidate_etag_cache(
                         f"repos/{self.owner_repo}/pulls"
                     )
+                    self.state.current_pr.head_sha = new_head_sha
+                    self.state.current_pr.review_status = ReviewStatus.PENDING
+                    self.state.current_pr.ci_status = CIStatus.PENDING
+                    self.state.current_pr.diff_scanned_at_sha = None
                     self.state.state = PipelineState.WATCH
                     self.log_event(
                         f"[MERGE] Pre-merge sync pushed new commits to PR "
@@ -423,6 +468,31 @@ class MergeMixin:
                     commit_task_status=True,
                 )
                 return
+
+        # Synchronization and external pushes can invalidate the WATCH verdict.
+        # Keep the bound identity until WATCH has admitted and scanned a new HEAD.
+        try:
+            policy = reviewer_policy or reviewer_policy_from_config(load_config())
+            fresh = self._read_final_merge_pr(policy)
+            if fresh is not None:
+                fresh = self._approval_filtered_pr(fresh)
+        except Exception as exc:
+            fresh = None
+            self.log_event(f"[MERGE] Final gate evidence unavailable for PR #{number}: {exc}.")
+        current = self.state.current_pr
+        if (
+            fresh is None or fresh.head_sha != current.head_sha
+            or fresh.branch != current.branch
+            or not self._merge_gates_satisfied(fresh)
+            or blocking_quarantine_labels(fresh.quarantine_labels)
+        ):
+            current.review_status = ReviewStatus.PENDING
+            current.ci_status = CIStatus.PENDING
+            self.state.state = PipelineState.WATCH
+            gh_cache._invalidate_etag_cache(f"repos/{self.owner_repo}/pulls")
+            self.log_event(f"[MERGE] PR #{number} needs fresh current-HEAD gates; returning to WATCH.")
+            await self.publish_state()
+            return
 
         merged_diff_stats = self._compute_diff_stats(base)
         self.log_event(
