@@ -463,7 +463,7 @@ async def test_fix_review_async_passes_prompt(
     assert "OPERATOR-AUTHORIZED EXECUTION POLICY" in prompt
     assert "one iteration" in prompt
     assert "scripts/make-review-artifacts.sh" in prompt
-    assert "remote PR HEAD is the pushed local HEAD" in prompt
+    assert "do not poll" in prompt
     assert "daemon owns review triggering" in prompt
     assert "Do not wait for a new review" in prompt
     assert prompt.endswith("Latest review feedback:\nP1: fix this")
@@ -720,7 +720,7 @@ async def test_run_auto_pr_async_formats_prompt_with_headers(
     assert "ready (not draft) PR" in cmd[-1]
     assert "scripts/make-review-artifacts.sh" in cmd[-1]
     assert "artifacts/pr.patch must be nonempty" in cmd[-1]
-    assert "repository, base branch, head branch, and HEAD SHA" in cmd[-1]
+    assert "daemon independently" in cmd[-1]
     assert "daemon owns review triggering" in cmd[-1]
     assert "Do not trigger or poll review" in cmd[-1]
     assert "Never fabricate a PR, push, gate, or approval" in cmd[-1]

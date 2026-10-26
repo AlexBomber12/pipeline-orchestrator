@@ -997,6 +997,10 @@ class IdleMixin:
         """Wait for rate limit window to expire, then resume previous flow."""
         attempt = self.state.publication_attempt
         invocation = self.state.active_invocation
+        if (attempt is not None and attempt.pending and attempt.contract_version == 2
+            and attempt.exit_classification == "success"):
+            await self._hold_unresolved_publication()
+            return
         if (not self.state.user_paused and attempt is not None and attempt.pending
             and invocation is not None and invocation.phase == "coding"
             and attempt.exit_classification != "success"):

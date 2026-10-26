@@ -64,16 +64,17 @@ When triggered by the pipeline orchestrator daemon (non-interactive):
 - NEVER use `git add -f` or explicitly stage files matched by .gitignore.
 - Artifacts (ci.log, pr.patch, structure.txt) are generated for Codex review but must not appear in commits. The .gitignore already excludes them.
 - NEVER commit .patch files to the repository under any circumstances.
-- For `AUTO PR`, finish after the ready PR is published and its repository, base, head branch, and HEAD SHA are verified. Report the evidence and exit; do not trigger or poll review, start a FIX round, or merge.
+- For `AUTO PR`, implement, push, and attempt ready PR publication. Make one bounded branch/PR observation, report the evidence, and exit promptly. The daemon independently reconciles delayed PR observations; do not poll synchronization, trigger or poll review, start a FIX round, or merge.
 - For daemon `FIX FEEDBACK`, address the supplied feedback and any necessary
   small, self-contained blocker in one iteration, publish to the same branch,
-  verify the remote PR HEAD, report the evidence, and exit. Do not wait for
+  report expected SHA, observed branch/PR SHAs and failed operations, then exit. Do not wait for
   another review or act on findings that arrive during the invocation.
 - Green GitHub CI and current-change Codex approval are still merge requirements. After publication, the daemon owns review triggering, CI/review waiting, any later FIX dispatch, and merge decisions.
 - A baseline-failure publication exception does not relax merge requirements or
   authorize unconfirmed coder-process cleanup. Cleanup still requires confirmed
   process ownership.
-- If implementation or publication cannot complete, report the real blocker and follow the `ESCALATE:` protocol. Never fabricate a PR, successful push, gate result, or approval.
+- Publication uncertainty after completed implementation is a normal handoff, not an `ESCALATE:` reason. Report expected SHA, observed branch SHA, PR identity/SHA if known, and unresolved operations separately. Preserve genuine implementation, authorization, guardrail, and process ownership failures.
+- If implementation cannot complete, report the real blocker and follow the `ESCALATE:` protocol. Never fabricate a PR, successful push, gate result, or approval.
 <!-- pipeline-orchestrator: managed END daemon_mode -->
 
 <!-- pipeline-orchestrator: managed BEGIN ci_gates -->
@@ -280,9 +281,9 @@ When invoked with prompt starting with `AUTO PR`:
    `scripts/make-review-artifacts.sh`, and confirm the review artifacts are
    complete and `artifacts/pr.patch` is nonempty. A nonzero result permits
    publication only under the documented confirmed-baseline exception.
-8. Push the task branch and open a ready (not draft) PR. Verify the PR repository, base branch, head branch, and HEAD SHA against the intended repository and local HEAD.
-9. Report the PR URL and verified publication evidence, then exit. Do not post `@codex review`, poll GitHub CI or review, start another review-fix round, or merge; the daemon owns all post-publication orchestration.
-10. If implementation or publication genuinely cannot complete under this
+8. Push the task branch and open a ready (not draft) PR. Make one bounded observation of repository, base, branch, and HEAD SHA; report expected and observed evidence separately and let the daemon reconcile uncertainty.
+9. Report the PR URL if known, expected SHA, observed branch/PR SHAs, and unresolved operations, then exit promptly. Do not post `@codex review`, poll GitHub CI or review, start another review-fix round, or merge; the daemon owns all post-publication orchestration.
+10. If implementation genuinely cannot complete under this
     policy, report the blocker and use the `ESCALATE:` protocol as its strict
     last-line rule requires. Estimate deviation, an unexpected necessary path,
     or a small incidental gate repair is not by itself a reason to escalate.
@@ -378,9 +379,9 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
   and `artifacts/pr.patch` is nonempty. Fix introduced failures; a nonzero result
   permits publication only under the documented confirmed-baseline exception.
 - Push to the same PR branch.
-- For a daemon invocation (identified by its handoff marker), perform exactly one iteration. Verify the remote PR HEAD equals the pushed local HEAD, report the evidence, and exit without triggering or waiting for review, handling newly arriving findings, or merging.
+- For a daemon invocation (identified by its handoff marker), perform exactly one iteration. Make one bounded branch/PR observation, report expected and observed SHAs separately, and exit promptly without triggering or waiting for review, handling newly arriving findings, or merging.
 - For a manual invocation, post `@codex review` after the push and use the manual Codex Review gate above until a non-stale thumbs up is present.
-- If the daemon iteration genuinely cannot implement or publish the change under
+- If the daemon iteration genuinely cannot implement the change under
   the execution policy, report the real blocker and follow the `ESCALATE:`
   protocol. Estimate deviation, an unexpected necessary path, or a small
   incidental gate repair is not by itself a reason to escalate. Never fabricate

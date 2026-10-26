@@ -27,6 +27,7 @@ from src.cancellation import (
 )
 from src.coder_registry import CoderPlugin
 from src.daemon import fix_escalation, git_ops
+from src.daemon import publication as publication_lifecycle
 from src.daemon.guardrails import GuardrailViolation, scan_stdout
 from src.daemon.handlers import CoderUnavailable
 from src.daemon.quarantine import apply_quarantine_label_for_violation
@@ -214,6 +215,11 @@ class CodingMixin:
             task_id=task.pr_id, branch=task.branch,
             run_id=invocation.run_id, attempt_index=invocation.attempt_index,
             started_at=started_at, baseline_numbers=baseline_numbers,
+            contract_version=2,
+            initial_pr_head_sha=self.state.current_pr.head_sha if invocation.phase == "fix"
+            and self.state.current_pr is not None else None,
+            initial_fix_iteration=self.state.current_pr.fix_iteration_count
+            if self.state.current_pr is not None else 0,
             pr_number=self.state.current_pr.number if invocation.phase == "fix"
             and self.state.current_pr is not None
             and self.state.current_pr.branch == task.branch
@@ -247,6 +253,10 @@ class CodingMixin:
         local_head = await asyncio.to_thread(
             _local_branch_head_sha, self.repo_path, attempt.branch,
         )
+        if attempt.contract_version == 2:
+            # Freeze the completed invocation's target before any terminal write.
+            attempt.expected_head_sha = attempt.expected_head_sha or local_head
+            await self.publish_state()
         if local_head is not None and local_head != attempt.head_sha:
             # Keep the known remote head and persist the local candidate so
             # reconciliation can retry after GitHub catches up with a push.
@@ -298,6 +308,10 @@ class CodingMixin:
         attempt = self.state.publication_attempt
         if not self._publication_attempt_matches_dispatch():
             return False
+        if attempt.contract_version == 2:
+            if attempt.expected_head_sha is None:
+                return False
+            return await publication_lifecycle.resolve(self, resolve_terminal=resolve_terminal)
         try:
             if self.state.active_invocation.phase == "fix":
                 local_head = await asyncio.to_thread(
@@ -522,6 +536,8 @@ class CodingMixin:
         attempt = self.state.publication_attempt
         if attempt is None or not attempt.pending:
             return False
+        if attempt.contract_version == 2 and attempt.exit_classification == "success":
+            return await publication_lifecycle.hold(self)
         resolved = await self._resolve_published_attempt()
         if resolved and self.state.current_task is None:
             return True
@@ -1137,6 +1153,8 @@ class CodingMixin:
                 )
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
             try:
+                if result is not None:
+                    await publication_lifecycle.record_exit(self, *result)
                 await self._capture_published_attempt(publication_observed)
             finally:
                 cleanup_confirmed = await self._confirm_current_coder_cleanup(
@@ -1147,6 +1165,7 @@ class CodingMixin:
             raise cancellation
         if not cleanup_confirmed:
             return None
+        await publication_lifecycle.record_cleanup(self)
 
         if interruption == "stop":
             if self.state.publication_attempt is not None:
@@ -1559,8 +1578,11 @@ class CodingMixin:
             return
 
         if self.state.publication_attempt is not None:
-            self.state.publication_attempt.exit_classification = "failure"
-            await self.publish_state()
+            if self.state.publication_attempt.contract_version == 1:
+                self.state.publication_attempt.exit_classification = "failure"
+                await self.publish_state()
+            else:
+                await publication_lifecycle.record_exit(self, code, stdout, stderr)
         if code != 0 and not (publication and publication.cancelled_by_publication):
             resolved = await self._resolve_published_attempt()
             if resolved and self.state.current_pr is None:
@@ -1615,9 +1637,12 @@ class CodingMixin:
                     self.state.current_pr, "Retained published PR -> WATCH.",
                 )
                 return
-            await self._diagnose_exit_zero_no_pr(
-                target_branch, coder_name, pause_for_stop_if_requested,
-            )
+            if self.state.publication_attempt.contract_version == 2:
+                await self._hold_unresolved_publication()
+            else:
+                await self._diagnose_exit_zero_no_pr(
+                    target_branch, coder_name, pause_for_stop_if_requested,
+                )
             return
         await self._transition_to_error(
             "Missing publication attempt identity", publish=False, log_prefix="[CODING]",
@@ -1630,6 +1655,10 @@ class CodingMixin:
     ) -> None:
         """Apply the shared CODING-to-WATCH bookkeeping for a verified PR."""
         self.state.current_pr = candidate
+        if (self.state.publication_attempt is not None
+            and self.state.publication_attempt.contract_version == 2):
+            await publication_lifecycle.hold(self)
+            return
         if self.state.publication_attempt is not None:
             self.state.publication_attempt.pr_number = candidate.number
             self.state.publication_attempt.pending = False

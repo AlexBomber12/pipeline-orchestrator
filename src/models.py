@@ -207,6 +207,23 @@ class PublicationAttempt(BaseModel):
     run_id: str | None
     attempt_index: int | None
     started_at: datetime
+    # Version 1 snapshots have no durable exit/cleanup proof or retry budget.
+    contract_version: int = 1
+    expected_head_sha: str | None = None
+    initial_pr_head_sha: str | None = None
+    initial_fix_iteration: int = 0
+    observed_branch_sha: str | None = None
+    observed_pr_sha: str | None = None
+    cleanup_confirmed: bool = False
+    reconcile_deadline: datetime | None = None
+    next_reconcile_at: datetime | None = None
+    reconcile_polls: int = 0
+    incident: str | None = None
+    exhausted: bool = False
+    terminal_message: str | None = None
+    push_accounted: bool = False
+    continuation_saved: bool = False
+    review_handoff_started: bool = False
     baseline_numbers: set[int] | None = None
     # None is unknown (including older snapshots); empty means proven absent.
     initial_branch_head_sha: str | None = None

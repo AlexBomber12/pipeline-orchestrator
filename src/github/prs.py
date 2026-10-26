@@ -125,6 +125,7 @@ class ExactPROutcome:
     merge_commit_sha: str | None = None
     reason: str | None = None
     merged_at: datetime | None = None
+    observed_head_sha: str | None = None
 
 
 @dataclass(frozen=True)
@@ -138,14 +139,16 @@ class PRDiscovery:
     reason: str | None = None
 
 
-def get_exact_pr_outcome(repo: str, base_branch: str, number: int, head_sha: str) -> ExactPROutcome:
+def get_exact_pr_outcome(
+    repo: str, base_branch: str, number: int, head_sha: str, *, expected_branch: str | None = None,
+) -> ExactPROutcome:
     """Read one PR by identity, including terminal outcomes absent from open lists.
 
     Evidence must have been fetched or successfully revalidated within the
     merged-list TTL to authorize a terminal decision. Callers can retry UNKNOWN later.
     """
 
-    def unknown(reason: str) -> ExactPROutcome:
+    def unknown(reason: str, observed_head_sha: str | None = None) -> ExactPROutcome:
         return ExactPROutcome(
             repo,
             base_branch,
@@ -153,7 +156,8 @@ def get_exact_pr_outcome(repo: str, base_branch: str, number: int, head_sha: str
             head_sha,
             ExactPRState.UNKNOWN,
             False,
-            reason=reason,
+            reason=reason, observed_head_sha=(observed_head_sha if isinstance(observed_head_sha, str)
+                and _FULL_SHA_RE.fullmatch(observed_head_sha) else None),
         )
 
     if (
@@ -185,8 +189,14 @@ def get_exact_pr_outcome(repo: str, base_branch: str, number: int, head_sha: str
         or not isinstance(head, dict)
     ):
         return unknown("identity mismatch")
+    if expected_branch is not None and (
+        head.get("ref") != expected_branch
+        or not isinstance(head.get("repo"), dict)
+        or str(head["repo"].get("full_name", "")).casefold() != repo.casefold()
+    ):
+        return unknown("head repository or branch mismatch")
     if head.get("sha") != head_sha:
-        return unknown("head mismatch")
+        return unknown("head mismatch", head.get("sha"))
     state = raw.get("state")
     merged = raw.get("merged")
     merge_sha = raw.get("merge_commit_sha")

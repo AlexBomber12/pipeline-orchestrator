@@ -433,7 +433,7 @@ def _usage_providers() -> tuple[_FakeUsageProvider, _FakeUsageProvider]:
     return _FakeUsageProvider(), _FakeUsageProvider()
 
 
-def _make_runner(**repo_overrides: Any) -> PipelineRunner:
+def _make_runner(*, publication_contract: int = 1, **repo_overrides: Any) -> PipelineRunner:
     claude_provider, codex_provider = _usage_providers()
     runner = PipelineRunner(
         _repo_cfg(**repo_overrides),
@@ -442,6 +442,16 @@ def _make_runner(**repo_overrides: Any) -> PipelineRunner:
         claude_provider,
         codex_provider,
     )
+    # Existing synthetic handler fixtures describe persisted version-1 attempts.
+    # Keep exercising that compatibility contract. Real Git lifecycle regressions
+    # opt into version 2 and use the production attempt builder unchanged.
+    if publication_contract == 1:
+        begin = runner._begin_publication_attempt
+        def legacy_attempt(**kwargs):
+            begin(**kwargs)
+            if runner.state.publication_attempt is not None:
+                runner.state.publication_attempt.contract_version = 1
+        runner._begin_publication_attempt = legacy_attempt
     runner._selector_rng.seed(0)
     runner._auth_status_cache = {
         "claude": {"status": "ok"},
@@ -498,6 +508,8 @@ def _patch_subprocess(
             return _FakeCompletedProcess(args=cmd, returncode=1)
         if cmd[:2] == ["git", "merge"] and len(cmd) > 2 and cmd[2].startswith("origin/"):
             return _FakeCompletedProcess(args=cmd, stdout="Already up to date.\n", returncode=0)
+        if cmd[:3] == ["git", "ls-remote", "--heads"]:
+            return _FakeCompletedProcess(args=cmd, stdout=f'{"a" * 40} {cmd[-1]}\n', returncode=0)
         if cmd[:3] == ["git", "rev-parse", "HEAD"]:
             rev_parse_head_calls["n"] += 1
             sha = "head-before-abc" if rev_parse_head_calls["n"] == 1 else "head-after-def"
@@ -539,9 +551,9 @@ def _patch_subprocess(
     monkeypatch.setattr(coding_module.gh_prs, "get_branch_publications", publications)
     monkeypatch.setattr(
         coding_module.gh_prs, "get_exact_pr_outcome",
-        lambda repo, base, number, sha: coding_module.gh_prs.ExactPROutcome(
+        lambda repo, base, number, sha, **kw: coding_module.gh_prs.ExactPROutcome(
             repo, base, number, sha, coding_module.gh_prs.ExactPRState.OPEN, True,
-        ) if (repo, number, sha) in published_identities else exact_outcome(repo, base, number, sha),
+        ) if (repo, number, sha) in published_identities else exact_outcome(repo, base, number, sha, **kw),
     )
     monkeypatch.setattr(
         coding_module,

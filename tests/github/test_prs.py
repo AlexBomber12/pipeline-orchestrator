@@ -534,3 +534,31 @@ def test_merge_admission_is_exact_and_fail_closed(monkeypatch, case, expected):
 
     monkeypatch.setattr(gh_prs.gh_runner, "run_gh", transport)
     assert gh_prs.get_pr_merge_admission("octo/demo", 42, "a" * 40) is expected
+
+
+@pytest.mark.parametrize('change', ['none', 'repo', 'base', 'branch', 'fork', 'no_head_repo', 'sha'])
+def test_publication_exact_outcome_binds_source_repository_and_branch(monkeypatch, change):
+    payload = {
+        'number': 42, 'state': 'open', 'merged': False,
+        'base': {'ref': 'main', 'repo': {'full_name': 'octo/demo'}},
+        'head': {'ref': 'repair', 'sha': 'a' * 40, 'repo': {'full_name': 'octo/demo'}},
+    }
+    if change == 'repo':
+        payload['base']['repo']['full_name'] = 'another/repo'
+    elif change == 'base':
+        payload['base']['ref'] = 'another-base'
+    elif change == 'branch':
+        payload['head']['ref'] = 'another-branch'
+    elif change == 'fork':
+        payload['head']['repo']['full_name'] = 'another/repo'
+    elif change == 'no_head_repo':
+        payload['head'].pop('repo')
+    elif change == 'sha':
+        payload['head']['sha'] = 'b' * 40
+    monkeypatch.setattr(cache, '_etag_get', lambda path: payload)
+    monkeypatch.setattr(cache, '_etag_payload_observed_at', lambda *a: None)
+    outcome = gh_prs.get_exact_pr_outcome('octo/demo', 'main', 42, 'a' * 40, expected_branch='repair')
+    assert outcome.discovery_complete is (change == 'none')
+    assert outcome.state == (gh_prs.ExactPRState.OPEN if change == 'none' else gh_prs.ExactPRState.UNKNOWN)
+    if change == 'sha':
+        assert outcome.observed_head_sha == 'b' * 40

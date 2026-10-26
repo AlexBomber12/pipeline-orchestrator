@@ -1444,8 +1444,17 @@ class PipelineRunner(
             or len(ref) <= len("refs/heads/")
         ):
             return None, reason or "publication identity unavailable or mismatched"
+        attempt = self.state.publication_attempt
+        bound_attempt = bool(
+            attempt is not None and attempt.contract_version == 2 and attempt.verified
+            and self._publication_attempt_matches_dispatch()
+            and (attempt.repo, attempt.pr_number, attempt.branch, attempt.expected_head_sha)
+            == (reported_repo, pr_number, ref.removeprefix("refs/heads/"), head_sha)
+            and observed_at >= attempt.started_at
+        )
         if (
             self._publication_recovery_cutoff_at is not None
+            and not bound_attempt
             and observed_at <= self._publication_recovery_cutoff_at
             and not (
                 prior_identity is not None
@@ -4111,6 +4120,15 @@ class PipelineRunner(
             and self.state.merge_phase in {"merging", "post_merge_cleanup"}
         ):
             await self.handle_merge()
+            await self.publish_state()
+            return
+
+        # Publication continuation precedes generic ERROR diagnosis and transient
+        # state resets, independent of the selected error-policy feature flags.
+        attempt = self.state.publication_attempt
+        if (attempt is not None and attempt.pending and attempt.contract_version == 2
+            and attempt.exit_classification == "success"):
+            await self._hold_unresolved_publication()
             await self.publish_state()
             return
 

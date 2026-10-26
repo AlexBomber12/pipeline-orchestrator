@@ -157,6 +157,11 @@ class HungMixin:
             ).stdout.strip() or None
         except Exception:
             head_sha = None
+        attempt = self.state.publication_attempt
+        if (attempt is not None and attempt.contract_version == 2 and attempt.pending
+            and attempt.verified and attempt.pr_number == pr_number
+            and self._publication_attempt_matches_dispatch()):
+            head_sha = attempt.expected_head_sha
         task = self.state.current_task
         generation = ""
         if task is not None and task.task_file:

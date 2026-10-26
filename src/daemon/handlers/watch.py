@@ -1355,6 +1355,10 @@ class WatchMixin:
                 attempt.exit_classification is None or not attempt.verified
                 or attempt.unverified_head_sha is not None
                 or attempt.head_sha != getattr(found, "head_sha", None)
+                or (attempt.contract_version == 2 and (
+                    not attempt.cleanup_confirmed or attempt.failure
+                    or attempt.exit_classification != "success"
+                ))
             ):
                 await self._transition_to_error(
                     "Terminal PR publication is unverified; operator Retry recovery required",

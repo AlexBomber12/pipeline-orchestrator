@@ -652,6 +652,12 @@ class RecoveryMixin:
         ):
             self._publication_recovery_cutoff_at = datetime.now(timezone.utc)
         self._cleanup_expected_branch()
+        if not await self._hydrate_current_task_from_persisted_state():
+            return False
+        attempt = self.state.publication_attempt
+        if (attempt is not None and attempt.pending and attempt.contract_version == 2):
+            await self._hold_unresolved_publication()
+            return True
         return await self._recover_state_headers()
 
     async def _hydrate_current_task_from_persisted_state(self) -> bool:
@@ -721,6 +727,12 @@ class RecoveryMixin:
                 self.state.current_pr = None
             self.state.user_paused = persisted.user_paused
             self.state.rate_limited_until = persisted.rate_limited_until
+            if persisted.publication_attempt.contract_version == 2:
+                for field in (
+                    "review_request_pr", "review_request_head", "review_request_task",
+                    "review_request_generation", "review_requested_at", "review_post_attempted_at",
+                ):
+                    setattr(self.state, field, getattr(persisted, field))
             if persisted.state == PipelineState.PAUSED:
                 self.state.state = PipelineState.PAUSED
             if (self._publication_attempt_matches_dispatch()

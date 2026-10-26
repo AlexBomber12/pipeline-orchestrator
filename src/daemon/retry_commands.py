@@ -539,6 +539,11 @@ class RetryCommandMixin:
                 return await self._defer_retry_command(command, f"Merge accounting Retry proof unavailable: {exc}.")
             return "merge", pr
         attempt = self.state.publication_attempt
+        if (attempt is not None and attempt.pending and attempt.contract_version == 2
+            and not attempt.cleanup_confirmed):
+            return await self._defer_retry_command(
+                command, "Prior invocation process cleanup is unconfirmed; publication cannot authorize Retry.",
+            )
         resolved = False
         if attempt is not None and attempt.pending:
             resolved = await self._resolve_published_attempt()
