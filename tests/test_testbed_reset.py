@@ -15,6 +15,7 @@ import importlib
 import subprocess
 import sys
 import types
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -546,6 +547,8 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
             patch.object(e2e_conftest, "reset_testbed_full", side_effect=reset_full),
             patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=clear_redis),
             patch.object(e2e_conftest.subprocess, "run", side_effect=service_command),
+            patch.object(e2e_conftest, "_wait_for_fresh_idle",
+                         side_effect=lambda slug, **kwargs: calls.append(f"ready:{slug}")),
         ):
             fixture = e2e_conftest.reset_testbed.__wrapped__()
             next(fixture)
@@ -561,6 +564,7 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
         f"clear:{e2e_conftest.TESTBED_SLUG}",
         "service:start",
         f"resume:{e2e_conftest.TESTBED_SLUG}",
+        f"ready:{e2e_conftest.TESTBED_SLUG}",
         f"clear:{e2e_conftest.TESTBED_SLUG}",
     ]
 
@@ -604,7 +608,7 @@ def test_reset_testbed_fixture_resumes_when_stop_wait_fails() -> None:
     assert excinfo.value.__notes__ == ["resume failed after reset setup error: resume failed"]
 
 
-@pytest.mark.parametrize("failure", ["stop", "reset", "clear", "start"])
+@pytest.mark.parametrize("failure", ["stop", "reset", "clear", "start", "ready"])
 def test_reset_fixture_does_not_run_with_partial_reset(failure: str) -> None:
     module_name = "tests.e2e.conftest"
     calls = []
@@ -628,6 +632,7 @@ def test_reset_fixture_does_not_run_with_partial_reset(failure: str) -> None:
             patch.object(module, "reset_testbed_full", side_effect=lambda _: stage("reset")),
             patch.object(module, "clear_testbed_redis_state", side_effect=lambda _: stage("clear")),
             patch.object(module, "_resume_daemon", side_effect=lambda _: stage("resume")),
+            patch.object(module, "_wait_for_fresh_idle", side_effect=lambda *a, **kw: stage("ready")),
         ):
             fixture = module.reset_testbed.__wrapped__()
             with pytest.raises(RuntimeError, match=f"{failure} unavailable"):
@@ -639,8 +644,70 @@ def test_reset_fixture_does_not_run_with_partial_reset(failure: str) -> None:
         "reset": ["paused", "stop", "reset", "start", "resume"],
         "clear": ["paused", "stop", "reset", "clear", "start", "resume"],
         "start": ["paused", "stop", "reset", "clear", "start"],
+        "ready": ["paused", "stop", "reset", "clear", "start", "resume", "ready"],
     }
     assert calls == expected[failure]
+
+
+def test_fresh_idle_wait_rejects_control_snapshot_and_unready_runner() -> None:
+    module_name = "tests.e2e.conftest"
+    after = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    fresh = {"name": "slug", "state": "IDLE", "user_paused": False,
+             "current_task": None, "current_pr": None,
+             "last_updated": (after + timedelta(seconds=1)).isoformat()}
+    snapshots = [
+        {**fresh, "last_updated": after.isoformat()},
+        {**fresh, "last_updated": (after - timedelta(seconds=1)).isoformat()},
+        {**fresh, "state": "CODING"},
+        {**fresh, "user_paused": True},
+        {**fresh, "current_task": {"pr_id": "PR-001"}},
+        {**fresh, "current_pr": {"number": 1}},
+        {**fresh, "last_updated": "invalid"},
+        {**fresh, "last_updated": "2026-01-01T00:00:01"},
+        {**fresh, "last_updated": None},
+        fresh,
+    ]
+    class Response:
+        def __init__(self, row):
+            self.row = row
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def read(self, *args):
+            import json
+            return json.dumps({"states": [self.row]}).encode()
+    responses = [Response(row) for row in snapshots]
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            module = importlib.import_module(module_name)
+        with (
+            patch.object(module.urllib.request, "urlopen", side_effect=responses) as read,
+            patch.object(module.time, "sleep") as sleep,
+        ):
+            module._wait_for_fresh_idle("slug", after=after, timeout_sec=1)
+        assert read.call_count == len(snapshots)
+        assert sleep.call_count == len(snapshots) - 1
+    finally:
+        sys.modules.pop(module_name, None)
+
+
+def test_fresh_idle_wait_times_out_on_unavailable_daemon() -> None:
+    module_name = "tests.e2e.conftest"
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            module = importlib.import_module(module_name)
+        with (
+            patch.object(module.urllib.request, "urlopen", side_effect=module.urllib.error.URLError("not ready")),
+            patch.object(module.time, "monotonic", side_effect=[0, 0, 2]),
+            patch.object(module.time, "sleep"),
+        ):
+            with pytest.raises(RuntimeError, match="fresh IDLE"):
+                module._wait_for_fresh_idle("slug", after=datetime.now(timezone.utc), timeout_sec=1)
+    finally:
+        sys.modules.pop(module_name, None)
 
 
 def test_shared_config_fixture_resets_testbed_after_dispatch() -> None:
