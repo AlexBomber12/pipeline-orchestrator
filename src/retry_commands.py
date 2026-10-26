@@ -18,13 +18,14 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-from src.cancellation import retry_count_key
+from src.cancellation import CancellationCause, retry_count_key
 from src.keyspace import (
     retry_command,
     retry_command_dedupe,
     retry_command_latest,
     retry_command_pending,
 )
+from src.models import QueueTask, RepoState
 
 COMMAND_TTL_SECONDS = 90 * 24 * 3600
 RETRY_COUNT_TTL_SECONDS = 30 * 24 * 3600
@@ -104,6 +105,49 @@ class RetryCapReached(RuntimeError):
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def relevant_retry_pr(state: RepoState | None, task: QueueTask) -> Any | None:
+    if state is None or state.current_pr is None:
+        return None
+    current_pr = state.current_pr
+    current_task_id = state.current_task.pr_id if state.current_task is not None else None
+    if current_task_id == task.pr_id:
+        return current_pr
+    if current_pr.pr_id == task.pr_id:
+        return current_pr
+    if task.branch and current_pr.branch == task.branch:
+        return current_pr
+    return None
+
+
+def retry_failure_identity(
+    task: QueueTask,
+    state: RepoState | None,
+    cause: CancellationCause | None,
+) -> str:
+    if cause is not None:
+        raw = cause.to_redis()
+    else:
+        relevant_pr = relevant_retry_pr(state, task)
+        raw = json.dumps(
+            {
+                "error_message": (
+                    state.error_message
+                    if state is not None
+                    and state.current_task is not None
+                    and state.current_task.pr_id == task.pr_id
+                    else None
+                ),
+                "pr_head_sha": relevant_pr.head_sha if relevant_pr is not None else None,
+                "pr_number": relevant_pr.number if relevant_pr is not None else None,
+                "status": task.status.value,
+                "task_id": task.pr_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def retry_request_binding(

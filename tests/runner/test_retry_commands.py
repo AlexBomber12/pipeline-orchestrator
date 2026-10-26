@@ -39,6 +39,7 @@ from src.retry_commands import (
     enqueue_retry_command,
     load_retry_command,
     new_retry_command,
+    retry_failure_identity,
 )
 from src.subsource_registry import SuppressionReason
 from src.suppression import SuppressionRecord
@@ -73,6 +74,9 @@ def _command(
     branch: str = "fix/pr-42",
     bound_pr: PRInfo | None = None,
 ):
+    task = QueueTask(pr_id=task_id, title="Retry", status=TaskStatus.ERROR)
+    state = RepoState(name="octo__demo", url="https://github.com/octo/demo",
+                      current_task=task, current_pr=bound_pr, error_message="prior failure")
     return new_retry_command(
         repo_slug="octo__demo",
         task_id=task_id,
@@ -80,10 +84,8 @@ def _command(
         task_branch=branch,
         task_fingerprint=task_spec_content_hash(text),
         request_binding="b" * 64,
-        failure_id="f" * 64,
+        failure_id=retry_failure_identity(task, state, None),
         retry_cap=3,
-        failure_subsource="crash",
-        failure_created_at=NOW.isoformat(),
         bound_pr_number=bound_pr.number if bound_pr else None,
         bound_pr_branch=bound_pr.branch if bound_pr else None,
         bound_pr_head_sha=bound_pr.head_sha if bound_pr else None,
@@ -117,6 +119,11 @@ async def _prepared_runner(
     runner.state.current_queue = [task]
     runner.state.error_message = "prior failure"
     command = command or _command(text)
+    if command.bound_pr_number is not None:
+        runner.state.current_pr = PRInfo(
+            number=command.bound_pr_number, branch=command.bound_pr_branch,
+            pr_id=command.task_id, head_sha=command.bound_pr_head_sha,
+        )
     await enqueue_retry_command(runner.redis, command)
     return runner, command, task, repo
 
@@ -683,6 +690,11 @@ async def test_coding_retry_applies_once_and_clears_only_task_local_state(
         category="ERROR",
         payload={"subsource": "crash"},
     ).to_redis()
+    command.failure_id = retry_failure_identity(
+        runner.state.current_task, runner.state,
+        CancellationCause.from_redis(runner.redis.store[cause_key(runner.name, command.task_id)]),
+    )
+    runner.redis.store[retry_command(runner.name, command.command_id)] = command.model_dump_json()
     runner.redis.store[f"diagnose_exhausted:{runner.name}:{command.task_id}"] = "1"
     runner.redis.store["error_rate_events"] = "global-history-must-survive"
     runner._crashed_task_pr_ids.add(command.task_id)
@@ -1437,6 +1449,10 @@ async def test_deferred_retry_allows_active_watch_and_later_resumes_once(
         branch=retry_branch,
         bound_pr=retry_pr,
     )
+    cause = CancellationCause(category="ERROR", payload={"subsource": "crash"})
+    command.failure_id = retry_failure_identity(
+        QueueTask(pr_id=retry_task_id, title="Retry", status=TaskStatus.ERROR), None, cause
+    )
     runner = h._make_runner()
     repo = tmp_path / "repo"
     task_path = repo / command.task_file
@@ -1469,6 +1485,7 @@ async def test_deferred_retry_allows_active_watch_and_later_resumes_once(
     runner.state.current_pr = active_pr
     runner._last_push_at = datetime.now(timezone.utc) - timedelta(minutes=10)
     runner._last_push_at_pr_number = active_pr.number
+    runner.redis.store[cause_key(runner.name, retry_task_id)] = cause.to_redis()
     await enqueue_retry_command(runner.redis, command)
 
     monkeypatch.setattr(runner, "ensure_repo_cloned", _async_value(None))
@@ -1794,3 +1811,176 @@ async def test_retry_does_not_rebind_retained_work_to_a_different_command(
     assert stored.status == RetryCommandStatus.FAILED
     assert attempt.pending
     assert runner.state.current_pr.number == 42
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["cause", "message", "state", "pr", "storage"])
+async def test_delayed_retry_preserves_new_failure_without_reserving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    runner, command, task, repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    original = (repo / command.task_file).read_bytes()
+    if change == "cause":
+        cause = CancellationCause(category="ERROR", payload={"subsource": "crash", "run_id": "new"})
+        runner.redis.store[cause_key(runner.name, task.pr_id)] = cause.to_redis()
+    elif change == "message":
+        runner.state.error_message = "a newer failure"
+    elif change == "state":
+        runner.state.state = PipelineState.CODING
+    elif change == "pr":
+        runner.state.current_pr = PRInfo(number=99, branch=task.branch, pr_id=task.pr_id)
+    else:
+        async def unavailable(*args, **kwargs):
+            raise RuntimeError("failure storage unavailable")
+        monkeypatch.setattr(retry_module, "get_cancellation_cause", unavailable)
+    before = runner.state.model_copy(deep=True)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == (RetryCommandStatus.DEFERRED if change == "storage" else RetryCommandStatus.FAILED)
+    assert stored.retry_count is None
+    assert stored.effect_stage == RetryEffectStage.NONE
+    assert runner.state.model_dump(exclude={"history"}) == before.model_dump(exclude={"history"})
+    assert (repo / command.task_file).read_bytes() == original
+    if change == "cause":
+        assert runner.redis.store[cause_key(runner.name, task.pr_id)] == cause.to_redis()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", [
+    RetryEffectStage.RETRY_RESERVED, RetryEffectStage.STATUS_COMMITTED, RetryEffectStage.APPLIED,
+])
+async def test_new_cause_is_stale_even_after_retry_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: RetryEffectStage,
+) -> None:
+    runner, command, task, _repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    command.effect_stage = stage
+    command.retry_count = 1
+    runner.redis.store[retry_command(runner.name, command.command_id)] = command.model_dump_json()
+    cause = CancellationCause(category="ERROR", payload={"subsource": "crash", "run_id": "new"})
+    runner.redis.store[cause_key(runner.name, task.pr_id)] = cause.to_redis()
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.FAILED
+    assert stored.retry_count == 1
+    assert runner.redis.store[cause_key(runner.name, task.pr_id)] == cause.to_redis()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold", ["other_coder", "pause", "cleanup", "storage"])
+async def test_owned_pr_retry_scopes_inhibitors_and_preserves_repo_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hold: str,
+) -> None:
+    pr = PRInfo(number=42, branch="fix/pr-42", pr_id="PR-42", head_sha="abc")
+    runner, command, _task, _repo = await _prepared_runner(
+        tmp_path, command=_command(_task_text(), bound_pr=pr),
+    )
+    _allow_validation(monkeypatch, runner, _task_text())
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *args: [pr])
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
+    runner.state.rate_limited_coder_until = {"claude": datetime.now(timezone.utc) + timedelta(hours=1)}
+    runner.app_config.daemon.spend_ceiling_session_percent = 80
+    runner.state.usage_session_percent = 100
+    if hold == "pause":
+        runner.state.user_paused = True
+    elif hold == "cleanup":
+        monkeypatch.setattr(runner, "_hold_for_coder_cleanup", _async_value(True))
+    elif hold == "storage":
+        async def unavailable(*args, **kwargs):
+            raise RuntimeError("storage unavailable")
+        monkeypatch.setattr(retry_module, "derive_active_inhibitors", unavailable)
+    outcome = await runner._consume_retry_command()
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    if hold == "other_coder":
+        assert outcome == RetryDispatch.WATCH
+        assert stored.status == RetryCommandStatus.APPLIED
+        assert stored.retry_count == 1
+        assert runner.state.current_pr.number == pr.number
+    else:
+        assert outcome == RetryDispatch.HANDLED
+        assert stored.status == RetryCommandStatus.DEFERRED
+        assert stored.retry_count is None
+
+
+@pytest.mark.asyncio
+async def test_coding_retry_only_checks_selected_coder_inhibitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, command, task, _repo = await _prepared_runner(tmp_path)
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", _async_value(None))
+    monkeypatch.setattr(retry_module, "resolve_active_coder", lambda *args, **kwargs:
+                        SimpleNamespace(name="codex", plugin=object()))
+    monkeypatch.setattr(runner, "usage_gate", _async_value(True))
+    header = SimpleNamespace(coder="codex")
+    runner.app_config.daemon.spend_ceiling_session_percent = 80
+    runner.state.usage_session_percent = 100
+    runner.state.rate_limited_coder_until = {"claude": datetime.now(timezone.utc) + timedelta(hours=1)}
+    assert isinstance(await runner._ensure_retry_coder_available(command, header, task), tuple)
+    runner.state.rate_limited_coder_until["codex"] = datetime.now(timezone.utc) + timedelta(hours=1)
+    assert await runner._ensure_retry_coder_available(command, header, task) == RetryDispatch.HANDLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["pr", "status"])
+async def test_same_cause_does_not_override_changed_pr_or_terminal_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    runner, command, task, repo = await _prepared_runner(tmp_path)
+    cause = CancellationCause(category="ERROR", payload={"subsource": "crash"})
+    command.failure_id = retry_failure_identity(task, runner.state, cause)
+    runner.redis.store[cause_key(runner.name, task.pr_id)] = cause.to_redis()
+    runner.redis.store[retry_command(runner.name, command.command_id)] = command.model_dump_json()
+    text = _task_text()
+    if change == "pr":
+        runner.state.current_pr = PRInfo(number=99, branch=task.branch, pr_id=task.pr_id)
+    else:
+        text = text.replace("status: ERROR", "status: DONE").replace("blocked_reason: daemon\n", "")
+        (repo / command.task_file).write_text(text)
+    _allow_validation(monkeypatch, runner, text)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.FAILED
+    assert "stale" in stored.outcome_reason
+    assert stored.retry_count is None
+
+
+@pytest.mark.asyncio
+async def test_retry_restart_after_cleanup_deferral_keeps_one_allowance_and_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = PRInfo(number=42, branch="fix/pr-42", pr_id="PR-42", head_sha="abc")
+    runner, command, _task, _repo = await _prepared_runner(
+        tmp_path, command=_command(_task_text(), bound_pr=pr),
+    )
+    commits = []
+
+    async def commit(*args, **kwargs):
+        commits.append(args[1])
+        return True
+
+    async def cleanup_failure(*args):
+        raise RuntimeError("cleanup store unavailable")
+
+    _allow_validation(monkeypatch, runner, _task_text())
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *args: [pr])
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit)
+    monkeypatch.setattr(runner, "_clear_retry_failure_evidence", cleanup_failure)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    deferred = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert deferred.effect_stage == RetryEffectStage.STATUS_COMMITTED
+    assert deferred.retry_count == 1
+
+    restarted = h._make_runner()
+    restarted.redis, restarted.repo_path = runner.redis, runner.repo_path
+    restarted.state = RepoState.model_validate_json(runner.state.model_dump_json())
+    _allow_validation(monkeypatch, restarted, _task_text())
+    monkeypatch.setattr(restarted, "_commit_task_status_change", commit)
+    assert await restarted._consume_retry_command() == RetryDispatch.WATCH
+    stored = await load_retry_command(restarted.redis, restarted.name, command.command_id)
+    assert stored.command_id == command.command_id
+    assert stored.request_binding == command.request_binding
+    assert stored.status == RetryCommandStatus.APPLIED
+    assert stored.retry_count == 1
+    assert commits == ["TODO"]
+    assert restarted.redis.store[f"metrics:retry_count:{runner.name}:{command.task_id}"] == "1"

@@ -801,3 +801,39 @@ def test_retry_receipt_requires_exact_stored_target(tmp_path, monkeypatch, field
         before = dict(redis_client.store)
         assert client.post(url, data={"retry_binding": binding}).status_code == 409
         assert redis_client.store == before
+
+
+def test_delayed_web_retry_returns_same_final_stale_command_on_replay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    task_path, redis_client = _setup_retry(tmp_path, monkeypatch, retry_count=1)
+    with TestClient(app) as client:
+        binding = _rendered_binding(client)
+        assert client.post(
+            "/repos/example__alpha/tasks/PR-283/retry", data={"retry_binding": binding},
+        ).status_code == 202
+        accepted = asyncio.run(load_latest_retry_command(redis_client, "example__alpha", "PR-283"))
+        cause = CancellationCause(category="ERROR", payload={"subsource": "crash", "run_id": "newer"})
+        redis_client.store[cause_key("example__alpha", "PR-283")] = cause.to_redis()
+        runner = runner_helpers._make_runner()
+        runner.name, runner.owner_repo = "example__alpha", "example/alpha"
+        runner.redis = redis_client
+        runner.repo_path = str(task_path.parents[1])
+        runner.state = RepoState.model_validate_json(redis_client.store["pipeline:example__alpha"])
+        monkeypatch.setattr(runner, "_retry_worktree_dirty", lambda: (False, ""))
+        monkeypatch.setattr(runner, "_origin_retry_task_text", lambda command: task_path.read_text())
+        asyncio.run(runner._consume_retry_command())
+        final = asyncio.run(load_latest_retry_command(redis_client, "example__alpha", "PR-283"))
+        assert final.command_id == accepted.command_id
+        assert final.status == RetryCommandStatus.FAILED
+        assert "stale" in final.outcome_reason
+        response = client.post(
+            "/repos/example__alpha/tasks/PR-283/retry", data={"retry_binding": binding},
+        )
+        assert response.status_code == 202
+        assert final.command_id in response.text
+        assert final.outcome_reason in response.text
+        replay = asyncio.run(load_latest_retry_command(redis_client, "example__alpha", "PR-283"))
+        assert replay == final
+        assert redis_client.store["metrics:retry_count:example__alpha:PR-283"] == "1"
+        assert redis_client.store[cause_key("example__alpha", "PR-283")] == cause.to_redis()

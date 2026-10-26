@@ -34,7 +34,9 @@ from src.retry_commands import (
     RetryExecutionState,
     claim_retry_command,
     list_pending_retry_commands,
+    relevant_retry_pr,
     reserve_retry_attempt,
+    retry_failure_identity,
     update_retry_command,
 )
 from src.subsource_registry import SuppressionReason
@@ -451,11 +453,60 @@ class RetryCommandMixin:
             branch=header.branch,
             priority=header.priority,
         )
+        try:
+            cause = await get_cancellation_cause(
+                self.redis, self.name, command.task_id, refresh_ttl=False
+            )
+        except Exception as exc:
+            return await self._defer_retry_command(
+                command, f"Cannot verify current Retry failure binding: {exc}."
+            )
+        # After our status/cleanup checkpoint, missing evidence can be our own
+        # effect. A present cause must still identify the original failure.
+        before_cleanup = command.effect_stage in {
+            RetryEffectStage.NONE, RetryEffectStage.RETRY_RESERVED,
+        }
+        if cause is not None or before_cleanup:
+            bound_task = next(
+                (item for item in self.state.current_queue or [] if item.pr_id == task.pr_id),
+                task,
+            )
+            if retry_failure_identity(bound_task, self.state, cause) != command.failure_id:
+                return await self._fail_retry_command(
+                    command, "Retry is stale: current failure identity changed."
+                )
+        if command.effect_stage == RetryEffectStage.NONE:
+            snapshot_error = any(
+                item.pr_id == task.pr_id and item.status in {TaskStatus.ERROR, TaskStatus.TODO}
+                for item in self.state.current_queue or []
+            )
+            if (
+                header.frontmatter_status not in {"error", "todo"}
+                and (header.frontmatter_status is not None or not snapshot_error)
+            ) or (
+                active_task is not None and active_task.pr_id == task.pr_id
+                and self.state.state in _ACTIVE_TASK_STATES
+            ):
+                return await self._fail_retry_command(
+                    command, "Retry is stale: task is no longer in its failed state."
+                )
+            pr = relevant_retry_pr(self.state, task)
+            if pr is not None and (pr.number, pr.branch, pr.head_sha) != (
+                command.bound_pr_number, command.bound_pr_branch,
+                command.bound_pr_head_sha,
+            ):
+                return await self._fail_retry_command(
+                    command, "Retry is stale: current attempt/PR binding changed."
+                )
         return header, task
 
     async def _retry_blocker(
-        self, command: RetryCommand
+        self, command: RetryCommand, continuation: str = "coding", coder: str | None = None
     ) -> RetryDispatch | None:
+        if await self._hold_for_coder_cleanup():
+            return await self._defer_retry_command(
+                command, "Coder cleanup ownership is unresolved."
+            )
         try:
             record = await self._suppression_record_for_task(command.task_id)
         except Exception as exc:
@@ -478,10 +529,18 @@ class RetryCommandMixin:
             return await self._defer_retry_command(
                 command, f"Cannot evaluate active inhibitors: {exc}."
             )
+        # The aggregate spend display can belong to a different credential.
+        # CODING checks the selected coder's quota through usage_gate below;
+        # observing an owned PR consumes no coder quota.
         blocking = [
             inhibitor
             for inhibitor in inhibitors
-            if inhibitor.inhibitor_type != InhibitorType.GITHUB_BUDGET_SLOWDOWN
+            if inhibitor.inhibitor_type not in {
+                InhibitorType.GITHUB_BUDGET_SLOWDOWN, InhibitorType.SPEND_CEILING,
+            }
+            and (not inhibitor.is_per_coder() or (
+                continuation == "coding" and inhibitor.coder_affected == coder
+            ))
         ]
         if blocking:
             details = ", ".join(
@@ -673,6 +732,9 @@ class RetryCommandMixin:
             return await self._defer_retry_command(
                 command, "No authenticated, enabled coder is currently available."
             )
+        blocker = await self._retry_blocker(command, "coding", resolution.name)
+        if blocker is not None:
+            return blocker
         if not await self.usage_gate(proactive_coder=resolution.name):
             return await self._defer_retry_command(
                 command,
@@ -806,13 +868,14 @@ class RetryCommandMixin:
             return validated
         header, task = validated
 
-        blocker = await self._retry_blocker(command)
-        if blocker is not None:
-            return blocker
         continuation = await self._select_retry_continuation(command)
         if isinstance(continuation, RetryDispatch):
             return continuation
         continuation_name, pr = continuation
+
+        blocker = await self._retry_blocker(command, continuation_name)
+        if blocker is not None:
+            return blocker
 
         if continuation_name == "watch":
             assert pr is not None
@@ -980,13 +1043,14 @@ class RetryCommandMixin:
         if isinstance(validated, RetryDispatch):
             return validated
         header, task = validated
-        blocker = await self._retry_blocker(command)
-        if blocker is not None:
-            return blocker
         continuation = await self._select_retry_continuation(command)
         if isinstance(continuation, RetryDispatch):
             return continuation
         continuation_name, pr = continuation
+
+        blocker = await self._retry_blocker(command, continuation_name)
+        if blocker is not None:
+            return blocker
 
         if continuation_name == "merge":
             try:

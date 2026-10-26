@@ -9,7 +9,6 @@ reads-only paths (rendering, JSON status, partials) live in
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import inspect
 import json
 import re
@@ -62,12 +61,19 @@ from src.queue_parser import (
     write_frontmatter_status,
 )
 from src.retry_commands import (
+    RetryCommand,
     RetryCommandStatus,
     enqueue_retry_command,
     load_latest_retry_command,
     load_retry_command_for_binding,
     new_retry_command,
     retry_request_binding,
+)
+from src.retry_commands import (
+    relevant_retry_pr as _relevant_retry_pr,
+)
+from src.retry_commands import (
+    retry_failure_identity as _retry_failure_identity,
 )
 from src.subsource_registry import SuppressionReason
 from src.suppression.redis_store import RedisSuppressionStore
@@ -706,49 +712,6 @@ async def _repo_state_for_retry(
         return None
 
 
-def _relevant_retry_pr(state: RepoState | None, task: QueueTask) -> Any | None:
-    if state is None or state.current_pr is None:
-        return None
-    current_pr = state.current_pr
-    current_task_id = state.current_task.pr_id if state.current_task is not None else None
-    if current_task_id == task.pr_id:
-        return current_pr
-    if current_pr.pr_id == task.pr_id:
-        return current_pr
-    if task.branch and current_pr.branch == task.branch:
-        return current_pr
-    return None
-
-
-def _retry_failure_identity(
-    task: QueueTask,
-    state: RepoState | None,
-    cause: CancellationCause | None,
-) -> str:
-    if cause is not None:
-        raw = cause.to_redis()
-    else:
-        relevant_pr = _relevant_retry_pr(state, task)
-        raw = json.dumps(
-            {
-                "error_message": (
-                    state.error_message
-                    if state is not None
-                    and state.current_task is not None
-                    and state.current_task.pr_id == task.pr_id
-                    else None
-                ),
-                "pr_head_sha": relevant_pr.head_sha if relevant_pr is not None else None,
-                "pr_number": relevant_pr.number if relevant_pr is not None else None,
-                "status": task.status.value,
-                "task_id": task.pr_id,
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
 async def _retry_binding_context(
     redis_client: aioredis.Redis,
     repo_slug: str,
@@ -1151,6 +1114,7 @@ async def _build_tasks_panel_context(
     *,
     redis_client: aioredis.Redis | None,
     retry_cap: int,
+    retry_receipt: RetryCommand | None = None,
 ) -> dict[str, object]:
     # Recovery may park before publishing a queue. Keep the failed task's
     # existing Retry action available independently of that projection.
@@ -1218,6 +1182,11 @@ async def _build_tasks_panel_context(
         "done": await _views_for(TaskStatus.DONE),
         "error": await _views_for(TaskStatus.ERROR),
     }
+    if retry_receipt is not None:
+        for views in grouped.values():
+            for view in views:
+                if view["pr_id"] == retry_receipt.task_id:
+                    view["retry_command"] = retry_receipt.model_dump(mode="json")
     has_pending_retry = any(
         task.get("retry_command") is not None
         and (
@@ -1923,6 +1892,7 @@ async def retry_repo_task(
                 tasks,
                 redis_client=redis_client,
                 retry_cap=cap,
+                retry_receipt=existing,
             ),
             status_code=202,
         )
