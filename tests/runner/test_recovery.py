@@ -3020,6 +3020,51 @@ def test_header_merge_recovery_prioritizes_unfinished_attempt(
     assert runner._current_run_record is None
 
 
+@pytest.mark.parametrize("mode", ["missing", "incomplete", "status-incomplete", "passing"])
+@pytest.mark.parametrize("changed_sha", [False, True])
+def test_restart_rehydrates_required_ci_for_exact_head(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, ci_policy_transport: dict,
+    mode: str, changed_sha: bool,
+) -> None:
+    """Persisted SUCCESS is never used in place of current policy evidence."""
+    from src.github import checks
+    from src.models import CIStatus
+
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner(required_checks=["unit", "integration"])
+    runner.repo_path = str(tmp_path)
+    task = QueueTask(pr_id="PR-404", title="CI policy", status=TaskStatus.DOING,
+                     branch="pr-404", task_file="tasks/PR-404.md")
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_task = task
+    runner.state.current_pr = PRInfo(number=404, branch="pr-404", pr_id="PR-404",
+                                   head_sha="a" * 40, ci_status=CIStatus.SUCCESS)
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
+    ci_policy_transport.update(mode=mode, sha=("b" if changed_sha else "a") * 40)
+    restarted = h._make_runner(required_checks=["unit", "integration"])
+    restarted.repo_path = str(tmp_path)
+    restarted.redis = runner.redis
+    monkeypatch.setattr(restarted, "_parse_tasks_from_headers", lambda: [task])
+    assert asyncio.run(restarted.recover_state()) is True
+    assert restarted.state.state == PipelineState.WATCH
+    found = restarted.state.current_pr
+    assert found.head_sha == ci_policy_transport["sha"]
+    expected = CIStatus.SUCCESS if mode == "passing" else CIStatus.PENDING
+    assert found.ci_status == expected
+    # Persist and restart again on the same SHA, retaining incomplete cache metadata.
+    asyncio.run(restarted.redis.set(pipeline_state(restarted.name), restarted.state.model_dump_json()))
+    again = h._make_runner(required_checks=["unit", "integration"])
+    again.repo_path = str(tmp_path)
+    again.redis = restarted.redis
+    monkeypatch.setattr(again, "_parse_tasks_from_headers", lambda: [task])
+    assert asyncio.run(again.recover_state()) is True
+    assert again.state.current_pr.ci_status == expected
+    assert again.state.current_pr.head_sha == found.head_sha
+    retrieval = checks._retrieve_ci_status_evidence(again.owner_repo, found.head_sha)
+    assert retrieval.evidence.sources_complete == (mode in {"missing", "passing"})
+    assert ci_policy_transport["reads"] == (2 if mode == "incomplete" else 1)
+
+
 @pytest.mark.parametrize(
     "case",
     ["success", "success_live", "success_live_stale_startup",
@@ -3404,3 +3449,43 @@ def test_live_obsolete_ci_recovery_defers_provider_outage(
     asyncio.run(runner._handle_single_error_exit())
     assert runner.state.state == PipelineState.ERROR
     assert any("Obsolete CI observation deferred" in e["event"] for e in runner.state.history)
+
+
+@pytest.mark.parametrize("mode", ["missing", "incomplete", "status-incomplete", "passing"])
+def test_migration_refresh_uses_required_ci_policy(
+    monkeypatch: pytest.MonkeyPatch, ci_policy_transport: dict, mode: str,
+) -> None:
+    from src.models import CIStatus
+
+    ci_policy_transport["mode"] = mode
+    runner = h._make_runner(required_checks=["unit", "integration"])
+    head = ci_policy_transport["sha"]
+    evidence = gh_prs.get_pr_head_publication(runner.owner_repo, 404, expected_head_sha=head)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=404, branch="pr-404", head_sha=head,
+                                   ci_status=CIStatus.SUCCESS)
+    runner.state.publication_migration = recovery_module.PublicationMigration(
+        repo=runner.owner_repo, pr_number=404, head_repo=runner.owner_repo,
+        ref="refs/heads/pr-404", head_sha=head, published_at=evidence.published_at,
+        provenance=evidence.provenance, reason="Operator confirmation required.",
+    )
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
+    binding = migration_binding(runner.state.publication_migration)
+    asyncio.run(enqueue_migration(runner.redis, runner.name, binding))
+    read_prs = gh_prs.get_open_prs
+    observed = []
+
+    def read(*args, **kwargs):
+        prs = read_prs(*args, **kwargs)
+        observed.extend(prs)
+        return prs
+
+    monkeypatch.setattr(gh_prs, "get_open_prs", read)
+    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    command = MigrationCommand.model_validate_json(asyncio.run(
+        runner.redis.get(migration_command_key(runner.name, binding)),
+    ))
+    assert command.status == "applied"
+    assert len(observed) == 1
+    assert observed[0].head_sha == head
+    assert observed[0].ci_status == (CIStatus.SUCCESS if mode == "passing" else CIStatus.PENDING)

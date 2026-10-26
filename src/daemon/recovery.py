@@ -337,7 +337,8 @@ class RecoveryMixin:
         else:
             try:
                 prs = gh_prs.get_open_prs(
-                    self.owner_repo, self.repo_config.allow_merge_without_checks
+                    self.owner_repo, self.repo_config.allow_merge_without_checks,
+                    required_checks=self.repo_config.required_checks,
                 )
                 pr = next((item for item in prs if item.number == bound.pr_number), None)
                 if (
@@ -975,6 +976,7 @@ class RecoveryMixin:
             prs = gh_prs.get_open_prs(
                 self.owner_repo,
                 allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                required_checks=self.repo_config.required_checks,
             )
         except Exception as exc:
             await self._transition_to_error(

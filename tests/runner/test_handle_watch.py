@@ -6115,6 +6115,53 @@ def test_recovery_without_usable_floor_holds_historical_approval(
     assert merged == []
 
 
+@pytest.mark.parametrize("mode", ["missing", "incomplete", "status-incomplete", "passing"])
+def test_watch_uses_required_policy_on_current_sha(
+    monkeypatch: pytest.MonkeyPatch, ci_policy_transport: dict, mode: str,
+) -> None:
+    """A prior successful SHA cannot bless missing or partial current checks."""
+    h._patch_subprocess(monkeypatch)
+    ci_policy_transport.update(sha="b" * 40, mode=mode)
+    runner = h._make_runner(required_checks=["unit", "integration"], auto_merge=True)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(
+        number=404, branch="pr-404", head_sha="a" * 40, ci_status=CIStatus.SUCCESS,
+    )
+    runner.handle_merge = AsyncMock()
+    # Publication authorization and diff scanning are independent gates.
+    monkeypatch.setattr(runner, "_validate_publication_observation", lambda *a, **kw: (a[2], None))
+    monkeypatch.setattr(watch_module.guardrails, "_DIFF_PATTERNS", ())
+    asyncio.run(runner.handle_watch())
+    found = runner.state.current_pr
+    assert found.head_sha == "b" * 40
+    assert found.ci_status == (CIStatus.SUCCESS if mode == "passing" else CIStatus.PENDING)
+    # A changed HEAD first holds review; the next exact-HEAD poll can merge.
+    assert runner.handle_merge.await_count == 0
+    asyncio.run(runner.handle_watch())
+    assert runner.handle_merge.await_count == (1 if mode == "passing" else 0)
+    # WATCH's age lookup consumes the same complete/incomplete cached retrieval.
+    assert ci_policy_transport["reads"] == (2 if mode == "incomplete" else 1)
+
+
+@pytest.mark.parametrize("mode", ["missing", "incomplete", "status-incomplete"])
+def test_watch_age_classifier_keeps_required_policy(
+    monkeypatch: pytest.MonkeyPatch, ci_policy_transport: dict, mode: str,
+) -> None:
+    from src.github import checks
+
+    ci_policy_transport["mode"] = mode
+    runner = h._make_runner(required_checks=["unit", "integration"])
+    found = PRInfo(number=404, branch="pr-404", head_sha=ci_policy_transport["sha"])
+    key = checks._pending_tracker_key(runner.owner_repo, 404, found.head_sha)
+    asyncio.run(runner.redis.set(key, "1700000000"))
+    monkeypatch.setattr(checks.time, "time", lambda: 1_700_000_000 + 86400)
+    asyncio.run(runner._maybe_reclassify_stuck_pending(found))
+    assert found.ci_status == CIStatus.PENDING
+    assert not any("stuck_pending" in entry["event"] for entry in runner.state.history)
+    if mode != "missing":
+        assert asyncio.run(runner.redis.get(key)) is None
+
+
 def _lifecycle_watch(monkeypatch, tmp_path, with_check_attempt):
     sha = 'a' * 40
     pr = _patch_infra_failure_pr(monkeypatch, pr_number=19, head_sha=sha)

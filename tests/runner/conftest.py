@@ -65,3 +65,51 @@ def recovery_golden_cases() -> list[tuple[str, dict, dict]]:
         expected = json.loads((scenario_dir / "expected.json").read_text())
         cases.append((scenario_dir.name, before, expected))
     return cases
+
+
+@pytest.fixture
+def ci_policy_transport(monkeypatch: pytest.MonkeyPatch):
+    """Exercise production PR/CI readers with bounded GitHub transport data."""
+    from datetime import datetime, timezone
+
+    from src.github import cache, checks, gh_runner, prs, reviews
+    from src.models import ReviewStatus
+
+    current = {"sha": "a" * 40, "mode": "missing", "reads": 0}
+    checks.clear_ci_status_cache()
+    cache.clear_etag_cache()
+
+    def transport(args, **_kwargs):
+        sha = current["sha"]
+        if args[:2] == ["pr", "list"]:
+            return [{"number": 404, "title": "PR-404: CI policy", "headRefName": "pr-404",
+                     "headRefOid": sha, "commits": [{}], "author": {"login": "author"}}]
+        path = args[1]
+        if "/check-runs?" in path:
+            current["reads"] += 1
+            if "page=2" in path:
+                return {"total_count": 3, "check_runs": []}
+            names = ["unit", "integration"] if current["mode"] != "missing" else ["unit"]
+            runs = [{"id": index, "name": name, "head_sha": sha, "status": "completed",
+                     "conclusion": "success", "app": {"id": 1}}
+                    for index, name in enumerate(names, 1)]
+            total = len(runs) + 1 if current["mode"] == "incomplete" else len(runs)
+            return {"total_count": total, "check_runs": runs}
+        if "/status?" in path:
+            total = 1 if current["mode"] == "status-incomplete" else 0
+            return {"sha": sha, "state": "success", "total_count": total, "statuses": []}
+        raise AssertionError(args)
+
+    def publication(repo, number, *, expected_head_sha):
+        return prs.HeadPublicationEvidence(
+            repo, number, repo, "refs/heads/pr-404", expected_head_sha,
+            datetime(2026, 10, 20, tzinfo=timezone.utc), "github-activity:branch_creation", None,
+        )
+
+    monkeypatch.setattr(gh_runner, "run_gh", transport)
+    monkeypatch.setattr(prs, "get_pr_head_publication", publication)
+    monkeypatch.setattr(prs, "get_pr_state", lambda *_: "OPEN")
+    monkeypatch.setattr(reviews, "get_pr_review_status", lambda *a, **kw: ReviewStatus.APPROVED)
+    yield current
+    checks.clear_ci_status_cache()
+    cache.clear_etag_cache()
