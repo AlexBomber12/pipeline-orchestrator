@@ -1570,7 +1570,7 @@ class FixMixin(BreachMixin):
 
         attempt = self.state.publication_attempt
         if (attempt is not None and attempt.contract_version == 2
-            and attempt.expected_head_sha != attempt.initial_pr_head_sha):
+            and (attempt.expected_head_sha != attempt.initial_pr_head_sha or not attempt.verified)):
             await capture_stop_requested_after_exit()
             if await pause_for_stop_after_bookkeeping():
                 return

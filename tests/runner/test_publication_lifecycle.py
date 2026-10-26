@@ -521,3 +521,52 @@ async def test_retry_cannot_bypass_missing_cleanup_proof(lifecycle, monkeypatch)
     monkeypatch.setattr(runner, '_defer_retry_command', deferred)
     assert await runner._select_retry_continuation(SimpleNamespace(selected_continuation=None)) == 'deferred'
     assert 'cleanup is unconfirmed' in deferred.call_args.args[1]
+
+
+@pytest.mark.parametrize('process_failure', [False, True])
+async def test_post_cleanup_observation_failure_is_distinct_from_process_failure(lifecycle, process_failure):
+    runner, provider, _, _, expected, _ = lifecycle
+    await finish(runner)
+    provider['head'] = expected
+    await runner._post_coder_resolution(
+        'claude', 0, 'Implementation completed.', '', target_branch='pr-001', current_pr_id='PR-001',
+        publication=coding._PublicationResolution(failure=OSError('recheck unavailable'),
+                                                  process_failure=process_failure),
+    )
+    assert runner.state.state == (PipelineState.ERROR if process_failure else PipelineState.WATCH)
+    assert runner.state.publication_attempt.pending is process_failure
+    assert len(provider['requests']) == (0 if process_failure else 1)
+
+
+async def test_daemon_publication_cancel_is_not_implementation_failure(lifecycle):
+    runner, *_ = lifecycle
+    await publication.record_exit(runner, -15, 'Published implementation.', '', publication_cancelled=True)
+    assert runner.state.publication_attempt.exit_classification == 'success'
+    assert not runner.state.publication_attempt.cleanup_confirmed
+
+
+@pytest.mark.parametrize('at_cap', [False, True])
+async def test_delayed_unchanged_fix_accounts_one_no_push_without_review(lifecycle, monkeypatch, at_cap):
+    runner, provider, _, _, expected, configure = lifecycle
+    a = runner.state.publication_attempt
+    a.initial_pr_head_sha = expected
+    a.initial_branch_head_sha = expected
+    a.candidate.head_sha = expected
+    a.candidate.observed_head_shas = {expected}
+    a.candidate.no_push_fix_count = runner.app_config.daemon.fix_no_push_cap - 1 if at_cap else 0
+    await finish(runner)
+    await runner._hold_unresolved_publication()
+    fresh = await restart(runner, configure)
+    cap = AsyncMock()
+    monkeypatch.setattr(fresh, '_escalate_fix_no_push_deadlock', cap)
+    provider['head'] = expected
+    Clock.value += timedelta(seconds=31)
+    await fresh._run_cycle_body()
+    assert not fresh.state.publication_attempt.pending
+    assert fresh.state.current_pr.fix_iteration_count == 3
+    assert fresh.state.current_pr.push_count == 1
+    assert provider['requests'] == []
+    assert cap.await_count == (1 if at_cap else 0)
+    assert fresh.state.current_pr.no_push_fix_count == (runner.app_config.daemon.fix_no_push_cap if at_cap else 1)
+    await fresh._hold_unresolved_publication()
+    assert cap.await_count == (1 if at_cap else 0)

@@ -22,7 +22,9 @@ if TYPE_CHECKING:
     from src.daemon.runner import PipelineRunner
 
 
-async def record_exit(runner: PipelineRunner, code: int, stdout: str, stderr: str) -> None:
+async def record_exit(
+    runner: PipelineRunner, code: int, stdout: str, stderr: str, *, publication_cancelled: bool = False,
+) -> None:
     """Checkpoint invocation outcome before cleanup and terminal bookkeeping."""
     attempt = runner.state.publication_attempt
     if attempt is None or attempt.contract_version != 2:
@@ -35,7 +37,7 @@ async def record_exit(runner: PipelineRunner, code: int, stdout: str, stderr: st
         )
     if attempt.exit_classification is None:
         attempt.exit_classification = (
-            "success" if code == 0 and not scan_stdout(f"{stdout}\n{stderr}")
+            "success" if (code == 0 or publication_cancelled) and not scan_stdout(f"{stdout}\n{stderr}")
             and fix_escalation.parse_escalate_marker(stdout) is None else "failure"
         )
     if attempt.reconcile_deadline is None:
@@ -187,19 +189,22 @@ async def hold(runner: PipelineRunner) -> bool:
         runner.state.review_request_pr = pr.number
         runner.state.review_request_head = pr.head_sha
         runner.state.review_request_task = attempt.task_id
+    is_fix = runner.state.active_invocation.phase == "fix"
+    changed = attempt.expected_head_sha != (attempt.initial_branch_head_sha or attempt.initial_pr_head_sha)
+    needs_review = not is_fix or attempt.expected_head_sha != attempt.initial_pr_head_sha
     if not attempt.push_accounted:
         pr.record_observed_head(attempt.expected_head_sha)
-        if runner.state.active_invocation.phase == "fix":
-            pr.fix_iteration_count = max(
-                pr.fix_iteration_count,
-                attempt.initial_fix_iteration + (
-                    attempt.expected_head_sha != (attempt.initial_branch_head_sha or attempt.initial_pr_head_sha)
-                ),
-            )
-            pr.no_push_fix_count = 0
+        if is_fix:
+            pr.fix_iteration_count = max(pr.fix_iteration_count, attempt.initial_fix_iteration + changed)
+            pr.no_push_fix_count = 0 if changed else pr.no_push_fix_count + 1
         attempt.push_accounted = True
         # Both the counter and its receipt are in the same durable snapshot.
         await runner.publish_state()
+    if is_fix and not changed and pr.no_push_fix_count >= runner.app_config.daemon.fix_no_push_cap:
+        attempt.pending = False
+        await runner.publish_state()
+        await runner._escalate_fix_no_push_deadlock(pr)
+        return True
     runner._rehydrate_last_push_at(pr)
     if not attempt.continuation_saved:
         record = runner._current_run_record
@@ -213,7 +218,7 @@ async def hold(runner: PipelineRunner) -> bool:
         return True
     # A crash after POST but before its checkpoint must query provider history
     # before posting again. Unavailable history cannot authorize a duplicate.
-    if attempt.review_handoff_started:
+    if needs_review and attempt.review_handoff_started:
         try:
             requested_at = gh_comments.latest_codex_review_request_time(
                 attempt.repo, pr.number, after=runner._last_push_at or attempt.started_at,
@@ -226,14 +231,15 @@ async def hold(runner: PipelineRunner) -> bool:
             runner.state.review_request_pr = pr.number
             runner.state.review_request_head = pr.head_sha
             runner.state.review_requested_at = requested_at
-    else:
+    elif needs_review:
         attempt.review_handoff_started = True
         await runner.publish_state()
     await runner._refresh_user_paused_from_redis()
     if runner.state.user_paused or await runner._pop_stop_request():
         await runner.publish_state()
         return True
-    if runner.state.review_requested_at is None and not runner._should_skip_codex_review_post(pr.number):
+    if (needs_review and runner.state.review_requested_at is None
+        and not runner._should_skip_codex_review_post(pr.number)):
         runner._post_codex_review(pr.number)
     attempt.pending = False
     attempt.incident = None

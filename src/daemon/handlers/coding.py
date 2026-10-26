@@ -173,6 +173,7 @@ class _PublicationResolution:
 
     failure: Exception | str | None = None
     cancelled_by_publication: bool = False
+    process_failure: bool = False
 
 
 def _fresh_ready_publication(
@@ -1154,7 +1155,10 @@ class CodingMixin:
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
             try:
                 if result is not None:
-                    await publication_lifecycle.record_exit(self, *result)
+                    await publication_lifecycle.record_exit(
+                        self, *result,
+                        publication_cancelled=publication_cancel_requested and publication_process_failure is None,
+                    )
                 await self._capture_published_attempt(publication_observed)
             finally:
                 cleanup_confirmed = await self._confirm_current_coder_cleanup(
@@ -1246,7 +1250,7 @@ class CodingMixin:
                 _PublicationResolution(
                     failure=f"Process supervision failed: "
                     f"{publication_process_failure}",
-                    cancelled_by_publication=True,
+                    cancelled_by_publication=True, process_failure=True,
                 ),
             )
 
@@ -1609,7 +1613,11 @@ class CodingMixin:
             return
 
         if publication is not None:
-            if publication.failure is not None:
+            if publication.failure is not None and (
+                self.state.publication_attempt is None
+                or self.state.publication_attempt.contract_version == 1
+                or publication.process_failure
+            ):
                 failure = publication.failure
                 await self._transition_to_error(
                     f"Publication handoff verification failed: {failure}",
