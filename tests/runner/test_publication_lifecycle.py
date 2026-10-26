@@ -643,3 +643,86 @@ async def test_header_recovery_defers_if_snapshot_read_is_unavailable(lifecycle,
     runner, *_ = lifecycle
     monkeypatch.setattr(runner, '_hydrate_current_task_from_persisted_state', AsyncMock(return_value=False))
     assert not await runner._recover_state_headers()
+
+
+@pytest.mark.parametrize('problem', ['stale_pr', 'stale_list', 'omitted_list', 'advanced', 'identity',
+                                     'cleanup', 'unknown_pr', 'invalid', 'api', 'converged'])
+async def test_retry_retains_exhausted_expected_head_after_independent_work(lifecycle, monkeypatch, problem):
+    from types import SimpleNamespace
+    from src.cancellation import cause_key, get_cancellation_cause
+    runner, provider, repo, old, expected, _ = lifecycle
+    await finish(runner)
+    Clock.value = runner.state.publication_attempt.reconcile_deadline
+    monkeypatch.setattr(runner, '_commit_task_status_change', AsyncMock(return_value=True))
+    await runner._hold_unresolved_publication()
+    assert runner.state.current_task is None
+    assert runner.state.publication_attempt.exhausted
+    # Another completed task may replace the active attempt. The durable cause
+    # must still prevent operator Retry from admitting the older green PR head.
+    runner.state.publication_attempt = None
+    cause = await get_cancellation_cause(runner.redis, runner.name, 'PR-001')
+    blob = cause.payload['publication_attempt']
+    if problem == 'identity':
+        blob['base'] = 'wrong-base'
+    elif problem == 'cleanup':
+        blob['cleanup_confirmed'] = False
+    elif problem == 'unknown_pr':
+        blob['pr_number'] = None
+    elif problem == 'invalid':
+        cause.payload['publication_attempt'] = 'damaged'
+    await runner.redis.set(cause_key(runner.name, 'PR-001'), cause.to_redis())
+    if problem == 'advanced':
+        (repo / 'external').write_text('preserve actor work')
+        git(repo, 'add', 'external')
+        git(repo, 'commit', '-m', 'external advancement')
+        git(repo, 'push', 'origin', 'pr-001')
+    provider['head'] = old if problem == 'stale_pr' else expected
+    provider['error'] = 'provider unavailable' if problem == 'api' else None
+    observed = PRInfo(number=646, branch='pr-001', pr_id='PR-001',
+                      head_sha=old if problem == 'stale_list' else expected)
+    monkeypatch.setattr(prs, 'get_open_prs', lambda *a, **kw: [] if problem == 'omitted_list' else [observed])
+    deferred = AsyncMock(return_value='deferred')
+    monkeypatch.setattr(runner, '_defer_retry_command', deferred)
+    command = SimpleNamespace(selected_continuation=None, task_id='PR-001', task_branch='pr-001',
+                              bound_pr_number=646, bound_pr_branch='pr-001', bound_pr_head_sha=expected)
+    result = await runner._select_retry_continuation(command)
+    if problem == 'converged':
+        assert result == ('watch', observed)
+        deferred.assert_not_called()
+    else:
+        assert result == 'deferred'
+        assert deferred.await_count == 1
+    assert runner.state.current_task is None
+    assert provider['requests'] == []
+
+
+@pytest.mark.parametrize('outcome', ['pending', 'open', 'terminal'])
+async def test_operator_retry_uses_shared_pending_publication_continuation(lifecycle, monkeypatch, outcome):
+    from types import SimpleNamespace
+    runner, provider, _, _, expected, _ = lifecycle
+    await finish(runner)
+    if outcome != 'pending':
+        provider['head'] = expected
+    if outcome == 'terminal':
+        provider['state'] = prs.ExactPRState.CLOSED
+    deferred = AsyncMock(return_value='deferred')
+    failed = AsyncMock(return_value='failed')
+    monkeypatch.setattr(runner, '_defer_retry_command', deferred)
+    monkeypatch.setattr(runner, '_fail_retry_command', failed)
+    monkeypatch.setattr(runner, '_commit_task_status_change', AsyncMock(return_value=True))
+    command = SimpleNamespace(selected_continuation=None, task_id='PR-001', task_branch='pr-001',
+                              bound_pr_number=646, bound_pr_branch='pr-001', bound_pr_head_sha=expected)
+    result = await runner._select_retry_continuation(command)
+    if outcome == 'pending':
+        assert result == 'deferred'
+        assert runner.state.publication_attempt.pending
+        assert provider['requests'] == []
+    elif outcome == 'terminal':
+        assert result == 'failed'
+        assert runner.state.current_task is None
+        assert provider['requests'] == []
+    else:
+        assert result == ('watch', runner.state.current_pr)
+        assert runner.state.current_pr.push_count == 2
+        assert runner.state.current_pr.fix_iteration_count == 4
+        assert len(provider['requests']) == 1

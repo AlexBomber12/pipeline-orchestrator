@@ -18,7 +18,7 @@ from src.cancellation import (
     task_spec_content_hash,
 )
 from src.config import normalize_repo_url
-from src.daemon import git_ops
+from src.daemon import git_ops, publication
 from src.daemon.recovery import MergeIdentityConflict
 from src.daemon.selector import CoderPurpose, resolve_active_coder
 from src.github import prs as gh_prs
@@ -544,9 +544,23 @@ class RetryCommandMixin:
             return await self._defer_retry_command(
                 command, "Prior invocation process cleanup is unconfirmed; publication cannot authorize Retry.",
             )
+        try:
+            floor = await publication.retry_floor(self, command)
+        except Exception as exc:
+            return await self._defer_retry_command(command, f"Publication Retry admission deferred: {exc}.")
         resolved = False
         if attempt is not None and attempt.pending:
-            resolved = await self._resolve_published_attempt()
+            if attempt.contract_version == 2 and attempt.exit_classification == "success":
+                await self._hold_unresolved_publication()
+                if self.state.current_task is None:
+                    return await self._fail_retry_command(
+                        command, "Retained publication reached its terminal boundary.",
+                    )
+                if self.state.publication_attempt.pending:
+                    return await self._defer_retry_command(command, "Publication convergence remains unresolved.")
+                resolved = True
+            else:
+                resolved = await self._resolve_published_attempt()
             attempt = self.state.publication_attempt
             if (not resolved and command.task_id == attempt.task_id
                 and command.task_branch == attempt.branch
@@ -588,6 +602,12 @@ class RetryCommandMixin:
                 command, f"GitHub open-PR state is unavailable: {exc}."
             )
 
+        if floor is not None:
+            matches = [pr for pr in open_prs if pr.number == floor.pr_number or pr.branch == floor.branch]
+            if len(matches) != 1 or (matches[0].number, matches[0].branch, matches[0].head_sha) != (
+                floor.pr_number, floor.branch, floor.expected_head_sha,
+            ):
+                return await self._defer_retry_command(command, "Retained publication has inconsistent PR discovery.")
         if command.bound_pr_number is not None:
             bound_open = next(
                 (pr for pr in open_prs if pr.number == command.bound_pr_number),

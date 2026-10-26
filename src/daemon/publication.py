@@ -9,17 +9,18 @@ import asyncio
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING
 
-from src.cancellation import CancellationCause
+from src.cancellation import CancellationCause, get_cancellation_cause
 from src.daemon import fix_escalation, git_ops
 from src.daemon.guardrails import scan_stdout
 from src.github import checks as gh_checks
 from src.github import comments as gh_comments
 from src.github import prs as gh_prs
-from src.models import CIStatus, PipelineState, ReviewStatus
+from src.models import CIStatus, PipelineState, PublicationAttempt, ReviewStatus
 from src.subsource_registry import SuppressionReason
 
 if TYPE_CHECKING:
     from src.daemon.runner import PipelineRunner
+    from src.retry_commands import RetryCommand
 
 
 async def record_exit(
@@ -315,3 +316,35 @@ def _run_matches(runner: PipelineRunner) -> bool:
     return bool(record is not None and (
         record.repo_name, record.task_id, record.run_id, record.attempt_index,
     ) == (runner.name, attempt.task_id, attempt.run_id, attempt.attempt_index))
+
+
+async def retry_floor(runner: PipelineRunner, command: RetryCommand) -> PublicationAttempt | None:
+    """Keep exhausted publication evidence binding after independent work runs.
+
+    Operator Retry may authorize continuation, but cannot discard a newer
+    expected commit merely because open-PR discovery still reports an old head.
+    """
+    cause = await get_cancellation_cause(runner.redis, runner.name, command.task_id, refresh_ttl=False)
+    raw = cause.payload.get("publication_attempt") if cause is not None else None
+    if raw is None:
+        return None
+    floor = PublicationAttempt.model_validate(raw)
+    if (floor.contract_version != 2 or not floor.exhausted or not floor.cleanup_confirmed
+        or not floor.expected_head_sha or floor.pr_number is None
+        or (floor.repo, floor.base, floor.task_id, floor.branch) != (
+            runner.owner_repo, runner.repo_config.branch or "main", command.task_id, command.task_branch,
+        )):
+        raise ValueError("Retained publication incident lacks matching identity or cleanup proof")
+    from src.daemon.handlers.coding import _remote_branch_exists
+
+    if await asyncio.to_thread(
+        _remote_branch_exists, runner.repo_path, floor.branch, floor.expected_head_sha,
+    ) is not True:
+        raise ValueError("Retained expected commit is not confirmed at the remote branch")
+    outcome = await asyncio.to_thread(
+        gh_prs.get_exact_pr_outcome, floor.repo, floor.base, floor.pr_number,
+        floor.expected_head_sha, expected_branch=floor.branch,
+    )
+    if not outcome.discovery_complete or outcome.state != gh_prs.ExactPRState.OPEN:
+        raise ValueError("Retained expected PR head is unresolved or terminal; implementation will not be rerun")
+    return floor

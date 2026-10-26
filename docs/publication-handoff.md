@@ -58,6 +58,11 @@ writes this task ERROR before releasing its active slot for independent tasks.
 A failed status write retains the slot and retries only bookkeeping. The task is
 never marked DONE and its dependants are not released. Branches and commits are
 preserved. Unrelated failure evidence cannot be cleared by reconciliation.
+Operator Retry retains the expected-commit floor from the saved incident even
+after independent work replaces the active attempt. It rechecks remote branch,
+exact PR and open-PR discovery agreement before admission; an older green PR
+view cannot bypass the floor. Missing identity or cleanup evidence requires
+operator inspection rather than a new coder invocation.
 
 ## Compatibility and verification boundaries
 
