@@ -102,8 +102,7 @@ class MergeMixin:
     def _merge_gates_satisfied(self, pr: PRInfo) -> bool:
         """Apply the same final admission rule in WATCH and MERGE."""
         return (
-            bool(pr.head_sha)
-            and pr.ci_status == CIStatus.SUCCESS
+            pr.ci_status == CIStatus.SUCCESS
             and (
                 pr.review_status == ReviewStatus.APPROVED
                 or self.repo_config.allow_merge_without_review
