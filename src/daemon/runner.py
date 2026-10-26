@@ -112,7 +112,7 @@ from src.daemon.notifications import (
 )
 from src.daemon.preflight import PreflightMixin
 from src.daemon.rate_limit import RateLimitMixin
-from src.daemon.recovery import RecoveryMixin
+from src.daemon.recovery import MergeIdentityConflict, RecoveryMixin
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.daemon.repo_ops import RepoOpsMixin
 from src.daemon.retry_commands import RetryCommandMixin, RetryDispatch
@@ -153,6 +153,7 @@ from src.process_supervisor import SupervisedProcess
 from src.queue_parser import (
     TYPE_SYNONYMS,
     QueueValidationError,
+    parse_existing_task_header_text,
     write_frontmatter_status,
 )
 from src.queue_parser import (
@@ -1805,6 +1806,13 @@ class PipelineRunner(
         if task is None:
             self._current_run_record = None
             return
+        if recover_missing_merge:
+            await self._restore_merge_run_record()
+            return
+        if self.state.state == PipelineState.MERGE:
+            # Saved invocation bindings are candidates, never merge admission.
+            self._current_run_record = None
+            return
         try:
             invocation = self.state.active_invocation
             run_id = invocation.run_id if invocation is not None else None
@@ -1839,35 +1847,138 @@ class PipelineRunner(
                 f"{task.pr_id}: {exc}."
             )
             return
-        if recover_missing_merge and not recent:
-            # Exact remote merge proof allows completion after Redis loss. Do
-            # not invent lost coder usage or fall back past a mismatched record.
-            # The caller checkpoints this accounting before writing DONE.
-            self._current_run_record = RunRecord(
-                run_id=run_id if run_id is not None else str(uuid.uuid4()),
-                task_id=task.pr_id,
-                repo_name=self.name,
-                profile_id="recovery:unknown:container",
-                task_type="",
-                complexity="",
-                started_at=datetime.now(timezone.utc).isoformat(),
-                ended_at=None,
-                duration_ms=None,
-                fix_iterations=0,
-                tokens_in=0,
-                tokens_out=0,
-                exit_reason="",
-                operator_intervention=False,
-                run_phase="merge",
-                invocations=[invocation] if invocation is not None else [],
-            )
-            self.log_event(f"[MERGE] Reconstructed missing accounting for {task.pr_id}.")
         if (
             self.state.active_invocation is None
             and self._current_run_record is not None
             and self._current_run_record.invocations
         ):
             self.state.active_invocation = self._current_run_record.invocations[-1]
+
+    def _proven_merge_generation(self) -> str:
+        """Compare authoritative base with the exact PR head and merge commit."""
+        task, pr = self.state.current_task, self.state.current_pr
+        outcome = getattr(self, "_confirmed_merge_outcome", None)
+        if (outcome is None or outcome.state != gh_prs.ExactPRState.MERGED
+                or (outcome.repo, outcome.base_branch, outcome.number, outcome.head_sha)
+                != (self.owner_repo, self.repo_config.branch, pr.number, pr.head_sha)
+                or not outcome.merge_commit_sha):
+            raise RuntimeError("exact merged identity unavailable")
+        path = Path(task.task_file or "")
+        if (path.parts != ("tasks", f"{task.pr_id}.md")
+                or task.branch != pr.branch or pr.pr_id not in {None, task.pr_id}):
+            raise MergeIdentityConflict("task path or PR branch differs from bound task")
+        origin = git_ops._git(self.repo_path, "config", "--get", "remote.origin.url").stdout
+        base = self.repo_config.branch
+        if (normalize_repo_url(origin) != normalize_repo_url(self.repo_config.url)
+                or not base or base.startswith("-") or git_ops._git(
+                    self.repo_path, "check-ref-format", "--branch", base, check=False,
+                ).returncode):
+            raise MergeIdentityConflict("repository or configured base differs")
+        git_ops._git(self.repo_path, "fetch", "--no-tags", "origin", base, timeout=120)
+        base_sha = git_ops._git(self.repo_path, "rev-parse", "FETCH_HEAD").stdout.strip()
+        hashes = []
+        for ref in (pr.head_sha, outcome.merge_commit_sha, base_sha):
+            if git_ops._git(self.repo_path, "cat-file", "-e", f"{ref}^{{commit}}", check=False).returncode:
+                git_ops._git(self.repo_path, "fetch", "--no-tags", "origin", ref, timeout=120)
+            hashes.append(self._merge_task_generation_at_ref(task, ref))
+        if len(set(hashes)) != 1:
+            raise MergeIdentityConflict("authoritative task generation differs from merged PR")
+        ancestry = git_ops._git(self.repo_path, "merge-base", "--is-ancestor",
+                                outcome.merge_commit_sha, base_sha, check=False).returncode
+        if ancestry == 1:
+            raise MergeIdentityConflict("merged commit absent from authoritative base")
+        if ancestry != 0:
+            raise RuntimeError("merged commit ancestry unavailable")
+        return hashes[0]
+
+    def _merge_task_generation_at_ref(self, task: Any, ref: str) -> str:
+        """Read a bounded task identity from a known Git commit, without checkout."""
+        path = task.task_file
+        entry = git_ops._git(self.repo_path, "ls-tree", ref, "--", path).stdout
+        if not entry.startswith(("100644 blob ", "100755 blob ")):
+            raise MergeIdentityConflict("task missing or unsafe in proved Git revision")
+        content = git_ops._git(self.repo_path, "show", f"{ref}:{path}").stdout
+        try:
+            header = parse_existing_task_header_text(path, content)
+        except ValueError as exc:
+            raise MergeIdentityConflict("invalid task in proved Git revision") from exc
+        if header.pr_id != task.pr_id or header.branch != task.branch:
+            raise MergeIdentityConflict("task identity differs in proved Git revision")
+        return task_spec_content_hash(content)
+
+    def _merge_record_compatible(
+        self, record: RunRecord, generation: str, *, task: Any = None, pr: Any = None,
+    ) -> bool:
+        """Accept generation evidence and ancestor heads, never terminal failures."""
+        task, pr = task or self.state.current_task, pr or self.state.current_pr
+        if (record.task_id != task.pr_id or record.repo_name != self.name
+                or record.task_spec_hash != generation
+                or record.exit_reason not in {"", "coding_complete", "success_merged"}
+                or record.exit_reason == "success_merged"
+                and (record.outcome != "merged" or record.head_sha != pr.head_sha)
+                or record.ended_at and (record.exit_reason == "" or record.outcome == "failed")
+                or any(i.run_id != record.run_id or i.attempt_index not in {None, record.attempt_index}
+                       for i in record.invocations)):
+            return False
+        if record.head_sha and record.head_sha != pr.head_sha:
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", record.head_sha):
+                return False
+            if git_ops._git(self.repo_path, "cat-file", "-e", record.head_sha, check=False).returncode:
+                git_ops._git(self.repo_path, "fetch", "--no-tags", "origin", record.head_sha, timeout=120)
+            result = git_ops._git(self.repo_path, "merge-base", "--is-ancestor",
+                                  record.head_sha, pr.head_sha, check=False)
+            if result.returncode not in {0, 1}:
+                raise RuntimeError("run HEAD ancestry unavailable")
+            if result.returncode != 0:
+                return False
+            try:
+                if self._merge_task_generation_at_ref(task, record.head_sha) != generation:
+                    return False
+            except MergeIdentityConflict:
+                return False
+        return True
+
+    async def _restore_merge_run_record(self) -> None:
+        """Select accounting only after proving the merged generation, on every path."""
+        generation = self._proven_merge_generation()
+        task, pr = self.state.current_task, self.state.current_pr
+        # Read all task runs: a newer failed/incompatible run cannot hide an
+        # interrupted checkpoint. Also consult a bound key if its index was lost.
+        records = sorted(
+            await self._metrics_store.list_task_runs(self.name, task.pr_id),
+            key=lambda r: (r.started_at, r.run_id), reverse=True,
+        )
+        invocation = self.state.active_invocation
+        if invocation is not None and invocation.run_id:
+            bound = await self._metrics_store.get(invocation.run_id)
+            if bound is not None:
+                records.insert(0, bound)
+        if self._current_run_record is not None:
+            records.insert(0, self._current_run_record)
+        # A finalized owner wins replay even if an older unfinished candidate
+        # remains bound in the snapshot. Never create a second success for it.
+        records.sort(key=lambda r: r.exit_reason != "success_merged")
+        record = next((r for r in records if self._merge_record_compatible(r, generation)), None)
+        if record is None:
+            # A deterministic identity survives partial checkpoint/index writes
+            # and lost snapshots without adopting an old invocation or its usage.
+            run_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                f"{self.repo_config.url}:{self.repo_config.branch}:{pr.number}:{pr.head_sha}:{generation}"))
+            record = await self._metrics_store.get(run_id)
+            if record is not None and not self._merge_record_compatible(record, generation):
+                raise MergeIdentityConflict("recovery accounting identity already incompatible")
+            if record is None:
+                record = RunRecord(
+                    run_id=run_id, task_id=task.pr_id, repo_name=self.name,
+                    profile_id="recovery:unknown:container", task_type="", complexity="",
+                    started_at=datetime.now(timezone.utc).isoformat(), ended_at=None,
+                    duration_ms=None, fix_iterations=0, tokens_in=0, tokens_out=0,
+                    exit_reason="", operator_intervention=False, run_phase="merge",
+                    task_spec_hash=generation, head_sha=pr.head_sha,
+                )
+                self.log_event(f"[MERGE] Reconstructed missing accounting for {task.pr_id}.")
+        self._current_run_record = record
+        self.state.active_invocation = record.invocations[-1] if record.invocations else None
 
     async def _save_current_run_record(
         self,
@@ -2609,6 +2720,7 @@ class PipelineRunner(
         blocked_reason: SuppressionReason | str | None = None,
         *,
         expected_task_sha256: str | None = None,
+        raise_identity_conflict: bool = False,
     ) -> bool:
         """Best-effort commit of daemon-written task frontmatter status."""
         task_file = getattr(current_task, "task_file", None)
@@ -2752,6 +2864,8 @@ class PipelineRunner(
                             f"status push not confirmed: {push.stderr.strip()}"
                         )
         except Exception as exc:
+            if raise_identity_conflict and isinstance(exc, ValueError):
+                raise MergeIdentityConflict(str(exc)) from exc
             self.log_event(
                 f"[INFRA] Warning: failed to commit {status} status for "
                 f"{task_file}: {exc}."

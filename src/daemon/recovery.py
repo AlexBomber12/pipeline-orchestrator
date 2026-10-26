@@ -97,6 +97,10 @@ def _task_pr_sort_key(pr_id: str) -> tuple[int, int | str, str]:
     return (0, int(match.group(1)), match.group(2))
 
 
+class MergeIdentityConflict(ValueError):
+    """Permanent contradiction in the task generation proved merged."""
+
+
 class RecoveryMixin:
     """State recovery on daemon startup."""
 
@@ -1106,7 +1110,9 @@ class RecoveryMixin:
         outcome log already accounts for them. Redis is only a cache.
         Discovery only selects an identity; MERGE still requires exact proof.
         """
-        if getattr(self, "_persisted_merge_recovery", None) is not None:
+        if (getattr(self, "_persisted_merge_recovery", None) is not None
+                or (saved_error := getattr(self, "_persisted_merge_error_recovery", None)) is not None
+                and saved_error.error_message.startswith("Merge accounting conflict:")):
             return True
         candidates = []
         try:
@@ -1121,13 +1127,13 @@ class RecoveryMixin:
                 record = max(records, key=lambda r: (r.started_at, r.run_id), default=None)
                 if (record is not None and record.exit_reason != "success_merged"
                         or header.frontmatter_status in {"todo", "doing"}
-                        or record is None and not has_merged_outcome(task.pr_id, self.name)):
+                        or not has_merged_outcome(task.pr_id, self.name)):
                     # A historical DONE task may lack analytics after a log
                     # failure. Never let it hide an interrupted current merge.
                     priority = (0 if header.frontmatter_status in {"todo", "doing"}
                                 else 1 if record is not None and record.exit_reason != "success_merged"
                                 else 2)
-                    candidates.append((priority, task, record))
+                    candidates.append((priority, task, records))
             if not candidates:
                 return True
             discovery = gh_prs.get_merged_prs_discovery(self.owner_repo, self.repo_config.branch)
@@ -1136,7 +1142,7 @@ class RecoveryMixin:
         except Exception as exc:
             self.log_event(f"[RECOVERY] Merge bookkeeping discovery deferred: {exc}.")
             return False
-        for _, task, record in sorted(candidates, key=lambda candidate: candidate[0]):
+        for _, task, records in sorted(candidates, key=lambda candidate: candidate[0]):
             matches = [pr for pr in discovery.prs
                        if pr.pr_id in {None, task.pr_id} and pr.branch == task.branch]
             if not matches:
@@ -1144,12 +1150,26 @@ class RecoveryMixin:
             if len(matches) != 1:
                 self.log_event(f"[RECOVERY] Ambiguous merged identity for {task.pr_id}; retrying.")
                 return False
+            header = self._recovery_task_headers[task.pr_id]
+            if header.frontmatter_status == "done" and (Path(self.repo_path) / ".git").exists():
+                try:
+                    if has_merged_outcome(task.pr_id, self.name):
+                        generation = self._merge_task_generation_at_ref(
+                            task, f"refs/remotes/origin/{self.repo_config.branch}",
+                        )
+                        if any(r.exit_reason == "success_merged" and self._merge_record_compatible(
+                            r, generation, task=task, pr=matches[0],
+                        ) for r in records):
+                            continue
+                except Exception as exc:
+                    self.log_event(f"[RECOVERY] Merge accounting generation read deferred: {exc}.")
+                    return False
             self._persisted_merge_recovery = self.state.model_copy(update={
                 "current_task": task, "current_pr": matches[0],
-                "active_invocation": record.invocations[-1] if record and record.invocations else None,
+                "active_invocation": None,
                 "state": PipelineState.MERGE, "merge_phase": "post_merge_cleanup",
             })
-            self._current_run_record = record
+            self._current_run_record = None
             break
         return True
 
@@ -1404,16 +1424,18 @@ class RecoveryMixin:
                 if queued is not None else None
             )
             if (
-                queued is not None and live_pr is not None
-                and live_pr.number == saved_pr.number
+                queued is not None
+                and (saved_merge_error.error_message.startswith("Merge accounting conflict:")
+                     or live_pr is not None and live_pr.number == saved_pr.number)
                 and (
-                    queued.status == TaskStatus.ERROR
+                    saved_merge_error.error_message.startswith("Merge accounting conflict:")
+                    or queued.status == TaskStatus.ERROR
                     or (queued.status == TaskStatus.DOING
                         and queued.pr_id in self._status_write_failed_task_pr_ids)
                 )
             ):
                 self.state.current_task = queued
-                self.state.current_pr = live_pr
+                self.state.current_pr = live_pr or saved_pr
                 await self._restore_current_run_record()
                 await self._transition_to_error(
                     saved_merge_error.error_message,
@@ -1423,7 +1445,7 @@ class RecoveryMixin:
                 )
                 self.log_event(
                     f"[RECOVERY] Restored retained merge failure for "
-                    f"{queued.pr_id} PR #{live_pr.number}."
+                    f"{queued.pr_id} PR #{self.state.current_pr.number}."
                 )
                 return
 

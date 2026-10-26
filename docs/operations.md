@@ -252,6 +252,28 @@ Both affordances are mutually exclusive: Retry is for unchanged content
 ("try again, environment may have transient issue"); re-upload is for
 changed content ("operator iterated on the spec itself").
 
+## Interrupted merge accounting
+
+Merge reconciliation proves the exact remote PR outcome before bookkeeping.
+The task on authoritative base, the PR head, and its merge commit must have the
+same normalized specification fingerprint; the merge commit must remain in base.
+Saved invocation IDs and task/repository equality alone do not admit a run.
+Compatible unfinished accounting can retain an earlier ancestor HEAD after fixes
+or base synchronization. Terminal failed attempts retain their original history.
+
+If no compatible accounting exists, recovery checkpoints a separate record whose
+identity is deterministic for the repository, base, PR, head, and generation.
+The isolated status writer rechecks the remote generation during publication and
+confirms the pushed commit before accounting is finalized. Repeated recovery
+preserves finalized metrics and the durable outcome logger deduplicates appends.
+
+A `Merge accounting conflict:` error parks reconciliation for operator Retry;
+it does not write DONE or ERROR into a conflicting task generation. Provider,
+Git, and Redis outages retain MERGE ownership and retry on a later cycle.
+Operator pause and Stop controls still apply. Resolving a conflict requires
+reviewing the exact PR and current task generation before using existing Retry
+or task-upload controls; this source change does not deploy or resume a daemon.
+
 ## WorkInhibitor rollback
 
 The WorkInhibitor cutover is complete: `use_unified_inhibitor_check`

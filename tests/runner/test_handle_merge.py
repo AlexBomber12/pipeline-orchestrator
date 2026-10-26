@@ -996,7 +996,7 @@ def test_merge_component_requires_exact_remote_proof(monkeypatch, case):
         assert runner.state.current_queue[0].status == TaskStatus.DONE
 
 
-@pytest.mark.parametrize("failure", ["read", "wrong_task", "wrong_repo", "wrong_run", "checkpoint"])
+@pytest.mark.parametrize("failure", ["read", "checkpoint"])
 def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeypatch, failure):
     from unittest.mock import AsyncMock
 
@@ -1011,14 +1011,8 @@ def test_confirmed_merge_retries_bound_record_before_releasing_ownership(monkeyp
     runner._capture_invocation_snapshot("claude", {"model": "opus"}, phase="coding")
     record = runner._current_run_record
     runner._current_run_record = None
-    bad = None
-    if failure.startswith("wrong_"):
-        from dataclasses import replace
-
-        bad = replace(record, **{{"wrong_task": "task_id", "wrong_repo": "repo_name",
-                                  "wrong_run": "run_id"}[failure]: "other"})
     lookup = (AsyncMock(side_effect=RuntimeError("metrics unavailable"))
-              if failure == "read" else AsyncMock(return_value=record if failure == "checkpoint" else bad))
+              if failure == "read" else AsyncMock(return_value=record))
     monkeypatch.setattr(runner._metrics_store, "get", lookup)
     monkeypatch.setattr(runner._metrics_store, "recent", AsyncMock(side_effect=AssertionError("wrong run fallback")))
     save = AsyncMock(side_effect=RuntimeError("checkpoint unavailable") if failure == "checkpoint" else None)
@@ -1092,8 +1086,8 @@ def test_confirmed_merge_reconstructs_missing_accounting_before_done(monkeypatch
     assert record.profile_id == "recovery:unknown:container"
     assert record.tokens_in == record.tokens_out == 0
     if bound:
-        assert record.run_id == invocation.run_id
-        assert record.invocations == [invocation]
+        assert record.run_id != invocation.run_id
+        assert record.invocations == []
     else:
         assert record.run_id and not record.invocations
     assert runner.state.state == PipelineState.MERGE
@@ -1101,11 +1095,8 @@ def test_confirmed_merge_reconstructs_missing_accounting_before_done(monkeypatch
     assert task.status == TaskStatus.DOING
     status.assert_not_awaited()
     save.assert_awaited_once_with(record)
-    if bound:
-        recent.assert_not_awaited()
-        task_runs.assert_not_awaited()
-    else:
-        task_runs.assert_awaited_once_with(runner.name, task.pr_id)
+    recent.assert_not_awaited()
+    task_runs.assert_awaited_once_with(runner.name, task.pr_id)
 
     save.side_effect = None
     save.reset_mock()
@@ -1302,7 +1293,7 @@ def test_done_header_retains_recoverable_run_without_pipeline_snapshot(
             raise RuntimeError("success save unavailable")
         await durable_save(record)
 
-    async def write_done(*args):
+    async def write_done(*args, **kwargs):
         records = await original._metrics_store.list_task_runs(original.name, task.pr_id)
         assert len(records) == 1 and records[0].run_id == run_id
         assert records[0].exit_reason != "success_merged"

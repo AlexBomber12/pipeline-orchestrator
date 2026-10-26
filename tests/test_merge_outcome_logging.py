@@ -398,6 +398,9 @@ def test_build_outcome_record_falls_back_to_config_when_run_record_missing(
 
 @pytest.fixture(autouse=True)
 def confirmed_remote_merge(monkeypatch):
+    # These handler tests use synthetic Git; real proof/writer coverage lives
+    # in tests/recovery/test_merge_accounting.py.
+    monkeypatch.setattr(runner_module.PipelineRunner, "_proven_merge_generation", lambda self: "")
     async def confirmed(self):
         return True
 

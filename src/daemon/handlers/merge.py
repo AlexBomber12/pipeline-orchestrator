@@ -19,6 +19,7 @@ from src.analytics.coder_version import detect_coder_extension_version
 from src.branch_context import BranchContext
 from src.cancellation import delete_retry_count, delete_task_spec_hash
 from src.daemon import git_ops
+from src.daemon.recovery import MergeIdentityConflict
 from src.github import cache as gh_cache
 from src.github import gh_runner
 from src.github import prs as gh_prs
@@ -478,6 +479,7 @@ class MergeMixin:
             self.owner_repo, self.repo_config.branch, pr.number, pr.head_sha
         )
         if outcome.state == gh_prs.ExactPRState.MERGED:
+            self._confirmed_merge_outcome = outcome
             self._confirmed_merge_at = outcome.merged_at
             return True
         if outcome.state == gh_prs.ExactPRState.CLOSED:
@@ -510,15 +512,16 @@ class MergeMixin:
         await self.publish_state()
         current_task = self.state.current_task
         if current_task is not None:
-            if self._current_run_record is None:
+            try:
                 await self._restore_current_run_record(recover_missing_merge=True)
-            record = self._current_run_record
-            invocation = self.state.active_invocation
-            if (record is None or record.task_id != current_task.pr_id
-                    or record.repo_name != self.name
-                    or invocation is not None and invocation.run_id is not None
-                    and record.run_id != invocation.run_id):
-                self.log_event(f"[MERGE] Run record unavailable for PR #{number}; retaining ownership.")
+            except MergeIdentityConflict as exc:
+                await self._transition_to_error(
+                    f"Merge accounting conflict: {exc}; operator Retry required",
+                    save_run_record_as=None,
+                )
+                return
+            except Exception as exc:
+                self.log_event(f"[MERGE] Accounting proof deferred for PR #{number}: {exc}.")
                 return
 
         # Persist the validated run and task index before the terminal header.
@@ -536,12 +539,19 @@ class MergeMixin:
                     current_task,
                     "DONE",
                     "PR merged",
+                    raise_identity_conflict=True,
                 )
                 if not written:
                     self.log_event(
                         f"[MERGE] Remote merge confirmed but status:DONE was not written to {current_task.task_file}."
                     )
                     return
+            except MergeIdentityConflict as exc:
+                await self._transition_to_error(
+                    f"Merge accounting conflict: {exc}; operator Retry required",
+                    save_run_record_as=None,
+                )
+                return
             except Exception as exc:
                 self.log_event(
                     f"[ERROR] Failed to write status:DONE to "
@@ -552,11 +562,12 @@ class MergeMixin:
         self._mark_task_done_in_snapshot()
 
         try:
-            await self._save_current_run_record(
-                "success_merged",
-                diff_stats=merged_diff_stats,
-                base_branch=base,
-            )
+            if self._current_run_record is None or self._current_run_record.exit_reason != "success_merged":
+                await self._save_current_run_record(
+                    "success_merged",
+                    diff_stats=merged_diff_stats,
+                    base_branch=base,
+                )
         except Exception as exc:
             self.log_event(f"[MERGE] Confirmed merge bookkeeping deferred for PR #{number}: {exc}.")
             return

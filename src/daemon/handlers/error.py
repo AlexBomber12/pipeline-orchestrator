@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
 
 _RETAINED_MERGE_ERROR_PREFIXES = (
+    "Merge accounting conflict:",
     "No eligible coder available for merge conflict resolution",
     "Merge conflict resolution failed",
     "Merge conflict resolution incomplete",
