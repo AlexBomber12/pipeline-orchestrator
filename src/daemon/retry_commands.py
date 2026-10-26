@@ -490,6 +490,31 @@ class RetryCommandMixin:
                     bound_task.model_copy(update={"status": TaskStatus.ERROR}),
                     self.state, cause,
                 )
+            # Selection can recover a verified publication that was absent
+            # from the accepted fallback identity. Binding it is our own effect,
+            # even if the TODO commit subsequently fails. Preserve the original
+            # hash and require the exact durable binding before removing that
+            # recovered PR from the comparison.
+            pr = relevant_retry_pr(self.state, bound_task)
+            if (
+                cause is None
+                and identity != command.failure_id
+                and pr is not None
+                and (pr.number, pr.branch, pr.head_sha) == (
+                    command.bound_pr_number, command.bound_pr_branch,
+                    command.bound_pr_head_sha,
+                )
+            ):
+                identity_task = bound_task
+                if (
+                    command.effect_stage == RetryEffectStage.RETRY_RESERVED
+                    and header.frontmatter_status == "todo"
+                    and bound_task.status == TaskStatus.TODO
+                ):
+                    identity_task = bound_task.model_copy(update={"status": TaskStatus.ERROR})
+                identity = retry_failure_identity(
+                    identity_task, self.state.model_copy(update={"current_pr": None}), cause,
+                )
             if identity != command.failure_id:
                 return await self._fail_retry_command(
                     command, "Retry is stale: current failure identity changed."

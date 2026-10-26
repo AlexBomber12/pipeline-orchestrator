@@ -2074,3 +2074,80 @@ async def test_reserved_retry_restart_after_lost_status_checkpoint(
     assert outcome == (RetryDispatch.HANDLED if new_failure else RetryDispatch.CODING)
     assert stored.status == (RetryCommandStatus.FAILED if new_failure else RetryCommandStatus.APPLIED)
     assert commits == (["TODO"] if new_failure else ["TODO", "TODO"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "message", "cause", "pr", "head"])
+@pytest.mark.parametrize("lost_checkpoint", [False, True])
+async def test_recovered_retry_publication_preserves_fallback_failure_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str | None,
+    lost_checkpoint: bool,
+) -> None:
+    runner, command, task, repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    runner._start_current_run_record("codex", "")
+    runner._capture_invocation_snapshot("codex", {}, phase="coding")
+    runner._begin_publication_attempt(started_at=NOW, baseline_numbers=set())
+    pr = PRInfo(number=42, branch=task.branch, pr_id=task.pr_id, head_sha="a" * 40)
+    attempt = runner.state.publication_attempt
+    attempt.pr_number, attempt.candidate, attempt.head_sha = pr.number, pr, pr.head_sha
+    attempt.exit_classification = "failure"
+    monkeypatch.setattr(retry_module.gh_prs, "get_exact_pr_outcome", lambda *args:
+        retry_module.gh_prs.ExactPROutcome("octo/demo", "main", 42, pr.head_sha,
+                                         retry_module.gh_prs.ExactPRState.OPEN, True))
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *args: [pr])
+    commits = []
+    record_stage = runner._record_retry_stage
+    todo = _task_text().replace("status: ERROR", "status: TODO").replace("blocked_reason: daemon\n", "")
+
+    async def commit(*args):
+        commits.append(args[1])
+        if lost_checkpoint:
+            (repo / command.task_file).write_text(todo)
+        return lost_checkpoint or len(commits) > 1
+
+    async def checkpoint(*args):
+        if len(commits) == 1:
+            raise RuntimeError("checkpoint unavailable")
+        return await record_stage(*args)
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit)
+    monkeypatch.setattr(runner, "_record_retry_stage", checkpoint)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    reserved = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert reserved.effect_stage == RetryEffectStage.RETRY_RESERVED
+    assert reserved.bound_pr_number == pr.number
+    assert reserved.failure_id == command.failure_id
+    assert runner.state.current_pr.number == pr.number
+    assert not attempt.pending
+    if lost_checkpoint:
+        runner.state.current_queue = [task.model_copy(update={"status": TaskStatus.TODO})]
+        _allow_validation(monkeypatch, runner, todo)
+    if change == "message":
+        runner.state.error_message = "new failure"
+    elif change == "cause":
+        runner.redis.store[cause_key(runner.name, task.pr_id)] = CancellationCause(
+            category="ERROR", payload={"subsource": "crash", "run_id": "new"},
+        ).to_redis()
+    elif change == "pr":
+        runner.state.current_pr = pr.model_copy(update={"number": 99})
+    elif change == "head":
+        runner.state.current_pr = pr.model_copy(update={"head_sha": "b" * 40})
+
+    result = await runner._consume_retry_command()
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.failure_id == command.failure_id
+    assert stored.request_binding == command.request_binding
+    assert stored.retry_count == 1
+    assert runner.redis.store[f"metrics:retry_count:{runner.name}:{task.pr_id}"] == "1"
+    if change:
+        assert result == RetryDispatch.HANDLED
+        assert stored.status == RetryCommandStatus.FAILED
+        assert "stale" in stored.outcome_reason
+        assert commits == ["TODO"]
+    else:
+        assert result == RetryDispatch.WATCH
+        assert stored.status == RetryCommandStatus.APPLIED
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_pr.number == pr.number
+        assert commits == ["TODO", "TODO"]
