@@ -6,9 +6,10 @@ from tests.e2e.lib.coder_shim import coder_shim
 
 DAEMON_CONTAINER = "pipeline-orchestrator-daemon-test"
 COMPOSE_FILE = "docker-compose.test.yml"
-# Recovery can defer on stale GitHub discovery and retry on the next 60s
-# daemon tick. CI run 40332894437 recovered after 136s, beyond the old 120s
-# deadline. Allow startup/discovery plus a retry, keeping a finite failure bound.
+# Recovery can defer on stale GitHub discovery and retry on a later cycle.
+# CI run 40332894437 needed 73s for initial discovery and 63s more to recover,
+# beyond the old 120s deadline. Budget startup/provider work plus a retry;
+# these observed durations are not the test config's 2s polling interval.
 RECOVERY_DEADLINE_SEC = 240
 
 

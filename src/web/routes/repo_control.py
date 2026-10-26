@@ -1887,17 +1887,16 @@ async def retry_repo_task(
         return HTMLResponse("Redis unavailable", status_code=503)
 
     cap = cfg.daemon.retry_button_cap
+    # Recognize an accepted request before reading eligibility for a new Retry.
+    # The daemon may already have applied it and advanced the task to DOING.
     try:
-        current_status = _read_task_frontmatter_status(task_path)
-    except (OSError, UnicodeError):
-        return HTMLResponse("Failed to read task status", status_code=503)
+        existing = await load_retry_command_for_binding(
+            redis_client, name, retry_binding
+        )
+    except Exception:
+        return HTMLResponse("Failed to read Retry command store", status_code=503)
     snapshot_tasks, _snapshot_at = await _load_current_queue_snapshot(name)
     snapshot_status = _task_status_from_snapshot(snapshot_tasks, pr_id)
-    state = await _repo_state_for_retry(redis_client, name)
-    accounting_retry = (
-        _is_merge_accounting_retry(state, name, pr_id, task_filename)
-        and state.url == repo_config.url
-    )
     task = next(
         (queued for queued in snapshot_tasks or [] if queued.pr_id == pr_id),
         QueueTask(
@@ -1907,20 +1906,13 @@ async def retry_repo_task(
             task_file=task_filename,
         ),
     )
-    if accounting_retry:
-        task = state.current_task.model_copy(update={"status": TaskStatus.ERROR})
-    current_count = await _get_retry_count(redis_client, name, pr_id)
-
-    # Replays of the exact browser request are idempotent even if the daemon
-    # applied it between the first and second HTTP delivery.
-    try:
-        existing = await load_retry_command_for_binding(
-            redis_client, name, retry_binding
-        )
-    except Exception:
-        return HTMLResponse("Failed to read Retry command store", status_code=503)
     if existing is not None:
-        if existing.task_id != pr_id or existing.repo_slug != name:
+        if (
+            existing.task_id != pr_id
+            or existing.repo_slug != name
+            or existing.task_file != task_filename
+            or existing.request_binding != retry_binding
+        ):
             return HTMLResponse("Retry binding belongs to another task", status_code=409)
         tasks = snapshot_tasks or [task]
         return _app.templates.TemplateResponse(
@@ -1934,6 +1926,19 @@ async def retry_repo_task(
             ),
             status_code=202,
         )
+
+    try:
+        current_status = _read_task_frontmatter_status(task_path)
+    except (OSError, UnicodeError):
+        return HTMLResponse("Failed to read task status", status_code=503)
+    state = await _repo_state_for_retry(redis_client, name)
+    accounting_retry = (
+        _is_merge_accounting_retry(state, name, pr_id, task_filename)
+        and state.url == repo_config.url
+    )
+    if accounting_retry:
+        task = state.current_task.model_copy(update={"status": TaskStatus.ERROR})
+    current_count = await _get_retry_count(redis_client, name, pr_id)
 
     if not _is_retryable_task_status(current_status, snapshot_status) and not accounting_retry:
         return HTMLResponse("Task is not in ERROR", status_code=409)

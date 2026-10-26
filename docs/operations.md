@@ -434,6 +434,152 @@ guarantees, deployment, or restart behavior of a future protocol. Any eventual
 provider smoke requires a separate operator release action; this investigation
 has no deployment prerequisite and performs no production operation.
 
+## Work preservation decision and restore proof (PR-410)
+
+Audit base: `e92487e28ad735ae510c244d7e1f6a4b97f3b421` (current main).
+This is an investigation, with zero runtime changes. Existing destructive paths
+below remain hazards until their owners migrate them. Nothing here authorizes
+cleanup of unknown directories, origin mismatches, or an unconfirmed process.
+Traceability: IMP-01, A14/A16; historical specifications at
+`7167c2e916a2bbb843ecb6a6ce7fc15795e61802` are not implementation dependencies.
+
+### Decision and observed restore
+
+Reuse `src/daemon/backups.py:create_repo_bundle`, which creates and verifies a
+self-contained `git bundle create --all`. Do not create another backup service,
+scheduler, retention policy or generic snapshot platform. Existing IDLE periodic
+bundles are useful history backups, but their interval and optional configuration
+cannot authorize an imminent destructive operation. A fresh verified capture
+would be mandatory at each actual loss boundary.
+
+`tests/test_work_preservation_contract.py` uses the existing real-Git initializer
+from `tests/test_backups.py`, the production bundle API, and two disposable Git
+repositories per case. Both attached and detached local-only commits are tested.
+The source clone is deleted only after capture, before restoring into a separate
+new repository. No alternates, source object directory, credentials or remote
+service is used. A remote-tracking ref models the last published commit; this
+proves local Git semantics, not provider push or recovery policy.
+
+| Captured state | Bundle alone | Bundle plus minimum missing capture |
+| --- | --- | --- |
+| Local branch, tag, remote-tracking refs | Exact `show-ref` restored | Same exact refs |
+| Unpushed branch commit / detached HEAD commit | Full SHA and committed file bytes recovered; bundle advertises `HEAD` even detached | Original raw HEAD restored, including attached vs detached identity |
+| `README.md` staged `staged version\x00\xfe\n`, worktree `unstaged version\x00\xff\n` | Committed `hello\n` only | Both versions recovered independently |
+| Index-only `staged-only.bin`, absent in worktree | Blob absent (`cat-file -e` fails) | Exact `index only\x00\xff` blob restored from object pack |
+| Staged deletion, staged rename with newline in filename, unstaged deletion | Original committed files return | Index stages/modes/OIDs/path bytes and worktree absences match |
+| Untracked binary `bytes(range(256))`, ignored binary, executable | Absent | Exact file bytes and permission bits match |
+| Raw index, cached/uncached binary diffs, porcelain `-z` status | Not recovered | Raw index bytes match before Git refresh; all semantic comparisons match afterward |
+
+The minimum missing capture demonstrated here is raw ordinary `.git/index`, a
+`git pack-objects --stdout` pack of its indexed blob OIDs, raw `.git/HEAD`, and a
+regular-file worktree inventory containing bytes and modes. NUL-delimited index
+records avoid filename splitting. Restoring an exact inventory also restores
+deletions; copying files over an existing checkout would leave unwanted files.
+The index pack is necessary: the raw index points at objects that may never have
+been committed. Refs and detached HEAD objects come from the verified bundle.
+Restore fetches `+refs/*:refs/*` into an unborn placeholder branch before checking
+out the saved HEAD; fetching into an already checked-out target branch is refused
+by Git. It then imports the index object pack and restores inventory/index/HEAD.
+The helper is test-only and keeps extra capture bytes in memory; it is not a
+crash-durable writer, consistency protocol, or production restore command.
+
+Existing recovery `_preserve_crashed_run_commits` and its `crash-backup/` fallback
+push keep named branch commits on origin. They do not capture dirty files or the
+index, nor arbitrary detached work. Keep this publication mechanism for its
+existing purpose. A stash would mutate the source index/worktree and ordinary
+stash omits ignored files; it is not the chosen capture primitive. A Git patch
+alone does not preserve untracked bytes, refs or all index objects.
+
+### Caller inventory and migration checks
+
+Locations refer to `src/`; owner means the proposed existing component boundary,
+not a new service. Reset can discard tracked/index versions and move the current
+branch tip; force checkout can discard conflicting work; `clean -fd` deletes
+nonignored untracked paths; `rmtree` loses all bytes including ignored files and
+local object storage. Plain checkout/path checkout can also overwrite selected
+bytes and must be included in the enclosing operation's checks.
+
+| Caller / proposed owner | Loss set and required migration check |
+| --- | --- |
+| `daemon/runner.py:_commit_status_to_git` (status owner, PR-398) | Already isolated temporary repo; force detached checkout retries affect only its own generated status edits. Reuse isolation and existing identity/hash/retry tests; no coder snapshot. |
+| `daemon/retry_commands.py:_remote_frontmatter_error_status_for_current_task` (Retry reader) | Isolated temporary fetch/checkout; no coder bytes affected. Retain origin/task identity validation and fixture-owned teardown. |
+| `daemon/repo_ops.py:sync_to_main`, called by `handlers/idle.py` before/after upload processing (repo sync owner) | Shared checkout/reset/clean loses index, tracked and untracked bytes and can move local base ref. Require identity, quiescence and complete verified capture before first mutation; restore dirty base and local-only branch cases. IDLE alone proves no safety. |
+| `daemon/preflight.py:_auto_reset_dirty_tree` (preflight owner) | Forced branch switch/reset/clean can lose all dirty versions and base tip. Capture before checkout; test dirty feature branch and preserved base/feature refs. Existing bounded recovery policy does not prove no loss. |
+| `daemon/repo_ops.py:process_pending_uploads` failure reset (upload consumer) | Reset may discard pre-existing edits and an unpushed upload commit. Keep `_safe=True` recovery behavior; prefer isolated upload commit/push using status pattern, test failed push and concurrent manifest. |
+| `daemon/scaffolder.py:ensure_claude_md` initial/failure resets (scaffolder owner) | Clean-tree checks do not rule out local commits. Prefer isolated backfill; test local-ahead base and rejected push before removing both resets. |
+| `daemon/handlers/merge.py:handle_merge` pre-merge reset (merge owner) | Dirty/index state and unpublished branch tip; capture before checkout/reset or isolate merge. Test dirty branch and unpublished tip, preserve confirmed-merge accounting. |
+| `daemon/handlers/fix.py:handle_fix` approved reset (FIX owner) | Existing approval/process/bound-ref checks reduce loss; retain them. Test mutation between checks and reset, dirty state and local-only HEAD; block or capture before mutation. |
+| `daemon/handlers/error.py:diagnose_error` three reset/clean paths (diagnostic owner) | Reverting diagnostic/coder edits can also discard pre-existing dirty/untracked work. Capture before diagnostic execution, distinguish attempt-owned output, test every failure/skip/branch path. |
+| `daemon/recovery.py:recover_state` and `_preserve_crashed_run_commits` (recovery owner) | Named-branch push is existing preservation, not a reset. Keep failure blocking; test dirty/index/detached state before downstream preflight/scaffold/sync can mutate. No second status snapshot. |
+| `web/routes/repo_control.py:_checkout_retry_base_task`, `_reset_retry_worktree`, called by `reset_task` (web reset owner) | Forced checkout/reset/path checkout and rollback touch shared checkout. Replace checkout mutation with daemon command/isolated status pattern; test failed push, dirty bytes and restart. Web must remain a control plane. |
+| `daemon/runner.py:RepoRunner.__init__` non-Git and wrong-origin `rmtree` (constructor owner) | Entire directory, potentially unrelated user data. Remove deletion in follow-up; block with diagnostic on unknown directory/origin mismatch. Test sentinel bytes survive both cases; do not snapshot as permission to delete. Legacy verified-origin move is distinct. |
+| `daemon/repo_ops.py:ensure_repo_cloned` retry `_do_clone` rmtree (clone owner) | A directory can appear after initial absence. Clone into a uniquely owned temporary sibling and publish only to an absent destination; test foreign directory appearing between retries. Never infer ownership from path/name. |
+| `daemon/main.py:_clean_breach_dir` (marker owner) | Deletes marker tree, not Git work. Require reserved marker-root ownership and symlink handling; no Git capture. Test unexpected directory retained and owned stale markers removed. |
+| `daemon/repo_ops.py:process_pending_uploads` two staging rmtrees; `web/routes/uploads.py:upload_tasks` finally cleanup (upload owners) | Uploaded task source bytes, not necessarily Git objects. Require exact staging ownership and manifest CAS/receipt before deletion; test failed publication and newer manifest remain recoverable. |
+| `web/services/upload_validation.py:sweep_abandoned_staging` (staging sweeper owner) | Age plus absence from active manifest alone does not prove disposable bytes. Require owned staging identity and durable consumed/abandoned disposition; retain unknown directories and active uploads in race tests. |
+
+The inventory covers executable force checkout/reset/clean/rmtree sites found by
+searching source, plus status, recovery and sync callers. GitHub CLI `-f` form
+fields are not force checkout. TemporaryDirectory teardown of isolated Git
+repositories is fixture/operation-owned disposal, not shared-checkout cleanup.
+Ordinary coding checkout and scaffolder checkout/add/commit are still mutations;
+their enclosing admission must protect work, even without a forced reset.
+
+### Unsupported states and required blocking behavior
+
+The tested envelope is a quiescent, ordinary non-bare full repository with an
+ordinary complete index and regular files on Linux. Submodules (gitlinks and
+nested repositories), LFS payloads/filters, symlinks, special files, empty directory
+identity, ACLs/xattrs, hardlink relationships, reflog-only/dangling objects,
+linked worktrees/common Git dirs, alternate object stores, shallow/partial clones,
+sparse checkout/index, split index, intent-to-add, unmerged stages, index flags
+and extensions beyond the tested ordinary index are unproved. Block these states
+in a first implementation; do not imply bundle verification includes LFS media,
+submodule objects or dangling history. Config, hooks, credentials and reflogs
+are not reconstructed. Do not copy credential-bearing Git config into captures.
+Unknown/non-Git directories and origin mismatch must be retained and blocked,
+not deleted; the test proves only that bundle failure leaves unknown bytes alone,
+not that the current constructor has been repaired.
+
+Disk full, read error, missing indexed object, verification failure or concurrent
+writer must block destructive work. Existing bundle failure tests cover mkdir,
+I/O, timeout and verify failures; the new test covers a real non-Git read failure.
+Production still needs an exclusive ownership/admission boundary, process
+quiescence checks, before/after HEAD/refs/index/file identity validation, durable
+external storage and atomic completed-capture publication. Check free space and
+bound size/time, hash and re-read stored payloads, verify bundle/pack and restore
+manifest, and leave source untouched on any failure. A digest comparison alone
+cannot make concurrent writers safe. No such runtime protocol is proved here.
+
+### Bounded follow-up and removal plan
+
+First: constructor/clone ownership blocking, estimated 50–90 production and
+100–160 test lines across existing runner/repo_ops modules/tests. No deletion of
+unknown or mismatched directories and no automatic process termination.
+Second: ordinary-repo capture/restore within existing backups boundary, estimated
+180–280 production and 240–360 test lines, with unsupported-state rejection,
+durable publication, consistency/failure tests and separate-directory restore.
+Third: migrate shared preflight/sync/error/FIX/merge boundaries, estimated
+100–180 production and 180–300 test lines; replace direct destructive chains
+with guarded admission using that capture, preserving all existing policy checks.
+Fourth: isolate upload/scaffold/web status mutations and tighten staging/marker
+ownership, estimated 140–240 production and 200–320 test lines. These are planning
+ranges requiring caller review, not approval to implement all work together.
+
+Obsolete logic to replace is the constructor's destructive stale-directory
+repair, clone retry's unconditional removal, shared status/upload/scaffold resets,
+and unguarded reset/clean chains listed above. Keep verified bundles, crash
+commit publication, PR-398 status isolation and existing approval/process guards.
+This PR removes no runtime logic and changes no backup retention. The prototype
+proves recoverable bytes/index/refs only; failure admission, real provider access,
+deployment and process races require follow-up verification. No deployment is
+needed for this investigation; eventual rollout needs an operator-run storage,
+restore and ownership smoke, without production failure drills here.
+
+Verification: `python -m pytest tests/test_work_preservation_contract.py -q`;
+`python -m pytest tests/test_backups.py -q`; final gate and review artifacts via
+`bash scripts/make-review-artifacts.sh` after the intended commit.
+
 ## Cleanup lifetime evidence (PR-408)
 
 This inventory describes the implementation at base
