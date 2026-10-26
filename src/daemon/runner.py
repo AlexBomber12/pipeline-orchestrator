@@ -1049,6 +1049,7 @@ class PipelineRunner(
             )
             app_config = app_config.model_copy(update={"daemon": daemon_config})
         ctx = self._selection_context(app_config=app_config)
+        ctx.check_inhibitors = True
         resolution = resolve_active_coder(ctx, purpose=CoderPurpose.DISPATCH)
         pin = ctx.task_coder_pin
         preferred = pin if pin and pin != "any" else (

@@ -504,40 +504,28 @@ def test_handle_idle_flag_off_dispatches_when_no_inhibitor(
     assert runner.state.current_pr.number == 99
 
 
-def test_handle_idle_flag_on_pinned_task_short_circuits_when_pin_rate_limited(
+def test_handle_idle_flag_on_previous_pin_does_not_block_new_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Task pin narrows the gate to the pinned coder only.
-
-    Regression for the PR-330a review: when the active task pins
-    ``claude`` and claude is rate-limited, the unified gate must
-    short-circuit IDLE rather than letting dispatch proceed and
-    parking the pinned task in ERROR as "coder unavailable". The
-    legacy gate iterated over every registered coder, so codex
-    appearing unblocked masked the per-coder claude rate limit.
-    """
+    """An obsolete active pin must not prevent examining the next task."""
+    _stub_dispatchable_world(monkeypatch)
     runner = h._make_runner()
-    monkeypatch.setattr(runner, "_active_task_coder_pin", lambda: "claude")
+    monkeypatch.setattr(runner, "_active_task_coder_pin", lambda: "codex")
     _enable_flag(runner)
     runner.state.active_inhibitors = [
         WorkInhibitor(
             inhibitor_type=InhibitorType.RATE_LIMIT,
             coder_affected="claude",
             expires_at=_future(),
-            reason_text="claude rate-limited",
-            source_key="state:octo__demo.rate_limited_coder_until.claude",
+            source_key="test:claude",
         )
     ]
+    async def coding(self):
+        self.state.state = PipelineState.WATCH
 
+    monkeypatch.setattr(type(runner), "handle_coding", coding)
     asyncio.run(runner.handle_idle())
-
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_task is None
-    assert any(
-        e["event"].startswith("[INFRA] IDLE inhibited by")
-        and "rate_limit" in e["event"]
-        for e in runner.state.history
-    )
+    assert runner.state.state == PipelineState.WATCH
 
 
 def test_handle_idle_flag_on_disabled_coders_short_circuits_on_remaining_block(

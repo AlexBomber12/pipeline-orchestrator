@@ -937,16 +937,11 @@ def test_handle_idle_proceeds_to_coding_when_no_matching_pr(
     assert runner.state.current_pr.number == 17
 
 
-def test_handle_idle_transitions_to_error_when_pinned_coder_unavailable(
+def test_handle_idle_waits_when_pinned_coder_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """PR-317: A task pinned to ``codex`` whose coder is unavailable parks
-    the runner in ERROR with subsource=infra_failure.
-
-    The terminal state migrated from IDLE to ERROR so the picker stops
-    re-selecting the same pinned task on every cycle while the coder auth
-    is broken — the prior ESCALATE→IDLE→re-pick loop is closed."""
+    """A temporary auth failure keeps the hard pin waiting without ERROR."""
     h._patch_subprocess(monkeypatch)
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir()
@@ -999,11 +994,10 @@ def test_handle_idle_transitions_to_error_when_pinned_coder_unavailable(
     )
     asyncio.run(runner.handle_idle())
 
-    assert runner.state.state == PipelineState.ERROR
-    assert runner.state.skip_ai_error_diagnose is False
-    assert runner.state.error_message == (
-        "Task PR-200 pinned to Codex CLI but coder unavailable: auth probe failed"
-    )
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert any("Task PR-200 waiting for coder resource" in e["event"]
+               for e in runner.state.history)
     assert runner.state.current_pr is None
     assert not coding_called["v"]
 
@@ -4542,3 +4536,91 @@ def test_idle_attachment_retains_canonical_ci_policy(monkeypatch, scenario):
             source.update(complete=True, status_complete=True, names=["unit", "integration"])
     finally:
         checks.clear_ci_status_cache()
+
+@pytest.mark.parametrize("unavailable", ["quota", "auth", "unknown", "disabled", "invalid", "default"])
+@pytest.mark.parametrize("unified", [False, True])
+def test_idle_skips_unavailable_pin_and_dispatches_independent_task(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unavailable: str, unified: bool,
+) -> None:
+    """Use the production DAG and selector with controlled Git/GitHub transport."""
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag",
+                        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG)
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *a, **kw: _merged_state())
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *a, **kw: [])
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda *a, **kw: [])
+    tasks = tmp_path / "tasks"
+    tasks.mkdir()
+    pin = {"unknown": "not-loaded", "invalid": "bad pin", "default": "any"}.get(unavailable, "claude")
+    for number, coder, deps in [(1, pin, "none"), (2, "codex", "none"), (3, "codex", "PR-001")]:
+        (tasks / f"PR-{number:03}.md").write_text(
+            f"---\nstatus: TODO\n---\n# PR-{number:03}: Task {number}\n\n"
+            f"Branch: pr-{number:03}\n- Type: feature\n- Complexity: low\n"
+            f"- Depends on: {deps}\n- Priority: {1 if number != 2 else 2}\n- Coder: {coder}\n"
+        )
+    runner = h._make_runner(disabled_coders=["claude"] if unavailable == "disabled" else [])
+    runner.repo_path = str(tmp_path)
+    runner.repo_config.feature_flags.use_unified_inhibitor_check = unified
+    runner.app_config.daemon.auto_fallback = False
+    runner.state.rate_limited_coders = {"claude"} if unavailable in {"quota", "default"} else set()
+    if unavailable == "auth":
+        runner._auth_status_cache["claude"] = {"status": "error", "failure_reason": "probe_timeout"}
+    # The stale pin must not gate examination of the real candidates.
+    runner.state.current_task = QueueTask(pr_id="PR-old", title="Old", status=TaskStatus.DONE)
+    calls = []
+
+    async def coding(self):
+        calls.append((self.state.current_task.pr_id, self._get_coder()[0]))
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_coding", coding)
+    asyncio.run(runner.handle_idle())
+    assert calls == [("PR-002", "codex")], runner.state.history
+    assert runner.state.state == PipelineState.CODING
+    assert runner.state.error_message is None
+    events = [e["event"] for e in runner.state.history]
+    assert any(("requires action" if unavailable in {"unknown", "disabled", "invalid"}
+                else "waiting for coder resource") in e for e in events)
+
+
+def test_idle_all_resources_wait_then_quota_recovery_preserves_priority(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(idle_module.IdleMixin, "_select_next_task_from_dag",
+                        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG)
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *a, **kw: _merged_state())
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *a, **kw: [])
+    monkeypatch.setattr("src.github.prs.get_merged_prs", lambda *a, **kw: [])
+    (tmp_path / "tasks").mkdir()
+    for number, coder in [(1, "claude"), (2, "codex")]:
+        (tmp_path / f"tasks/PR-{number:03}.md").write_text(
+            f"---\nstatus: TODO\n---\n# PR-{number:03}: Work\n\n"
+            f"Branch: pr-{number:03}\n- Type: feature\n- Complexity: low\n"
+            f"- Depends on: none\n- Priority: {number}\n- Coder: {coder}\n"
+        )
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.rate_limited_coder_until = {
+        name: datetime.now(timezone.utc) + timedelta(minutes=5) for name in ("claude", "codex")
+    }
+    runner._error_skip_count = 7
+    calls = []
+
+    async def coding(self):
+        calls.append((self.state.current_task.pr_id, self._get_coder()[0]))
+
+    monkeypatch.setattr(runner_module.PipelineRunner, "handle_coding", coding)
+    for _ in range(2):
+        asyncio.run(runner.handle_idle())
+        assert runner.state.state == PipelineState.IDLE
+        assert runner.state.current_task is None
+        assert runner._error_skip_count == 7
+        assert runner.state.error_message is None
+    assert not calls
+    runner.state.rate_limited_coder_until["claude"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+    runner.state.user_paused = True
+    asyncio.run(runner.handle_idle())
+    assert not calls
+    runner.state.user_paused = False
+    asyncio.run(runner.handle_idle())
+    assert calls == [("PR-001", "claude")]

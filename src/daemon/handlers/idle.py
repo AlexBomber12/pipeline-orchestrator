@@ -26,9 +26,8 @@ from src.daemon.main_commit_audit import (
     record_audit_findings_in_redis,
 )
 from src.daemon.selector import (
-    CoderSelectionUnavailable,
-    SelectionContext,
     candidate_coders,
+    eligible_coders,
     resolve_pause_coder,
 )
 from src.dag import get_eligible_tasks
@@ -381,6 +380,12 @@ class IdleMixin:
                 skipped_unstructured_pr_ids.add(task_file.stem)
                 continue
             except QueueValidationError as exc:
+                if exc.issues and all(": invalid Coder " in issue for issue in exc.issues):
+                    self.log_event(
+                        f"[INFRA] Task {task_file.stem}: admission requires action; {exc}"
+                    )
+                    skipped_unstructured_pr_ids.add(task_file.stem)
+                    continue
                 if not self._is_missing_task_header_error(exc):
                     raise
                 skipped_unstructured_pr_ids.add(task_file.stem)
@@ -586,18 +591,14 @@ class IdleMixin:
         if doing_tasks:
             stopped_task_pr_ids.clear()
             return doing_tasks[0]
-        if eligible:
+        self._idle_resource_wait = False
+        if eligible or stopped_eligible:
+            await self._refresh_auth_status_cache()
+        for picked in [*eligible, *stopped_eligible]:
+            if not self._idle_task_coder_available(picked.pr_id, picked.coder):
+                self._idle_resource_wait = True
+                continue
             stopped_task_pr_ids.clear()
-            picked = eligible[0]
-            return self._queue_task_from_header(
-                picked,
-                TaskStatus.TODO,
-                task_files,
-                unresolved_deps_map.get(picked.pr_id, []),
-            )
-        if stopped_eligible:
-            stopped_task_pr_ids.clear()
-            picked = stopped_eligible[0]
             return self._queue_task_from_header(
                 picked,
                 TaskStatus.TODO,
@@ -605,6 +606,34 @@ class IdleMixin:
                 unresolved_deps_map.get(picked.pr_id, []),
             )
         return None
+
+    def _idle_task_coder_available(self, pr_id: str, pin: str | None) -> bool:
+        """Probe a candidate without selecting a coder or consuming exploration."""
+        ctx = self._selection_context(task_coder_pin=pin or "any")
+        ctx.check_inhibitors = True
+        candidates = candidate_coders(ctx)
+        if not candidates:
+            self.log_event(
+                f"[INFRA] Task {pr_id}: coder configuration requires action; "
+                f"load/enable the configured plugin or correct Coder: {pin or 'any'}."
+            )
+            return False
+        available = eligible_coders(ctx)
+        if available:
+            return True
+        self.log_event(
+            f"[INFRA] Task {pr_id} waiting for coder resource "
+            f"{candidates}: {ctx.exclusion_reasons}."
+        )
+        return False
+
+    def _idle_coder_blockers(self, name: str) -> list[WorkInhibitor]:
+        _, blocking = is_work_inhibited(self.state, coder=name)
+        return [
+            inh for inh in blocking
+            if inh.inhibitor_type != InhibitorType.GITHUB_BUDGET_SLOWDOWN
+            and (inh.inhibitor_type != InhibitorType.USER_PAUSE or self.state.user_paused)
+        ]
 
     def _queue_task_from_header(
         self,
@@ -636,6 +665,7 @@ class IdleMixin:
         existing open PR matched the chosen task and the runner has
         already transitioned to WATCH.
         """
+        self._idle_resource_wait = False
         self._idle_open_prs = prs
         self._idle_merged_prs = merged_prs
         try:
@@ -689,7 +719,8 @@ class IdleMixin:
         if task is None:
             self.log_event("[INFRA] No tasks available.")
             self.state.current_task = None
-            self._reset_runner_local_task_counters()
+            if not self._idle_resource_wait:
+                self._reset_runner_local_task_counters()
             if prs:
                 self.log_event(
                     f"[INFRA] IDLE: {len(prs)} open PR(s) detected "
@@ -740,19 +771,9 @@ class IdleMixin:
             self, "_idle_merged_pr_304_streak", 0,
         )
         self._idle_merged_pr_304_streak = 0
-        # PR-330a: per-repo feature flag selects the unified inhibitor
-        # check over the legacy ``user_paused`` branch. The unified
-        # gate evaluates the inhibitor list once per coder that
-        # dispatch would actually consider — task pin, repo pin, and
-        # ``disabled_coders`` narrow the candidate set the same way
-        # ``selector.eligible_coders`` does, so a per-coder
-        # ``RATE_LIMIT`` on the only runnable coder short-circuits IDLE
-        # instead of being masked by a registered-but-unrunnable coder
-        # appearing unblocked. ``candidate_coders`` deliberately skips
-        # rate-limit/auth probes; per-coder rate-limit semantics flow
-        # through ``is_work_inhibited`` below. The flag stays False by
-        # default until PR-330d flips production; canary repos opt in
-        # earlier via ``feature_flags.use_unified_inhibitor_check``.
+        # Before reading the DAG, only rule out resources unavailable to every
+        # possible task. A previous task pin or repo default cannot narrow this
+        # gate: another eligible task may explicitly pin a different coder.
         if self.repo_config.feature_flags.use_unified_inhibitor_check:
             # ``state.user_paused`` is refreshed from Redis at cycle
             # START, while ``state.active_inhibitors`` is rebuilt at
@@ -764,20 +785,15 @@ class IdleMixin:
             if self.state.user_paused:
                 self.log_event("[INFRA] IDLE inhibited by ['user_pause']")
                 return
-            ctx = SelectionContext(
-                registry=self._registry,
-                repo_config=self.repo_config,
-                app_config=self.app_config,
-                state=self.state,
-                rng=self._selector_rng,
-                auth_statuses=self._auth_status_cache or None,
-                task_coder_pin=self._active_task_coder_pin(),
-            )
-            candidates = candidate_coders(ctx)
+            candidates = [
+                name for name in self._registry.coder_names()
+                if name not in (self.repo_config.disabled_coders or [])
+            ]
             if not candidates:
                 self.log_event(
                     "[INFRA] IDLE inhibited by no eligible coder"
                 )
+                self.log_event("[INFRA] Coder configuration requires action: load/enable a plugin.")
                 return
             # ``GITHUB_BUDGET_SLOWDOWN`` is a polling-cadence throttle
             # enforced by ``_check_github_api_budget`` at the runner-cycle
@@ -788,17 +804,7 @@ class IdleMixin:
             # polling less often.
             blocking_by_coder: dict[str, list[WorkInhibitor]] = {}
             for name in candidates:
-                _, blocking = is_work_inhibited(self.state, coder=name)
-                hard_blocking = [
-                    inh
-                    for inh in blocking
-                    if inh.inhibitor_type
-                    != InhibitorType.GITHUB_BUDGET_SLOWDOWN
-                    and (
-                        inh.inhibitor_type != InhibitorType.USER_PAUSE
-                        or self.state.user_paused
-                    )
-                ]
+                hard_blocking = self._idle_coder_blockers(name)
                 if not hard_blocking:
                     blocking_by_coder.clear()
                     break
@@ -942,18 +948,11 @@ class IdleMixin:
             )
             return
 
-        pin = self._active_task_coder_pin()
-        if pin and pin != "any":
-            await self._refresh_auth_status_cache()
-            try:
-                self._get_coder(allow_exploration=False)
-            except CoderSelectionUnavailable as exc:
-                self.state.current_pr = None
-                await self._commit_and_park_in_error(
-                    str(exc).replace("Task pinned", f"Task {task.pr_id} pinned", 1),
-                    subsource="infra_failure",
-                )
-                return
+        await self._refresh_auth_status_cache()
+        if not self._idle_task_coder_available(task.pr_id, self._active_task_coder_pin()):
+            self.state.current_task = None
+            self.state.current_pr = None
+            return
 
         self.state.state = PipelineState.CODING
         self.log_event(f"[INFRA] Picked task {task.pr_id}: {task.title}.")
