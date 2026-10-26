@@ -5,12 +5,14 @@ cases use the production version-2 builder and actual runner persistence/ticks.
 """
 from __future__ import annotations
 
+import asyncio
 import subprocess
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from src.daemon import publication
+from src.daemon import fix_supervision, publication
 from src.daemon.handlers import coding
 from src.github import checks, prs
 from src.keyspace import control_stop, pipeline_state
@@ -359,6 +361,83 @@ async def test_actual_fix_exit_enters_same_durable_continuation(lifecycle, monke
         assert fresh.state.current_task is None
         assert provider['requests'] == []
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize('terminal', ['MERGED', 'CLOSED'])
+@pytest.mark.parametrize('boundary', ['delayed', 'cleanup', 'reopened'])
+async def test_supervisor_cancelled_fix_retains_terminal_only_continuation(
+    lifecycle, monkeypatch, terminal, boundary,
+):
+    runner, provider, repo, old, expected, configure = lifecycle
+    remote = git(repo, 'remote', 'get-url', 'origin')
+    git(remote, 'update-ref', 'refs/heads/pr-001', old)
+    git(repo, 'reset', '--hard', old)
+    runner.state.publication_attempt = None
+    await runner._save_current_run_record('coding_complete')
+    runner.state.active_invocation = None
+    runner._refresh_auth_status_cache = AsyncMock()
+    runner.usage_gate = AsyncMock(return_value=True)
+    runner.state.current_pr.review_status = ReviewStatus.PENDING
+    ready = asyncio.Event()
+
+    async def poll_tick(_seconds):
+        await ready.wait()
+
+    # Exercise the real external-state poller and actual target cancellation,
+    # with only the polling clock/provider transport controlled by the fixture.
+    monkeypatch.setattr(fix_supervision, 'asyncio', SimpleNamespace(
+        sleep=poll_tick, to_thread=asyncio.to_thread, create_task=asyncio.create_task,
+    ))
+    monkeypatch.setattr(runner, '_monitor_fix_idle', AsyncMock())
+    monkeypatch.setattr(prs, 'pr_state', lambda *a: {'state': terminal})
+    _, plugin = runner._get_coder()
+    async def coder(*args, **kwargs):
+        git(repo, 'reset', '--hard', expected)
+        git(repo, 'push', 'origin', 'pr-001')
+        ready.set()
+        await asyncio.Future()
+    monkeypatch.setattr(plugin, 'fix_review', coder)
+    status = AsyncMock(return_value=True)
+    monkeypatch.setattr(runner, '_commit_task_status_change', status)
+    if boundary == 'cleanup':
+        monkeypatch.setattr(runner, '_confirm_current_coder_cleanup', AsyncMock(return_value=False))
+    provider['state'] = prs.ExactPRState(terminal)
+    await runner.handle_fix()
+    attempt = runner.state.publication_attempt
+    assert attempt.exit_classification == 'success'
+    assert attempt.terminal_cancelled
+    assert attempt.expected_head_sha == expected
+    assert attempt.pending
+    assert status.await_count == 0
+    assert provider['requests'] == []
+    provider['head'] = expected
+    if boundary == 'reopened':
+        provider['state'] = prs.ExactPRState.OPEN
+    def restore(fresh):
+        configure(fresh)
+        fresh._commit_task_status_change = status
+        return fresh
+    fresh = await restart(runner, restore)
+    Clock.value += timedelta(seconds=31)
+    await fresh._run_cycle_body()
+    if boundary == 'delayed':
+        assert fresh.state.state == PipelineState.IDLE
+        assert fresh.state.current_task is None
+        if terminal == 'MERGED':
+            assert status.call_args.args[1] == 'DONE'
+        else:
+            assert status.await_count == 0  # existing closed-unmerged bookkeeping
+        records = await fresh._metrics_store.recent(task_id='PR-001', repo_name=fresh.name)
+        assert records[0].exit_reason == ('success_merged' if terminal == 'MERGED' else 'closed_unmerged')
+    else:
+        assert fresh.state.publication_attempt.pending
+        assert fresh.state.current_task is not None
+        assert fresh.state.state != PipelineState.WATCH
+        assert status.await_count == 0
+        if boundary == 'reopened':
+            fresh._admit_observed_pr(fresh.state.current_pr)
+            assert fresh.state.publication_attempt.pending
+    assert provider['requests'] == []
 
 
 @pytest.mark.parametrize('phase', ['coding', 'fix'])
@@ -734,7 +813,7 @@ async def test_header_recovery_defers_if_snapshot_read_is_unavailable(lifecycle,
 
 
 @pytest.mark.parametrize('problem', ['stale_pr', 'stale_list', 'omitted_list', 'advanced', 'identity',
-                                     'cleanup', 'unknown_pr', 'invalid', 'api', 'converged'])
+                                     'cleanup', 'unknown_pr', 'invalid', 'api', 'terminal_cancelled', 'converged'])
 async def test_retry_retains_exhausted_expected_head_after_independent_work(lifecycle, monkeypatch, problem):
     from types import SimpleNamespace
 
@@ -755,6 +834,8 @@ async def test_retry_retains_exhausted_expected_head_after_independent_work(life
         blob['base'] = 'wrong-base'
     elif problem == 'cleanup':
         blob['cleanup_confirmed'] = False
+    elif problem == 'terminal_cancelled':
+        blob['terminal_cancelled'] = True
     elif problem == 'unknown_pr':
         blob['pr_number'] = None
     elif problem == 'invalid':

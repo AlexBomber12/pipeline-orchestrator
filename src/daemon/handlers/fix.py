@@ -1170,6 +1170,9 @@ class FixMixin(BreachMixin):
             try:
                 if coder_result is not None and not breach_flag["breached"] and not idle_flag["timed_out"]:
                     await publication.record_exit(self, code, stdout, stderr)
+                elif (coder_result is None and external_state_flag["state"] is not None
+                      and not stop_cancelled and not breach_flag["breached"] and not idle_flag["timed_out"]):
+                    await publication.record_exit(self, code, stdout, stderr, terminal_cancelled=True)
                 await self._capture_published_attempt()
             finally:
                 cleanup_confirmed = await self._confirm_current_coder_cleanup(

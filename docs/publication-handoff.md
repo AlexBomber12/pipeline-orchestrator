@@ -35,6 +35,13 @@ consuming the global Stop key. The pause survives that key's expiry and daemon
 restart; only Play clears it. A failed Redis transaction retains the Stop key
 and blocks continuation.
 
+When the FIX supervisor cancels a coder because the PR was externally merged
+or closed, the exit checkpoint retains that cancellation reason. Confirmed
+cleanup and exact terminal PR/branch evidence can then complete the existing
+terminal bookkeeping. This cancellation permits no open-PR WATCH handoff or
+review request, including after restart or operator Retry. Implementation,
+Stop, breach and idle-timeout failures retain their existing classification.
+
 The deadline uses the existing review timeout policy; the next poll uses the
 existing FIX polling interval. Both are persisted before observation. Restarts
 and pauses do not grant fresh budgets. GitHub budget admission still gates ticks.

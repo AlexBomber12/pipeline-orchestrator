@@ -235,6 +235,8 @@ class PublicationAttempt(BaseModel):
     verified: bool = False
     failure: str | None = None
     exit_classification: Literal["success", "failure"] | None = None
+    # Supervised terminal cancellation permits exact terminal bookkeeping only.
+    terminal_cancelled: bool = False
 
 class SizeFixCompletion(BaseModel):
     """Confirmed FIX exit awaiting a status write or marker cleanup."""

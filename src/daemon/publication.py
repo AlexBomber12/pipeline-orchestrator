@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 async def record_exit(
     runner: PipelineRunner, code: int, stdout: str, stderr: str, *, publication_cancelled: bool = False,
+    terminal_cancelled: bool = False,
 ) -> None:
     """Checkpoint invocation outcome before cleanup and terminal bookkeeping."""
     attempt = runner.state.publication_attempt
@@ -38,8 +39,10 @@ async def record_exit(
             _local_branch_head_sha, runner.repo_path, attempt.branch,
         )
     if attempt.exit_classification is None:
+        attempt.terminal_cancelled = terminal_cancelled
         attempt.exit_classification = (
-            "success" if (code == 0 or publication_cancelled) and not scan_stdout(f"{stdout}\n{stderr}")
+            "success" if (code == 0 or publication_cancelled or terminal_cancelled)
+            and not scan_stdout(f"{stdout}\n{stderr}")
             and fix_escalation.parse_escalate_marker(stdout) is None else "failure"
         )
     if attempt.reconcile_deadline is None:
@@ -125,6 +128,9 @@ async def resolve(runner: PipelineRunner, *, resolve_terminal: bool) -> bool:
                 return False
             return await runner._handle_external_pr_resolution(current, outcome.state.value)
         if outcome.state != gh_prs.ExactPRState.OPEN:
+            return False
+        if attempt.terminal_cancelled:
+            attempt.incident = "supervisor-cancelled FIX awaits exact terminal PR evidence"
             return False
         try:
             retrieval = await asyncio.to_thread(
@@ -354,6 +360,8 @@ async def retry_floor(runner: PipelineRunner, command: RetryCommand) -> Publicat
     if raw is None:
         return None
     floor = PublicationAttempt.model_validate(raw)
+    if floor.terminal_cancelled:
+        raise ValueError("Supervisor-cancelled FIX requires terminal bookkeeping, not open-PR continuation")
     if (floor.contract_version != 2 or not floor.exhausted or not floor.cleanup_confirmed
         or not floor.expected_head_sha or floor.pr_number is None
         or (floor.repo, floor.base, floor.task_id, floor.branch) != (
