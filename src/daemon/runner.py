@@ -2613,6 +2613,9 @@ class PipelineRunner(
 
     async def _handle_single_error_exit(self) -> None:
         """Feature-flagged ERROR dispatcher with one visible exit per cycle."""
+        if (self.state.error_message or "").startswith("Merge accounting conflict:"):
+            self.log_event("[RECOVERY] Merge accounting conflict remains parked for operator Retry.")
+            return
         if await self._maybe_resume_obsolete_ci_error() is not None:
             return
         if self.state.rate_limited_until is not None:
@@ -4042,7 +4045,7 @@ class PipelineRunner(
                                 raise
                             else:
                                 await self._finish_retry_dispatch(retry_dispatch)
-                    elif retry_dispatch == RetryDispatch.WATCH:
+                    elif retry_dispatch in {RetryDispatch.WATCH, RetryDispatch.MERGE}:
                         await self._finish_retry_dispatch(retry_dispatch)
                     await self.publish_state()
                     return

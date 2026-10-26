@@ -270,6 +270,9 @@ preserves finalized metrics and the durable outcome logger deduplicates appends.
 A `Merge accounting conflict:` error parks reconciliation for operator Retry;
 it does not write DONE or ERROR into a conflicting task generation. Provider,
 Git, and Redis outages retain MERGE ownership and retry on a later cycle.
+Retry for a retained accounting conflict revalidates its exact PR and task
+generation, then resumes post-merge bookkeeping without dispatching a coder or
+rewriting TODO. Both ERROR dispatchers retain the park until operator action.
 Operator pause and Stop controls still apply. Resolving a conflict requires
 reviewing the exact PR and current task generation before using existing Retry
 or task-upload controls; this source change does not deploy or resume a daemon.

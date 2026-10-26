@@ -12,10 +12,17 @@ import pytest
 from src.cancellation import task_spec_content_hash
 from src.daemon import git_ops
 from src.daemon.handlers import merge as merge_module
+from src.daemon.retry_commands import RetryDispatch
 from src.github import cache, prs
 from src.keyspace import pipeline_state
 from src.metrics import MetricsStore
-from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.models import PipelineState, PRInfo, PublicationAttempt, QueueTask, TaskStatus
+from src.retry_commands import (
+    RetryCommandStatus,
+    enqueue_retry_command,
+    load_retry_command,
+    new_retry_command,
+)
 from src.task_status import MergedState
 
 from tests.legacy_recovery_git import git
@@ -181,7 +188,8 @@ def test_incident_releases_merged_generation_without_rewriting_failed_attempt(
 
 
 @pytest.mark.parametrize("conflict", ["generation", "race", "branch", "head_task", "merge_task"])
-def test_conflicting_generation_parks_without_done_or_failed_run_rewrite(incident, monkeypatch, conflict):
+@pytest.mark.parametrize("single_error", [False, True])
+def test_conflicting_generation_parks_without_done_or_failed_run_rewrite(incident, monkeypatch, conflict, single_error):
     c = incident
     real_git = git_ops._git
     changed = False
@@ -215,7 +223,7 @@ def test_conflicting_generation_parks_without_done_or_failed_run_rewrite(inciden
     assert "status: DONE" not in c.remote_task()
     before = c.remote_task()
     for _ in range(2):
-        asyncio.run(c.runner.handle_error())
+        asyncio.run(c.runner._handle_single_error_exit() if single_error else c.runner.handle_error())
     assert c.remote_task() == before
     records = asyncio.run(c.runner._metrics_store.list_task_runs(c.runner.name, c.task.pr_id))
     assert all(r.outcome != "merged" for r in records)
@@ -223,7 +231,7 @@ def test_conflicting_generation_parks_without_done_or_failed_run_rewrite(inciden
         restarted = c.fresh()
         c.recover(restarted)
         assert restarted.state.state == PipelineState.ERROR
-        asyncio.run(restarted.handle_error())
+        asyncio.run(restarted._handle_single_error_exit() if single_error else restarted.handle_error())
         assert c.remote_task() == before
     c.preserved()
 
@@ -595,4 +603,107 @@ def test_compatible_legacy_checkpoint_is_recovered_from_shared_recent_index(inci
     saved = asyncio.run(c.runner._metrics_store.get(good.run_id))
     assert saved.outcome == "merged" and saved.head_sha == c.head
     assert (saved.tokens_in, saved.tokens_out) == (good.tokens_in, good.tokens_out)
+    c.preserved()
+
+
+def accounting_retry(c):
+    return new_retry_command(
+        repo_slug=c.runner.name, task_id=c.task.pr_id, task_file=c.task_file, task_branch=c.task.branch,
+        task_fingerprint=task_spec_content_hash(c.generation_b), request_binding="b" * 64,
+        failure_id="f" * 64, retry_cap=3, bound_pr_number=c.pr.number,
+        bound_pr_branch=c.pr.branch, bound_pr_head_sha=c.pr.head_sha,
+    )
+
+
+@pytest.mark.parametrize("failure", [None, "ack", "cleanup", "publish", "applied_publish"])
+def test_operator_retry_resumes_only_proved_merge_bookkeeping(incident, monkeypatch, failure):
+    c = incident
+    # Operator restores B after observing the permanent conflict with C.
+    for content in (c.generation_b + "\nGeneration C\n", c.generation_b):
+        git(c.repo, "checkout", "main")
+        c.path.write_text(content)
+        git(c.repo, "commit", "-am", "operator task update")
+        git(c.repo, "push", "origin", "main")
+        git(c.repo, "checkout", c.task.branch)
+        if content != c.generation_b:
+            asyncio.run(c.runner.handle_merge())
+            assert c.runner.state.state == PipelineState.ERROR
+    # The operator handles fixture-owned unpublished evidence before Retry;
+    # the daemon's existing dirty-checkout restriction remains in force.
+    retained = c.repo / "retained.txt"
+    retained.unlink()
+    command = accounting_retry(c)
+    asyncio.run(enqueue_retry_command(c.runner.redis, command))
+    status = c.runner._commit_task_status_change
+    writes = []
+
+    async def observed_write(task, value, *args, **kwargs):
+        writes.append(value)
+        return await status(task, value, *args, **kwargs)
+
+    monkeypatch.setattr(c.runner, "_commit_task_status_change", observed_write)
+    if failure == "applied_publish":
+        assert asyncio.run(c.runner._consume_retry_command()) == RetryDispatch.MERGE
+    if failure:
+        method = {"ack": "_mark_retry_applied", "cleanup": "_clear_retry_failure_evidence",
+                  "publish": "publish_state", "applied_publish": "publish_state"}[failure]
+        original = getattr(c.runner, method)
+        monkeypatch.setattr(c.runner, method, AsyncMock(side_effect=RuntimeError("handoff outage")))
+        assert asyncio.run(c.runner._consume_retry_command()) == RetryDispatch.HANDLED
+        monkeypatch.setattr(c.runner, method, original)
+    else:
+        assert asyncio.run(c.runner._consume_retry_command()) == RetryDispatch.MERGE
+    assert not writes  # Retry never resets status or runs implementation.
+
+    restarted = c.fresh()
+    c.recover(restarted)
+    restarted._recovered = True
+    for method in ("ensure_repo_cloned", "_refresh_user_paused_from_redis"):
+        monkeypatch.setattr(restarted, method, AsyncMock())
+    for method in ("_hold_for_coder_cleanup", "_consume_approval_command", "_consume_publication_migration_command"):
+        monkeypatch.setattr(restarted, method, AsyncMock(return_value=False))
+    monkeypatch.setattr(restarted, "handle_coding", AsyncMock(side_effect=AssertionError("duplicate coding")))
+    asyncio.run(restarted._run_cycle_body())
+    assert restarted.state.state == PipelineState.MERGE
+    assert restarted.state.merge_phase == "post_merge_cleanup"
+    stored = asyncio.run(load_retry_command(restarted.redis, restarted.name, command.command_id))
+    assert stored.status == RetryCommandStatus.APPLIED and stored.selected_continuation == "merge"
+    assert stored.retry_count == 1
+    asyncio.run(restarted.handle_merge())
+    assert restarted.state.state == PipelineState.IDLE and "status: DONE" in c.remote_task()
+    records = asyncio.run(restarted._metrics_store.list_task_runs(restarted.name, c.task.pr_id))
+    assert len([r for r in records if r.outcome == "merged"]) == 1
+    retained.write_text("unpublished evidence\n")
+    c.preserved()
+
+
+@pytest.mark.parametrize("failure", ["identity", "head", "unknown", "open", "generation", "storage", "publication"])
+def test_bookkeeping_retry_rejects_or_defers_unproved_identity(incident, monkeypatch, failure):
+    c = incident
+    c.runner.state.state = PipelineState.ERROR
+    c.runner.state.error_message = "Merge accounting conflict: operator Retry required"
+    command = accounting_retry(c)
+    if failure == "identity":
+        command.bound_pr_head_sha = "c" * 40
+    elif failure == "head":
+        c.payload["head"]["sha"] = "c" * 40
+    elif failure == "unknown":
+        c.payload["merged"] = None
+    elif failure == "open":
+        c.payload.update(merged=False, state="open")
+    elif failure == "generation":
+        monkeypatch.setattr(c.runner, "_proven_merge_generation", lambda: "different")
+    elif failure == "publication":
+        c.runner.state.publication_attempt = PublicationAttempt(
+            repo=c.runner.owner_repo, base="main", task_id=c.task.pr_id, branch=c.task.branch,
+            run_id=None, attempt_index=None, started_at=command.requested_at,
+        )
+    else:
+        monkeypatch.setattr(c.runner, "_proven_merge_generation", lambda: (_ for _ in ()).throw(OSError("offline")))
+    asyncio.run(enqueue_retry_command(c.runner.redis, command))
+    assert asyncio.run(c.runner._select_retry_continuation(command)) == RetryDispatch.HANDLED
+    stored = asyncio.run(load_retry_command(c.runner.redis, c.runner.name, command.command_id))
+    assert stored.status == (RetryCommandStatus.DEFERRED if failure in {"unknown", "storage", "publication"}
+                             else RetryCommandStatus.FAILED)
+    assert c.runner.state.state == PipelineState.ERROR and "status: DONE" not in c.remote_task()
     c.preserved()
