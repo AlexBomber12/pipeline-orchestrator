@@ -780,7 +780,9 @@ class RetryCommandMixin:
         blocker = await self._retry_blocker(command, "coding", resolution.name)
         if blocker is not None:
             return blocker
-        if not await self.usage_gate(proactive_coder=resolution.name):
+        if not await self.usage_gate(
+            proactive_coder=resolution.name, preserve_error_message=True
+        ):
             return await self._defer_retry_command(
                 command,
                 f"Provider or spend limit currently blocks {resolution.name}.",

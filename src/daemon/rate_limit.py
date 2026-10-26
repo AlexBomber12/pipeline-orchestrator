@@ -268,10 +268,11 @@ class RateLimitMixin:
         *,
         coder_name: str,
         breach: UsageThresholdBreach,
+        preserve_error_message: bool = False,
     ) -> None:
         until = datetime.fromtimestamp(breach.resets_at, tz=timezone.utc)
         self._record_rate_limit(coder_name, until, reactive=False)
-        if breach.source == "rate-limit" and self.state.state == PipelineState.ERROR:
+        if preserve_error_message or (breach.source == "rate-limit" and self.state.state == PipelineState.ERROR):
             pass
         else:
             self.state.error_message = None
@@ -516,7 +517,9 @@ class RateLimitMixin:
             if callable(invalidate):
                 invalidate()
 
-    async def _proactive_usage_check(self, proactive_coder: str | None = None) -> bool:
+    async def _proactive_usage_check(
+        self, proactive_coder: str | None = None, *, preserve_error_message: bool = False
+    ) -> bool:
         """Return True if CLI calls are allowed, False if usage threshold breached.
 
         Fail-open: returns True when the provider cannot reach the endpoint,
@@ -549,23 +552,32 @@ class RateLimitMixin:
         if breach is None:
             breach = self._spend_ceiling_threshold_breach(snapshot)
         if breach is not None:
-            await self._apply_usage_gate_pause(coder_name=coder_name, breach=breach)
+            await self._apply_usage_gate_pause(
+                coder_name=coder_name, breach=breach, preserve_error_message=preserve_error_message
+            )
             return False
 
         await self._maybe_send_ceiling_warning(coder_name, snapshot)
         return True
 
-    async def usage_gate(self, proactive_coder: str | None = None) -> bool:
+    async def usage_gate(
+        self, proactive_coder: str | None = None, *, preserve_error_message: bool = False
+    ) -> bool:
         """Return True if dispatch may proceed under the unified usage gate.
 
         The gate keeps the existing pause-window orchestration from the
         rate-limit gate and runs proactive predicates against one usage
         snapshot: rate-limit pause thresholds first, then spend-ceiling
-        thresholds and warning behavior.
+        thresholds and warning behavior. Retry callers preserve their bound
+        failure message across resource pauses, including state publication.
         """
-        return await self._check_rate_limit(proactive_coder=proactive_coder)
+        return await self._check_rate_limit(
+            proactive_coder=proactive_coder, preserve_error_message=preserve_error_message
+        )
 
-    async def _check_rate_limit(self, proactive_coder: str | None = None) -> bool:
+    async def _check_rate_limit(
+        self, proactive_coder: str | None = None, *, preserve_error_message: bool = False
+    ) -> bool:
         """Return True if CLI calls are allowed, False if rate-limited.
 
         *proactive_coder* is forwarded to ``_proactive_usage_check`` so
@@ -598,7 +610,9 @@ class RateLimitMixin:
                         update_global=True,
                     )
                     return False
-                return await self._proactive_usage_check(proactive_coder=proactive_coder)
+                return await self._proactive_usage_check(
+                    proactive_coder=proactive_coder, preserve_error_message=preserve_error_message
+                )
 
             # A pause from a *different* effective coder doesn't apply.
             # When proactive_coder is set (e.g. "claude" for merge/diagnosis),
@@ -630,7 +644,9 @@ class RateLimitMixin:
                     f"while {global_pause.pause_coder} remains rate-limited until "
                     f"{global_pause.until.isoformat()}."
                 )
-                return await self._proactive_usage_check(proactive_coder=proactive_coder)
+                return await self._proactive_usage_check(
+                    proactive_coder=proactive_coder, preserve_error_message=preserve_error_message
+                )
 
             if global_pause.active:
                 self._apply_pause_state(
@@ -649,7 +665,9 @@ class RateLimitMixin:
                 update_global=True,
             )
             return False
-        return await self._proactive_usage_check(proactive_coder=proactive_coder)
+        return await self._proactive_usage_check(
+            proactive_coder=proactive_coder, preserve_error_message=preserve_error_message
+        )
 
     def _detect_rate_limit(self, stderr: str, coder_name: str | None = None) -> None:
         """Set rate-limit pause if stderr contains rate-limit signals.

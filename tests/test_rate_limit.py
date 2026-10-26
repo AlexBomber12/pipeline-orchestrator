@@ -746,7 +746,9 @@ def test_check_rate_limit_uses_get_coder_when_repo_coder_is_unset(
 ) -> None:
     runner = _make_runner(monkeypatch, coder=None)
 
-    async def fake_proactive(*, proactive_coder: str | None = None) -> bool:
+    async def fake_proactive(
+        *, proactive_coder: str | None = None, preserve_error_message: bool = False
+    ) -> bool:
         assert proactive_coder is None
         return True
 

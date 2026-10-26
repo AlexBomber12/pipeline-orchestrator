@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,6 +44,7 @@ from src.retry_commands import (
 )
 from src.subsource_registry import SuppressionReason
 from src.suppression import SuppressionRecord
+from src.usage import UsageSnapshot
 
 from tests.runner import _helpers as h
 
@@ -2151,3 +2153,66 @@ async def test_recovered_retry_publication_preserves_fallback_failure_identity(
         assert runner.state.state == PipelineState.WATCH
         assert runner.state.current_pr.number == pr.number
         assert commits == ["TODO", "TODO"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit_kind", ["session", "weekly"])
+async def test_spend_deferred_coding_retry_preserves_failure_and_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit_kind: str,
+) -> None:
+    runner, command, task, repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *args: [])
+    monkeypatch.setattr(retry_module.gh_prs, "get_merged_prs", lambda *args, **kw: [])
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", _async_value(None))
+    monkeypatch.setattr(retry_module, "resolve_active_coder", lambda *args, **kw:
+                        SimpleNamespace(name="codex", plugin=object()))
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
+    setattr(runner.app_config.daemon, f"spend_ceiling_{limit_kind}_percent", 50)
+    resets_at = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
+    snapshot = UsageSnapshot(**{
+        "session_percent": None, "session_resets_at": None,
+        "weekly_percent": None, "weekly_resets_at": None,
+        f"{limit_kind}_percent": 60,
+        f"{limit_kind}_resets_at": resets_at,
+        "fetched_at": 0,
+    })
+    runner._codex_usage_provider = h._FakeUsageProvider(snapshot=snapshot)
+    original = (repo / command.task_file).read_bytes()
+
+    # The real spend gate publishes PAUSED; neither that snapshot nor another
+    # consumption may lose the fallback failure identity or reserve an attempt.
+    for _ in range(2):
+        assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+        stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+        assert stored.status == RetryCommandStatus.DEFERRED
+        assert stored.failure_id == command.failure_id
+        assert stored.request_binding == command.request_binding
+        assert stored.retry_count is None
+        assert stored.effect_stage == RetryEffectStage.NONE
+        assert runner.state.state == PipelineState.PAUSED
+        assert runner.state.error_message == "prior failure"
+        assert task.status == TaskStatus.ERROR
+        assert (repo / command.task_file).read_bytes() == original
+        published = RepoState.model_validate_json(runner.redis.store[pipeline_state(runner.name)])
+        assert published.error_message == "prior failure"
+        assert retry_failure_identity(task, published, None) == command.failure_id
+
+    # Once the recorded window expires, the same command checks fresh usage
+    # and resumes exactly once. No cancellation cause supplies an alternate ID.
+    expired = datetime.now(timezone.utc) - timedelta(seconds=1)
+    runner.state.rate_limited_until = expired
+    runner.state.rate_limited_coder_until["codex"] = expired
+    runner._codex_usage_provider = h._FakeUsageProvider(
+        snapshot=replace(snapshot, **{f"{limit_kind}_percent": 10})
+    )
+    assert await runner._consume_retry_command() == RetryDispatch.CODING
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.APPLIED
+    assert stored.command_id == command.command_id
+    assert stored.failure_id == command.failure_id
+    assert stored.request_binding == command.request_binding
+    assert stored.retry_count == 1
+    assert runner.state.error_message is None
+    assert runner.state.state == PipelineState.CODING
+    assert runner.redis.store[f"metrics:retry_count:{runner.name}:{command.task_id}"] == "1"
