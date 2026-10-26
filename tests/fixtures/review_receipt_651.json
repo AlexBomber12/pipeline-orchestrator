@@ -1,0 +1,345 @@
+{
+  "source": "PR 651 comments/reviews from read-only GitHub API, 2026-10-27, reduced to review evidence. Reactions intentionally empty to reproduce the operator-reported missing-reaction state; the live PR subsequently acquired a reaction.",
+  "head": "96b8724103746602959555702996b68fc5f5d5a6",
+  "author": "AlexBomber12",
+  "issue_comments": [
+    {
+      "id": 6424706654,
+      "created_at": "2026-10-26T18:56:27Z",
+      "updated_at": "2026-10-26T23:17:00Z",
+      "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"96b8724103746602959555702996b68fc5f5d5a6\",\"has_any_findings\":true,\"has_unresolved_findings\":true,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n## Codex Review Summary\n\nThis comment shows the latest Codex review activity on this pull request.\n\n| Review | Status | Commit | Review trigger |\n| --- | --- | --- | --- |\n| \ud83d\udcdd **Code Review** | \u2705 **Completed** <relative-time datetime=\"2026-10-26T23:16:59.090826Z\">2026-10-26T23:16:59.090826Z</relative-time> | `96b8724` | Manual request |\n\n\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\" or \"@codex security review\".\n\nCodex reacts with \ud83d\udc40 while any review is running, comments if it has suggestions, and reacts with \ud83d\udc4d once all reviews finish with no findings.\n\n</details>",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "id": 6425039114,
+      "created_at": "2026-10-26T19:12:48Z",
+      "updated_at": "2026-10-26T19:12:48Z",
+      "body": "@codex review",
+      "user": {
+        "login": "AlexBomber12",
+        "id": 48256657
+      }
+    },
+    {
+      "id": 6425352143,
+      "created_at": "2026-10-26T19:27:59Z",
+      "updated_at": "2026-10-26T19:27:59Z",
+      "body": "@codex review",
+      "user": {
+        "login": "AlexBomber12",
+        "id": 48256657
+      }
+    },
+    {
+      "id": 6425689975,
+      "created_at": "2026-10-26T19:44:58Z",
+      "updated_at": "2026-10-26T19:44:58Z",
+      "body": "@codex review",
+      "user": {
+        "login": "AlexBomber12",
+        "id": 48256657
+      }
+    },
+    {
+      "id": 6425757317,
+      "created_at": "2026-10-26T19:48:21Z",
+      "updated_at": "2026-10-26T19:48:21Z",
+      "body": "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. What shall we delve into next?\n\n**Reviewed commit:** `df11612873`\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "id": 6426162501,
+      "created_at": "2026-10-26T20:08:41Z",
+      "updated_at": "2026-10-26T20:08:41Z",
+      "body": "@codex review",
+      "user": {
+        "login": "AlexBomber12",
+        "id": 48256657
+      }
+    },
+    {
+      "id": 6426686355,
+      "created_at": "2026-10-26T20:34:11Z",
+      "updated_at": "2026-10-26T20:34:11Z",
+      "body": "@codex review",
+      "user": {
+        "login": "AlexBomber12",
+        "id": 48256657
+      }
+    },
+    {
+      "id": 6426726225,
+      "created_at": "2026-10-26T20:36:12Z",
+      "updated_at": "2026-10-26T20:36:12Z",
+      "body": "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. Hooray!\n\n**Reviewed commit:** `98235a5897`\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "id": 6427135672,
+      "created_at": "2026-10-26T20:56:46Z",
+      "updated_at": "2026-10-26T20:56:46Z",
+      "body": "@codex review",
+      "user": {
+        "login": "AlexBomber12",
+        "id": 48256657
+      }
+    },
+    {
+      "id": 6427187380,
+      "created_at": "2026-10-26T20:59:26Z",
+      "updated_at": "2026-10-26T20:59:26Z",
+      "body": "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. You're on a roll.\n\n**Reviewed commit:** `98235a5897`\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "id": 6427629253,
+      "created_at": "2026-10-26T21:22:05Z",
+      "updated_at": "2026-10-26T21:22:05Z",
+      "body": "@codex review",
+      "user": {
+        "login": "AlexBomber12",
+        "id": 48256657
+      }
+    },
+    {
+      "id": 6427676369,
+      "created_at": "2026-10-26T21:24:17Z",
+      "updated_at": "2026-10-26T21:24:17Z",
+      "body": "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. Swish!\n\n**Reviewed commit:** `98235a5897`\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "id": 6428182657,
+      "created_at": "2026-10-26T21:50:51Z",
+      "updated_at": "2026-10-26T21:50:51Z",
+      "body": "@codex review",
+      "user": {
+        "login": "AlexBomber12",
+        "id": 48256657
+      }
+    },
+    {
+      "id": 6428478504,
+      "created_at": "2026-10-26T22:07:49Z",
+      "updated_at": "2026-10-26T22:07:49Z",
+      "body": "@codex review",
+      "user": {
+        "login": "AlexBomber12",
+        "id": 48256657
+      }
+    },
+    {
+      "id": 6428836187,
+      "created_at": "2026-10-26T22:28:22Z",
+      "updated_at": "2026-10-26T22:28:22Z",
+      "body": "@codex review",
+      "user": {
+        "login": "AlexBomber12",
+        "id": 48256657
+      }
+    },
+    {
+      "id": 6428883689,
+      "created_at": "2026-10-26T22:31:12Z",
+      "updated_at": "2026-10-26T22:31:12Z",
+      "body": "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. What shall we delve into next?\n\n**Reviewed commit:** `96b8724103`\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "id": 6429213311,
+      "created_at": "2026-10-26T22:51:45Z",
+      "updated_at": "2026-10-26T22:51:45Z",
+      "body": "@codex review",
+      "user": {
+        "login": "AlexBomber12",
+        "id": 48256657
+      }
+    },
+    {
+      "id": 6429247861,
+      "created_at": "2026-10-26T22:54:02Z",
+      "updated_at": "2026-10-26T22:54:02Z",
+      "body": "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. Hooray!\n\n**Reviewed commit:** `96b8724103`\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "id": 6429565709,
+      "created_at": "2026-10-26T23:14:47Z",
+      "updated_at": "2026-10-26T23:14:47Z",
+      "body": "@codex review",
+      "user": {
+        "login": "AlexBomber12",
+        "id": 48256657
+      }
+    },
+    {
+      "id": 6429599785,
+      "created_at": "2026-10-26T23:16:57Z",
+      "updated_at": "2026-10-26T23:16:57Z",
+      "body": "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. What shall we delve into next?\n\n**Reviewed commit:** `96b8724103`\n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    }
+  ],
+  "review_comments": [
+    {
+      "pull_request_review_id": 5657465750,
+      "id": 4381289079,
+      "commit_id": "f9ab010ea009dba0ad1af601a70b527989c7f792",
+      "original_commit_id": "f9ab010ea009dba0ad1af601a70b527989c7f792",
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Check global inhibitors before publication recovery side effects**\n\nWhen Retry targets a retained publication attempt with a pushed branch but no PR, selecting the continuation can create a PR before checking operator pause, stop, or GitHub-budget inhibitors. `_select_retry_continuation()` calls `_recover_branch_without_pr()`, which invokes `gh pr create` in `src/daemon/handlers/coding.py:508-514` (`gh pr create --help`: \u201cCreate a pull request on GitHub.\u201d). With `user_paused=True`, this path creates the PR and only afterward records the Retry as deferred for the pause. Keep global safety checks before these side effects, while leaving coder-specific resource checks after continuation selection.\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.\n\n<!-- codex-code-review-finding:v1 -->",
+      "created_at": "2026-10-26T19:00:25Z",
+      "updated_at": "2026-10-26T19:00:26Z",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "pull_request_review_id": 5657465750,
+      "id": 4381289094,
+      "commit_id": "f9ab010ea009dba0ad1af601a70b527989c7f792",
+      "original_commit_id": "f9ab010ea009dba0ad1af601a70b527989c7f792",
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Preserve reserved retries across their own TODO status write**\n\nFor a Retry admitted without a cancellation cause, if the TODO status commit succeeds but recording `STATUS_COMMITTED` fails or the daemon exits before that checkpoint, the durable command remains `RETRY_RESERVED`. On restart, the queue is reconstructed from the now-TODO task header, so this fallback identity hashes TODO instead of the original ERROR and permanently fails the command as stale, despite no new failure having occurred. The already-reserved allowance is then consumed without resuming the Retry. Validation at this checkpoint needs to account for its own completed status write rather than treating that transition as a different failure.\n\nAGENTS.md reference: [AGENTS.md:L199-L199](https://github.com/AlexBomber12/pipeline-orchestrator/blob/f9ab010ea009dba0ad1af601a70b527989c7f792/AGENTS.md#L199-L199)\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.\n\n<!-- codex-code-review-finding:v1 -->",
+      "created_at": "2026-10-26T19:00:25Z",
+      "updated_at": "2026-10-26T19:00:26Z",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "pull_request_review_id": 5657665225,
+      "id": 4381435828,
+      "commit_id": "96b8724103746602959555702996b68fc5f5d5a6",
+      "original_commit_id": "2f82a8600a4710f4b11eb0e595b67187145500f3",
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Preserve failure identity across Retry's own PR recovery**\n\nWhen a Retry has no cancellation cause and initially has no bound PR, `_select_retry_continuation()` can recover the retained publication and set `state.current_pr`. The command then records that PR binding, but its fallback `failure_id` still hashes the original missing PR. If the subsequent TODO status commit fails, the next consumption recomputes the identity with the recovered PR and permanently fails the command as stale, consuming the reserved allowance without resuming WATCH. This is reproducible across two consumptions without a restart or any new failure. Account for the command's own verified publication recovery when validating the fallback identity, rather than treating it as a changed failure.\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.\n\n<!-- codex-code-review-finding:v1 -->",
+      "created_at": "2026-10-26T19:15:21Z",
+      "updated_at": "2026-10-26T19:15:21Z",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "pull_request_review_id": 5657861906,
+      "id": 4381591740,
+      "commit_id": "96b8724103746602959555702996b68fc5f5d5a6",
+      "original_commit_id": "9a048d0748b62cca99aa71a9dc0fb4ee0790021e",
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Preserve failure identity when the spend gate defers Retry**\n\nFor a CODING Retry with no cancellation cause, a spend-ceiling deferral changes the fallback failure identity itself: `_ensure_retry_coder_available()` calls `usage_gate()`, whose `_apply_usage_gate_pause()` clears `state.error_message` for spend breaches (`src/daemon/rate_limit.py:274-278`). On the next consumption, this comparison permanently fails the command as stale, although no new task failure occurred. Using the existing runner fixture with a 50% spend cap and 60% usage reproduces DEFERRED on the first consumption and FAILED on the second. Preserve the bound error message across this resource-only deferral so the accepted Retry can resume when quota becomes available.\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.\n\n<!-- codex-code-review-finding:v1 -->",
+      "created_at": "2026-10-26T19:31:58Z",
+      "updated_at": "2026-10-26T19:31:58Z",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "pull_request_review_id": 5658332295,
+      "id": 4381955249,
+      "commit_id": "96b8724103746602959555702996b68fc5f5d5a6",
+      "original_commit_id": "df11612873d9ac5ed786fe067f8c09846b340fc6",
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Preserve fallback failure bindings across startup recovery**\n\nWhen a Retry is accepted without a cancellation cause for an ERROR task with no PR, restarting the daemon before consumption permanently rejects the unchanged command. `_hydrate_current_task_from_persisted_state()` does not restore `current_task` or `error_message` for this ordinary ERROR snapshot, and `_apply_recovery_decisions()` recovers the ERROR header into IDLE with no current task. Consequently, this recomputation hashes a null error message instead of the accepted failure message and reports the Retry as stale despite no new failure. This reproduces even at effect stage NONE, before any TODO write. Preserve or reconstruct the accepted fallback identity through actual startup recovery rather than relying on the previous runner's in-memory error context.\n\nAGENTS.md reference: [AGENTS.md:L199-L199](https://github.com/AlexBomber12/pipeline-orchestrator/blob/df11612873d9ac5ed786fe067f8c09846b340fc6/AGENTS.md#L199-L199)\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.\n\n<!-- codex-code-review-finding:v1 -->",
+      "created_at": "2026-10-26T20:11:52Z",
+      "updated_at": "2026-10-26T20:11:52Z",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "pull_request_review_id": 5659618598,
+      "id": 4382938319,
+      "commit_id": "98235a589740fa2505a4ecd086560445bb988129",
+      "original_commit_id": "98235a589740fa2505a4ecd086560445bb988129",
+      "body": "**<sub><sub>![P2 Badge](https://img.shields.io/badge/P2-yellow?style=flat)</sub></sub>  Restore failure context from resource-paused Retry snapshots**\n\nWhen a fallback-bound CODING Retry is deferred by a spend ceiling and the daemon restarts, the command is still permanently rejected as stale. The usage gate preserves the error message but publishes `PipelineState.PAUSED`, which this new ERROR-only recovery condition excludes. With the unchanged ERROR task header and no PR, actual `recover_state()` consequently restores IDLE with no current task or error message; the next consumption computes a different failure identity and marks the accepted command FAILED rather than retaining it until quota becomes available. Preserve the bound failure context across this resource-paused startup path as well.\n\nAGENTS.md reference: [AGENTS.md:L199-L199](https://github.com/AlexBomber12/pipeline-orchestrator/blob/98235a589740fa2505a4ecd086560445bb988129/AGENTS.md#L199-L199)\n\nUseful? React with \ud83d\udc4d\u00a0/ \ud83d\udc4e.\n\n<!-- codex-code-review-finding:v1 -->",
+      "created_at": "2026-10-26T21:52:44Z",
+      "updated_at": "2026-10-26T21:52:44Z",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    }
+  ],
+  "review_events": [
+    {
+      "id": 5657465750,
+      "body": "<!-- codex-review-receipt:v1 -->\n\n\n### \ud83d\udca1 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `f9ab010ea0`\n    \n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-26T19:00:25Z",
+      "commit_id": "f9ab010ea009dba0ad1af601a70b527989c7f792",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "id": 5657665225,
+      "body": "<!-- codex-review-receipt:v1 -->\n\n\n### \ud83d\udca1 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `2f82a8600a`\n    \n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-26T19:15:21Z",
+      "commit_id": "2f82a8600a4710f4b11eb0e595b67187145500f3",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "id": 5657861906,
+      "body": "<!-- codex-review-receipt:v1 -->\n\n\n### \ud83d\udca1 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `9a048d0748`\n    \n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-26T19:31:58Z",
+      "commit_id": "9a048d0748b62cca99aa71a9dc0fb4ee0790021e",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "id": 5658332295,
+      "body": "<!-- codex-review-receipt:v1 -->\n\n\n### \ud83d\udca1 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `df11612873`\n    \n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-26T20:11:52Z",
+      "commit_id": "df11612873d9ac5ed786fe067f8c09846b340fc6",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    },
+    {
+      "id": 5659618598,
+      "body": "<!-- codex-review-receipt:v1 -->\n\n\n### \ud83d\udca1 Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `98235a5897`\n    \n\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with \ud83d\udc4d.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>",
+      "state": "COMMENTED",
+      "submitted_at": "2026-10-26T21:52:44Z",
+      "commit_id": "98235a589740fa2505a4ecd086560445bb988129",
+      "user": {
+        "login": "chatgpt-codex-connector[bot]",
+        "id": 199175422
+      }
+    }
+  ],
+  "reactions": []
+}
