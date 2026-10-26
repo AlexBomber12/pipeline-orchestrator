@@ -558,3 +558,19 @@ def test_completed_accounting_discovery_defers_unavailable_generation_read(incid
     c.recover(restarted)
     assert restarted.state.state == PipelineState.WATCH
     c.preserved()
+
+
+def test_legacy_optional_invocation_binding_uses_proved_generation_and_ancestor(incident):
+    c = incident
+    invocation = replace(c.old.invocations[0], run_id=None, attempt_index=None)
+    good = replace(c.old, run_id="legacy-compatible", ended_at=None, exit_reason="",
+                   cause="CRASH", cause_subsource=None, head_sha=c.intermediate,
+                   task_spec_hash=task_spec_content_hash(c.generation_b), invocations=[invocation])
+    asyncio.run(c.runner._metrics_store.save(good))
+    asyncio.run(c.runner.handle_merge())
+    saved = asyncio.run(c.runner._metrics_store.get(good.run_id))
+    assert saved.outcome == "merged" and saved.head_sha == c.head
+    assert saved.invocations == [invocation]
+    assert (saved.tokens_in, saved.tokens_out) == (good.tokens_in, good.tokens_out)
+    assert "status: DONE" in c.remote_task()
+    c.preserved()

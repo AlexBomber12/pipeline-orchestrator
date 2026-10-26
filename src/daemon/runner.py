@@ -1917,7 +1917,7 @@ class PipelineRunner(
                 or record.exit_reason == "success_merged"
                 and (record.outcome != "merged" or record.head_sha != pr.head_sha)
                 or record.ended_at and (record.exit_reason == "" or record.outcome == "failed")
-                or any(i.run_id != record.run_id or i.attempt_index not in {None, record.attempt_index}
+                or any(i.run_id not in {None, record.run_id} or i.attempt_index not in {None, record.attempt_index}
                        for i in record.invocations)):
             return False
         if record.head_sha and record.head_sha != pr.head_sha:
