@@ -475,7 +475,22 @@ class RetryCommandMixin:
                 (item for item in self.state.current_queue or [] if item.pr_id == task.pr_id),
                 task,
             )
-            if retry_failure_identity(bound_task, self.state, cause) != command.failure_id:
+            identity = retry_failure_identity(bound_task, self.state, cause)
+            # A crash can leave the reservation durable but lose the checkpoint
+            # after our TODO commit. Recovery then rebuilds the queue as TODO.
+            # Only normalize that status; the message and PR must still match.
+            if (
+                cause is None
+                and command.effect_stage == RetryEffectStage.RETRY_RESERVED
+                and header.frontmatter_status == "todo"
+                and bound_task.status == TaskStatus.TODO
+                and identity != command.failure_id
+            ):
+                identity = retry_failure_identity(
+                    bound_task.model_copy(update={"status": TaskStatus.ERROR}),
+                    self.state, cause,
+                )
+            if identity != command.failure_id:
                 return await self._fail_retry_command(
                     command, "Retry is stale: current failure identity changed."
                 )
@@ -875,14 +890,16 @@ class RetryCommandMixin:
             return validated
         header, task = validated
 
+        # Publication recovery during selection can create a PR. Repository
+        # holds must apply before that; coder checks follow actual selection.
+        blocker = await self._retry_blocker(command, "watch")
+        if blocker is not None:
+            return blocker
+
         continuation = await self._select_retry_continuation(command)
         if isinstance(continuation, RetryDispatch):
             return continuation
         continuation_name, pr = continuation
-
-        blocker = await self._retry_blocker(command, continuation_name)
-        if blocker is not None:
-            return blocker
 
         if continuation_name == "watch":
             assert pr is not None
@@ -1050,14 +1067,13 @@ class RetryCommandMixin:
         if isinstance(validated, RetryDispatch):
             return validated
         header, task = validated
+        blocker = await self._retry_blocker(command, "watch")
+        if blocker is not None:
+            return blocker
         continuation = await self._select_retry_continuation(command)
         if isinstance(continuation, RetryDispatch):
             return continuation
         continuation_name, pr = continuation
-
-        blocker = await self._retry_blocker(command, continuation_name)
-        if blocker is not None:
-            return blocker
 
         if continuation_name == "merge":
             try:

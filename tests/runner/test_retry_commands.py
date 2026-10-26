@@ -19,7 +19,7 @@ from src.cancellation import (
 from src.daemon import retry_commands as retry_module
 from src.daemon.retry_commands import RetryDispatch
 from src.inhibitor import InhibitorType, WorkInhibitor
-from src.keyspace import pipeline_state, retry_command, retry_command_pending
+from src.keyspace import control_stop, pipeline_state, retry_command, retry_command_pending
 from src.models import (
     CIStatus,
     PipelineState,
@@ -1984,3 +1984,93 @@ async def test_retry_restart_after_cleanup_deferral_keeps_one_allowance_and_comm
     assert stored.retry_count == 1
     assert commits == ["TODO"]
     assert restarted.redis.store[f"metrics:retry_count:{runner.name}:{command.task_id}"] == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("applied", [False, True])
+@pytest.mark.parametrize("hold", ["pause", "stop", "budget"])
+async def test_global_holds_precede_publication_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, applied: bool, hold: str,
+) -> None:
+    runner, command, _task, _repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    runner._start_current_run_record("codex", "")
+    runner._capture_invocation_snapshot("codex", {}, phase="coding")
+    runner._begin_publication_attempt(started_at=NOW, baseline_numbers=set())
+    attempt = runner.state.publication_attempt
+    attempt.head_sha = "a" * 40
+    attempt.exit_classification = "failure"
+    if applied:
+        command.effect_stage = RetryEffectStage.APPLIED
+    if hold == "pause":
+        runner.state.user_paused = True
+    elif hold == "stop":
+        runner.redis.store[control_stop(runner.name)] = "1"
+    else:
+        monkeypatch.setattr(retry_module, "derive_active_inhibitors", _async_value([
+            WorkInhibitor(inhibitor_type=InhibitorType.GITHUB_BUDGET_PAUSE,
+                          source_key="github-budget", reason_text="budget exhausted"),
+        ]))
+    recovered = []
+
+    async def recover():
+        recovered.append(True)
+        return False
+
+    monkeypatch.setattr(runner, "_resolve_published_attempt", _async_value(False))
+    monkeypatch.setattr(runner, "_recover_branch_without_pr", recover)
+    method = runner._reconcile_applied_retry if applied else runner._apply_retry_command
+    assert await method(command) == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.DEFERRED
+    assert stored.retry_count is None
+    assert attempt.pending
+    assert recovered == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_failure", [False, True])
+async def test_reserved_retry_restart_after_lost_status_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, new_failure: bool,
+) -> None:
+    runner, command, task, repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    monkeypatch.setattr(runner, "_select_retry_continuation", _async_value(("coding", None)))
+    monkeypatch.setattr(runner, "_ensure_retry_coder_available", _async_value(("codex", object())))
+    commits = []
+    todo = _task_text().replace("status: ERROR", "status: TODO").replace("blocked_reason: daemon\n", "")
+
+    async def commit(*args):
+        commits.append(args[1])
+        (repo / command.task_file).write_text(todo)
+        return True
+
+    async def lost_checkpoint(*args):
+        raise RuntimeError("checkpoint storage unavailable")
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit)
+    monkeypatch.setattr(runner, "_record_retry_stage", lost_checkpoint)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    reserved = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert reserved.effect_stage == RetryEffectStage.RETRY_RESERVED
+    assert reserved.retry_count == 1
+
+    restarted = h._make_runner()
+    restarted.redis, restarted.repo_path = runner.redis, runner.repo_path
+    restarted.state = RepoState.model_validate_json(runner.state.model_dump_json())
+    restarted.state.current_queue = [task.model_copy(update={"status": TaskStatus.TODO})]
+    if new_failure:
+        restarted.state.error_message = "a newer failure"
+    _allow_validation(monkeypatch, restarted, todo)
+    monkeypatch.setattr(restarted, "_select_retry_continuation", _async_value(("coding", None)))
+    monkeypatch.setattr(restarted, "_ensure_retry_coder_available", _async_value(("codex", object())))
+    monkeypatch.setattr(restarted, "_commit_task_status_change", commit)
+    outcome = await restarted._consume_retry_command()
+    stored = await load_retry_command(restarted.redis, restarted.name, command.command_id)
+    assert stored.command_id == command.command_id
+    assert stored.request_binding == command.request_binding
+    assert stored.retry_count == 1
+    assert restarted.redis.store[f"metrics:retry_count:{runner.name}:{command.task_id}"] == "1"
+    assert outcome == (RetryDispatch.HANDLED if new_failure else RetryDispatch.CODING)
+    assert stored.status == (RetryCommandStatus.FAILED if new_failure else RetryCommandStatus.APPLIED)
+    assert commits == (["TODO"] if new_failure else ["TODO", "TODO"])
