@@ -6,6 +6,10 @@ from tests.e2e.lib.coder_shim import coder_shim
 
 DAEMON_CONTAINER = "pipeline-orchestrator-daemon-test"
 COMPOSE_FILE = "docker-compose.test.yml"
+# Recovery can defer on stale GitHub discovery and retry on the next 60s
+# daemon tick. CI run 40332894437 recovered after 136s, beyond the old 120s
+# deadline. Allow startup/discovery plus a retry, keeping a finite failure bound.
+RECOVERY_DEADLINE_SEC = 240
 
 
 def _is_daemon_running() -> str:
@@ -146,7 +150,7 @@ def test_sigkill_during_coding_recovers_correctly(
         last_seen_state = None
         last_seen_ts: dt.datetime | None = None
         last_seen_current_task: object = "<unset>"
-        deadline = time.monotonic() + 120
+        deadline = time.monotonic() + RECOVERY_DEADLINE_SEC
         while time.monotonic() < deadline:
             entry = get_state()
             if entry is not None:
@@ -171,7 +175,7 @@ def test_sigkill_during_coding_recovers_correctly(
             time.sleep(1)
         assert recovered is not None, (
             f"daemon did not quiesce in {list(recovered_states)!r} within "
-            f"120s after restart; "
+            f"{RECOVERY_DEADLINE_SEC}s after restart; "
             f"last_seen_state={last_seen_state!r}, "
             f"last_seen_current_task={last_seen_current_task!r}, "
             f"last_seen_last_updated={last_seen_ts.isoformat() if last_seen_ts else None!r}, "
