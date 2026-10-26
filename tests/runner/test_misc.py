@@ -1253,7 +1253,9 @@ def test_restore_current_run_record_rehydrates_latest_invocation() -> None:
 
 
 @pytest.mark.asyncio
-async def test_restored_invocation_is_not_restart_process_ownership(tmp_path: Path) -> None:
+async def test_restored_invocation_is_not_restart_process_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
     original = h._make_runner()
     original.state.current_task = QueueTask(
         pr_id="PR-001", title="t", status=TaskStatus.DOING,
@@ -1268,6 +1270,17 @@ async def test_restored_invocation_is_not_restart_process_ownership(tmp_path: Pa
         cwd=tmp_path, stdout=asyncio.subprocess.PIPE,
     )
     try:
+        # Model this fixture's process namespace: hosted CI can have unrelated
+        # same-UID processes whose cwd is unreadable. Keep the owned child's
+        # real /proc entry and cwd inspection, including after it is reaped.
+        original_iterdir = Path.iterdir
+
+        def owned_process_entries(path: Path):
+            if path == Path("/proc"):
+                return iter([path / str(managed.process.pid)])
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", owned_process_entries)
         assert managed.process.stdout is not None
         assert await asyncio.wait_for(managed.process.stdout.readline(), 2) == b"ready\n"
         original._track_current_coder_supervised_process(managed)
@@ -1285,7 +1298,9 @@ async def test_restored_invocation_is_not_restart_process_ownership(tmp_path: Pa
         # proof: the real, fixture-owned process still blocks the checkout.
         assert await fresh._terminate_current_coder()
         assert managed.process.returncode is None
-        assert checkout_process_blocker(str(tmp_path))
+        assert checkout_process_blocker(str(tmp_path)) == (
+            f"Process {managed.process.pid} still uses the checkout; waiting for it to exit."
+        )
     finally:
         async with asyncio.timeout(3):
             result = await managed.cleanup(term_grace=0.05, kill_grace=0.5)
