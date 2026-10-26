@@ -99,6 +99,7 @@ from src.daemon.handlers.error import (  # noqa: F401 — re-exported for tests
     ErrorMixin,
     _classify_error,
     _is_infra_error,
+    is_retained_merge_error,
 )
 from src.daemon.handlers.fix import FixMixin
 from src.daemon.handlers.hung import HungMixin
@@ -111,7 +112,7 @@ from src.daemon.notifications import (
 )
 from src.daemon.preflight import PreflightMixin
 from src.daemon.rate_limit import RateLimitMixin
-from src.daemon.recovery import RecoveryMixin
+from src.daemon.recovery import MergeIdentityConflict, RecoveryMixin
 from src.daemon.recovery_policy import BoundedRecoveryPolicy
 from src.daemon.repo_ops import RepoOpsMixin
 from src.daemon.retry_commands import RetryCommandMixin, RetryDispatch
@@ -152,6 +153,7 @@ from src.process_supervisor import SupervisedProcess
 from src.queue_parser import (
     TYPE_SYNONYMS,
     QueueValidationError,
+    parse_existing_task_header_text,
     write_frontmatter_status,
 )
 from src.queue_parser import (
@@ -1047,6 +1049,7 @@ class PipelineRunner(
             )
             app_config = app_config.model_copy(update={"daemon": daemon_config})
         ctx = self._selection_context(app_config=app_config)
+        ctx.check_inhibitors = True
         resolution = resolve_active_coder(ctx, purpose=CoderPurpose.DISPATCH)
         pin = ctx.task_coder_pin
         preferred = pin if pin and pin != "any" else (
@@ -1345,6 +1348,7 @@ class PipelineRunner(
         *,
         phase: Literal["coding", "fix"],
         fix_iteration: int | None = None,
+        fix_trigger: dict | None = None,
     ) -> InvocationSnapshot:
         """Capture the allowlisted settings passed to a primary invocation."""
         record = self._current_run_record
@@ -1360,6 +1364,7 @@ class PipelineRunner(
             attempt_index=record.attempt_index if record is not None else None,
             phase=phase,
             fix_iteration=fix_iteration,
+            fix_trigger=fix_trigger,
         )
         self.state.active_invocation = snapshot
         if record is not None:
@@ -1802,6 +1807,13 @@ class PipelineRunner(
         if task is None:
             self._current_run_record = None
             return
+        if recover_missing_merge:
+            await self._restore_merge_run_record()
+            return
+        if self.state.state == PipelineState.MERGE:
+            # Saved invocation bindings are candidates, never merge admission.
+            self._current_run_record = None
+            return
         try:
             invocation = self.state.active_invocation
             run_id = invocation.run_id if invocation is not None else None
@@ -1836,35 +1848,139 @@ class PipelineRunner(
                 f"{task.pr_id}: {exc}."
             )
             return
-        if recover_missing_merge and not recent:
-            # Exact remote merge proof allows completion after Redis loss. Do
-            # not invent lost coder usage or fall back past a mismatched record.
-            # The caller checkpoints this accounting before writing DONE.
-            self._current_run_record = RunRecord(
-                run_id=run_id if run_id is not None else str(uuid.uuid4()),
-                task_id=task.pr_id,
-                repo_name=self.name,
-                profile_id="recovery:unknown:container",
-                task_type="",
-                complexity="",
-                started_at=datetime.now(timezone.utc).isoformat(),
-                ended_at=None,
-                duration_ms=None,
-                fix_iterations=0,
-                tokens_in=0,
-                tokens_out=0,
-                exit_reason="",
-                operator_intervention=False,
-                run_phase="merge",
-                invocations=[invocation] if invocation is not None else [],
-            )
-            self.log_event(f"[MERGE] Reconstructed missing accounting for {task.pr_id}.")
         if (
             self.state.active_invocation is None
             and self._current_run_record is not None
             and self._current_run_record.invocations
         ):
             self.state.active_invocation = self._current_run_record.invocations[-1]
+
+    def _proven_merge_generation(self) -> str:
+        """Compare authoritative base with the exact PR head and merge commit."""
+        task, pr = self.state.current_task, self.state.current_pr
+        outcome = getattr(self, "_confirmed_merge_outcome", None)
+        if (outcome is None or outcome.state != gh_prs.ExactPRState.MERGED
+                or (outcome.repo, outcome.base_branch, outcome.number, outcome.head_sha)
+                != (self.owner_repo, self.repo_config.branch, pr.number, pr.head_sha)
+                or not outcome.merge_commit_sha):
+            raise RuntimeError("exact merged identity unavailable")
+        path = Path(task.task_file or "")
+        if (path.parts != ("tasks", f"{task.pr_id}.md")
+                or task.branch != pr.branch or pr.pr_id not in {None, task.pr_id}):
+            raise MergeIdentityConflict("task path or PR branch differs from bound task")
+        origin = git_ops._git(self.repo_path, "config", "--get", "remote.origin.url").stdout
+        base = self.repo_config.branch
+        if (normalize_repo_url(origin) != normalize_repo_url(self.repo_config.url)
+                or not base or base.startswith("-") or git_ops._git(
+                    self.repo_path, "check-ref-format", "--branch", base, check=False,
+                ).returncode):
+            raise MergeIdentityConflict("repository or configured base differs")
+        git_ops._git(self.repo_path, "fetch", "--no-tags", "origin", base, timeout=120)
+        base_sha = git_ops._git(self.repo_path, "rev-parse", "FETCH_HEAD").stdout.strip()
+        hashes = []
+        for ref in (pr.head_sha, outcome.merge_commit_sha, base_sha):
+            if git_ops._git(self.repo_path, "cat-file", "-e", f"{ref}^{{commit}}", check=False).returncode:
+                git_ops._git(self.repo_path, "fetch", "--no-tags", "origin", ref, timeout=120)
+            hashes.append(self._merge_task_generation_at_ref(task, ref))
+        if len(set(hashes)) != 1:
+            raise MergeIdentityConflict("authoritative task generation differs from merged PR")
+        ancestry = git_ops._git(self.repo_path, "merge-base", "--is-ancestor",
+                                outcome.merge_commit_sha, base_sha, check=False).returncode
+        if ancestry == 1:
+            raise MergeIdentityConflict("merged commit absent from authoritative base")
+        if ancestry != 0:
+            raise RuntimeError("merged commit ancestry unavailable")
+        return hashes[0]
+
+    def _merge_task_generation_at_ref(self, task: Any, ref: str) -> str:
+        """Read a bounded task identity from a known Git commit, without checkout."""
+        path = task.task_file
+        entry = git_ops._git(self.repo_path, "ls-tree", ref, "--", path).stdout
+        if not entry.startswith(("100644 blob ", "100755 blob ")):
+            raise MergeIdentityConflict("task missing or unsafe in proved Git revision")
+        content = git_ops._git(self.repo_path, "show", f"{ref}:{path}").stdout
+        try:
+            header = parse_existing_task_header_text(path, content)
+        except ValueError as exc:
+            raise MergeIdentityConflict("invalid task in proved Git revision") from exc
+        if header.pr_id != task.pr_id or header.branch != task.branch:
+            raise MergeIdentityConflict("task identity differs in proved Git revision")
+        return task_spec_content_hash(content)
+
+    def _merge_record_compatible(
+        self, record: RunRecord, generation: str, *, task: Any = None, pr: Any = None,
+    ) -> bool:
+        """Accept generation evidence and ancestor heads, never terminal failures."""
+        task, pr = task or self.state.current_task, pr or self.state.current_pr
+        if (record.task_id != task.pr_id or record.repo_name != self.name
+                or record.task_spec_hash != generation
+                or record.exit_reason not in {"", "coding_complete", "success_merged"}
+                or record.exit_reason == "success_merged"
+                and (record.outcome != "merged" or record.head_sha != pr.head_sha)
+                or record.ended_at and (record.exit_reason == "" or record.outcome == "failed")
+                or any(i.run_id not in {None, record.run_id} or i.attempt_index not in {None, record.attempt_index}
+                       for i in record.invocations)):
+            return False
+        if record.head_sha and record.head_sha != pr.head_sha:
+            if not re.fullmatch(r"[0-9a-fA-F]{40}", record.head_sha):
+                return False
+            if git_ops._git(self.repo_path, "cat-file", "-e", record.head_sha, check=False).returncode:
+                git_ops._git(self.repo_path, "fetch", "--no-tags", "origin", record.head_sha, timeout=120)
+            result = git_ops._git(self.repo_path, "merge-base", "--is-ancestor",
+                                  record.head_sha, pr.head_sha, check=False)
+            if result.returncode not in {0, 1}:
+                raise RuntimeError("run HEAD ancestry unavailable")
+            if result.returncode != 0:
+                return False
+            try:
+                if self._merge_task_generation_at_ref(task, record.head_sha) != generation:
+                    return False
+            except MergeIdentityConflict:
+                return False
+        return True
+
+    async def _restore_merge_run_record(self) -> None:
+        """Select accounting only after proving the merged generation, on every path."""
+        generation = self._proven_merge_generation()
+        task, pr = self.state.current_task, self.state.current_pr
+        # Read all task runs: a newer failed/incompatible run cannot hide an
+        # interrupted checkpoint. Also consult a bound key if its index was lost.
+        records = sorted(
+            [*await self._metrics_store.list_task_runs(self.name, task.pr_id),
+             *await self._metrics_store.recent(task_id=task.pr_id, limit=200, repo_name=self.name)],
+            key=lambda r: (r.started_at, r.run_id), reverse=True,
+        )
+        invocation = self.state.active_invocation
+        if invocation is not None and invocation.run_id:
+            bound = await self._metrics_store.get(invocation.run_id)
+            if bound is not None:
+                records.insert(0, bound)
+        if self._current_run_record is not None:
+            records.insert(0, self._current_run_record)
+        # A finalized owner wins replay even if an older unfinished candidate
+        # remains bound in the snapshot. Never create a second success for it.
+        records.sort(key=lambda r: r.exit_reason != "success_merged")
+        record = next((r for r in records if self._merge_record_compatible(r, generation)), None)
+        if record is None:
+            # A deterministic identity survives partial checkpoint/index writes
+            # and lost snapshots without adopting an old invocation or its usage.
+            run_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
+                f"{self.repo_config.url}:{self.repo_config.branch}:{pr.number}:{pr.head_sha}:{generation}"))
+            record = await self._metrics_store.get(run_id)
+            if record is not None and not self._merge_record_compatible(record, generation):
+                raise MergeIdentityConflict("recovery accounting identity already incompatible")
+            if record is None:
+                record = RunRecord(
+                    run_id=run_id, task_id=task.pr_id, repo_name=self.name,
+                    profile_id="recovery:unknown:container", task_type="", complexity="",
+                    started_at=datetime.now(timezone.utc).isoformat(), ended_at=None,
+                    duration_ms=None, fix_iterations=0, tokens_in=0, tokens_out=0,
+                    exit_reason="", operator_intervention=False, run_phase="merge",
+                    task_spec_hash=generation, head_sha=pr.head_sha,
+                )
+                self.log_event(f"[MERGE] Reconstructed missing accounting for {task.pr_id}.")
+        self._current_run_record = record
+        self.state.active_invocation = record.invocations[-1] if record.invocations else None
 
     async def _save_current_run_record(
         self,
@@ -2341,6 +2457,98 @@ class PipelineRunner(
             return False
         return cause is None
 
+    async def _maybe_resume_review_timeout(self) -> bool:
+        """Admit a late trusted result for a retained timeout failure."""
+        from src.github.reviewer_policy import reviewer_policy_from_config
+        from src.models import FeedbackCheckResult, ReviewStatus
+
+        task, bound = self.state.current_task, self.state.current_pr
+        if task is None or bound is None or not bound.head_sha or not task.branch:
+            return False
+        if bound.branch != task.branch or bound.pr_id not in (None, task.pr_id):
+            return False
+        try:
+            cause = await get_cancellation_cause(
+                self.redis, self.name, task.pr_id, refresh_ttl=False
+            )
+            suppression = await self._suppression_record_for_task(task.pr_id)
+        except Exception:
+            return False
+        if (
+            cause is None or cause.payload.get("subsource") != "review_timeout"
+            or (suppression is not None and suppression.reason != SuppressionReason.REVIEW_TIMEOUT)
+            or self.state.user_paused
+            or task.pr_id in self._user_stopped_task_pr_ids
+        ):
+            return False
+        status, reason, revision = self._remote_frontmatter_error_status_for_current_task()
+        if revision is None or not (
+            (status == "error" and reason == SuppressionReason.REVIEW_TIMEOUT)
+            or (status == "todo" and reason is None)
+        ):
+            return False
+        if self.state.review_request_generation:
+            try:
+                current_generation = task_spec_content_hash(
+                    (Path(self.repo_path) / task.task_file).read_text(encoding="utf-8")
+                )
+            except (OSError, TypeError, ValueError):
+                return False
+            if current_generation != self.state.review_request_generation:
+                return False
+        try:
+            policy = reviewer_policy_from_config(load_config())
+            candidates = gh_prs.get_open_prs(
+                self.owner_repo,
+                allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                reviewer_policy=policy,
+            )
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Review timeout evidence unavailable: {exc}")
+            return False
+        found = next((pr for pr in candidates if pr.number == bound.number), None)
+        if (
+            found is None or found.branch != task.branch
+            or found.head_sha != bound.head_sha
+            or found.pr_id not in (None, task.pr_id)
+        ):
+            return False
+        found = self._approval_filtered_pr(found)
+        if found.review_status == ReviewStatus.CHANGES_REQUESTED:
+            prior = self.state.current_pr
+            self.state.current_pr = found
+            self._rehydrate_last_push_at(found)
+            fresh = self._has_new_codex_feedback_since_last_push(policy)
+            self.state.current_pr = prior
+            if fresh != FeedbackCheckResult.NEW:
+                return False
+        elif found.review_status != ReviewStatus.APPROVED:
+            return False
+        if status == "error":
+            if not await self._commit_task_status_change(
+                task, "TODO", "Late Codex review received; continuing published PR",
+                expected_task_sha256=revision,
+            ):
+                return False
+        await safe_delete_cancellation_cause(
+            self.redis, self.name, task.pr_id, log=self.log_event
+        )
+        if suppression is not None:
+            await self._clear_task_suppression(task.pr_id)
+        self.state.current_task = task.model_copy(update={"status": TaskStatus.DOING})
+        self.state.current_queue = [
+            self.state.current_task if item.pr_id == task.pr_id else item
+            for item in (self.state.current_queue or [task])
+        ]
+        self.state.skip_ai_error_diagnose = False
+        self.state.error_message = None
+        self.state.state = PipelineState.WATCH
+        self.log_event(
+            f"[RECOVERY] PR #{bound.number} late review admitted for "
+            f"{bound.head_sha[:7]}; resuming WATCH."
+        )
+        return True
+
     async def _exit_error_to_idle_for_retry(self, reason: SuppressionReason | None) -> None:
         """Leave ERROR for a plain retry when AI diagnosis is disabled."""
         task = self.state.current_task
@@ -2365,8 +2573,52 @@ class PipelineRunner(
             f"({label}) -> IDLE for retry."
         )
 
+    async def _maybe_resume_obsolete_ci_error(self) -> bool | None:
+        """Admit a proven obsolete CI-only escalation in either ERROR dispatcher."""
+        task = self.state.current_task
+        snapshot = self.state.active_invocation
+        if (
+            task is not None and snapshot is not None
+            and isinstance(snapshot.fix_trigger, dict)
+            and isinstance(snapshot.fix_trigger.get("ci"), dict)
+        ):
+            try:
+                cause = await get_cancellation_cause(
+                    self.redis, self.name, task.pr_id, refresh_ttl=False,
+                )
+                if (
+                    cause is not None
+                    and cause.payload.get("subsource") == "coder_escalate"
+                    and cause.payload.get("reason_text") == "OBSOLETE_CI_EVIDENCE"
+                    and isinstance(cause.payload.get("obsolete_ci_trigger"), dict)
+                ) or (
+                    cause is None and snapshot.run_id is not None
+                    and snapshot.fix_trigger.get("review") is False
+                    and await self._metrics_store.get(str(uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"{self.name}:{task.pr_id}:{snapshot.run_id}:obsolete-ci-continuation",
+                    ))) is not None
+                ):
+                    tasks = self._parse_tasks_from_headers()
+                    prs = gh_prs.get_open_prs(
+                        self.owner_repo,
+                        allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                    )
+                    if tasks is not None and await self._recover_obsolete_ci_error(tasks, prs):
+                        return True
+                    return False
+            except Exception as exc:
+                self.log_event(f"[RECOVERY] Obsolete CI observation deferred: {exc}.")
+                return False
+        return None
+
     async def _handle_single_error_exit(self) -> None:
         """Feature-flagged ERROR dispatcher with one visible exit per cycle."""
+        if (self.state.error_message or "").startswith("Merge accounting conflict:"):
+            self.log_event("[RECOVERY] Merge accounting conflict remains parked for operator Retry.")
+            return
+        if await self._maybe_resume_obsolete_ci_error() is not None:
+            return
         if self.state.rate_limited_until is not None:
             self.state.state = PipelineState.PAUSED
             self.log_event(
@@ -2383,11 +2635,14 @@ class PipelineRunner(
         frontmatter_status, _blocked, _revision = (
             self._remote_frontmatter_error_status_for_current_task()
         )
-        if task is not None and frontmatter_status is None:
-            self.log_event("[RECOVERY] Remote ERROR task status unavailable; staying ERROR.")
-            return
         if frontmatter_status == "error" and (reason is None or from_frontmatter):
             reason, from_frontmatter = _blocked, True
+        merge_sync_error = is_retained_merge_error(self.state.error_message)
+        if merge_sync_error and task_id in self._status_write_failed_task_pr_ids:
+            # A failed status write leaves TODO on the confirmed base. It is
+            # not evidence of an operator Retry; repair it before reading TODO.
+            await self.handle_error()
+            return
         if frontmatter_status == "todo":
             self.state.skip_ai_error_diagnose = False
             self.state.error_message = None
@@ -2398,6 +2653,16 @@ class PipelineRunner(
             self.log_event(
                 "[ESCALATE] operator-cleared ERROR task frontmatter "
                 "-> IDLE."
+            )
+            return
+
+        if task is not None and frontmatter_status is None:
+            self.log_event("[RECOVERY] Remote ERROR task status unavailable; staying ERROR.")
+            return
+        if merge_sync_error:
+            self.log_event(
+                "[RECOVERY] Retained checkout failure remains ERROR until "
+                "operator Retry or a task update."
             )
             return
 
@@ -2460,6 +2725,7 @@ class PipelineRunner(
         blocked_reason: SuppressionReason | str | None = None,
         *,
         expected_task_sha256: str | None = None,
+        raise_identity_conflict: bool = False,
     ) -> bool:
         """Best-effort commit of daemon-written task frontmatter status."""
         task_file = getattr(current_task, "task_file", None)
@@ -2603,6 +2869,8 @@ class PipelineRunner(
                             f"status push not confirmed: {push.stderr.strip()}"
                         )
         except Exception as exc:
+            if raise_identity_conflict and isinstance(exc, ValueError):
+                raise MergeIdentityConflict(str(exc)) from exc
             self.log_event(
                 f"[INFRA] Warning: failed to commit {status} status for "
                 f"{task_file}: {exc}."
@@ -3723,6 +3991,26 @@ class PipelineRunner(
         try:
             await self.ensure_repo_cloned()
         except RuntimeError as exc:
+            task, pr = self.state.current_task, self.state.current_pr
+            if (
+                self.state.state in {PipelineState.ERROR, PipelineState.PAUSED}
+                and task is not None and pr is not None
+                and self._bound_pr_has_unpublished_work(task, pr)
+            ):
+                self.log_event(
+                    f"[INFRA] ensure_repo_cloned failed: {exc}; "
+                    "retaining unpublished PR checkout and failure."
+                )
+                if not is_retained_merge_error(self.state.error_message):
+                    await self._transition_to_error(
+                        "Published task failure unresolved; unpublished checkout "
+                        "retained; operator Retry required",
+                        save_run_record_as=None,
+                        publish=False,
+                        log_prefix="[RECOVERY]",
+                    )
+                await self.publish_state()
+                return
             await self._transition_to_error(
                 str(exc),
                 log_prefix="[INFRA]",
@@ -3758,7 +4046,7 @@ class PipelineRunner(
                                 raise
                             else:
                                 await self._finish_retry_dispatch(retry_dispatch)
-                    elif retry_dispatch == RetryDispatch.WATCH:
+                    elif retry_dispatch in {RetryDispatch.WATCH, RetryDispatch.MERGE}:
                         await self._finish_retry_dispatch(retry_dispatch)
                     await self.publish_state()
                     return
@@ -3883,8 +4171,18 @@ class PipelineRunner(
         elif current == PipelineState.PAUSED:
             await self.handle_paused()
         elif current == PipelineState.ERROR:
-            if (self.state.error_message or "").startswith("FIX idle timeout"):
+            obsolete_ci = (
+                await self._maybe_resume_obsolete_ci_error()
+                if not self.repo_config.feature_flags.use_single_error_exit else None
+            )
+            if obsolete_ci is True:
+                await self.handle_watch()
+            elif obsolete_ci is False:
+                pass
+            elif (self.state.error_message or "").startswith("FIX idle timeout"):
                 await self._admit_fix_idle_timeout()
+            elif await self._maybe_resume_review_timeout():
+                await self.handle_watch()
             elif self.repo_config.feature_flags.use_single_error_exit:
                 await self._handle_single_error_exit()
             elif self.state.rate_limited_until is not None:

@@ -397,6 +397,10 @@ def test_handle_merge_from_watch_clears_phase_after_confirmed_merge(
 
 @pytest.fixture(autouse=True)
 def confirmed_remote_merge(monkeypatch):
+    h._stub_final_merge_evidence(monkeypatch)
+    # Phase tests isolate Git proof; real generations and DONE publication
+    # are exercised together in recovery/test_merge_accounting.py.
+    monkeypatch.setattr(PipelineRunner, "_proven_merge_generation", lambda self: "")
     async def confirmed(self):
         return True
 

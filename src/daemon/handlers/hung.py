@@ -8,7 +8,9 @@ Mixin methods:
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+from src.cancellation.storage import task_spec_content_hash
 from src.config import load_config
 from src.daemon import git_ops
 from src.github import comments as gh_comments
@@ -155,6 +157,60 @@ class HungMixin:
             ).stdout.strip() or None
         except Exception:
             head_sha = None
+        task = self.state.current_task
+        generation = ""
+        if task is not None and task.task_file:
+            try:
+                generation = task_spec_content_hash(
+                    (Path(self.repo_path) / task.task_file).read_text(encoding="utf-8")
+                )
+            except (OSError, TypeError, ValueError):
+                pass
+        if (
+            current_pr is not None
+            and current_pr.number == pr_number
+            and head_sha == current_pr.head_sha
+            and head_sha
+            and (
+                (self.state.review_request_pr, self.state.review_request_head)
+                != (pr_number, head_sha)
+                or (self.state.review_request_task and task is not None
+                    and self.state.review_request_task != task.pr_id)
+                or (self.state.review_request_generation and generation
+                    and self.state.review_request_generation != generation)
+            )
+        ):
+            # Some push paths mutate PRInfo.head_sha in place. They bypass
+            # RepoState.__setattr__, so reset explicitly on the observed HEAD.
+            self.state._reset_review_request_history()
+            self.state.review_request_pr = pr_number
+            self.state.review_request_head = head_sha
+            self.state.review_request_task = (
+                task.pr_id if task else ""
+            )
+            self.state.review_request_generation = generation
+        if (
+            not bypass_same_head_dedup
+            and current_pr is not None
+            and current_pr.number == pr_number
+            and head_sha == current_pr.head_sha
+            and self.state.review_request_pr == pr_number
+            and self.state.review_request_head == head_sha
+        ):
+            interval = timedelta(minutes=(
+                self.repo_config.review_timeout_min
+                if self.repo_config.review_timeout_min is not None
+                else self.app_config.daemon.review_timeout_min
+            ))
+            last_request = self.state.review_requested_at
+            last_attempt = self.state.review_post_attempted_at
+            retry_at = max(
+                (stamp + interval for stamp in (last_request, last_attempt)
+                 if stamp is not None),
+                default=None,
+            )
+            if retry_at is not None and datetime.now(timezone.utc) < retry_at:
+                return True, False, retry_at
         try:
             metadata = gh_prs.get_pr_metadata(
                 self.owner_repo, pr_number
@@ -190,7 +246,37 @@ class HungMixin:
                 f"[INFRA] Warning: failed to resolve HEAD for PR "
                 f"#{pr_number}; posting @codex review without dedup."
             )
-        elif (
+        if (
+            not bypass_same_head_dedup
+            and self.state.review_post_attempted_at is not None
+            and self.state.review_requested_at is None
+            and current_pr is not None
+            and current_pr.number == pr_number
+        ):
+            if not publication_iso:
+                return True, False, None
+            try:
+                confirmed_at = gh_comments.latest_codex_review_request_time(
+                    self.owner_repo, pr_number,
+                    after=datetime.fromisoformat(publication_iso),
+                )
+            except Exception as exc:
+                self.log_event(
+                    f"[INFRA] PR #{pr_number} review request history "
+                    f"unavailable: {exc}"
+                )
+                return True, False, None
+            if confirmed_at is not None:
+                self.state.review_requested_at = confirmed_at
+                interval = timedelta(minutes=(
+                    self.repo_config.review_timeout_min
+                    if self.repo_config.review_timeout_min is not None
+                    else self.app_config.daemon.review_timeout_min
+                ))
+                retry_at = confirmed_at + interval
+                if datetime.now(timezone.utc) < retry_at:
+                    return True, False, retry_at
+        if (
             not bypass_author_dedup
             and pr_author
             and publication_iso
@@ -236,10 +322,21 @@ class HungMixin:
 
         try:
             if current_pr is not None and current_pr.number == pr_number:
-                current_pr.last_activity = datetime.now(timezone.utc)
+                self.state.review_request_generation = generation
+                self.state.review_request_task = task.pr_id if task else ""
+                self.state.review_request_pr = pr_number
+                self.state.review_request_head = current_pr.head_sha
+                self.state.review_post_attempted_at = datetime.now(timezone.utc)
             gh_comments.post_comment(
                 self.owner_repo, pr_number, "@codex review"
             )
+            if current_pr is not None and current_pr.number == pr_number:
+                self.state.review_request_pr = pr_number
+                self.state.review_request_head = current_pr.head_sha
+                self.state.review_request_task = (
+                    self.state.current_task.pr_id if self.state.current_task else ""
+                )
+                self.state.review_requested_at = self.state.review_post_attempted_at
             kind = (
                 "force_repost"
                 if bypass_same_head_dedup or bypass_author_dedup

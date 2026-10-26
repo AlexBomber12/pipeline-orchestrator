@@ -48,6 +48,17 @@ from src.usage import UsageSnapshot
 from tests.runner import _helpers as h
 
 
+def _admit_test_ci(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "src.daemon.handlers.fix._current_ci_failure",
+        lambda repo, number, sha, required, empty, trusted, observations=None: {
+            "repo": repo, "pr_number": number, "head_sha": sha,
+            "contexts": [{"name": "unit", "source": "check", "check_id": 1, "attempt": 1,
+                          "state": "failure", "workflow_run_id": None, "job_id": None}],
+        },
+    )
+
+
 class FakeCoderPlugin:
     """Third coder implementing the full ``CoderPlugin`` Protocol.
 
@@ -237,6 +248,7 @@ def test_handle_fix_dispatches_to_fake_plugin(
     applicable). No breach kwargs from the Claude path may leak.
     """
     h._patch_subprocess(monkeypatch)
+    _admit_test_ci(monkeypatch)
     fake = FakeCoderPlugin()
     monkeypatch.setattr(
         "src.github.comments.post_comment",
@@ -285,6 +297,7 @@ def test_configured_plugin_reaches_normal_coding_and_fix_dispatch(
 ) -> None:
     """A module:factory plugin is selected without patching runner selection."""
     h._patch_subprocess(monkeypatch)
+    _admit_test_ci(monkeypatch)
     opened_pr = PRInfo(
         number=42,
         branch="pr-901",
@@ -610,8 +623,15 @@ def test_handle_merge_dispatches_auxiliary_prompt_to_fake_plugin(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Merge-conflict execution is plugin-owned for an arbitrary name."""
+    git_calls: list[list[str]] = []
 
     def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
+        git_calls.append(cmd)
+        if cmd[1:3] == ["rev-parse", "HEAD"]:
+            count = sum(c[1:3] == ["rev-parse", "HEAD"] for c in git_calls)
+            return h._FakeCompletedProcess(stdout=("a" if count == 1 else "b") * 40)
+        if cmd[1:3] == ["ls-remote", "origin"]:
+            return h._FakeCompletedProcess(stdout=f"{'b' * 40}\trefs/heads/pr-001\n")
         if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
             return h._FakeCompletedProcess(
                 args=cmd,
@@ -623,13 +643,17 @@ def test_handle_merge_dispatches_auxiliary_prompt_to_fake_plugin(
     fake = _OverridingPlugin()
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     monkeypatch.setattr(
+        "src.daemon.handlers.merge._validated_conflict_commit",
+        lambda *args: "b" * 40,
+    )
+    monkeypatch.setattr(
         "src.github.comments.post_comment",
         lambda repo, number, body: None,
     )
 
     runner = h._make_runner()
     runner._registry.register(fake)  # type: ignore[arg-type]
-    runner._get_auxiliary_coder = lambda: ("fake", fake)  # type: ignore[method-assign]
+    runner._select_coder = lambda **kw: ("fake", fake)  # type: ignore[method-assign]
     runner.state.current_pr = PRInfo(number=42, branch="pr-001")
     runner.state.current_task = QueueTask(
         pr_id="PR-001", title="t", status=TaskStatus.DOING
@@ -640,8 +664,9 @@ def test_handle_merge_dispatches_auxiliary_prompt_to_fake_plugin(
     assert len(fake.run_prompt_calls) == 1
     call = fake.run_prompt_calls[0]
     assert call["prompt"] == (
-        "Resolve all merge conflicts in the working tree. Keep both sides "
-        "where possible. Run scripts/ci.sh to verify."
+        "Resolve the current merge conflicts, stage the resolution, and create "
+        "one local merge commit. Keep both sides where possible. Do not push, run "
+        "CI, or request review; the daemon owns those gates."
     )
     assert call["repo_path"] == runner.repo_path
     assert call["model"] == "fake-1"
@@ -694,7 +719,7 @@ def test_handle_merge_stop_cleans_auxiliary_process_and_aborts(
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
 
     runner = h._make_runner()
-    runner._get_auxiliary_coder = lambda: ("fake", fake)  # type: ignore[method-assign]
+    runner._select_coder = lambda **kw: ("fake", fake)  # type: ignore[method-assign]
     runner.redis.store[f"control:{runner.name}:stop"] = "1"
     runner.state.current_pr = PRInfo(number=42, branch="pr-001")
     runner.state.current_task = QueueTask(
@@ -707,7 +732,7 @@ def test_handle_merge_stop_cleans_auxiliary_process_and_aborts(
     assert runner.state.user_paused is True
     assert runner._current_coder_process is None
     assert runner._current_coder_supervised_process is None
-    assert any(cmd[:3] == ["git", "merge", "--abort"] for cmd in git_calls)
+    assert not any(cmd[:3] == ["git", "merge", "--abort"] for cmd in git_calls)
     assert not any(cmd[:2] == ["git", "push"] for cmd in git_calls)
 
 
@@ -792,6 +817,7 @@ def test_handle_fix_handler_keys_override_plugin_kwargs(
     a plugin that emits the same key cannot be allowed to overwrite it.
     """
     h._patch_subprocess(monkeypatch)
+    _admit_test_ci(monkeypatch)
     fake = _OverridingPlugin()
     monkeypatch.setattr(
         "src.github.comments.post_comment",

@@ -33,9 +33,23 @@ sets `MCP_RUNTIME_DIAGNOSTICS=1` for the localhost-published listener. Operators
 starting `python -m src.mcp` outside Compose must explicitly set that variable
 and retain an equivalent loopback-only or authenticated access boundary.
 
-Raw CLI, CI, event, artifact, daemon-stdout, and live-stream retrieval is not
-exposed. Persistent capture and a separately reviewed safe log-export contract
-remain follow-up work.
+`get_repo_events` reads the same retained `RepoState.history` entries shown in
+the dashboard Event log for one configured `owner__repo` slug. It returns the
+newest entries first, with event category, recorded state, timestamp, message,
+and repetition count. Category is historical event metadata; it does not
+describe the current task or pipeline state. The tool reports source freshness,
+missing/malformed/oversized/unavailable sources, and truncation. It reads at
+most a 256 KiB state snapshot and returns at most 20 events, 500 characters per
+message, and 16 KiB of event data. Before export, each message is limited to
+4,096 source characters; JSON escapes and supported terminal formatting are
+normalized. Credential-bearing messages and kind metadata are omitted in full,
+while event timestamps, category, state, and repetition count remain available.
+Ambiguous or oversized text is also omitted. A bounded recognized timeout marker
+is retained when available. Ordinary event text remains readable. Retention
+follows the dashboard's capped history; this is not a live process or complete
+audit stream. Reads do not write, refresh TTLs, or prune.
+
+Raw CLI, CI, artifact, daemon-stdout, and live-stream retrieval is not exposed.
 
 ### Protected remote diagnostics with Cloudflare Access
 
@@ -120,9 +134,9 @@ After deployment, verify these separately:
   data. A previously issued MCP session ID must fail in the same way without a
   fresh assertion.
 - An allowed operator can initialize the streamable-HTTP connection, discover
-  only the existing allowlisted tools, and call `get_orchestrator_status`.
-  Confirm that no log, artifact, event, credential, arbitrary-file, or mutation
-  tool appears.
+  only the existing allowlisted tools, and call `get_orchestrator_status` and
+  `get_repo_events` for a configured repository. Confirm that no raw log,
+  artifact, credential, arbitrary-file, or mutation tool appears.
 - A denied identity cannot complete the Access policy. Rotate the Access
   signing key in a test application, reconnect, and confirm the origin accepts
   the new key after its bounded refresh without accepting the old application
@@ -238,6 +252,34 @@ Both affordances are mutually exclusive: Retry is for unchanged content
 ("try again, environment may have transient issue"); re-upload is for
 changed content ("operator iterated on the spec itself").
 
+## Interrupted merge accounting
+
+Merge reconciliation proves the exact remote PR outcome before bookkeeping.
+The task on authoritative base, the PR head, and its merge commit must have the
+same normalized specification fingerprint; the merge commit must remain in base.
+Saved invocation IDs and task/repository equality alone do not admit a run.
+Compatible unfinished accounting can retain an earlier ancestor HEAD after fixes
+or base synchronization. Terminal failed attempts retain their original history.
+
+If no compatible accounting exists, recovery checkpoints a separate record whose
+identity is deterministic for the repository, base, PR, head, and generation.
+The isolated status writer rechecks the remote generation during publication and
+confirms the pushed commit before accounting is finalized. Repeated recovery
+preserves finalized metrics and the durable outcome logger deduplicates appends.
+
+A `Merge accounting conflict:` error parks reconciliation for operator Retry;
+it does not write DONE or ERROR into a conflicting task generation. Provider,
+Git, and Redis outages retain MERGE ownership and retry on a later cycle.
+Retry for a retained accounting conflict revalidates its exact PR and task
+generation, then resumes post-merge bookkeeping without dispatching a coder or
+rewriting TODO. Both ERROR dispatchers retain the park until operator action.
+The existing HTTP Retry action admits a bound accounting conflict while retaining
+its header and normal task validation. Recovery preserves the saved merged PR
+identity even if an open PR reuses that task branch.
+Operator pause and Stop controls still apply. Resolving a conflict requires
+reviewing the exact PR and current task generation before using existing Retry
+or task-upload controls; this source change does not deploy or resume a daemon.
+
 ## WorkInhibitor rollback
 
 The WorkInhibitor cutover is complete: `use_unified_inhibitor_check`
@@ -271,3 +313,269 @@ of inventing required contexts from unrelated repositories. Preserved
 server configs and production overlays must opt in explicitly during the
 final production update; this repository change only updates committed
 examples and validation.
+
+CI-driven FIX admits failed GitHub Actions jobs from the current PR HEAD.
+For commit statuses posted by another trusted producer, configure
+`ci_fix_trusted_statuses` as context names mapped to explicit producer lists,
+for example `{"external/gate": ["app:12345", "user:ci-app[bot]"]}`.
+This policy controls coder admission only; it does not change required
+checks or merge eligibility. Unconfigured status producers remain visible
+as CI failures but do not launch a coder.
+When GitHub's combined-status response omits a configured status producer,
+the daemon binds that status by ID, context, state, and timestamp to the
+complete status-history response for the same commit before admission.
+
+## Automatic review replacement investigation (PR-406)
+
+Result: **insufficient linkage; no automatic replacement is authorized**. Reusing
+an existing request and posting a fresh exact `@codex review` both leave missing
+publication provenance unknown. No runtime policy, review gate, Redis state,
+operator confirmation, or migration code changes in this investigation.
+
+### Recorded evidence and replay boundary
+
+`tests/fixtures/review_provenance_cases.json` records selected public #620 REST
+responses read on 2026-10-26: issue comments, body reactions, PR head projection,
+and repository activity. User objects retain only numeric ID and login. Comment
+IDs, timestamps, full SHAs, hidden connector metadata, and reaction identity are
+retained. This is read-only evidence collection, not a live review experiment.
+Sources are the repository's `/issues/620/comments`, `/issues/620/reactions`,
+`/pulls/620`, and `/activity?ref=refs%2Fheads%2Fpr-459-e2e-failure-evidence`
+REST endpoints. Existing `review_receipt_620.json`,
+`review_summary_structured.json`, and `test_activity_api_url_syntax.py` remain
+unchanged and supply the prior sanitized receipt/summary and activity contracts.
+
+The component replay calls production `get_pr_head_publication`,
+`get_pr_review_status`, `latest_codex_review_request_time`, and `post_comment`
+with controlled external transport. It exercises the publication metadata reader
+from #622, reused by #623's Retry/WATCH admission. It does not simulate a daemon
+migration confirmation or claim that a reader verdict initializes a safety floor.
+The recorded deletion is excluded only for a labeled pre-merge control; the
+fixture retains it. Replaying today's complete activity would report deletion,
+not a current publication.
+
+The positive control is actual #620 data: full HEAD
+`bd7bd1ea89766790981bd3f8749d2c407132db38`, push at
+`2026-10-19T18:56:08Z`, exact request comment `6274859306` at `18:56:12Z`,
+summary `6241079517` updated at `18:58:30Z`, and trusted actor ID `199175422`
+body reaction `580423677` at `18:58:33Z`. With known publication the existing
+reader returns APPROVED. This proves the existing freshness contract only.
+The actual branch-creation event at `2026-10-17T21:06:35Z` proves full-SHA/ref/
+head-repository publication metadata; the recorded abbreviated receipt alone
+returns PENDING. Neither control proves an automatic trust migration.
+
+### Supported and unsupported variants
+
+| Evidence or replay | Observed result / limit |
+| --- | --- |
+| Known current publication plus recorded trusted body +1 | Existing review reader APPROVED; no request/invocation identity in the reaction. |
+| Recorded `branch_creation` with full SHA, ref, head repository, timestamp | Publication reader returns `github-activity:branch_creation`; historical safety-floor initialization still requires existing admission policy. |
+| Reuse latest exact request with missing activity | PENDING; discovering a request timestamp supplies no publication boundary. |
+| Fresh exact request with missing activity | PENDING; successful posting supplies no provider review-result linkage. |
+| Same SHA repeated requests | Recorded comments `6274750173` and `6274764254` precede receipt `6274795896` for `b40534d8f4`; no receipt field names either request. Another same-SHA request cannot identify the invocation. |
+| Same SHA republished later (synthetic negative) | Later activity resets freshness; the old +1 is PENDING even though SHA is unchanged. |
+| Old body +1 with new mutable full-SHA summary (synthetic negative) | PENDING, with and without known publication. Updating the summary cannot renew the reaction timestamp. |
+| HEAD changes during post (injected race) | Re-read with expected full SHA reports `observed PR HEAD changed`; PENDING. A successful comment write is not a HEAD compare-and-swap. |
+| Accepted post with lost response (injected failure) | Posting raises; exact comment is discoverable, but publication stays unknown/PENDING. Readback cannot identify which competing identical write was accepted. |
+| Unknown numeric actor ID (synthetic negative) | PENDING even with known publication; a familiar login cannot substitute for trusted identity. |
+| Abbreviated receipt with two possible full-SHA candidates (synthetic negative) | PENDING; the receipt classifier is not a full-SHA or invocation resolver. |
+
+The structured summary supplies a full `commit_sha`, completion status and finding
+flags, but its stable comment ID spans updates (`created_at` on October 17,
+`updated_at` on October 19). Its current bytes do not retain earlier versions or
+a request ID. The receipt supplies an abbreviated reviewed commit. The body
+reaction supplies user, content, ID and creation time, without SHA, request ID,
+run ID or summary-version binding. Joining those records by actor, chronology
+and SHA cannot distinguish repeated reviews of the same SHA. A reaction on a
+specific anchor would identify its comment target, but no positive recorded
+anchor +1 is supplied here; that variant remains unproved, including its binding
+to the full HEAD and a recovery invocation. No synthetic positive is admitted.
+
+### Missing delta, operator panel and bounded follow-up
+
+No operator panel behavior can safely disappear on this evidence. Retain the
+exact publication migration proposal/confirmation, unknown-evidence blocking,
+Retry behavior, and normal Approve semantics. A fresh request does not replace
+confirmation. This result is not approval to issue requests or confirm trust
+without the operator under current policy.
+
+Minimum additional provider evidence is a durable, verifiable association of a
+trusted +1 with the exact repository/PR, full reviewed HEAD, and particular
+request/invocation (including a version if a mutable summary participates).
+The association must survive same-SHA retries, reordered responses, accepted
+writes with lost responses, and concurrent HEAD changes. The observed endpoints
+do not deliver that association. Timestamp comparison alone cannot fill it.
+An anchor-target reaction could be investigated only with an actual supported
+recording and explicit full-HEAD/invocation evidence; no undocumented connector
+field or future provider behavior should be assumed.
+
+Follow-up scope: one evidence-only task, estimated 150–250 test/fixture lines and
+60–100 documentation lines, zero production changes, to replay an operator-
+supplied supported recording carrying that missing association. No live provider
+experiment is implied. If it proves linkage, separately specify and estimate a
+protocol for durable request identity, write reconciliation, HEAD revalidation,
+restart safety and atomic state admission before implementation. A reliable
+runtime implementation estimate is premature until that evidence exists.
+Potential replacement paths are recovery's `_initialize_publication_admission`,
+`_offer_publication_migration` and `_consume_publication_migration_command`, the
+existing `src/publication_migration.py` command/receipt path, and the dashboard's
+confirmation route/panel. None is removed now; ordinary watermark validation,
+CI gates, trusted review checks and process ownership rules remain required.
+
+Verification: `python -m pytest tests/test_github_client.py -q`. Before generating
+review artifacts, ensure the checkout has the review base (`origin/main` for
+this repository); fetch it with `git fetch origin main` if needed. After the
+intended commit, run `bash scripts/make-review-artifacts.sh` and confirm that
+`artifacts/ci.log`, `artifacts/structure.txt`, and a nonempty `artifacts/pr.patch`
+exist. A focused test pass alone does not establish a successful full gate.
+Controlled
+transport proves reader behavior only, not real account access, provider delivery
+guarantees, deployment, or restart behavior of a future protocol. Any eventual
+provider smoke requires a separate operator release action; this investigation
+has no deployment prerequisite and performs no production operation.
+
+## Work preservation decision and restore proof (PR-410)
+
+Audit base: `e92487e28ad735ae510c244d7e1f6a4b97f3b421` (current main).
+This is an investigation, with zero runtime changes. Existing destructive paths
+below remain hazards until their owners migrate them. Nothing here authorizes
+cleanup of unknown directories, origin mismatches, or an unconfirmed process.
+Traceability: IMP-01, A14/A16; historical specifications at
+`7167c2e916a2bbb843ecb6a6ce7fc15795e61802` are not implementation dependencies.
+
+### Decision and observed restore
+
+Reuse `src/daemon/backups.py:create_repo_bundle`, which creates and verifies a
+self-contained `git bundle create --all`. Do not create another backup service,
+scheduler, retention policy or generic snapshot platform. Existing IDLE periodic
+bundles are useful history backups, but their interval and optional configuration
+cannot authorize an imminent destructive operation. A fresh verified capture
+would be mandatory at each actual loss boundary.
+
+`tests/test_work_preservation_contract.py` uses the existing real-Git initializer
+from `tests/test_backups.py`, the production bundle API, and two disposable Git
+repositories per case. Both attached and detached local-only commits are tested.
+The source clone is deleted only after capture, before restoring into a separate
+new repository. No alternates, source object directory, credentials or remote
+service is used. A remote-tracking ref models the last published commit; this
+proves local Git semantics, not provider push or recovery policy.
+
+| Captured state | Bundle alone | Bundle plus minimum missing capture |
+| --- | --- | --- |
+| Local branch, tag, remote-tracking refs | Exact `show-ref` restored | Same exact refs |
+| Unpushed branch commit / detached HEAD commit | Full SHA and committed file bytes recovered; bundle advertises `HEAD` even detached | Original raw HEAD restored, including attached vs detached identity |
+| `README.md` staged `staged version\x00\xfe\n`, worktree `unstaged version\x00\xff\n` | Committed `hello\n` only | Both versions recovered independently |
+| Index-only `staged-only.bin`, absent in worktree | Blob absent (`cat-file -e` fails) | Exact `index only\x00\xff` blob restored from object pack |
+| Staged deletion, staged rename with newline in filename, unstaged deletion | Original committed files return | Index stages/modes/OIDs/path bytes and worktree absences match |
+| Untracked binary `bytes(range(256))`, ignored binary, executable | Absent | Exact file bytes and permission bits match |
+| Raw index, cached/uncached binary diffs, porcelain `-z` status | Not recovered | Raw index bytes match before Git refresh; all semantic comparisons match afterward |
+
+The minimum missing capture demonstrated here is raw ordinary `.git/index`, a
+`git pack-objects --stdout` pack of its indexed blob OIDs, raw `.git/HEAD`, and a
+regular-file worktree inventory containing bytes and modes. NUL-delimited index
+records avoid filename splitting. Restoring an exact inventory also restores
+deletions; copying files over an existing checkout would leave unwanted files.
+The index pack is necessary: the raw index points at objects that may never have
+been committed. Refs and detached HEAD objects come from the verified bundle.
+Restore fetches `+refs/*:refs/*` into an unborn placeholder branch before checking
+out the saved HEAD; fetching into an already checked-out target branch is refused
+by Git. It then imports the index object pack and restores inventory/index/HEAD.
+The helper is test-only and keeps extra capture bytes in memory; it is not a
+crash-durable writer, consistency protocol, or production restore command.
+
+Existing recovery `_preserve_crashed_run_commits` and its `crash-backup/` fallback
+push keep named branch commits on origin. They do not capture dirty files or the
+index, nor arbitrary detached work. Keep this publication mechanism for its
+existing purpose. A stash would mutate the source index/worktree and ordinary
+stash omits ignored files; it is not the chosen capture primitive. A Git patch
+alone does not preserve untracked bytes, refs or all index objects.
+
+### Caller inventory and migration checks
+
+Locations refer to `src/`; owner means the proposed existing component boundary,
+not a new service. Reset can discard tracked/index versions and move the current
+branch tip; force checkout can discard conflicting work; `clean -fd` deletes
+nonignored untracked paths; `rmtree` loses all bytes including ignored files and
+local object storage. Plain checkout/path checkout can also overwrite selected
+bytes and must be included in the enclosing operation's checks.
+
+| Caller / proposed owner | Loss set and required migration check |
+| --- | --- |
+| `daemon/runner.py:_commit_status_to_git` (status owner, PR-398) | Already isolated temporary repo; force detached checkout retries affect only its own generated status edits. Reuse isolation and existing identity/hash/retry tests; no coder snapshot. |
+| `daemon/retry_commands.py:_remote_frontmatter_error_status_for_current_task` (Retry reader) | Isolated temporary fetch/checkout; no coder bytes affected. Retain origin/task identity validation and fixture-owned teardown. |
+| `daemon/repo_ops.py:sync_to_main`, called by `handlers/idle.py` before/after upload processing (repo sync owner) | Shared checkout/reset/clean loses index, tracked and untracked bytes and can move local base ref. Require identity, quiescence and complete verified capture before first mutation; restore dirty base and local-only branch cases. IDLE alone proves no safety. |
+| `daemon/preflight.py:_auto_reset_dirty_tree` (preflight owner) | Forced branch switch/reset/clean can lose all dirty versions and base tip. Capture before checkout; test dirty feature branch and preserved base/feature refs. Existing bounded recovery policy does not prove no loss. |
+| `daemon/repo_ops.py:process_pending_uploads` failure reset (upload consumer) | Reset may discard pre-existing edits and an unpushed upload commit. Keep `_safe=True` recovery behavior; prefer isolated upload commit/push using status pattern, test failed push and concurrent manifest. |
+| `daemon/scaffolder.py:ensure_claude_md` initial/failure resets (scaffolder owner) | Clean-tree checks do not rule out local commits. Prefer isolated backfill; test local-ahead base and rejected push before removing both resets. |
+| `daemon/handlers/merge.py:handle_merge` pre-merge reset (merge owner) | Dirty/index state and unpublished branch tip; capture before checkout/reset or isolate merge. Test dirty branch and unpublished tip, preserve confirmed-merge accounting. |
+| `daemon/handlers/fix.py:handle_fix` approved reset (FIX owner) | Existing approval/process/bound-ref checks reduce loss; retain them. Test mutation between checks and reset, dirty state and local-only HEAD; block or capture before mutation. |
+| `daemon/handlers/error.py:diagnose_error` three reset/clean paths (diagnostic owner) | Reverting diagnostic/coder edits can also discard pre-existing dirty/untracked work. Capture before diagnostic execution, distinguish attempt-owned output, test every failure/skip/branch path. |
+| `daemon/recovery.py:recover_state` and `_preserve_crashed_run_commits` (recovery owner) | Named-branch push is existing preservation, not a reset. Keep failure blocking; test dirty/index/detached state before downstream preflight/scaffold/sync can mutate. No second status snapshot. |
+| `web/routes/repo_control.py:_checkout_retry_base_task`, `_reset_retry_worktree`, called by `reset_task` (web reset owner) | Forced checkout/reset/path checkout and rollback touch shared checkout. Replace checkout mutation with daemon command/isolated status pattern; test failed push, dirty bytes and restart. Web must remain a control plane. |
+| `daemon/runner.py:RepoRunner.__init__` non-Git and wrong-origin `rmtree` (constructor owner) | Entire directory, potentially unrelated user data. Remove deletion in follow-up; block with diagnostic on unknown directory/origin mismatch. Test sentinel bytes survive both cases; do not snapshot as permission to delete. Legacy verified-origin move is distinct. |
+| `daemon/repo_ops.py:ensure_repo_cloned` retry `_do_clone` rmtree (clone owner) | A directory can appear after initial absence. Clone into a uniquely owned temporary sibling and publish only to an absent destination; test foreign directory appearing between retries. Never infer ownership from path/name. |
+| `daemon/main.py:_clean_breach_dir` (marker owner) | Deletes marker tree, not Git work. Require reserved marker-root ownership and symlink handling; no Git capture. Test unexpected directory retained and owned stale markers removed. |
+| `daemon/repo_ops.py:process_pending_uploads` two staging rmtrees; `web/routes/uploads.py:upload_tasks` finally cleanup (upload owners) | Uploaded task source bytes, not necessarily Git objects. Require exact staging ownership and manifest CAS/receipt before deletion; test failed publication and newer manifest remain recoverable. |
+| `web/services/upload_validation.py:sweep_abandoned_staging` (staging sweeper owner) | Age plus absence from active manifest alone does not prove disposable bytes. Require owned staging identity and durable consumed/abandoned disposition; retain unknown directories and active uploads in race tests. |
+
+The inventory covers executable force checkout/reset/clean/rmtree sites found by
+searching source, plus status, recovery and sync callers. GitHub CLI `-f` form
+fields are not force checkout. TemporaryDirectory teardown of isolated Git
+repositories is fixture/operation-owned disposal, not shared-checkout cleanup.
+Ordinary coding checkout and scaffolder checkout/add/commit are still mutations;
+their enclosing admission must protect work, even without a forced reset.
+
+### Unsupported states and required blocking behavior
+
+The tested envelope is a quiescent, ordinary non-bare full repository with an
+ordinary complete index and regular files on Linux. Submodules (gitlinks and
+nested repositories), LFS payloads/filters, symlinks, special files, empty directory
+identity, ACLs/xattrs, hardlink relationships, reflog-only/dangling objects,
+linked worktrees/common Git dirs, alternate object stores, shallow/partial clones,
+sparse checkout/index, split index, intent-to-add, unmerged stages, index flags
+and extensions beyond the tested ordinary index are unproved. Block these states
+in a first implementation; do not imply bundle verification includes LFS media,
+submodule objects or dangling history. Config, hooks, credentials and reflogs
+are not reconstructed. Do not copy credential-bearing Git config into captures.
+Unknown/non-Git directories and origin mismatch must be retained and blocked,
+not deleted; the test proves only that bundle failure leaves unknown bytes alone,
+not that the current constructor has been repaired.
+
+Disk full, read error, missing indexed object, verification failure or concurrent
+writer must block destructive work. Existing bundle failure tests cover mkdir,
+I/O, timeout and verify failures; the new test covers a real non-Git read failure.
+Production still needs an exclusive ownership/admission boundary, process
+quiescence checks, before/after HEAD/refs/index/file identity validation, durable
+external storage and atomic completed-capture publication. Check free space and
+bound size/time, hash and re-read stored payloads, verify bundle/pack and restore
+manifest, and leave source untouched on any failure. A digest comparison alone
+cannot make concurrent writers safe. No such runtime protocol is proved here.
+
+### Bounded follow-up and removal plan
+
+First: constructor/clone ownership blocking, estimated 50–90 production and
+100–160 test lines across existing runner/repo_ops modules/tests. No deletion of
+unknown or mismatched directories and no automatic process termination.
+Second: ordinary-repo capture/restore within existing backups boundary, estimated
+180–280 production and 240–360 test lines, with unsupported-state rejection,
+durable publication, consistency/failure tests and separate-directory restore.
+Third: migrate shared preflight/sync/error/FIX/merge boundaries, estimated
+100–180 production and 180–300 test lines; replace direct destructive chains
+with guarded admission using that capture, preserving all existing policy checks.
+Fourth: isolate upload/scaffold/web status mutations and tighten staging/marker
+ownership, estimated 140–240 production and 200–320 test lines. These are planning
+ranges requiring caller review, not approval to implement all work together.
+
+Obsolete logic to replace is the constructor's destructive stale-directory
+repair, clone retry's unconditional removal, shared status/upload/scaffold resets,
+and unguarded reset/clean chains listed above. Keep verified bundles, crash
+commit publication, PR-398 status isolation and existing approval/process guards.
+This PR removes no runtime logic and changes no backup retention. The prototype
+proves recoverable bytes/index/refs only; failure admission, real provider access,
+deployment and process races require follow-up verification. No deployment is
+needed for this investigation; eventual rollout needs an operator-run storage,
+restore and ownership smoke, without production failure drills here.
+
+Verification: `python -m pytest tests/test_work_preservation_contract.py -q`;
+`python -m pytest tests/test_backups.py -q`; final gate and review artifacts via
+`bash scripts/make-review-artifacts.sh` after the intended commit.

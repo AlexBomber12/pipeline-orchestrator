@@ -129,3 +129,26 @@ def get_recent_codex_review_request_time(
         if (now - created).total_seconds() < cutoff:
             return created
     return None
+
+
+def latest_codex_review_request_time(
+    repo: str, pr_number: int, *, after: datetime
+) -> datetime | None:
+    """Latest explicit trigger on the current publication, from any author.
+
+    Transport failures propagate: an unavailable comment history cannot be
+    mistaken for an absent request.
+    """
+    comments = cache._gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
+    latest = None
+    for comment in comments:
+        if "@codex review" not in (comment.get("body") or "").lower():
+            continue
+        stamp = gh_runner._parse_iso(comment.get("created_at"))
+        if stamp is None:
+            continue
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        if stamp >= after and (latest is None or stamp > latest):
+            latest = stamp
+    return latest

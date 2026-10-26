@@ -96,8 +96,13 @@ jobs:
             --github-output "$GITHUB_OUTPUT"
 
       - name: Install shared integration config
+        env:
+          TESTBED_STATUS_APP_SLUG: ${{ steps.testbed-token.outputs.app-slug }}
+          TESTBED_STATUS_APP_ID: ${{ secrets.TESTBED_APP_ID }}
         run: |
-          python scripts/prepare_test_config.py config.test.yml tests/e2e/data/config.test.yml
+          python scripts/prepare_test_config.py config.test.yml tests/e2e/data/config.test.yml \
+            --status-app-slug "$TESTBED_STATUS_APP_SLUG" \
+            --status-app-id "$TESTBED_STATUS_APP_ID"
           # Host pytest and UID-1000 containers both atomically replace files here.
           chmod 0777 tests/e2e/data
 
@@ -146,11 +151,15 @@ jobs:
         env:
           EXPECTED_REVIEWER_ID: ${{ steps.prepare-test-reviewer.outputs.user-id }}
           EXPECTED_REVIEWER_LOGIN: ${{ steps.prepare-test-reviewer.outputs.login }}
+          EXPECTED_STATUS_APP_ID: ${{ secrets.TESTBED_APP_ID }}
+          EXPECTED_STATUS_APP_SLUG: ${{ steps.testbed-token.outputs.app-slug }}
         run: |
           for service in web-test daemon-test; do
             docker compose -f docker-compose.test.yml exec -T \
               -e "EXPECTED_REVIEWER_ID=$EXPECTED_REVIEWER_ID" \
               -e "EXPECTED_REVIEWER_LOGIN=$EXPECTED_REVIEWER_LOGIN" \
+              -e "EXPECTED_STATUS_APP_ID=$EXPECTED_STATUS_APP_ID" \
+              -e "EXPECTED_STATUS_APP_SLUG=$EXPECTED_STATUS_APP_SLUG" \
               "$service" python -c '
           import os
           from src.config import load_config
@@ -164,6 +173,13 @@ jobs:
               for identity in identities
           ):
               raise SystemExit("prepared reviewer identity is missing")
+          repos = load_config().repositories
+          expected_producers = {
+              "app:" + os.environ["EXPECTED_STATUS_APP_ID"],
+              "user:" + os.environ["EXPECTED_STATUS_APP_SLUG"] + "[bot]",
+          }
+          if len(repos) != 1 or set(repos[0].ci_fix_trusted_statuses.get("e2e/watch-merge-gate", [])) != expected_producers:
+              raise SystemExit("prepared CI status producer policy is missing")
           '
             echo "OK: $service loaded the prepared reviewer identity"
           done

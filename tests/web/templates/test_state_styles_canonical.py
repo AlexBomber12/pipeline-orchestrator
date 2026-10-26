@@ -7,12 +7,10 @@ from pathlib import Path
 from src.models import PipelineState, RepoState
 from src.web.app import templates
 
-
 COMPONENT_DIR = Path("src/web/templates/components")
 CHANGED_COMPONENTS = (
     COMPONENT_DIR / "repo_list.html",
     COMPONENT_DIR / "activity_feed.html",
-    COMPONENT_DIR / "event_list.html",
 )
 WARN_BADGE = "bg-warn/10 text-warn border-warn/30"
 
@@ -81,19 +79,6 @@ def _render_activity_feed(state: PipelineState) -> str:
     )
 
 
-def _render_event_list(state: PipelineState) -> str:
-    return templates.get_template("components/event_list.html").render(
-        events=[
-            {
-                "time": "12:00:00",
-                "state": state.value,
-                "message": "state update",
-            }
-        ],
-        repo={"name": "example__repo"},
-    )
-
-
 def test_no_local_state_styles_in_repo_list() -> None:
     assert "set state_styles =" not in _source(COMPONENT_DIR / "repo_list.html")
 
@@ -138,7 +123,6 @@ def test_all_pipeline_states_render_in_each_component() -> None:
         rendered = (
             _render_repo_list(repo),
             _render_activity_feed(state),
-            _render_event_list(state),
         )
 
         for html in rendered:

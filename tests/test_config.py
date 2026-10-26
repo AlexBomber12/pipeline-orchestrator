@@ -27,7 +27,7 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
     assert isinstance(cfg, AppConfig)
     assert cfg.repositories == []
     assert cfg.daemon.poll_interval_sec == 60
-    assert cfg.daemon.review_timeout_min == 20
+    assert cfg.daemon.review_timeout_min == 10
     assert cfg.daemon.hung_fallback_codex_review is True
     assert cfg.daemon.error_handler_use_ai is True
     assert cfg.daemon.claude_model == "opus"
@@ -36,6 +36,25 @@ def test_load_config_missing_file_returns_defaults(tmp_path: Path) -> None:
     assert cfg.auth.claude_config_dir == "/data/auth/claude"
     assert cfg.auth.gh_config_dir == "/data/auth/gh"
     assert cfg.coder_plugins == config_module.DEFAULT_CODER_PLUGINS
+
+
+@pytest.mark.parametrize(
+    "statuses",
+    [[], {"": ["user:bot"]}, {"unit": []}, {"unit": ["user:"]},
+     {"unit": ["app:0"]}, {"unit": ["other:bot"]},
+     {"unit": ["user:ci[bot]", "user:ci[bot]"]}],
+)
+def test_ci_fix_trusted_statuses_rejects_invalid_policy(statuses: object) -> None:
+    with pytest.raises(ValueError, match="ci_fix_trusted_statuses"):
+        RepoConfig(url="https://github.com/example/repo.git", ci_fix_trusted_statuses=statuses)
+
+
+def test_ci_fix_trusted_statuses_accepts_configured_producers() -> None:
+    repo = RepoConfig(
+        url="https://github.com/example/repo.git",
+        ci_fix_trusted_statuses={"gate": ["user:ci-app[bot]", "app:15368"]},
+    )
+    assert repo.ci_fix_trusted_statuses["gate"] == ["user:ci-app[bot]", "app:15368"]
 
 
 def test_load_config_missing_file_applies_env_overrides(
@@ -669,7 +688,7 @@ def test_update_daemon_config_updates_fields(tmp_path: Path) -> None:
     assert cfg.daemon.poll_interval_sec == 120
     assert cfg.daemon.error_handler_use_ai is False
     # Unchanged fields keep their previous values.
-    assert cfg.daemon.review_timeout_min == 20
+    assert cfg.daemon.review_timeout_min == 10
     assert cfg.daemon.hung_fallback_codex_review is True
 
     reloaded = load_config(str(path))

@@ -8,10 +8,12 @@ Mixin methods:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
 import subprocess
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,15 +26,24 @@ from src.cancellation import (
     get_cancellation_cause,
     get_current_run_started_at,
     safe_record_cancellation_cause,
+    task_spec_content_hash,
 )
+from src.cancellation.storage import delete_cancellation_cause
 from src.daemon import git_ops
+from src.daemon.approval_commands import checkout_process_blocker
+from src.daemon.ci_attempts import canonical_ci_incident
 from src.daemon.guardrails import SECRET_PATTERNS_A, SECRET_PATTERNS_B, scan_pr_diff
+from src.daemon.handlers.error import is_retained_merge_error
 from src.daemon.quarantine import (
     blocking_quarantine_labels,
 )
+from src.github import checks as gh_checks
+from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.keyspace import pipeline_state, recovery_backup_branch
+from src.inhibitor import is_work_inhibited
+from src.keyspace import control_stop, pipeline_state, recovery_backup_branch
 from src.models import (
+    CIStatus,
     PipelineState,
     PRInfo,
     PublicationMigration,
@@ -86,8 +97,198 @@ def _task_pr_sort_key(pr_id: str) -> tuple[int, int | str, str]:
     return (0, int(match.group(1)), match.group(2))
 
 
+class MergeIdentityConflict(ValueError):
+    """Permanent contradiction in the task generation proved merged."""
+
+
 class RecoveryMixin:
     """State recovery on daemon startup."""
+
+    async def _recover_obsolete_ci_error(
+        self, tasks: list[QueueTask], prs: list[PRInfo],
+    ) -> bool:
+        """Resume only a proven CI-only, exact-marker escalation."""
+        saved = (
+            self.state if self.state.state == PipelineState.ERROR
+            else getattr(self, "_persisted_fix_recovery", None)
+        )
+        if (
+            saved is None or saved.state != PipelineState.ERROR
+            or saved.name != self.name or saved.url != self.repo_config.url
+            or saved.current_task is None or saved.current_pr is None
+            or saved.active_invocation is None
+            or saved.user_paused or self.state.user_paused or not self.repo_config.active
+            or await self.redis.get(control_stop(self.name))
+            or checkout_process_blocker(self.repo_path)
+            or is_work_inhibited(saved, coder=None)[0]
+        ):
+            return False
+        snapshot = saved.active_invocation
+        trigger = snapshot.fix_trigger
+        task = next((t for t in tasks if t.pr_id == saved.current_task.pr_id), None)
+        if (
+            task is None or task.status not in {TaskStatus.ERROR, TaskStatus.DOING}
+            or task.branch != saved.current_task.branch
+            or task.task_file != saved.current_task.task_file
+            or not isinstance(trigger, dict) or trigger.get("review") is not False
+            or not isinstance(trigger.get("ci"), dict)
+            or snapshot.phase != "fix" or snapshot.run_id is None
+        ):
+            return False
+        pr = find_matching_open_pr(task.pr_id, task.branch, prs)
+        ci = trigger["ci"]
+        if (
+            pr is None or pr.number != saved.current_pr.number
+            or pr.head_sha != saved.current_pr.head_sha
+            or pr.is_cross_repository or pr.quarantine_labels
+            or ci.get("repo") != self.owner_repo
+            or ci.get("pr_number") != pr.number
+            or ci.get("head_sha") != pr.head_sha
+            or len(pr.head_sha) != 40
+        ):
+            return False
+        attempt = saved.publication_attempt
+        if attempt is not None and attempt.pending:
+            candidate = attempt.candidate
+            if (
+                (attempt.repo, attempt.base, attempt.task_id, attempt.branch,
+                 attempt.run_id, attempt.attempt_index, attempt.pr_number,
+                 attempt.head_sha, attempt.exit_classification) != (
+                    self.owner_repo, self.repo_config.branch or "main",
+                    task.pr_id, task.branch, snapshot.run_id,
+                    snapshot.attempt_index, pr.number, pr.head_sha, "failure",
+                )
+                or attempt.unverified_head_sha is not None
+                or candidate is None or candidate.number != pr.number
+                or candidate.branch != pr.branch or candidate.head_sha != pr.head_sha
+            ):
+                return False
+        current_attempt = self.state.publication_attempt
+        if current_attempt is not None and current_attempt.pending and current_attempt != attempt:
+            return False
+        try:
+            cause = await get_cancellation_cause(
+                self.redis, self.name, task.pr_id, refresh_ttl=False,
+            )
+            run = await self._metrics_store.get(snapshot.run_id)
+            continuation_id = str(uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                f"{self.name}:{task.pr_id}:{snapshot.run_id}:obsolete-ci-continuation",
+            ))
+            continuation = await self._metrics_store.get(continuation_id)
+            if (Path(self.repo_path) / ".git").exists():
+                base_ref = f"refs/remotes/origin/{self.repo_config.branch}"
+                task_bytes = git_ops._git(
+                    self.repo_path, "show", f"{base_ref}:{task.task_file}", timeout=60,
+                ).stdout.encode("utf-8")
+            else:
+                task_bytes = (Path(self.repo_path) / task.task_file).read_bytes()
+            task_hash = task_spec_content_hash(task_bytes.decode("utf-8"))
+            metadata = gh_prs.get_pr_metadata(self.owner_repo, pr.number)
+            retrieval = (
+                gh_checks._retrieve_ci_status_evidence(
+                    self.owner_repo, pr.head_sha, fresh=True,
+                ) if cause is not None else None
+            )
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Obsolete CI evidence unavailable: {exc}.")
+            return False
+        claim = cause.payload.get("obsolete_ci_trigger") if cause is not None else None
+        completed_cleanup = (
+            cause is None and task.status == TaskStatus.DOING
+            and continuation is not None and not pr.is_escalated
+        )
+        exact_cause = (
+            cause is not None and cause.payload.get("subsource") == "coder_escalate"
+            and cause.payload.get("reason_text") == "OBSOLETE_CI_EVIDENCE"
+            and isinstance(claim, dict) and isinstance(claim.get("ci"), dict)
+            and canonical_ci_incident(claim["ci"]) == canonical_ci_incident(ci)
+            and claim.get("task_id") == task.pr_id
+            and claim.get("branch") == task.branch
+            and claim.get("run_id") == snapshot.run_id
+            and claim.get("attempt_index") == snapshot.attempt_index
+            and claim.get("fix_iteration") == snapshot.fix_iteration
+            and claim.get("task_spec_hash") == task_hash
+        )
+        if (
+            not (exact_cause or completed_cleanup)
+            or run is None or run.task_id != task.pr_id or run.repo_name != self.name
+            or run.run_id != snapshot.run_id or not run.invocations
+            or run.invocations[-1] != snapshot or run.ended_at is None
+            or run.cause_subsource != "coder_escalate"
+            or metadata.get("head_sha") != pr.head_sha
+        ):
+            return False
+        if continuation is not None and (
+            run is None or continuation.run_id != continuation_id
+            or continuation.task_id != task.pr_id
+            or continuation.repo_name != self.name
+            or continuation.ended_at is not None
+            or continuation.attempt_index != run.attempt_index + 1
+            or continuation.fix_iterations != run.fix_iterations
+            or continuation.fix_recovery_baseline != run.fix_recovery_baseline
+            or continuation.task_spec_hash != task_hash
+            or continuation.invocations
+        ):
+            return False
+        if exact_cause:
+            if (not retrieval.evidence.sources_complete
+                    or not retrieval.status_source.sha_matches):
+                return False
+            ci_status = gh_checks._classify_ci_retrieval(
+                retrieval,
+                required_contexts=self.repo_config.required_checks,
+                empty_is_success=self.repo_config.allow_merge_without_checks,
+            )
+            if ci_status not in {CIStatus.SUCCESS, CIStatus.PENDING}:
+                return False
+        suppression = await self._suppression_record_for_task(task.pr_id)
+        if suppression is not None and suppression.reason != SuppressionReason.CODER_ESCALATE:
+            return False
+        try:
+            if continuation is None:
+                continuation = self._new_fix_run_record(
+                    run, task_spec_hash=task_hash,
+                )
+                continuation.run_id = continuation_id
+                await self._metrics_store.save(continuation)
+            self._current_run_record = continuation
+            if cause is not None and cause.payload.get("label_applied") and pr.is_escalated:
+                gh_runner.run_gh(
+                    ["pr", "edit", str(pr.number), "--remove-label", "escalated"],
+                    repo=self.owner_repo,
+                )
+            if task.status == TaskStatus.ERROR and not await self._commit_task_status_change(
+                task, "DOING", "obsolete CI-only failure recovered",
+                expected_task_sha256=hashlib.sha256(task_bytes).hexdigest(),
+            ):
+                return False
+            # Keep the exact cause until every earlier cleanup step succeeds.
+            # A restart can then finish cleanup after the header became DOING.
+            if suppression is not None:
+                await self._clear_task_suppression(task.pr_id)
+            elif cause is not None:
+                await delete_cancellation_cause(self.redis, self.name, task.pr_id)
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Obsolete CI cleanup deferred: {exc}.")
+            return False
+        resumed = task.model_copy(update={"status": TaskStatus.DOING})
+        tasks[tasks.index(task)] = resumed
+        pr.is_escalated = False
+        self.state.current_task = resumed
+        self.state.current_pr = pr
+        if attempt is not None and attempt.pending:
+            # The exact no-push escalation and fresh PR HEAD observation release
+            # this FIX hold while its invocation binding is still available.
+            attempt.pending = False
+            self.state.publication_attempt = attempt
+        self.state.active_invocation = None
+        self.state.state = PipelineState.WATCH
+        self.state.error_message = None
+        self._current_run_record = continuation
+        self._rehydrate_last_push_at(pr)
+        self.log_event(f"[RECOVERY] Obsolete CI-only condition cleared for PR #{pr.number}; resuming WATCH.")
+        return True
 
     async def _consume_publication_migration_command(self) -> bool:
         """Apply one exact operator trust anchor; never authorize merge itself."""
@@ -488,6 +689,8 @@ class RecoveryMixin:
         """
         self._persisted_fix_recovery = None
         self._persisted_merge_recovery = None
+        self._persisted_merge_error_recovery = None
+        self._persisted_review_timeout_recovery = None
         try:
             raw = await self.redis.get(pipeline_state(self.name))
         except Exception as exc:
@@ -502,6 +705,9 @@ class RecoveryMixin:
         except Exception:
             self._publication_snapshot_damaged = True
             return True
+        if persisted.name == self.name and persisted.url == self.repo_config.url:
+            self.state.ci_attempt_scope = persisted.ci_attempt_scope
+            self.state.ci_attempts = dict(persisted.ci_attempts)
         if (
             persisted.name == self.name and persisted.url == self.repo_config.url
             and persisted.publication_attempt is not None
@@ -656,11 +862,25 @@ class RecoveryMixin:
                     and (
                         persisted.state == PipelineState.FIX
                         or (persisted.error_message or "").startswith("FIX idle timeout")
+                        or persisted.active_invocation.fix_trigger is not None
                     )
                 )
             )
         ):
             self._persisted_fix_recovery = persisted
+        if (
+            persisted.name == self.name
+            and persisted.url == self.repo_config.url
+            and persisted.state in {PipelineState.ERROR, PipelineState.PAUSED}
+            and persisted.current_task is not None
+            and persisted.current_pr is not None
+            and persisted.current_task.branch == persisted.current_pr.branch
+            and persisted.current_pr.pr_id in (None, persisted.current_task.pr_id)
+            and re.fullmatch(r"[0-9a-fA-F]{40}", persisted.current_pr.head_sha)
+        ):
+            self._persisted_review_timeout_recovery = persisted
+            if is_retained_merge_error(persisted.error_message):
+                self._persisted_merge_error_recovery = persisted
         if (
             persisted.name == self.name
             and persisted.url == self.repo_config.url
@@ -892,7 +1112,9 @@ class RecoveryMixin:
         outcome log already accounts for them. Redis is only a cache.
         Discovery only selects an identity; MERGE still requires exact proof.
         """
-        if getattr(self, "_persisted_merge_recovery", None) is not None:
+        if (getattr(self, "_persisted_merge_recovery", None) is not None
+                or (saved_error := getattr(self, "_persisted_merge_error_recovery", None)) is not None
+                and saved_error.error_message.startswith("Merge accounting conflict:")):
             return True
         candidates = []
         try:
@@ -907,13 +1129,13 @@ class RecoveryMixin:
                 record = max(records, key=lambda r: (r.started_at, r.run_id), default=None)
                 if (record is not None and record.exit_reason != "success_merged"
                         or header.frontmatter_status in {"todo", "doing"}
-                        or record is None and not has_merged_outcome(task.pr_id, self.name)):
+                        or not has_merged_outcome(task.pr_id, self.name)):
                     # A historical DONE task may lack analytics after a log
                     # failure. Never let it hide an interrupted current merge.
                     priority = (0 if header.frontmatter_status in {"todo", "doing"}
                                 else 1 if record is not None and record.exit_reason != "success_merged"
                                 else 2)
-                    candidates.append((priority, task, record))
+                    candidates.append((priority, task, records))
             if not candidates:
                 return True
             discovery = gh_prs.get_merged_prs_discovery(self.owner_repo, self.repo_config.branch)
@@ -922,7 +1144,7 @@ class RecoveryMixin:
         except Exception as exc:
             self.log_event(f"[RECOVERY] Merge bookkeeping discovery deferred: {exc}.")
             return False
-        for _, task, record in sorted(candidates, key=lambda candidate: candidate[0]):
+        for _, task, records in sorted(candidates, key=lambda candidate: candidate[0]):
             matches = [pr for pr in discovery.prs
                        if pr.pr_id in {None, task.pr_id} and pr.branch == task.branch]
             if not matches:
@@ -930,12 +1152,26 @@ class RecoveryMixin:
             if len(matches) != 1:
                 self.log_event(f"[RECOVERY] Ambiguous merged identity for {task.pr_id}; retrying.")
                 return False
+            header = self._recovery_task_headers[task.pr_id]
+            if header.frontmatter_status == "done" and (Path(self.repo_path) / ".git").exists():
+                try:
+                    if has_merged_outcome(task.pr_id, self.name):
+                        generation = self._merge_task_generation_at_ref(
+                            task, f"refs/remotes/origin/{self.repo_config.branch}",
+                        )
+                        if any(r.exit_reason == "success_merged" and self._merge_record_compatible(
+                            r, generation, task=task, pr=matches[0],
+                        ) for r in records):
+                            continue
+                except Exception as exc:
+                    self.log_event(f"[RECOVERY] Merge accounting generation read deferred: {exc}.")
+                    return False
             self._persisted_merge_recovery = self.state.model_copy(update={
                 "current_task": task, "current_pr": matches[0],
-                "active_invocation": record.invocations[-1] if record and record.invocations else None,
+                "active_invocation": None,
                 "state": PipelineState.MERGE, "merge_phase": "post_merge_cleanup",
             })
-            self._current_run_record = record
+            self._current_run_record = None
             break
         return True
 
@@ -989,6 +1225,36 @@ class RecoveryMixin:
             ):
                 continue
             pr = find_matching_open_pr(task.pr_id, task.branch, prs)
+            saved_timeout = getattr(self, "_persisted_review_timeout_recovery", None)
+            if (
+                pr is not None
+                and header.blocked_reason == SuppressionReason.REVIEW_TIMEOUT.value
+                and saved_timeout is not None
+                and saved_timeout.current_task.pr_id == task.pr_id
+                and saved_timeout.current_task.branch == task.branch
+                and saved_timeout.current_pr.number == pr.number
+                and saved_timeout.current_pr.head_sha == pr.head_sha
+            ):
+                # Preserve the published PR even if Redis is temporarily
+                # unavailable. Admission still requires its timeout cause.
+                return task, pr
+            saved = getattr(self, "_persisted_fix_recovery", None)
+            if (
+                pr is not None and saved is not None
+                and saved.state == PipelineState.ERROR
+                and saved.current_task is not None
+                and saved.current_task.pr_id == task.pr_id
+                and saved.active_invocation is not None
+                and isinstance(saved.active_invocation.fix_trigger, dict)
+                and isinstance(saved.active_invocation.fix_trigger.get("ci"), dict)
+                and (cause := await get_cancellation_cause(
+                    self.redis, self.name, task.pr_id, refresh_ttl=False,
+                )) is not None
+                and cause.payload.get("subsource") == "coder_escalate"
+                and cause.payload.get("reason_text") == "OBSOLETE_CI_EVIDENCE"
+                and isinstance(cause.payload.get("obsolete_ci_trigger"), dict)
+            ):
+                return task, pr
             if pr is not None and (
                 header.blocked_reason in {
                     SuppressionReason.GUARDRAIL.value,
@@ -1002,6 +1268,35 @@ class RecoveryMixin:
                 return task, pr
         return None
 
+    def _restore_review_request_history(
+        self, saved: RepoState, task: QueueTask, pr: PRInfo
+    ) -> None:
+        """Restore a consumed budget only for the same task generation/HEAD."""
+        if (
+            saved.review_request_pr != pr.number
+            or saved.review_request_head != pr.head_sha
+            or saved.review_request_task != task.pr_id
+            or not saved.review_request_generation
+            or not task.task_file
+        ):
+            return
+        try:
+            generation = task_spec_content_hash(
+                (Path(self.repo_path) / task.task_file).read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError):
+            return
+        if generation != saved.review_request_generation:
+            return
+        self.state.review_request_pr = saved.review_request_pr
+        self.state.review_request_head = saved.review_request_head
+        self.state.review_request_task = saved.review_request_task
+        self.state.review_request_generation = generation
+        self.state.review_requested_at = saved.review_requested_at
+        self.state.review_post_attempted_at = saved.review_post_attempted_at
+        self.state.review_reminder_count = saved.review_reminder_count
+        self.state.review_overdue_reported = saved.review_overdue_reported
+
     async def _apply_recovery_decisions(
         self, tasks: list[QueueTask], prs: list[PRInfo]
     ) -> None:
@@ -1014,11 +1309,18 @@ class RecoveryMixin:
             sum(1 for t in tasks if t.status == TaskStatus.DONE),
             len(tasks),
         )
+        if await self._recover_obsolete_ci_error(tasks, prs):
+            return
         await self._rehydrate_quarantines_from_labels(prs)
 
         if self.repo_config.feature_flags.use_single_error_exit:
             for queued in tasks:
                 if queued.status != TaskStatus.ERROR:
+                    continue
+                if unresolved_error_pr is not None and queued.pr_id == unresolved_error_pr[0].pr_id and (
+                    self._recovery_task_headers[queued.pr_id].blocked_reason
+                    == SuppressionReason.REVIEW_TIMEOUT.value
+                ):
                     continue
                 saved_fix = getattr(self, "_persisted_fix_recovery", None)
                 if (
@@ -1029,6 +1331,21 @@ class RecoveryMixin:
                     # run and remote header below. Do not add a new CRASH
                     # suppression that would defeat its pending TODO retry.
                     continue
+                if (
+                    saved_fix is not None and saved_fix.state == PipelineState.ERROR
+                    and saved_fix.current_task is not None
+                    and saved_fix.current_task.pr_id == queued.pr_id
+                    and saved_fix.active_invocation is not None
+                    and isinstance(saved_fix.active_invocation.fix_trigger, dict)
+                    and isinstance(saved_fix.active_invocation.fix_trigger.get("ci"), dict)
+                    and (saved_cause := await get_cancellation_cause(
+                        self.redis, self.name, queued.pr_id, refresh_ttl=False,
+                    )) is not None
+                    and saved_cause.payload.get("subsource") == "coder_escalate"
+                    and saved_cause.payload.get("reason_text") == "OBSOLETE_CI_EVIDENCE"
+                    and isinstance(saved_cause.payload.get("obsolete_ci_trigger"), dict)
+                ):
+                    continue
                 record = await self._suppression_record_for_task(queued.pr_id)
                 if record is None:
                     await self._suppress_task(
@@ -1038,7 +1355,15 @@ class RecoveryMixin:
                     )
         else:
             for queued in tasks:
-                if queued.status == TaskStatus.ERROR:
+                if (
+                    queued.status == TaskStatus.ERROR
+                    and not (
+                        unresolved_error_pr is not None
+                        and queued.pr_id == unresolved_error_pr[0].pr_id
+                        and self._recovery_task_headers[queued.pr_id].blocked_reason
+                        == SuppressionReason.REVIEW_TIMEOUT.value
+                    )
+                ):
                     self._crashed_task_pr_ids.add(queued.pr_id)
 
         doing = next((t for t in tasks if t.status == TaskStatus.DOING), None)
@@ -1083,6 +1408,49 @@ class RecoveryMixin:
                 self.log_event(
                     f"[RECOVERY] Restored MERGE attempt for {queued.pr_id} "
                     f"PR #{self.state.current_pr.number} ({self.state.merge_phase})."
+                )
+                return
+
+        saved_merge_error = getattr(self, "_persisted_merge_error_recovery", None)
+        if saved_merge_error is not None:
+            saved_task = saved_merge_error.current_task
+            saved_pr = saved_merge_error.current_pr
+            queued = next(
+                (task for task in tasks
+                 if task.pr_id == saved_task.pr_id
+                 and task.branch == saved_task.branch),
+                None,
+            )
+            live_pr = (
+                find_matching_open_pr(queued.pr_id, queued.branch, prs)
+                if queued is not None else None
+            )
+            if (
+                queued is not None
+                and (saved_merge_error.error_message.startswith("Merge accounting conflict:")
+                     or live_pr is not None and live_pr.number == saved_pr.number)
+                and (
+                    saved_merge_error.error_message.startswith("Merge accounting conflict:")
+                    or queued.status == TaskStatus.ERROR
+                    or (queued.status == TaskStatus.DOING
+                        and queued.pr_id in self._status_write_failed_task_pr_ids)
+                )
+            ):
+                self.state.current_task = queued
+                self.state.current_pr = (
+                    saved_pr if saved_merge_error.error_message.startswith("Merge accounting conflict:")
+                    else live_pr
+                )
+                await self._restore_current_run_record()
+                await self._transition_to_error(
+                    saved_merge_error.error_message,
+                    save_run_record_as=None,
+                    publish=False,
+                    log_prefix="[RECOVERY]",
+                )
+                self.log_event(
+                    f"[RECOVERY] Restored retained merge failure for "
+                    f"{queued.pr_id} PR #{self.state.current_pr.number}."
                 )
                 return
 
@@ -1178,6 +1546,8 @@ class RecoveryMixin:
                         ),
                     })
                 self.state.current_pr = live_bound or bound
+                if self.state.current_pr.head_sha == bound.head_sha:
+                    self._restore_review_request_history(saved, queued, self.state.current_pr)
                 self.state.active_invocation = saved.active_invocation
                 self.state.size_fix_completion = completion if pending_size_completion else None
                 if recovered_state == PipelineState.ERROR and saved.state != PipelineState.ERROR:
@@ -1415,12 +1785,40 @@ class RecoveryMixin:
         if unresolved_error_pr is not None:
             task, pr = unresolved_error_pr
             header = self._recovery_task_headers.get(task.pr_id)
+            saved_timeout = getattr(self, "_persisted_review_timeout_recovery", None)
+            retained_checkout = self._bound_pr_has_unpublished_work(task, pr)
             self.state = self.state.model_copy(update={
                 "current_task": task,
                 "current_pr": pr,
                 "state": PipelineState.ERROR,
-                "error_message": "Published task failure unresolved; operator Retry or revised approval required.",
+                "error_message": (
+                    saved_timeout.error_message
+                    if saved_timeout is not None
+                    and header is not None
+                    and header.blocked_reason == SuppressionReason.REVIEW_TIMEOUT.value
+                    else (
+                        "Published task failure unresolved; unpublished checkout "
+                        "retained; operator Retry required"
+                        if retained_checkout else
+                        "Published task failure unresolved; operator Retry or revised approval required."
+                    )
+                ),
+                "active_invocation": (
+                    self._persisted_fix_recovery.active_invocation
+                    if (
+                        getattr(self, "_persisted_fix_recovery", None) is not None
+                        and self._persisted_fix_recovery.current_task is not None
+                        and self._persisted_fix_recovery.current_task.pr_id == task.pr_id
+                    )
+                    else self.state.active_invocation
+                ),
             })
+            if (
+                saved_timeout is not None and header is not None
+                and header.blocked_reason == SuppressionReason.REVIEW_TIMEOUT.value
+            ):
+                self.state.skip_ai_error_diagnose = True
+                self._restore_review_request_history(saved_timeout, task, pr)
             return
 
         self.state.state = PipelineState.IDLE

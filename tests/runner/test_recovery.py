@@ -33,6 +33,7 @@ Tests do not change production behavior; they only assert it.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 
 # PR-224a: imports needed by tests moved from tests/test_runner.py
@@ -47,6 +48,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from src.cancellation import (
+    CancellationCause,
+    get_cancellation_cause,
+    safe_record_cancellation_cause,
+)
+from src.cancellation.storage import task_spec_content_hash
 from src.daemon import recovery as recovery_module
 from src.daemon import runner as runner_module
 from src.daemon.handlers import coding as coding_module  # noqa: F401,F811
@@ -54,9 +61,13 @@ from src.daemon.handlers import error as error_module  # noqa: F401,F811
 from src.daemon.handlers import idle as idle_module  # noqa: F811
 from src.daemon.handlers import merge as merge_module  # noqa: F401,F811
 from src.daemon.handlers import watch as watch_module  # noqa: F401,F811
+from src.github import checks as gh_checks
 from src.github import prs as gh_prs
 from src.keyspace import pipeline_state
+from src.metrics import RunRecord
 from src.models import (
+    CIStatus,
+    InvocationSnapshot,
     PipelineState,  # noqa: F811
     PRInfo,  # noqa: F811
     PublicationWatermark,
@@ -75,6 +86,7 @@ from src.publication_migration import (
     enqueue as enqueue_migration,
 )
 from src.publication_migration import pending_key as migration_pending_key
+from src.subsource_registry import SuppressionReason
 from src.task_status import MergedState
 
 from tests.runner import _helpers as h
@@ -1944,11 +1956,17 @@ def test_dirty_tree_auto_recovery_preserves_watch_with_open_pr(
     def fake_run(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         if cmd[:3] == ["git", "status", "--porcelain"]:
             return h._FakeCompletedProcess(args=cmd, stdout=" M src/foo.py\n", returncode=0)
+        if cmd[1:4] == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            return h._FakeCompletedProcess(args=cmd, stdout="pr-099-wip\n")
+        if cmd[1:5] == ["rev-parse", "-q", "--verify", "MERGE_HEAD"]:
+            return h._FakeCompletedProcess(args=cmd, returncode=1)
+        if cmd[1:3] == ["rev-parse", "HEAD"]:
+            return h._FakeCompletedProcess(args=cmd, stdout="a" * 40)
         return h._FakeCompletedProcess(args=cmd, stdout="", returncode=0)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
     runner = h._make_runner()
-    runner.state.current_pr = PRInfo(number=99, branch="pr-099-wip")
+    runner.state.current_pr = PRInfo(number=99, branch="pr-099-wip", head_sha="a" * 40)
     runner.state.current_task = QueueTask(pr_id="PR-099", title="wip", status=TaskStatus.DOING, branch="pr-099-wip")
 
     asyncio.run(runner.preflight())
@@ -2159,6 +2177,280 @@ def test_hydrate_current_task_restores_coding_snapshot() -> None:
     asyncio.run(runner._hydrate_current_task_from_persisted_state())
 
     assert runner.state.current_task == task
+
+
+def _saved_review_state(
+    runner: object, tmp_path: Path, *, error: bool,
+) -> tuple[QueueTask, PRInfo, RepoState]:
+    runner.repo_path = str(tmp_path)
+    task_path = tmp_path / "tasks" / "PR-405.md"
+    task_path.parent.mkdir()
+    task_path.write_text("# PR-405\nBranch: pr-405\n", encoding="utf-8")
+    task = QueueTask(
+        pr_id="PR-405", title="Review", branch="pr-405",
+        task_file="tasks/PR-405.md",
+        status=TaskStatus.ERROR if error else TaskStatus.DOING,
+    )
+    pr = PRInfo(number=640, branch="pr-405", head_sha="a" * 40, pr_id="PR-405")
+    saved = runner.state.model_copy(deep=True)
+    saved.state = PipelineState.ERROR if error else PipelineState.WATCH
+    saved.current_task = task
+    saved.current_pr = pr
+    saved.review_request_pr = pr.number
+    saved.review_request_head = pr.head_sha
+    saved.review_request_task = task.pr_id
+    saved.review_request_generation = task_spec_content_hash(task_path.read_text())
+    saved.review_requested_at = datetime.now(timezone.utc) - timedelta(minutes=31)
+    saved.review_post_attempted_at = datetime.now(timezone.utc) - timedelta(minutes=11)
+    saved.review_reminder_count = 3
+    return task, pr, saved
+
+
+def test_watch_recovery_restores_current_head_reminder_budget(
+    tmp_path: Path,
+) -> None:
+    runner = h._make_runner()
+    task, pr, saved = _saved_review_state(runner, tmp_path, error=False)
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
+    runner._recovery_task_headers = {}
+    runner._rehydrate_last_push_at = lambda *_args: None
+    assert asyncio.run(runner._hydrate_current_task_from_persisted_state()) is True
+    asyncio.run(runner._apply_recovery_decisions([task], [pr]))
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.review_reminder_count == 3
+    assert runner.state.review_post_attempted_at == saved.review_post_attempted_at
+
+
+def test_watch_recovery_restores_unconfirmed_initial_attempt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = h._make_runner()
+    task, pr, saved = _saved_review_state(runner, tmp_path, error=False)
+    saved.review_requested_at = None
+    saved.review_post_attempted_at = datetime.now(timezone.utc) - timedelta(minutes=31)
+    saved.review_reminder_count = 0
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
+
+    fresh = h._make_runner()
+    fresh.redis = runner.redis
+    fresh.repo_path = str(tmp_path)
+    fresh._recovery_task_headers = {}
+    fresh._rehydrate_last_push_at = lambda *_args: None
+    assert asyncio.run(fresh._hydrate_current_task_from_persisted_state()) is True
+    asyncio.run(fresh._apply_recovery_decisions([task], [pr]))
+    assert fresh.state.state == PipelineState.WATCH
+    assert fresh.state.review_request_pr == pr.number
+    assert fresh.state.review_request_head == pr.head_sha
+    assert fresh.state.review_request_task == task.pr_id
+    assert fresh.state.review_request_generation == saved.review_request_generation
+    assert fresh.state.review_requested_at is None
+    assert fresh.state.review_post_attempted_at == saved.review_post_attempted_at
+    assert fresh.state.review_reminder_count == 0
+    monkeypatch.setattr(
+        "src.github.comments.latest_codex_review_request_time",
+        lambda *_args, **_kwargs: None,
+    )
+    posts: list[int] = []
+    fresh._post_codex_review_result = lambda number, **_kwargs: (
+        posts.append(number) is None, True, None
+    )
+    fresh._watch_retrigger_inhibited = lambda *_args: False
+    observed = pr.model_copy(update={
+        "publication_at": datetime.now(timezone.utc) - timedelta(minutes=40),
+    })
+    asyncio.run(fresh._maybe_remind_review(observed))
+    asyncio.run(fresh._maybe_remind_review(observed))
+    assert posts == [pr.number]
+    assert fresh.state.review_reminder_count == 1
+
+
+@pytest.mark.parametrize("change", ["changed_generation", "missing_task_file"])
+@pytest.mark.parametrize("unconfirmed", [False, True])
+def test_watch_recovery_rejects_unverified_task_generation(
+    tmp_path: Path, change: str, unconfirmed: bool,
+) -> None:
+    runner = h._make_runner()
+    task, pr, saved = _saved_review_state(runner, tmp_path, error=False)
+    if unconfirmed:
+        saved.review_requested_at = None
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
+    task_path = tmp_path / "tasks/PR-405.md"
+    if change == "changed_generation":
+        task_path.write_text("# PR-405 changed\nBranch: pr-405\n", encoding="utf-8")
+    else:
+        task_path.unlink()
+    runner._recovery_task_headers = {}
+    runner._rehydrate_last_push_at = lambda *_args: None
+    assert asyncio.run(runner._hydrate_current_task_from_persisted_state()) is True
+    asyncio.run(runner._apply_recovery_decisions([task], [pr]))
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.review_reminder_count == 0
+
+
+@pytest.mark.parametrize("single_error_exit", [False, True])
+def test_legacy_review_timeout_recovery_keeps_bound_pr(
+    tmp_path: Path, single_error_exit: bool,
+) -> None:
+    runner = h._make_runner()
+    runner.repo_config.feature_flags.use_single_error_exit = single_error_exit
+    task, pr, saved = _saved_review_state(runner, tmp_path, error=True)
+    saved.skip_ai_error_diagnose = True
+    saved.error_message = "review timeout"
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), saved.model_dump_json()))
+    runner._recovery_task_headers = {
+        task.pr_id: types.SimpleNamespace(
+            frontmatter_status="error",
+            blocked_reason=SuppressionReason.REVIEW_TIMEOUT.value,
+        )
+    }
+    assert asyncio.run(runner._hydrate_current_task_from_persisted_state()) is True
+    asyncio.run(runner._apply_recovery_decisions([task], [pr]))
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task.pr_id == task.pr_id
+    assert runner.state.current_pr.head_sha == pr.head_sha
+    assert runner.state.review_reminder_count == 3
+    assert runner.state.skip_ai_error_diagnose is True
+    assert task.pr_id not in runner._crashed_task_pr_ids
+
+
+@pytest.mark.parametrize("status_write_pending", [False, True])
+@pytest.mark.parametrize("paused", [False, True])
+def test_restart_restores_bound_merge_failure_and_timeout_evidence(
+    tmp_path: Path, status_write_pending: bool, paused: bool,
+) -> None:
+    original = h._make_runner()
+    task, pr, saved = _saved_review_state(
+        original, tmp_path, error=not status_write_pending
+    )
+    saved.error_message = (
+        "Merge conflict resolution failed (exit -1): Timeout after 300s; "
+        "operator Retry required"
+    )
+    if paused:
+        saved.state = PipelineState.PAUSED
+    asyncio.run(original.redis.set(pipeline_state(original.name), saved.model_dump_json()))
+
+    fresh = h._make_runner()
+    fresh.redis = original.redis
+    fresh.repo_path = str(tmp_path)
+    fresh._recovery_task_headers = {
+        task.pr_id: types.SimpleNamespace(
+            frontmatter_status="doing" if status_write_pending else "error",
+            blocked_reason=SuppressionReason.CRASH.value,
+        )
+    }
+    assert asyncio.run(fresh._hydrate_current_task_from_persisted_state()) is True
+    if status_write_pending:
+        fresh._status_write_failed_task_pr_ids.add(task.pr_id)
+
+    asyncio.run(fresh._apply_recovery_decisions([task], [pr]))
+
+    assert fresh.state.state == PipelineState.ERROR
+    assert fresh.state.current_task.pr_id == task.pr_id
+    assert fresh.state.current_pr.number == pr.number
+    assert fresh.state.error_message == saved.error_message
+
+
+@pytest.mark.parametrize(
+    "checkout", ["feature", "detached", "other", "status_error", "branch_error"],
+)
+def test_restart_without_snapshot_retains_dirty_error_pr_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, checkout: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from src.daemon import git_ops as git_ops_module
+    from src.daemon.retry_commands import RetryDispatch
+
+    def git(*args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, check=check, text=True,
+            capture_output=True,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    (tmp_path / "example.txt").write_text("base\n")
+    git("add", "example.txt")
+    git("commit", "-qm", "base")
+    git("checkout", "-qb", "feature")
+    (tmp_path / "example.txt").write_text("feature\n")
+    git("commit", "-qam", "feature")
+    feature_head = git("rev-parse", "HEAD").stdout.strip()
+    git("checkout", "main")
+    (tmp_path / "example.txt").write_text("main\n")
+    git("commit", "-qam", "main")
+    git("update-ref", "refs/remotes/origin/main", "HEAD")
+    if checkout == "detached":
+        git("checkout", "--detach", "feature")
+    elif checkout == "other":
+        git("checkout", "-qb", "other")
+    else:
+        git("checkout", "feature")
+    checkout_head = git("rev-parse", "HEAD").stdout.strip()
+    (tmp_path / "example.txt").write_text("unpublished resolution\n")
+    (tmp_path / "notes.txt").write_text("untracked resolver notes\n")
+    unpublished = (tmp_path / "example.txt").read_text()
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    task = QueueTask(
+        pr_id="PR-404", title="conflict", status=TaskStatus.ERROR,
+        branch="feature", task_file="tasks/PR-404.md",
+    )
+    pr = PRInfo(number=636, branch="feature", pr_id=task.pr_id,
+                head_sha=feature_head)
+    runner._recovery_task_headers = {
+        task.pr_id: types.SimpleNamespace(
+            frontmatter_status="error",
+            blocked_reason=SuppressionReason.CRASH.value,
+        )
+    }
+
+    assert asyncio.run(runner._hydrate_current_task_from_persisted_state()) is True
+    assert runner._publication_snapshot_absent is True
+    if checkout.endswith("_error"):
+        original_git = git_ops_module._git
+        failed_probe = "status" if checkout == "status_error" else "rev-parse"
+
+        def unavailable(repo_path: str, *args: str, **kwargs: Any):
+            if args[0] == failed_probe:
+                raise subprocess.TimeoutExpired(["git", *args], 30)
+            return original_git(repo_path, *args, **kwargs)
+
+        monkeypatch.setattr(git_ops_module, "_git", unavailable)
+    asyncio.run(runner._apply_recovery_decisions([task], [pr]))
+    if checkout.endswith("_error"):
+        monkeypatch.setattr(git_ops_module, "_git", original_git)
+
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message.startswith(
+        "Published task failure unresolved; unpublished checkout retained"
+    )
+    runner._recovered = True
+    runner._consecutive_dirty_cycles = 2
+    for method in (
+        "_hold_for_coder_cleanup", "_consume_approval_command",
+        "_consume_publication_migration_command", "_maybe_resume_review_timeout",
+    ):
+        monkeypatch.setattr(runner, method, AsyncMock(return_value=False))
+    monkeypatch.setattr(runner, "_consume_retry_command", AsyncMock(return_value=RetryDispatch.NONE))
+    monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+    monkeypatch.setattr(runner, "_refresh_user_paused_from_redis", AsyncMock())
+    monkeypatch.setattr(runner, "_check_github_api_budget", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner, "_maybe_resume_obsolete_ci_error", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        runner, "_remote_frontmatter_error_status_for_current_task",
+        lambda: ("error", SuppressionReason.CRASH.value, "revision"),
+    )
+    for _ in range(4):
+        asyncio.run(runner._run_cycle_body())
+        assert runner.state.state == PipelineState.ERROR
+        assert runner._consecutive_dirty_cycles == 0
+        assert git("rev-parse", "HEAD").stdout.strip() == checkout_head
+        assert (tmp_path / "example.txt").read_text() == unpublished
+        assert (tmp_path / "notes.txt").read_text() == "untracked resolver notes\n"
 
 
 # ---------------------------------------------------------------------------
@@ -2491,7 +2783,7 @@ def test_restart_retains_merge_until_remote_bookkeeping_finishes(
     assert runner.state.current_task.pr_id == queued.pr_id
     assert runner.state.current_pr.head_sha == "a" * 40
     assert runner.state.current_pr.pr_id == pr_id
-    assert runner._current_run_record is record
+    assert runner._current_run_record is None
 
     # The first cycle after recovery uses the retained identity, even though
     # GitHub's open-PR list is empty and headers may already say DONE. A dirty
@@ -2620,7 +2912,13 @@ def test_header_merge_recovery_uses_complete_bound_github_evidence(
             "task_id_hash": compute_task_id_hash(task.pr_id, runner.name),
         }) + "\n")
     if case == "finished":
+        from src.analytics.outcome_logger import compute_task_id_hash
+
         record.exit_reason = "success_merged"
+        isolate_analytics_dir.mkdir(parents=True, exist_ok=True)
+        (isolate_analytics_dir / "2026-04.jsonl").write_text(json.dumps({
+            "task_id_hash": compute_task_id_hash(task.pr_id, runner.name),
+        }) + "\n")
     if case == "wrong_record":
         records = [replace(record, task_id="PR-999"), replace(record, repo_name="other")]
     if case == "not_done":
@@ -2673,7 +2971,7 @@ def test_header_merge_recovery_uses_complete_bound_github_evidence(
         assert saved.current_pr.number == 629
         assert saved.current_pr.head_sha == "a" * 40
         assert saved.merge_phase == "post_merge_cleanup"
-        assert runner._current_run_record is (None if case in {"pending_header", "wrong_record"} else record)
+        assert runner._current_run_record is None
     else:
         assert saved is None
     if case in {"historical", "finished", "open", "not_done", "no_branch"}:
@@ -2719,7 +3017,7 @@ def test_header_merge_recovery_prioritizes_unfinished_attempt(
     assert saved.current_pr.number == 629
     assert saved.current_pr.head_sha == "a" * 40
     assert saved.merge_phase == "post_merge_cleanup"
-    assert runner._current_run_record is (record if current_evidence == "run" else None)
+    assert runner._current_run_record is None
 
 
 @pytest.mark.parametrize("mode", ["missing", "incomplete", "status-incomplete", "passing"])
@@ -2765,3 +3063,429 @@ def test_restart_rehydrates_required_ci_for_exact_head(
     retrieval = checks._retrieve_ci_status_evidence(again.owner_repo, found.head_sha)
     assert retrieval.evidence.sources_complete == (mode in {"missing", "passing"})
     assert ci_policy_transport["reads"] == (2 if mode == "incomplete" else 1)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["success", "success_live", "success_live_stale_startup",
+     "success_default_dispatch", "stale_coder_checkout",
+     "legacy_observations", "cause_delete_ack_lost_default_dispatch",
+     "cause_delete_ack_lost_single_dispatch", "cause_delete_ack_lost_restart",
+     "suppression_disappeared", "identity_changed",
+     "provider_unavailable", "incomplete_evidence", "still_failed",
+     "still_failed_default_dispatch", "wrong_run_cause",
+     "unrelated_hold", "status_write_failed", "label_cleanup_failed", "cleanup_failed",
+     "continuation_corrupt", "continuation_save_failed", "paused",
+     "mismatched_hold", "different_live_hold"],
+)
+def test_structured_obsolete_ci_error_recovers_once_after_snapshot_reload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    runner = h._make_runner()
+    monkeypatch.setattr(runner, "repo_path", str(tmp_path))
+    monkeypatch.setattr(recovery_module, "checkout_process_blocker", lambda path: False)
+    task_path = tmp_path / "tasks" / "PR-019.md"
+    task_path.parent.mkdir()
+    task_path.write_text("---\nPR_ID: PR-019\nBranch: pr-019\nstatus: ERROR\n---\nTask\n")
+    task_hash = task_spec_content_hash(task_path.read_text())
+    task = QueueTask(
+        pr_id="PR-019", title="CI", status=TaskStatus.ERROR,
+        branch="pr-019", task_file="tasks/PR-019.md",
+    )
+    pr = PRInfo(number=19, pr_id="PR-019", branch="pr-019", head_sha="a" * 40,
+                is_escalated=True)
+    ci = {
+        "repo": runner.owner_repo, "pr_number": 19, "head_sha": pr.head_sha,
+        "contexts": [{"name": "unit", "source": "check", "check_id": 41, "attempt": 1,
+                      "state": "failure", "workflow_run_id": 99, "job_id": 41}],
+    }
+    snapshot = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="run-19", attempt_index=1, phase="fix", fix_iteration=1,
+        fix_trigger={"ci": ci, "review": False},
+    )
+    claim = {
+        "ci": ci, "task_id": task.pr_id, "branch": task.branch,
+        "run_id": snapshot.run_id, "attempt_index": 1,
+        "fix_iteration": 1, "task_spec_hash": task_hash,
+    }
+    if case == "legacy_observations":
+        claim["ci"] = dict(ci, _observed_attempts={"99": 2})
+    runner.state.current_task = task
+    runner.state.current_pr = pr
+    runner.state.active_invocation = snapshot
+    runner.state.state = PipelineState.ERROR
+    if case in {"success", "mismatched_hold", "different_live_hold"}:
+        runner._begin_publication_attempt(started_at=datetime.now(timezone.utc))
+        if case in {"mismatched_hold", "different_live_hold"}:
+            runner.state.publication_attempt.exit_classification = "failure"
+            if case == "mismatched_hold":
+                runner.state.publication_attempt.head_sha = "b" * 40
+    runner._persisted_fix_recovery = RepoState.model_validate_json(
+        runner.state.model_dump_json(),
+    )
+    if case == "different_live_hold":
+        runner.state.state = PipelineState.WATCH
+        runner.state.publication_attempt.head_sha = "b" * 40
+    cause = CancellationCause(category="ERROR", payload={
+        "subsource": "coder_escalate", "reason_text": "OBSOLETE_CI_EVIDENCE",
+        "obsolete_ci_trigger": claim, "label_applied": True,
+    })
+    if case == "success":
+        monkeypatch.setattr("src.github.comments.post_comment", lambda *args: None)
+        monkeypatch.setattr(
+            recovery_module.gh_runner, "run_gh", lambda *args, **kwargs: "",
+        )
+        monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
+        monkeypatch.setattr(runner, "_save_current_run_record", AsyncMock())
+        runner.state.state = PipelineState.FIX
+        runner.state.publication_attempt.exit_classification = "failure"
+        asyncio.run(runner._escalate_fix_coder_initiated(
+            pr, "OBSOLETE_CI_EVIDENCE", ci_trigger=claim,
+        ))
+        recorded = asyncio.run(get_cancellation_cause(
+            runner.redis, runner.name, task.pr_id, refresh_ttl=False,
+        ))
+        assert recorded is not None
+        assert recorded.payload["reason_text"] == "OBSOLETE_CI_EVIDENCE"
+        assert recorded.payload["label_applied"] is True
+        assert recorded.payload["obsolete_ci_trigger"] == claim
+        assert runner.state.publication_attempt.pending
+        assert runner.state.publication_attempt.exit_classification == "failure"
+    else:
+        asyncio.run(safe_record_cancellation_cause(
+            runner.redis, runner.name, task.pr_id, cause,
+        ))
+    run = RunRecord(
+        run_id=snapshot.run_id, task_id=task.pr_id, repo_name=runner.name,
+        profile_id="claude:default:container", task_type="fix", complexity="low",
+        started_at="2026-10-24T00:00:00Z", ended_at="2026-10-24T00:01:00Z",
+        duration_ms=60000, fix_iterations=1, tokens_in=0, tokens_out=0,
+        exit_reason="ESCALATE", operator_intervention=False,
+        outcome="failed", cause="ESCALATE", cause_subsource="coder_escalate",
+        run_phase="fix", attempt_index=1, task_spec_hash=task_hash,
+        invocations=[snapshot],
+    )
+    stored_runs: dict[str, RunRecord] = {run.run_id: run}
+    monkeypatch.setattr(
+        runner._metrics_store, "get",
+        AsyncMock(side_effect=lambda run_id: stored_runs.get(run_id)),
+    )
+    async def save_run(record: RunRecord) -> None:
+        stored_runs[record.run_id] = record
+
+    monkeypatch.setattr(runner._metrics_store, "save", save_run)
+    monkeypatch.setattr(runner, "_git_rev_parse", lambda ref: "b" * 40)
+    monkeypatch.setattr(gh_prs, "get_pr_metadata", lambda *args: {"head_sha": pr.head_sha})
+    retrieval = gh_checks._make_ci_retrieval(
+        runner.owner_repo, pr.head_sha, 0.0,
+        [{"id": 42, "name": "unit", "head_sha": pr.head_sha,
+          "app": {"id": 1}, "status": "completed",
+          "conclusion": "failure" if case in {"still_failed", "still_failed_default_dispatch"}
+          else "success"}],
+        {"sha": pr.head_sha, "state": "pending", "statuses": []},
+        gh_checks._CiSourceResult(case != "incomplete_evidence", False),
+        gh_checks._CiSourceResult(True, True),
+    )
+    monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *a, **kw: retrieval)
+    labels: list[list[str]] = []
+    def edit_label(args: list[str], **kwargs: object) -> None:
+        if case == "label_cleanup_failed":
+            raise RuntimeError("label unavailable")
+        labels.append(args)
+
+    monkeypatch.setattr(recovery_module.gh_runner, "run_gh", edit_label)
+    write = AsyncMock(return_value=case != "status_write_failed")
+    monkeypatch.setattr(runner, "_commit_task_status_change", write)
+    monkeypatch.setattr(runner, "_rehydrate_last_push_at", lambda pr: None)
+    runner._recovery_task_headers = {
+        task.pr_id: types.SimpleNamespace(
+            frontmatter_status="error", blocked_reason="coder_escalate",
+        ),
+    }
+
+    if case == "identity_changed":
+        pr.head_sha = "b" * 40
+    elif case == "provider_unavailable":
+        monkeypatch.setattr(gh_prs, "get_pr_metadata", lambda *args: 1 / 0)
+    elif case == "unrelated_hold":
+        monkeypatch.setattr(
+            runner, "_suppression_record_for_task",
+            AsyncMock(return_value=types.SimpleNamespace(reason=SuppressionReason.GUARDRAIL)),
+        )
+    elif case == "wrong_run_cause":
+        run.cause_subsource = "guardrail"
+    elif case == "stale_coder_checkout":
+        (tmp_path / ".git").mkdir()
+        task_path.write_text(task_path.read_text().replace("status: ERROR", "status: TODO"))
+        remote_text = "---\nPR_ID: PR-019\nBranch: pr-019\nstatus: ERROR\n---\nTask\n"
+        monkeypatch.setattr(
+            recovery_module.git_ops, "_git",
+            lambda *args, **kwargs: types.SimpleNamespace(stdout=remote_text),
+        )
+    elif case == "suppression_disappeared":
+        monkeypatch.setattr(runner, "_suppression_record_for_task", AsyncMock(return_value=None))
+    elif case == "paused":
+        runner.state.user_paused = True
+    elif case == "cleanup_failed":
+        original_clear = runner._clear_task_suppression
+        clear_count = 0
+
+        async def flaky_clear(task_id: str) -> None:
+            nonlocal clear_count
+            clear_count += 1
+            if clear_count == 1:
+                raise RuntimeError("Redis unavailable")
+            await original_clear(task_id)
+
+        monkeypatch.setattr(runner, "_clear_task_suppression", flaky_clear)
+    elif case.startswith("cause_delete_ack_lost"):
+        original_clear = runner._clear_task_suppression
+        clear_count = 0
+
+        async def lost_ack(task_id: str) -> None:
+            nonlocal clear_count
+            await original_clear(task_id)
+            clear_count += 1
+            if clear_count == 1:
+                raise RuntimeError("clear acknowledgement lost")
+
+        monkeypatch.setattr(runner, "_clear_task_suppression", lost_ack)
+    elif case == "continuation_corrupt":
+        import uuid
+
+        bad = runner._new_fix_run_record(run, task_spec_hash="wrong")
+        bad.run_id = str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            f"{runner.name}:{task.pr_id}:{snapshot.run_id}:obsolete-ci-continuation",
+        ))
+        stored_runs[bad.run_id] = bad
+    elif case == "continuation_save_failed":
+        monkeypatch.setattr(
+            runner._metrics_store, "save",
+            AsyncMock(side_effect=RuntimeError("metrics unavailable")),
+        )
+
+    if case not in {"success", "success_live", "success_live_stale_startup",
+                    "legacy_observations",
+                    "success_default_dispatch",
+                    "stale_coder_checkout",
+                    "suppression_disappeared"}:
+        assert not asyncio.run(runner._recover_obsolete_ci_error([task], [pr]))
+        assert runner.state.state == (
+            PipelineState.WATCH if case == "different_live_hold" else PipelineState.ERROR
+        )
+        assert write.await_count == (1 if case in {
+            "status_write_failed", "cleanup_failed",
+            "cause_delete_ack_lost_default_dispatch", "cause_delete_ack_lost_single_dispatch",
+            "cause_delete_ack_lost_restart",
+        } else 0)
+        if case == "cleanup_failed":
+            assert asyncio.run(runner._suppression_record_for_task(task.pr_id)) is not None
+            resumed = task.model_copy(update={"status": TaskStatus.DOING})
+            task_path.write_text(task_path.read_text().replace("status: ERROR", "status: DOING"))
+            pr.is_escalated = False
+            assert asyncio.run(runner._recover_obsolete_ci_error([resumed], [pr]))
+            assert runner.state.state == PipelineState.WATCH
+            assert write.await_count == 1
+        if case.startswith("cause_delete_ack_lost"):
+            assert asyncio.run(get_cancellation_cause(
+                runner.redis, runner.name, task.pr_id, refresh_ttl=False,
+            )) is None
+            resumed = task.model_copy(update={"status": TaskStatus.DOING})
+            task_path.write_text(task_path.read_text().replace("status: ERROR", "status: DOING"))
+            pr.is_escalated = False
+            monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [resumed])
+            monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: [pr])
+            if case.endswith("restart"):
+                asyncio.run(runner._apply_recovery_decisions([resumed], [pr]))
+            elif case.endswith("default_dispatch"):
+                runner._recovered = True
+                runner._scaffolded = True
+                monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+                monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+                monkeypatch.setattr(runner, "reload_repo_config_if_dirty", AsyncMock())
+                monkeypatch.setattr(runner, "_maybe_auto_pause_for_error_rate", AsyncMock(return_value=False))
+                asyncio.run(runner.run_cycle())
+            else:
+                asyncio.run(runner._handle_single_error_exit())
+            assert runner.state.state == PipelineState.WATCH
+            assert runner.state.current_task.status == TaskStatus.DOING
+            assert write.await_count == 1
+        if case == "still_failed":
+            runner.repo_config.feature_flags.use_single_error_exit = True
+            monkeypatch.setattr(runner, "_restore_current_run_record", AsyncMock())
+            asyncio.run(runner._apply_recovery_decisions([task], [pr]))
+            suppression = asyncio.run(runner._suppression_record_for_task(task.pr_id))
+            assert suppression is not None
+            assert suppression.reason == SuppressionReason.CODER_ESCALATE
+        if case == "still_failed_default_dispatch":
+            runner._recovered = True
+            runner._scaffolded = True
+            monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+            monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+            monkeypatch.setattr(runner, "reload_repo_config_if_dirty", AsyncMock())
+            monkeypatch.setattr(runner, "_maybe_auto_pause_for_error_rate", AsyncMock(return_value=False))
+            monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [task])
+            monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: [pr])
+            diagnose = AsyncMock()
+            monkeypatch.setattr(runner, "handle_error", diagnose)
+            asyncio.run(runner.run_cycle())
+            assert runner.state.state == PipelineState.ERROR
+            diagnose.assert_not_awaited()
+        return
+
+    if case != "success_live_stale_startup":
+        assert asyncio.run(runner._recover_unresolved_error_pr([task], [pr])) == (task, pr)
+    if case in {"success_live", "success_live_stale_startup", "success_default_dispatch"}:
+        if case == "success_live_stale_startup":
+            runner._persisted_fix_recovery.state = PipelineState.WATCH
+        monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [task])
+        monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: [pr])
+        if case == "success_default_dispatch":
+            runner._recovered = True
+            runner._scaffolded = True
+            monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+            monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+            monkeypatch.setattr(runner, "reload_repo_config_if_dirty", AsyncMock())
+            monkeypatch.setattr(runner, "_maybe_auto_pause_for_error_rate", AsyncMock(return_value=False))
+            watch = AsyncMock()
+            monkeypatch.setattr(runner, "handle_watch", watch)
+            asyncio.run(runner.run_cycle())
+            watch.assert_awaited_once()
+        else:
+            asyncio.run(runner._handle_single_error_exit())
+    else:
+        asyncio.run(runner._apply_recovery_decisions([task], [pr]))
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_task.status == TaskStatus.DOING
+    assert runner.state.active_invocation is None
+    if case == "success":
+        assert runner.state.publication_attempt is not None
+        assert not runner.state.publication_attempt.pending
+        assert not asyncio.run(runner._hold_unresolved_publication())
+    assert runner._current_run_record is not run
+    assert runner._current_run_record.fix_iterations == run.fix_iterations
+    assert runner._current_run_record.ended_at is None
+    if case == "stale_coder_checkout":
+        assert write.await_args.kwargs["expected_task_sha256"] == hashlib.sha256(
+            remote_text.encode("utf-8")
+        ).hexdigest()
+    if case == "success":
+        from src.coders.claude import claude_cli
+        from src.daemon.handlers import fix as fix_module
+
+        h._patch_subprocess(monkeypatch)
+        monkeypatch.setattr(claude_cli, "fix_review_async", h._async_cli_result(0, "", ""))
+        monkeypatch.setattr(fix_module, "_current_ci_failure", lambda *args: ci)
+        monkeypatch.setattr(fix_module, "_fetch_failed_ci_logs", lambda *args: None)
+        runner.state.current_pr.ci_status = CIStatus.FAILURE
+        asyncio.run(runner.handle_fix())
+        assert runner._current_run_record.fix_iterations == run.fix_iterations + 1
+        assert not any(
+            "Completed or unrelated run record" in event["event"]
+            for event in runner.state.history
+        )
+    assert labels[0] == ["pr", "edit", "19", "--remove-label", "escalated"]
+    assert run.fix_iterations == 1
+    if case in {"success", "success_live_stale_startup"}:
+        assert not asyncio.run(runner._recover_obsolete_ci_error([task], [pr]))
+    else:
+        resumed = task.model_copy(update={"status": TaskStatus.DOING})
+        monkeypatch.setattr(
+            gh_checks, "_retrieve_ci_status_evidence",
+            lambda *args, **kwargs: 1 / 0,
+        )
+        assert asyncio.run(runner._recover_obsolete_ci_error([resumed], [pr]))
+        assert len(stored_runs) == 2
+    assert write.await_count == 1
+
+    unrelated = CancellationCause(category="ERROR", payload={
+        "subsource": "coder_escalate", "reason_text": "permission required",
+        "obsolete_ci_trigger": claim,
+    })
+    asyncio.run(safe_record_cancellation_cause(
+        runner.redis, runner.name, task.pr_id, unrelated,
+    ))
+    assert not asyncio.run(runner._recover_obsolete_ci_error([task], [pr]))
+    assert write.await_count == 1
+
+    legacy = replace(snapshot, fix_trigger=None)
+    runner._persisted_fix_recovery.active_invocation = legacy
+    assert not asyncio.run(runner._recover_obsolete_ci_error([task], [pr]))
+
+
+def test_live_obsolete_ci_recovery_defers_provider_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    runner = h._make_runner()
+    task = QueueTask(
+        pr_id="PR-019", title="CI", status=TaskStatus.ERROR,
+        branch="pr-019", task_file="tasks/PR-019.md",
+    )
+    runner.state.current_task = task
+    runner.state.current_pr = PRInfo(number=19, branch=task.branch, head_sha="a" * 40)
+    runner.state.state = PipelineState.ERROR
+    runner.state.active_invocation = InvocationSnapshot(
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+        run_id="run-19", attempt_index=1, phase="fix",
+        fix_trigger={"ci": {"head_sha": "a" * 40}, "review": False},
+    )
+    asyncio.run(safe_record_cancellation_cause(
+        runner.redis, runner.name, task.pr_id,
+        CancellationCause(category="ERROR", payload={
+            "subsource": "coder_escalate", "reason_text": "OBSOLETE_CI_EVIDENCE",
+            "obsolete_ci_trigger": {"head_sha": "a" * 40},
+        }),
+    ))
+    monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: [task])
+    monkeypatch.setattr(gh_prs, "get_open_prs", lambda *a, **kw: 1 / 0)
+    monkeypatch.setattr(runner, "_error_suppression_reason", AsyncMock(return_value=(None, False)))
+    monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task", lambda: (None, None, None))
+    asyncio.run(runner._handle_single_error_exit())
+    assert runner.state.state == PipelineState.ERROR
+    assert any("Obsolete CI observation deferred" in e["event"] for e in runner.state.history)
+
+
+@pytest.mark.parametrize("mode", ["missing", "incomplete", "status-incomplete", "passing"])
+def test_migration_refresh_uses_required_ci_policy(
+    monkeypatch: pytest.MonkeyPatch, ci_policy_transport: dict, mode: str,
+) -> None:
+    from src.models import CIStatus
+
+    ci_policy_transport["mode"] = mode
+    runner = h._make_runner(required_checks=["unit", "integration"])
+    head = ci_policy_transport["sha"]
+    evidence = gh_prs.get_pr_head_publication(runner.owner_repo, 404, expected_head_sha=head)
+    runner.state.state = PipelineState.WATCH
+    runner.state.current_pr = PRInfo(number=404, branch="pr-404", head_sha=head,
+                                   ci_status=CIStatus.SUCCESS)
+    runner.state.publication_migration = recovery_module.PublicationMigration(
+        repo=runner.owner_repo, pr_number=404, head_repo=runner.owner_repo,
+        ref="refs/heads/pr-404", head_sha=head, published_at=evidence.published_at,
+        provenance=evidence.provenance, reason="Operator confirmation required.",
+    )
+    asyncio.run(runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json()))
+    binding = migration_binding(runner.state.publication_migration)
+    asyncio.run(enqueue_migration(runner.redis, runner.name, binding))
+    read_prs = gh_prs.get_open_prs
+    observed = []
+
+    def read(*args, **kwargs):
+        prs = read_prs(*args, **kwargs)
+        observed.extend(prs)
+        return prs
+
+    monkeypatch.setattr(gh_prs, "get_open_prs", read)
+    assert asyncio.run(runner._consume_publication_migration_command()) is True
+    command = MigrationCommand.model_validate_json(asyncio.run(
+        runner.redis.get(migration_command_key(runner.name, binding)),
+    ))
+    assert command.status == "applied"
+    assert len(observed) == 1
+    assert observed[0].head_sha == head
+    assert observed[0].ci_status == (CIStatus.SUCCESS if mode == "passing" else CIStatus.PENDING)

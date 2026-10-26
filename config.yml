@@ -43,10 +43,7 @@ repositories:
     use_single_error_exit: false
 daemon:
   poll_interval_sec: 60
-  review_timeout_min: 20
-  stale_review_threshold_min: 10
-  stale_review_threshold_eyes_min: 5
-  hung_fallback_codex_review: true
+  review_timeout_min: 10
   error_handler_use_ai: true
   claude_model: opus
   fix_idle_timeout_sec: 1800
@@ -80,6 +77,7 @@ daemon:
   watch_slow_poll_interval_sec: 300
   watch_fast_poll_interval_sec: 45
   watch_retrigger_cap: 3
+  # Report CI still pending after this many minutes; this never fails a check.
   ci_pending_max_min: 30
   error_rate_threshold: 5
   error_rate_window_min: 60

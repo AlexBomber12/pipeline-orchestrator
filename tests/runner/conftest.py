@@ -16,6 +16,19 @@ from src.daemon.handlers import idle as idle_module
 
 
 @pytest.fixture(autouse=True)
+def _isolate_merge_generation_proof(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Runner unit tests use synthetic Git; recovery/test_merge_accounting.py
+    exercises the production proof together with the real isolated writer.
+    """
+    from src.daemon.runner import PipelineRunner
+
+    monkeypatch.setattr(
+        PipelineRunner, "_proven_merge_generation",
+        lambda self: self._current_run_record.task_spec_hash if self._current_run_record is not None else "",
+    )
+
+
+@pytest.fixture(autouse=True)
 def _disable_dag_selection_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

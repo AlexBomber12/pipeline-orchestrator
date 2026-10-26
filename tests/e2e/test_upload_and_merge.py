@@ -1,6 +1,27 @@
+import base64
+import json
+import subprocess
 import time
 
 from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
+
+
+def _assert_merged_task_done(repo: str, number: int, branch: str, task_id: str) -> None:
+    """Verify the exact PR and task reached their external terminal outcomes."""
+    result = subprocess.run(
+        ["gh", "pr", "view", str(number), "-R", repo,
+         "--json", "state,headRefName,mergedAt"],
+        capture_output=True, text=True, check=True, timeout=30,
+    )
+    merged = json.loads(result.stdout)
+    assert merged["headRefName"] == branch, merged
+    assert merged["state"] == "MERGED" and merged["mergedAt"], merged
+    task = subprocess.run(
+        ["gh", "api", f"repos/{repo}/contents/tasks/{task_id}.md?ref=main"],
+        capture_output=True, text=True, check=True, timeout=30,
+    )
+    content = base64.b64decode(json.loads(task.stdout)["content"]).decode()
+    assert content.startswith("---\nstatus: DONE\n"), content[:300]
 
 
 def test_full_happy_path_via_shim_succeeds(
@@ -48,6 +69,8 @@ def test_full_happy_path_via_shim_succeeds(
             f"WATCH current_pr.branch={watch_pr.get('branch')!r}, "
             f"expected {expected_branch!r}"
         )
+        number = watch_pr["number"]
+        assert isinstance(number, int) and number > 0
 
         wait_for_state(["IDLE"], timeout_sec=180)
 
@@ -57,6 +80,9 @@ def test_full_happy_path_via_shim_succeeds(
     current_pr = state.get("current_pr")
     assert current_pr is None or current_pr.get("state") == "MERGED", (
         f"unexpected current_pr after merge: {current_pr!r}"
+    )
+    _assert_merged_task_done(
+        testbed_slug.replace("__", "/", 1), number, expected_branch, expected_pr_id,
     )
 
 
@@ -69,9 +95,6 @@ def test_legacy_size_label_pr_merges_and_task_is_done(
     reset_testbed,
 ):
     """An obsolete size label does not prevent ordinary FIX and merge."""
-    import base64
-    import json
-    import subprocess
 
     repo = testbed_slug.replace("__", "/", 1)
     wait_for_state(["IDLE"], timeout_sec=30)
@@ -122,18 +145,5 @@ def test_legacy_size_label_pr_merges_and_task_is_done(
     assert state is not None and any(
         item.get("state") == "FIX" for item in (state.get("history") or [])
     ), "legacy PR did not enter ordinary FIX"
-    result = subprocess.run(
-        ["gh", "pr", "view", str(number), "-R", repo,
-         "--json", "state,headRefName,mergedAt"],
-        capture_output=True, text=True, check=True, timeout=30,
-    )
-    merged = json.loads(result.stdout)
-    assert merged["headRefName"] == branch
-    assert merged["state"] == "MERGED" and merged["mergedAt"], merged
-    task = subprocess.run(
-        ["gh", "api", f"repos/{repo}/contents/tasks/{task_id}.md?ref=main"],
-        capture_output=True, text=True, check=True, timeout=30,
-    )
-    content = base64.b64decode(json.loads(task.stdout)["content"]).decode()
-    assert content.startswith("---\nstatus: DONE\n"), content[:300]
+    _assert_merged_task_done(repo, number, branch, task_id)
     assert state["state"] == "IDLE"

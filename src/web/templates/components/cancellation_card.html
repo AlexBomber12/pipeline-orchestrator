@@ -42,13 +42,16 @@
         {% elif subsource == 'review_timeout' %}
             <span class="cause-badge cause-stale">Stale review</span>
             {% if cause.payload.get('elapsed_min') is not none %}
-            <p>Codex did not respond within {{ cause.payload.get('elapsed_min') }}m. Push a manual review or close the PR.</p>
+            <p>Codex had not responded after {{ cause.payload.get('elapsed_min') }}m. The daemon checks for a late result; Retry remains available.</p>
             {% else %}
-            <p>Codex did not respond within the review_timeout window. Push a manual review or close the PR.</p>
+            <p>Codex review timed out under the earlier policy. The daemon checks for a late result; Retry remains available.</p>
             {% endif %}
             {% if cause.payload.get('reason_text') %}
             <div class="cancellation-reason">{{ cause.payload.get('reason_text') }}</div>
             {% endif %}
+        {% elif subsource == 'watch_retrigger_cap' %}
+            <span class="cause-badge cause-stale">Legacy review reminder cap</span>
+            <p>This earlier failure remains available for operator Retry.</p>
         {% elif subsource == 'fix_iteration_cap' %}
             <span class="cause-badge cause-deadlock">FIX iteration cap</span>
             {% if cause.payload.get('iteration_count') is not none %}

@@ -18,6 +18,10 @@ _REPO_URL_RE = re.compile(
 )
 
 
+class GhNotStartedError(RuntimeError):
+    """The CLI process was not created; no remote request could be submitted."""
+
+
 def run_gh(
     args: list[str],
     repo: str | None = None,
@@ -27,26 +31,36 @@ def run_gh(
 
     If ``repo`` is provided, ``-R <repo>`` is appended. The command's stdout is
     parsed as JSON when possible; otherwise the raw stripped string is returned.
-    A non-zero exit raises ``RuntimeError`` with stderr.
+    A non-zero exit raises ``RuntimeError`` with stderr. Known process-creation
+    failures raise ``GhNotStartedError``; errors after creation keep their type.
     """
     cmd: list[str] = ["gh", *args]
     if repo:
         cmd.extend(["-R", repo])
 
-    result = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
-    if result.returncode != 0:
+    try:
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+    except (BlockingIOError, FileNotFoundError, PermissionError) as exc:
+        # Classify only known spawn failures, at construction. Errors after
+        # creation (including timeouts) retain their uncertain remote outcome.
+        raise GhNotStartedError(f"gh process could not start: {exc}") from exc
+    with process:
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except BaseException:
+            # Match subprocess.run cleanup: terminate on communication failure;
+            # the context manager reaps the child while the original error exits.
+            process.kill()
+            raise
+    if process.returncode != 0:
         raise RuntimeError(
-            f"gh {' '.join(args)} failed (exit {result.returncode}): "
-            f"{result.stderr.strip()}"
+            f"gh {' '.join(args)} failed (exit {process.returncode}): "
+            f"{stderr.strip()}"
         )
 
-    stdout = result.stdout.strip()
+    stdout = stdout.strip()
     if not stdout:
         return ""
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from src.github.prs import get_pr_head_publication, get_pr_last_push_time
@@ -27,12 +27,16 @@ def _transport(monkeypatch: pytest.MonkeyPatch, activity: object, *, head: dict 
         "branch": "feature/fix&one#two", "repo": "fork-owner/fork-repo", "sha": HEAD,
     }
 
-    def fake_run(cmd: list[str], **_kwargs: object) -> SimpleNamespace:
+    def fake_start(cmd: list[str], **_kwargs: object) -> object:
         calls.append(cmd)
         payload = head if "/pulls/" in cmd[2] else activity
-        return SimpleNamespace(returncode=0, stdout=json.dumps(payload), stderr="")
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.returncode = 0
+        process.communicate.return_value = (json.dumps(payload), "")
+        return process
 
-    monkeypatch.setattr("src.github.gh_runner.subprocess.run", fake_run)
+    monkeypatch.setattr("src.github.gh_runner.subprocess.Popen", fake_start)
     return calls
 
 
@@ -142,7 +146,7 @@ def test_transport_failure_is_unknown(monkeypatch: pytest.MonkeyPatch) -> None:
     def fail(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("gh unavailable")
 
-    monkeypatch.setattr("src.github.gh_runner.subprocess.run", fail)
+    monkeypatch.setattr("src.github.gh_runner.subprocess.Popen", fail)
     evidence = get_pr_head_publication("owner/name", 42)
     assert evidence.published_at is None
     assert evidence.unknown_reason == "publication read unavailable: RuntimeError"

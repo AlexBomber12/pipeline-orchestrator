@@ -597,6 +597,22 @@ def _is_retryable_task_status(
     }
 
 
+def _is_merge_accounting_retry(
+    state: RepoState | None, name: str, task_id: str, task_file: str,
+) -> bool:
+    """Admit only a retained, exactly bound failure; daemon proves completion."""
+    return bool(
+        state is not None and state.name == name and state.state == PipelineState.ERROR
+        and (state.error_message or "").startswith("Merge accounting conflict:")
+        and state.current_task is not None and state.current_pr is not None
+        and state.current_task.pr_id == task_id
+        and state.current_task.task_file == task_file == f"tasks/{task_id}.md"
+        and state.current_task.branch == state.current_pr.branch
+        and state.current_pr.pr_id in {None, task_id} and state.current_pr.number > 0
+        and re.fullmatch(r"[0-9a-fA-F]{40}", state.current_pr.head_sha)
+    )
+
+
 def _head_commit_subject(repo_root: Path) -> str:
     result = _run_retry_git(repo_root, "log", "-1", "--pretty=%s")
     return result.stdout.strip()
@@ -1136,6 +1152,44 @@ async def _build_tasks_panel_context(
     redis_client: aioredis.Redis | None,
     retry_cap: int,
 ) -> dict[str, object]:
+    # Recovery may park before publishing a queue. Keep the failed task's
+    # existing Retry action available independently of that projection.
+    if redis_client is not None:
+        state = await _repo_state_for_retry(redis_client, name)
+        if (
+            state is not None and state.state != PipelineState.ERROR
+            and state.current_task is not None
+            and not any(item.pr_id == state.current_task.pr_id for item in tasks)
+        ):
+            tasks.append(state.current_task)
+        if (
+            state is not None
+            and state.state == PipelineState.ERROR
+            and state.current_task is not None
+            and (
+                state.current_pr is None
+                or (state.current_task.branch == state.current_pr.branch
+                    and state.current_pr.head_sha)
+            )
+        ):
+            failed = state.current_task
+            try:
+                cause = await get_cancellation_cause(
+                    redis_client, name, failed.pr_id, refresh_ttl=False
+                )
+            except Exception:
+                cause = None
+            if (
+                cause is not None and cause.category == "ERROR"
+                or _is_merge_accounting_retry(state, name, failed.pr_id, failed.task_file or "")
+            ):
+                replacement = failed.model_copy(update={"status": TaskStatus.ERROR})
+                tasks = [
+                    replacement if item.pr_id == failed.pr_id else item
+                    for item in tasks
+                ]
+                if not any(item.pr_id == failed.pr_id for item in tasks):
+                    tasks.append(replacement)
     async def _views_for(status: TaskStatus) -> list[dict[str, object]]:
         views = [
             await _task_view(
@@ -1787,7 +1841,13 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
             status_code=404,
         )
     tasks, _snapshot_at = await _load_current_queue_snapshot(name)
-    if tasks is None:
+    context = await _build_tasks_panel_context(
+        name,
+        tasks or [],
+        redis_client=getattr(request.app.state, "redis", None),
+        retry_cap=cfg.daemon.retry_button_cap,
+    )
+    if tasks is None and not context["tasks_total"]:
         return HTMLResponse(
             _QUEUE_NOT_READY_FRAGMENT,
             status_code=503,
@@ -1795,12 +1855,7 @@ async def list_repo_tasks(request: Request, name: str) -> Response:
     return _app.templates.TemplateResponse(
         request,
         "components/tasks_panel.html",
-        await _build_tasks_panel_context(
-            name,
-            tasks,
-            redis_client=getattr(request.app.state, "redis", None),
-            retry_cap=cfg.daemon.retry_button_cap,
-        ),
+        context,
     )
 
 
@@ -1832,14 +1887,16 @@ async def retry_repo_task(
         return HTMLResponse("Redis unavailable", status_code=503)
 
     cap = cfg.daemon.retry_button_cap
+    # Recognize an accepted request before reading eligibility for a new Retry.
+    # The daemon may already have applied it and advanced the task to DOING.
     try:
-        current_status = _read_task_frontmatter_status(task_path)
-    except (OSError, UnicodeError):
-        return HTMLResponse("Failed to read task status", status_code=503)
+        existing = await load_retry_command_for_binding(
+            redis_client, name, retry_binding
+        )
+    except Exception:
+        return HTMLResponse("Failed to read Retry command store", status_code=503)
     snapshot_tasks, _snapshot_at = await _load_current_queue_snapshot(name)
     snapshot_status = _task_status_from_snapshot(snapshot_tasks, pr_id)
-    if not _is_retryable_task_status(current_status, snapshot_status):
-        return HTMLResponse("Task is not in ERROR", status_code=409)
     task = next(
         (queued for queued in snapshot_tasks or [] if queued.pr_id == pr_id),
         QueueTask(
@@ -1849,18 +1906,13 @@ async def retry_repo_task(
             task_file=task_filename,
         ),
     )
-    current_count = await _get_retry_count(redis_client, name, pr_id)
-
-    # Replays of the exact browser request are idempotent even if the daemon
-    # applied it between the first and second HTTP delivery.
-    try:
-        existing = await load_retry_command_for_binding(
-            redis_client, name, retry_binding
-        )
-    except Exception:
-        return HTMLResponse("Failed to read Retry command store", status_code=503)
     if existing is not None:
-        if existing.task_id != pr_id or existing.repo_slug != name:
+        if (
+            existing.task_id != pr_id
+            or existing.repo_slug != name
+            or existing.task_file != task_filename
+            or existing.request_binding != retry_binding
+        ):
             return HTMLResponse("Retry binding belongs to another task", status_code=409)
         tasks = snapshot_tasks or [task]
         return _app.templates.TemplateResponse(
@@ -1875,12 +1927,27 @@ async def retry_repo_task(
             status_code=202,
         )
 
+    try:
+        current_status = _read_task_frontmatter_status(task_path)
+    except (OSError, UnicodeError):
+        return HTMLResponse("Failed to read task status", status_code=503)
+    state = await _repo_state_for_retry(redis_client, name)
+    accounting_retry = (
+        _is_merge_accounting_retry(state, name, pr_id, task_filename)
+        and state.url == repo_config.url
+    )
+    if accounting_retry:
+        task = state.current_task.model_copy(update={"status": TaskStatus.ERROR})
+    current_count = await _get_retry_count(redis_client, name, pr_id)
+
+    if not _is_retryable_task_status(current_status, snapshot_status) and not accounting_retry:
+        return HTMLResponse("Task is not in ERROR", status_code=409)
+
     if current_count >= cap:
         return HTMLResponse(
             "Retry cap reached. Edit task spec or delete to proceed.",
             status_code=409,
         )
-    state = await _repo_state_for_retry(redis_client, name)
     try:
         cause = await get_cancellation_cause(
             redis_client, name, pr_id, refresh_ttl=False

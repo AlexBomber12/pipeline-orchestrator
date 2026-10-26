@@ -91,6 +91,14 @@ async def _published_coding_runner(
 
 async def _watch_requires_fix(runner, pr, monkeypatch: pytest.MonkeyPatch) -> None:
     pr.ci_status = CIStatus.FAILURE
+    monkeypatch.setattr(
+        "src.daemon.handlers.fix._current_ci_failure",
+        lambda repo, number, sha, required, empty, trusted, observations=None: {
+            "repo": repo, "pr_number": number, "head_sha": sha,
+            "contexts": [{"name": "unit", "source": "check", "check_id": 1, "attempt": 1,
+                          "state": "failure", "workflow_run_id": None, "job_id": None}],
+        },
+    )
     monkeypatch.setattr(gh_prs, "get_open_prs", lambda *_a, **_k: [pr])
     monkeypatch.setattr(gh_prs, "get_pr_state", lambda *_a: "OPEN")
     monkeypatch.setattr(runner, "_approval_filtered_pr", lambda found: found)
@@ -134,7 +142,7 @@ async def test_published_coding_record_allows_two_real_fix_dispatches(
     await restarted._apply_recovery_decisions([task], [pr])
     assert restarted.state.state == PipelineState.WATCH
     await _watch_requires_fix(restarted, pr, monkeypatch)
-    assert calls == [pr.number, pr.number]
+    assert calls == [pr.number, pr.number], [entry["event"] for entry in restarted.state.history[-10:]]
     assert restarted._current_run_record.fix_iterations == 2
     historical = await runner._metrics_store.get(coding_record.run_id)
     assert historical.ended_at is not None

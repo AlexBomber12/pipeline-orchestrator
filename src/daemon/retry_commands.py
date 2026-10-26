@@ -19,6 +19,7 @@ from src.cancellation import (
 )
 from src.config import normalize_repo_url
 from src.daemon import git_ops
+from src.daemon.recovery import MergeIdentityConflict
 from src.daemon.selector import CoderPurpose, resolve_active_coder
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, derive_active_inhibitors
@@ -47,6 +48,7 @@ class RetryDispatch(StrEnum):
     ACTIVE_TASK_DEFERRED = "active_task_deferred"
     CODING = "coding"
     WATCH = "watch"
+    MERGE = "merge"
 
 
 _ACTIVE_TASK_STATES = {
@@ -505,6 +507,37 @@ class RetryCommandMixin:
     async def _select_retry_continuation(
         self, command: RetryCommand
     ) -> tuple[str, PRInfo | None] | RetryDispatch:
+        if ((self.state.error_message or "").startswith("Merge accounting conflict:")
+                or command.selected_continuation == "merge"):
+            task, pr = self.state.current_task, self.state.current_pr
+            if (task is None or pr is None or command.task_id != task.pr_id
+                    or command.task_branch != task.branch or pr.branch != task.branch
+                    or (command.bound_pr_number, command.bound_pr_branch, command.bound_pr_head_sha)
+                    != (pr.number, pr.branch, pr.head_sha)):
+                return await self._fail_retry_command(command, "Merge accounting Retry identity changed.")
+            if self.state.publication_attempt is not None and self.state.publication_attempt.pending:
+                return await self._defer_retry_command(
+                    command, "Publication ownership is unresolved; merge Retry retained.",
+                )
+            try:
+                outcome = await asyncio.to_thread(
+                    gh_prs.get_exact_pr_outcome, self.owner_repo, self.repo_config.branch, pr.number, pr.head_sha,
+                )
+                if outcome.state == gh_prs.ExactPRState.UNKNOWN:
+                    if outcome.reason in {"head mismatch", "identity mismatch", "invalid identity"}:
+                        return await self._fail_retry_command(command, "Exact merge Retry identity changed.")
+                    return await self._defer_retry_command(command, "Exact merge proof unavailable; Retry retained.")
+                if outcome.state != gh_prs.ExactPRState.MERGED:
+                    return await self._fail_retry_command(command, "Retained PR is not the confirmed merge.")
+                self._confirmed_merge_outcome = outcome
+                self._confirmed_merge_at = outcome.merged_at
+                if self._proven_merge_generation() != command.task_fingerprint:
+                    raise MergeIdentityConflict("Retry generation differs from merged task")
+            except MergeIdentityConflict as exc:
+                return await self._fail_retry_command(command, f"Merge accounting Retry conflict: {exc}.")
+            except Exception as exc:
+                return await self._defer_retry_command(command, f"Merge accounting Retry proof unavailable: {exc}.")
+            return "merge", pr
         attempt = self.state.publication_attempt
         resolved = False
         if attempt is not None and attempt.pending:
@@ -752,6 +785,21 @@ class RetryCommandMixin:
         )
         return updated
 
+    async def _resume_merge_accounting_retry(
+        self, command: RetryCommand, task: QueueTask, pr: PRInfo,
+    ) -> RetryDispatch:
+        """Transfer an admitted operator command to restart-safe bookkeeping."""
+        await self._clear_retry_failure_evidence(command)
+        self._current_run_record = None
+        self.state.active_invocation = None
+        self._set_retry_task_snapshot(task)
+        self.state.current_pr = pr
+        self.state.error_message = None
+        self.state.state = PipelineState.MERGE
+        self.state.merge_phase = "post_merge_cleanup"
+        await self.publish_state()
+        return RetryDispatch.MERGE
+
     async def _apply_retry_command(self, command: RetryCommand) -> RetryDispatch:
         validated = await self._validate_retry_command(command)
         if isinstance(validated, RetryDispatch):
@@ -807,6 +855,13 @@ class RetryCommandMixin:
             return await self._defer_retry_command(
                 command, f"Could not reserve retry allowance: {exc}."
             )
+
+        if continuation_name == "merge":
+            try:
+                await self._mark_retry_applied(command, "merge", [])
+                return await self._resume_merge_accounting_retry(command, task, pr)
+            except Exception as exc:
+                return await self._defer_retry_command(command, f"Merge accounting Retry handoff deferred: {exc}.")
 
         if continuation_name == "watch":
             # Only transfer ownership after reservation succeeds: a cap failure
@@ -932,6 +987,12 @@ class RetryCommandMixin:
         if isinstance(continuation, RetryDispatch):
             return continuation
         continuation_name, pr = continuation
+
+        if continuation_name == "merge":
+            try:
+                return await self._resume_merge_accounting_retry(command, task, pr)
+            except Exception as exc:
+                return await self._defer_retry_command(command, f"Applied merge Retry handoff deferred: {exc}.")
 
         if continuation_name == "watch":
             assert pr is not None

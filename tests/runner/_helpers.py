@@ -379,6 +379,15 @@ class _FakeCompletedProcess:
         self.stderr = stderr
         self.returncode = returncode
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        pass
+
+    def communicate(self, **kwargs):
+        return self.stdout, self.stderr
+
 
 def _repo_cfg(**overrides: Any) -> RepoConfig:
     base: dict[str, Any] = {
@@ -448,6 +457,16 @@ def _allow_all_coder_auth(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def _stub_final_merge_evidence(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate unrelated merge unit contracts; component cases use real readers."""
+    monkeypatch.setattr(
+        "src.daemon.handlers.merge.MergeMixin._read_final_merge_pr",
+        lambda self, policy: self.state.current_pr.model_copy(update={
+            "ci_status": CIStatus.SUCCESS, "review_status": ReviewStatus.APPROVED,
+        }),
+    )
+
+
 def _patch_subprocess(
     monkeypatch: pytest.MonkeyPatch,
     stdout: str = "",
@@ -455,6 +474,7 @@ def _patch_subprocess(
     *,
     stub_auto_pr_read: bool = True,
 ) -> list[list[str]]:
+    _stub_final_merge_evidence(monkeypatch)
     calls: list[list[str]] = []
     rev_parse_head_calls = {"n": 0}
 
@@ -487,6 +507,16 @@ def _patch_subprocess(
         return _FakeCompletedProcess(args=cmd, stdout=stdout, returncode=returncode)
 
     monkeypatch.setattr(runner_module.subprocess, "run", fake_run)
+    # gh now distinguishes construction failures from errors after launch.
+    # Keep the same controlled transport, including per-test run overrides.
+    original_start = gh_runner.subprocess.Popen
+
+    def start(cmd, **kwargs):
+        if cmd[0] == "gh":
+            return runner_module.subprocess.run(cmd, **kwargs)
+        return original_start(cmd, **kwargs)
+
+    monkeypatch.setattr(gh_runner.subprocess, "Popen", start)
     # Legacy handler fixtures expose publication through the targeted API too.
     publication_calls = 0
     published_identities = set()

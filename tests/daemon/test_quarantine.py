@@ -194,6 +194,7 @@ def test_coding_guardrail_populates_quarantine(
 
 
 def _stub_successful_merge(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    h._stub_final_merge_evidence(monkeypatch)
     merged: list[int] = []
 
     def fake_git(repo_path: str, *args: str, **kwargs: object):
@@ -280,8 +281,8 @@ def test_label_removal_detected_in_watch(monkeypatch: pytest.MonkeyPatch) -> Non
     )
     monkeypatch.setattr(
         runner,
-        "_maybe_retrigger_stale_review",
-        lambda number: asyncio.sleep(0),
+        "_maybe_remind_review",
+        lambda pr: asyncio.sleep(0),
     )
 
     asyncio.run(runner.handle_watch())

@@ -402,91 +402,12 @@ def _seed_stale_review(runner: Any, coder: str) -> list[int]:
     return posted
 
 
-def test_handle_watch_skips_retrigger_when_coder_rate_limited_legacy(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = h._make_runner()
-    _set_flag(runner, False)
-    posted = _seed_stale_review(runner, "claude")
-    runner.state.rate_limited_coder_until["claude"] = _future()
-    monkeypatch.setattr(
-        "src.github.prs.get_last_push_age_seconds",
-        lambda *_args, **_kwargs: 60 * 30,
-    )
-
-    result = asyncio.run(runner._maybe_retrigger_stale_review(42))
-
-    assert result is False
-    assert posted == []
 
 
-def test_handle_watch_skips_retrigger_when_coder_rate_limited_unified(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = h._make_runner()
-    _set_flag(runner, True)
-    posted = _seed_stale_review(runner, "claude")
-    runner.state.active_inhibitors = [_rate_limit("claude")]
-    monkeypatch.setattr(
-        "src.github.prs.get_last_push_age_seconds",
-        lambda *_args, **_kwargs: 60 * 30,
-    )
-
-    result = asyncio.run(runner._maybe_retrigger_stale_review(42))
-
-    assert result is False
-    assert posted == []
 
 
-@pytest.mark.parametrize("flag", [False, True])
-def test_handle_watch_allows_retrigger_for_unaffected_coder(
-    flag: bool,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = h._make_runner()
-    _set_flag(runner, flag)
-    posted = _seed_stale_review(runner, "codex")
-    if flag:
-        runner.state.active_inhibitors = [_rate_limit("claude")]
-    else:
-        runner.state.rate_limited_coder_until["claude"] = _future()
-    monkeypatch.setattr(
-        "src.github.prs.get_last_push_age_seconds",
-        lambda *_args, **_kwargs: 60 * 30,
-    )
-
-    result = asyncio.run(runner._maybe_retrigger_stale_review(42))
-
-    assert result is True
-    assert posted == [42]
 
 
-def test_handle_watch_skips_bot_error_retrigger_when_coder_rate_limited_unified(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = h._make_runner()
-    _set_flag(runner, True)
-    runner.state.coder = "claude"
-    runner.state.active_inhibitors = [_rate_limit("claude")]
-    posted: list[int] = []
-    runner._post_codex_review_result = (  # type: ignore[method-assign]
-        lambda number, **_kwargs: (posted.append(number) is None, True, None)
-    )
-    monkeypatch.setattr(
-        "src.github.cache._gh_api_paginated",
-        lambda *_args, **_kwargs: [
-            {
-                "user": {"id": 199175422, "login": "chatgpt-codex-connector[bot]"},
-                "body": "Something went wrong. Try again",
-                "created_at": datetime.now(timezone.utc).isoformat(),
-            }
-        ],
-    )
-
-    result = runner._maybe_retrigger_on_codex_bot_error(42)
-
-    assert result is False
-    assert posted == []
 
 
 def test_watch_retrigger_legacy_normalizes_naive_per_coder_until() -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import shlex
 import uuid
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
@@ -12,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from src.cancellation.storage import cause_key
 from src.config import AppConfig, CoderType, RepoConfig
+from src.events.publisher import EVENT_TIERS
 from src.inhibitor import InhibitorType, WorkInhibitor
 from src.keyspace import pipeline_state, retry_command, retry_command_pending
 from src.metrics import MetricsStore, RunRecord
@@ -521,6 +523,402 @@ async def test_redis_cleanup_preserves_results_and_propagates_cancellation(
 
     with pytest.raises(asyncio.CancelledError):
         await diagnostics._close_redis(CancelledCloseRedis())
+
+
+async def test_repo_events_reads_dashboard_history_newest_first_and_redacts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    state = _state(updated=NOW)
+    state.history = [
+        {"time": (NOW - timedelta(minutes=2)).isoformat(), "state": "MERGE",
+         "event": "[MERGE] older", "count": 1},
+        {"time": (NOW - timedelta(minutes=1)).isoformat(), "last_seen_at": NOW.isoformat(),
+         "state": "ERROR", "event": "Timeout after 300s Authorization: Bearer abc123 password=hunter2 "
+         "{\"api_key\": \"abcdefgh12345678\"} password=\"correct horse battery staple\" "
+         "Authorization: Basic YWJjOnNlY3JldA== "
+         "ghp_1234567890abcdef https://alice:secret@example.com", "tier": "merge",
+         "kind": "conflict", "count": 3},
+    ]
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    before = copy.deepcopy((redis.store, redis.lists, redis.ttls))
+
+    result = await diagnostics.get_repo_events(SLUG, limit=1)
+
+    assert result["source"]["status"] == "fresh"
+    assert result["retained_count"] == 2
+    assert result["truncated"] is True
+    assert len(result["events"]) == 1
+    event = result["events"][0]
+    assert event["recorded_state"] == "ERROR"
+    assert event["category"] == "merge"
+    assert event["kind"] == "conflict"
+    assert event["count"] == 3
+    assert event["last_seen_at"] == NOW.isoformat().replace("+00:00", "Z")
+    assert "Timeout after 300s" in event["message"]
+    assert "abc123" not in json.dumps(result)
+    assert "hunter2" not in json.dumps(result)
+    assert "abcdefgh12345678" not in json.dumps(result)
+    assert "correct horse battery staple" not in json.dumps(result)
+    assert "YWJjOnNlY3JldA" not in json.dumps(result)
+    assert "ghp_" not in json.dumps(result)
+    assert "alice" not in json.dumps(result)
+    assert (redis.store, redis.lists, redis.ttls) == before
+    assert {operation for operation, _ in redis.calls} <= {"strlen", "getrange", "exists", "aclose"}
+    assert redis.closed
+    assert "merge" in EVENT_TIERS
+
+    # _save_cli_log records only the beginning of CLI output, so the PEM
+    # closing marker may be absent from a retained event.
+    state.history[-1]["event"] = "[INFRA] CLI output: -----BEGIN EC PRIVATE KEY-----\n" + "A" * 160
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    pem = await diagnostics.get_repo_events(SLUG, limit=1)
+    assert "BEGIN EC PRIVATE KEY" not in pem["events"][0]["message"]
+    assert "A" * 40 not in pem["events"][0]["message"]
+    assert pem["events"][0]["message"] == "[OMITTED: credential-bearing event]"
+
+    state.history[-1]["event"] = '[INFRA] password="correct horse battery'
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    partial_quote = await diagnostics.get_repo_events(SLUG, limit=1)
+    assert "correct horse battery" not in partial_quote["events"][0]["message"]
+
+    state.history[-1]["tier"] = None
+    state.history[-1]["event"] = "[MERGE] Timeout after 300s"
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    legacy = await diagnostics.get_repo_events(SLUG, limit=1)
+    assert legacy["events"][0]["category"] == "MERGE"
+
+    state.history[-1]["event"] = "[RECOVERY] Applied Retry"
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    recovery = await diagnostics.get_repo_events(SLUG, limit=1)
+    assert recovery["events"][0]["category"] == "RECOVERY"
+    assert recovery["events"][0]["message"] == "[RECOVERY] Applied Retry"
+
+    state.history[-1]["event"] = "[UNKNOWN] Applied Retry"
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    unknown = await diagnostics.get_repo_events(SLUG, limit=1)
+    assert unknown["events"][0]["category"] is None
+
+    monkeypatch.setattr(diagnostics, "_MAX_EVENT_RESPONSE_BYTES", 600)
+    state.history[-1]["event"] = "x" * 1000
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    capped = await diagnostics.get_repo_events(SLUG, limit=1)
+    assert capped["events"] == []
+    assert capped["truncated"] is True
+    assert len(json.dumps(capped).encode()) <= 600
+
+
+@pytest.mark.parametrize(
+    ("message", "canary", "safe_text"),
+    [
+        (
+            'before {"access_token":"CANARY_ACCESS"} after Timeout after 300s',
+            "CANARY_ACCESS", "after Timeout after 300s",
+        ),
+        ('before {"refresh_token":"CANARY_REFRESH"} after', "CANARY_REFRESH", "after"),
+        ('before {"client_secret":"CANARY_CLIENT"} after', "CANARY_CLIENT", "after"),
+        ('before {"private_key":"CANARY_PRIVATE"} after', "CANARY_PRIVATE", "after"),
+        ('before {"clientSecret":"CANARY_CAMEL"} after', "CANARY_CAMEL", "after"),
+        ('before {"aws_secret_access_key":"CANARY_AWS"} after', "CANARY_AWS", "after"),
+        ('before {"session_id":"CANARY_SESSION"} after', "CANARY_SESSION", "after"),
+        ('before Cookie: sessionid=CANARY_COOKIE; theme=light\nafter', "CANARY_COOKIE", "after"),
+        ('before Cookie: theme=light; sid=CANARY_COOKIE_AFTER_SEMI\nafter',
+         "CANARY_COOKIE_AFTER_SEMI", "after"),
+        ('before Set-Cookie: sid=CANARY_SET_COOKIE; Secure\nafter', "CANARY_SET_COOKIE", "after"),
+        ('before Proxy-Authorization: Basic CANARY_PROXY\nafter', "CANARY_PROXY", "after"),
+        (r'before {"pass\u0077ord":"CANARY_ESCAPED"} after', "CANARY_ESCAPED", "after"),
+        (r'Timeout after 300s {"password":"prefix\u0022CANARY_UNICODE_QUOTE"}',
+         "CANARY_UNICODE_QUOTE", "Timeout after 300s"),
+        (r'Timeout after 300s password=prefix\u003bCANARY_ESCAPED_SEMICOLON',
+         "CANARY_ESCAPED_SEMICOLON", "Timeout after 300s"),
+        (r'Timeout after 300s password=prefix\u002cCANARY_ESCAPED_COMMA',
+         "CANARY_ESCAPED_COMMA", "Timeout after 300s"),
+        (r'Timeout after 300s password=prefix\u000aCANARY_ESCAPED_NEWLINE',
+         "CANARY_ESCAPED_NEWLINE", "Timeout after 300s"),
+        ('Timeout after 300s {"password":"prefix＂CANARY_FULLWIDTH_QUOTE"}',
+         "CANARY_FULLWIDTH_QUOTE", "Timeout after 300s"),
+        (r'Timeout after 300s {"password":"prefix\uff02CANARY_ESCAPED_FULLWIDTH"}',
+         "CANARY_ESCAPED_FULLWIDTH", "Timeout after 300s"),
+        ('before {"ｐａｓｓｗｏｒｄ":"CANARY_FULLWIDTH_KEY"} after',
+         "CANARY_FULLWIDTH_KEY", "after"),
+        (r'before {\"access_token\":\"CANARY_JSON_QUOTES\"} after', "CANARY_JSON_QUOTES", "after"),
+        (r'before {"access_token":"abc\"CANARY_INNER_QUOTE"} after', "CANARY_INNER_QUOTE", "after"),
+        (
+            json.dumps(json.dumps({"password": 'prefix"CANARY_DOUBLE_JSON',
+                                   "detail": "Timeout after 300s"})),
+            "CANARY_DOUBLE_JSON", "Timeout after 300s",
+        ),
+        (
+            "before " + json.dumps(json.dumps({"password": 'prefix"CANARY_EMBEDDED_JSON'}))
+            + " after Timeout after 300s",
+            "CANARY_EMBEDDED_JSON", "Timeout after 300s",
+        ),
+        ('"Timeout after 300s\\q"', "CANARY_NOT_PRESENT", "Timeout after 300s"),
+        ('before pa\x1b[31mssword=CANARY_ANSI', "CANARY_ANSI", "before"),
+        ('before https://user:CANARY_URL@relay@host/repo after', "CANARY_URL", "/repo after"),
+        ('before redis://default:CANARY_REDIS@cache.example:6379/0 after',
+         "CANARY_REDIS", "/0 after"),
+        ('before rediss://default:CANARY_REDISS@cache.example:6379/0 after',
+         "CANARY_REDISS", "/0 after"),
+        ('before postgresql://dbuser:CANARY_POSTGRES@db.example/app after',
+         "CANARY_POSTGRES", "/app after"),
+        ('before aws_access_key_id=CANARY_AWS_ID; after', "CANARY_AWS_ID", "before"),
+        ('before PASSWORD=prefix,CANARY_LITERAL_SUFFIX Timeout after 300s',
+         "CANARY_LITERAL_SUFFIX", "Timeout after 300s"),
+        ('PASSWORD="prefix"CANARY_QUOTED_SUFFIX Timeout after 300s',
+         "CANARY_QUOTED_SUFFIX", "Timeout after 300s"),
+        ("PASSWORD='prefix'CANARY_SINGLE_SUFFIX", "CANARY_SINGLE_SUFFIX", ""),
+        ('passphrase="CANARY_PASSPHRASE"', "CANARY_PASSPHRASE", ""),
+        ('Server=db;User ID=sa;Pwd=CANARY_CONNECTION', "CANARY_CONNECTION", ""),
+        ('Command failed: client --password CANARY_CLI_VALUE', "CANARY_CLI_VALUE", ""),
+        ('before PASSWORD=prefix;CANARY_LITERAL_SEMICOLON\nafter',
+         "CANARY_LITERAL_SEMICOLON", "before"),
+        ('before PASSWORD=prefix\nCANARY_MULTILINE_SUFFIX\nTimeout after 300s',
+         "CANARY_MULTILINE_SUFFIX", "Timeout after 300s"),
+        ('Timeout after 300s PASSWORD=' + shlex.quote("prefix'CANARY_SHELL_SUFFIX"),
+         "CANARY_SHELL_SUFFIX", "Timeout after 300s"),
+        ('before GOOGLE_API_KEY=AIzaCANARY_GOOGLE_API after',
+         "CANARY_GOOGLE_API", "before"),
+        ('before OPENAI_API_KEY=CANARY_OPENAI_API after',
+         "CANARY_OPENAI_API", "before"),
+        ('before https://user:CANARY_URL_TRUNC', "CANARY_URL_TRUNC", "before"),
+        ('before https://host.example:443/health after', "CANARY_NOT_PRESENT", "https://host.example:443/health"),
+        ('before password="CANARY_TRUNCATED', "CANARY_TRUNCATED", "before"),
+        ('before -----BEGIN OPENSSH PRIVATE KEY-----\nCANARY_PEM', "CANARY_PEM", "before"),
+        ('before private_key=-----BEGIN EC PRIVATE KEY-----\nCANARY_PEM_BODY\n'
+         '-----END EC PRIVATE KEY-----\nafter', "CANARY_PEM_BODY", "before"),
+        ('before \x1b]0;CANARY_OSC\x07 after', "CANARY_OSC", "after"),
+        ('Timeout after 300s \x1bX CANARY_UNKNOWN', "CANARY_UNKNOWN", "Timeout after 300s"),
+        ("CANARY_OVERSIZED" + "x" * 4100, "CANARY_OVERSIZED", "OMITTED: oversized"),
+        ("CANARY_NFKC" + "ﬃ" * 2000, "CANARY_NFKC", "OMITTED: oversized"),
+        (r"Timeout after 300s password=\u00ZZ CANARY_BAD_ESCAPE", "CANARY_BAD_ESCAPE", "Timeout after 300s"),
+        (r"Timeout after 300s pass\u001bword=CANARY_ENCODED_ESC", "CANARY_ENCODED_ESC", "Timeout after 300s"),
+        (r'before {"pass\u200bword":"CANARY_ZERO_WIDTH"} after', "CANARY_ZERO_WIDTH", "after"),
+        (
+            '[MERGE] Merge conflict resolution failed (exit 1): access_token=CANARY_MERGE; operator Retry required',
+            "CANARY_MERGE", "Merge conflict resolution failed",
+        ),
+        ('[MERGE] Timeout after 300s; PR #12 remains open', "CANARY_NOT_PRESENT", "PR #12 remains open"),
+        ('Command failed: client --verbose; Timeout after 300s',
+         "CANARY_NOT_PRESENT", "--verbose; Timeout after 300s"),
+    ],
+)
+async def test_repo_events_sanitizes_complete_response(
+    monkeypatch: pytest.MonkeyPatch, message: str, canary: str, safe_text: str,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    state = _state(updated=NOW)
+    state.history = [{"time": NOW.isoformat(), "state": "MERGE", "event": message,
+                      "kind": "client_secret=CANARY_KIND"}]
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+
+    result = await diagnostics.get_repo_events(SLUG)
+
+    serialized = json.dumps(result)
+    assert canary not in serialized
+    assert "CANARY_KIND" not in serialized
+    if canary == "CANARY_NOT_PRESENT" or canary == "CANARY_OSC":
+        assert safe_text in result["events"][0]["message"]
+    elif canary in {"CANARY_OVERSIZED", "CANARY_NFKC", "CANARY_UNKNOWN",
+                    "CANARY_BAD_ESCAPE", "CANARY_ENCODED_ESC"}:
+        assert result["events"][0]["message"].startswith("[OMITTED:")
+    else:
+        assert result["events"][0]["message"].startswith("[OMITTED: credential-bearing event]")
+        if "Timeout after" in safe_text:
+            assert "Timeout after 300s" in result["events"][0]["message"]
+    assert result["events"][0]["kind"] == "[OMITTED: credential-bearing event]"
+    assert result["source"]["status"] == "fresh"
+    assert redis.closed
+
+
+@pytest.mark.parametrize(
+    ("kind", "canary"),
+    [
+        ('PASSWORD="prefix"CANARY_KIND_DOUBLE', "CANARY_KIND_DOUBLE"),
+        ("PASSWORD='prefix'CANARY_KIND_SINGLE", "CANARY_KIND_SINGLE"),
+        ('passphrase="CANARY_KIND_PASSPHRASE"', "CANARY_KIND_PASSPHRASE"),
+        ('Server=db;User ID=sa;Pwd=CANARY_KIND_CONNECTION', "CANARY_KIND_CONNECTION"),
+        (r'{"pass\u0077ord":"CANARY_KIND_ESCAPED"}', "CANARY_KIND_ESCAPED"),
+        ('pa\x1b[31mssword=CANARY_KIND_ANSI', "CANARY_KIND_ANSI"),
+        ('Cookie: sid=CANARY_KIND_COOKIE', "CANARY_KIND_COOKIE"),
+        ('https://user:CANARY_KIND_URL@relay@host', "CANARY_KIND_URL"),
+        ('--password CANARY_KIND_CLI', "CANARY_KIND_CLI"),
+    ],
+)
+async def test_repo_events_omits_sensitive_kind_but_keeps_safe_event(
+    monkeypatch: pytest.MonkeyPatch, kind: str, canary: str,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    state = _state(updated=NOW)
+    state.history = [{"time": NOW.isoformat(), "state": "MERGE",
+                      "event": "[MERGE] Timeout after 300s; PR #12 remains open", "kind": kind}]
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+
+    result = await diagnostics.get_repo_events(SLUG)
+
+    assert canary not in json.dumps(result)
+    assert result["events"][0]["kind"] == "[OMITTED: credential-bearing event]"
+    assert result["events"][0]["message"] == "[MERGE] Timeout after 300s; PR #12 remains open"
+
+
+@pytest.mark.parametrize("truncated", [False, True])
+async def test_repo_events_sanitizes_real_cli_log_producer(
+    monkeypatch: pytest.MonkeyPatch, truncated: bool,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    from tests.runner import _helpers as h
+
+    runner = h._make_runner()
+    value = '"CANARY_PRODUCER' + ("X" * 220 if truncated else '"}')
+    await runner._save_cli_log('{"access_token":' + value, "", "CODER")
+    assert "CANARY_PRODUCER" in runner.state.history[-1]["event"]
+    assert len(runner.state.history[-1]["event"]) <= 216
+
+    runner.state.last_updated = NOW
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    redis.store[pipeline_state(SLUG)] = runner.state.model_dump_json()
+
+    result = await diagnostics.get_repo_events(SLUG)
+
+    assert "CANARY_PRODUCER" not in json.dumps(result)
+    assert result["events"][0]["message"] == "[OMITTED: credential-bearing event]"
+    assert redis.closed
+
+
+@pytest.mark.parametrize(
+    ("stdout", "canary"),
+    [
+        ("Cookie: theme=light; sid=CANARY_PRODUCER_COOKIE", "CANARY_PRODUCER_COOKIE"),
+        (r'{"password":"prefix\u0022CANARY_PRODUCER_QUOTE"}', "CANARY_PRODUCER_QUOTE"),
+        ('private_key=-----BEGIN EC PRIVATE KEY-----\nCANARY_PRODUCER_PEM\n'
+         '-----END EC PRIVATE KEY-----', "CANARY_PRODUCER_PEM"),
+        ("Connection failed: redis://default:CANARY_PRODUCER_REDIS@cache.example:6379/0",
+         "CANARY_PRODUCER_REDIS"),
+        ('{"password":"prefix＂CANARY_PRODUCER_FULLWIDTH"}',
+         "CANARY_PRODUCER_FULLWIDTH"),
+        (r'password=prefix\u003bCANARY_PRODUCER_DELIMITER',
+         "CANARY_PRODUCER_DELIMITER"),
+        ("GOOGLE_API_KEY=AIzaCANARY_PRODUCER_GOOGLE1234567890abcdef",
+         "CANARY_PRODUCER_GOOGLE"),
+        ("PASSWORD=prefix,CANARY_PRODUCER_LITERAL_SUFFIX",
+         "CANARY_PRODUCER_LITERAL_SUFFIX"),
+        ("PASSWORD=" + shlex.quote("prefix'CANARY_PRODUCER_SHELL"),
+         "CANARY_PRODUCER_SHELL"),
+        ('PASSWORD="prefix"CANARY_PRODUCER_QUOTED', "CANARY_PRODUCER_QUOTED"),
+        ("PASSWORD='prefix'CANARY_PRODUCER_SINGLE", "CANARY_PRODUCER_SINGLE"),
+        ('passphrase="CANARY_PRODUCER_PASSPHRASE"', "CANARY_PRODUCER_PASSPHRASE"),
+        ('Server=db;User ID=sa;Pwd=CANARY_PRODUCER_CONNECTION',
+         "CANARY_PRODUCER_CONNECTION"),
+        ('Command failed: client --password CANARY_PRODUCER_CLI',
+         "CANARY_PRODUCER_CLI"),
+        ('Command failed: client --passphrase CANARY_PRODUCER_PASSPHRASE_OPTION',
+         "CANARY_PRODUCER_PASSPHRASE_OPTION"),
+        ('Command failed: client --client-secret CANARY_PRODUCER_CLIENT_OPTION',
+         "CANARY_PRODUCER_CLIENT_OPTION"),
+        ('Command failed: client --google-api-key CANARY_PRODUCER_API_OPTION',
+         "CANARY_PRODUCER_API_OPTION"),
+    ],
+)
+async def test_repo_events_sanitizes_cli_log_boundary_cases(
+    monkeypatch: pytest.MonkeyPatch, stdout: str, canary: str,
+) -> None:
+    from src.mcp.tools import diagnostics
+
+    from tests.runner import _helpers as h
+
+    runner = h._make_runner()
+    await runner._save_cli_log(stdout, "", "CODER")
+    assert canary in runner.state.history[-1]["event"]
+    runner.state.last_updated = NOW
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    redis.store[pipeline_state(SLUG)] = runner.state.model_dump_json()
+
+    result = await diagnostics.get_repo_events(SLUG)
+
+    assert canary not in json.dumps(result)
+    assert result["events"][0]["message"] == "[OMITTED: credential-bearing event]"
+    assert redis.closed
+
+
+async def test_repo_events_source_states_bounds_and_cancellation(monkeypatch: pytest.MonkeyPatch) -> None:
+    from src.mcp.tools import diagnostics
+
+    redis = FakeRedis()
+    _patch_runtime(monkeypatch, redis)
+    monkeypatch.setattr(
+        diagnostics, "_configured_repositories",
+        lambda: (_ for _ in ()).throw(ValueError("password=hidden")),
+    )
+    bad_config = await diagnostics.get_repo_events(SLUG)
+    assert bad_config["source"]["code"] == "configuration_invalid"
+    assert "hidden" not in json.dumps(bad_config)
+    _patch_runtime(monkeypatch, redis)
+    with pytest.raises(ValueError, match="canonical"):
+        await diagnostics.get_repo_events("../secrets")
+    with pytest.raises(ValueError, match="not configured"):
+        await diagnostics.get_repo_events(OTHER_SLUG)
+    with pytest.raises(ValueError, match="limit"):
+        await diagnostics.get_repo_events(SLUG, limit=21)
+    assert (await diagnostics.get_repo_events(SLUG))["source"]["status"] == "missing"
+
+    redis.store[pipeline_state(SLUG)] = "broken JSON"
+    assert (await diagnostics.get_repo_events(SLUG))["source"]["status"] == "malformed"
+    redis.store[pipeline_state(SLUG)] = _state().model_dump_json()
+    assert (await diagnostics.get_repo_events(SLUG))["source"]["status"] == "stale"
+    state = _state(updated=NOW)
+    state.history = [{"time": NOW.isoformat(), "state": "WATCH", "event": "x" * 2000}]
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    shortened = await diagnostics.get_repo_events(SLUG)
+    assert len(shortened["events"][0]["message"]) == diagnostics._MAX_EVENT_MESSAGE
+    assert shortened["events"][0]["message_truncated"] is True
+    assert len(json.dumps(shortened).encode()) <= diagnostics._MAX_EVENT_RESPONSE_BYTES
+    state.history = [{"time": "not-a-time", "state": "WATCH", "event": "bad"}]
+    redis.store[pipeline_state(SLUG)] = state.model_dump_json()
+    malformed = await diagnostics.get_repo_events(SLUG)
+    assert malformed["source"]["status"] == "malformed"
+    assert malformed["events"] == []
+    redis.store[pipeline_state(SLUG)] = "x" * (diagnostics._MAX_STATE_BYTES + 1)
+    oversized = await diagnostics.get_repo_events(SLUG)
+    assert oversized["source"]["status"] == "oversized"
+    assert oversized["events"] == []
+    redis.fail.add(("strlen", pipeline_state(SLUG)))
+    assert (await diagnostics.get_repo_events(SLUG))["source"]["status"] == "unavailable"
+
+    started = asyncio.Event()
+
+    class BlockingRedis(FakeRedis):
+        async def strlen(self, key: str) -> int:
+            started.set()
+            await asyncio.Event().wait()
+            return 0
+
+    blocking = BlockingRedis()
+    _patch_runtime(monkeypatch, blocking)
+    request = asyncio.create_task(diagnostics.get_repo_events(SLUG))
+    await started.wait()
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    assert blocking.closed
+
+    timed_out = BlockingRedis()
+    _patch_runtime(monkeypatch, timed_out)
+    monkeypatch.setattr(diagnostics, "_REDIS_TIMEOUT_SECONDS", 0.01)
+    result = await diagnostics.get_repo_events(SLUG)
+    assert result["source"]["status"] == "unavailable"
+    assert timed_out.closed
 
 
 def test_scalar_validation_and_configured_repo_guards(monkeypatch: pytest.MonkeyPatch) -> None:

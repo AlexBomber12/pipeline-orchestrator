@@ -411,7 +411,7 @@ def _make_ci_retrieval(
     )
 
 
-def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiRetrieval:
+def _retrieve_ci_status_evidence(repo: str, sha: str, *, fresh: bool = False) -> _CiRetrieval:
     now = time.monotonic()
     if not sha:
         empty = _CiSourceResult(True, True)
@@ -420,7 +420,7 @@ def _retrieve_ci_status_evidence(repo: str, sha: str) -> _CiRetrieval:
     cache_key = (repo, sha)
     cached = _ci_status_cache.get(cache_key)
     if (
-        cached is not None
+        not fresh and cached is not None
         and cached.evidence.repo == repo
         and cached.evidence.sha == sha.lower()
         and (now - cached.fetched_at) < _CI_STATUS_CACHE_TTL_SECONDS
@@ -738,8 +738,8 @@ async def _resolve_now_seconds(redis_client: Any) -> float:
     source within a single classification call. Without this, daemon
     clock skew (NTP step or drift relative to Redis) would make
     ``age_seconds = local_now - redis_first_seen`` non-deterministic
-    across hosts and restarts: too large would trigger ``stuck_pending``
-    early, negative would prevent reclassification entirely.
+    across hosts and restarts: too large would report overdue CI early,
+    while a negative value would defer that report.
     """
     redis_now = await _redis_server_time(redis_client)
     if redis_now is not None:
@@ -788,11 +788,11 @@ async def classify_ci_status_with_age(
     fetch_ok: bool = True,
     canonical_status: CIStatus | None = None,
 ) -> tuple[CIStatus, str | None]:
-    """Augment :func:`_map_rest_ci_status_to_enum` with stuck-PENDING reclassification.
+    """Track pending age without changing the canonical CI verdict.
 
     Returns ``(status, reclassification_reason)``. When the canonical status is
     PENDING for longer than ``pending_max_seconds`` on the same
-    ``head_sha``, returns ``(CIStatus.FAILURE, "stuck_pending")``;
+    ``head_sha``, returns ``(CIStatus.PENDING, "pending_overdue")``;
     otherwise returns the selected status with reason ``None``. The
     first-seen-PENDING timestamp is tracked per ``head_sha`` in Redis so
     a fresh push naturally resets the clock, and the tracker is cleared
@@ -817,12 +817,8 @@ async def classify_ci_status_with_age(
         await _clear_pending_tracker(redis_client, repo, pr_number, head_sha)
         return raw_status, None
     if not fetch_ok:
-        # Both REST calls failed: the PENDING above is the
-        # ``empty_is_success=False`` default, not an observation that CI
-        # is actually pending. Counting outage/rate-limit windows toward
-        # ``stuck_pending`` would route WATCH into ``handle_fix`` on a
-        # PR whose CI state we genuinely cannot read. Drop any prior
-        # anchor so the window restarts fresh once visibility resumes.
+        # The PENDING above may be a fetch default, rather than an
+        # observation. Restart the age window once visibility resumes.
         await _clear_pending_tracker(redis_client, repo, pr_number, head_sha)
         return raw_status, None
     if redis_client is None or not head_sha or pending_max_seconds <= 0:
@@ -843,5 +839,5 @@ async def classify_ci_status_with_age(
     )
     age_seconds = now_seconds - first_seen
     if age_seconds >= pending_max_seconds:
-        return CIStatus.FAILURE, "stuck_pending"
+        return CIStatus.PENDING, "pending_overdue"
     return raw_status, None

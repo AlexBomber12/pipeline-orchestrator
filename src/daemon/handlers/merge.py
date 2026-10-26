@@ -10,6 +10,7 @@ Mixin methods:
 from __future__ import annotations
 
 import logging
+import re
 import subprocess
 from datetime import datetime, timezone
 
@@ -17,11 +18,16 @@ from src.analytics import log_merged_pr
 from src.analytics.coder_version import detect_coder_extension_version
 from src.branch_context import BranchContext
 from src.cancellation import delete_retry_count, delete_task_spec_hash
+from src.config import load_config
 from src.daemon import git_ops
+from src.daemon.quarantine import blocking_quarantine_labels
+from src.daemon.recovery import MergeIdentityConflict
 from src.github import cache as gh_cache
+from src.github import checks as gh_checks
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.models import PipelineState, ReviewStatus, TaskStatus
+from src.github.reviewer_policy import ReviewerPolicy, reviewer_policy_from_config
+from src.models import CIStatus, PipelineState, PRInfo, ReviewStatus, TaskStatus
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
 
@@ -32,11 +38,104 @@ _QUEUE_SYNC_MAX_WAIT_SEC = 3600
 
 logger = logging.getLogger(__name__)
 
+_RESOLVER_TIMEOUT = re.compile(
+    r"\b(?:Timeout|timed out) after (\d{1,4}(?:\.\d{1,3})?)s\b",
+    re.IGNORECASE,
+)
+
+
+def _resolver_failure_message(
+    coder_name: str, code: int, stdout: str, stderr: str, *, rate_limited: bool,
+) -> str:
+    """Keep CLI output outside the durable error and event history."""
+    coder = (
+        coder_name if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,47}", coder_name)
+        else "configured"
+    )
+    exit_code = str(code) if isinstance(code, int) and abs(code) <= 999999 else "unknown"
+    timeout = _RESOLVER_TIMEOUT.search(stderr) or _RESOLVER_TIMEOUT.search(stdout)
+    classification = (
+        "rate_limit" if rate_limited else "timeout"
+        if timeout or code in {-1, 124} else "nonzero_exit"
+    )
+    timeout_detail = f", Timeout after {timeout.group(1)}s" if timeout else ""
+    return (
+        f"Merge conflict resolution failed (coder {coder}, exit {exit_code}, "
+        f"classification {classification}{timeout_detail}); operator Retry required"
+    )
+
+
+def _validated_conflict_commit(
+    repo_path: str, branch: str, previous_head: str, base: str
+) -> str:
+    """Require a finished, clean merge incorporating both observed inputs."""
+    def output(*args: str) -> str:
+        return git_ops._git(repo_path, *args).stdout.strip()
+
+    if output("branch", "--show-current") != branch:
+        raise RuntimeError("conflict resolver changed the checked-out branch")
+    if git_ops._git(
+        repo_path, "rev-parse", "-q", "--verify", "MERGE_HEAD",
+        check=False,
+    ).returncode == 0:
+        raise RuntimeError("conflict resolver left a merge in progress")
+    if output("ls-files", "-u"):
+        raise RuntimeError("conflict resolver left unmerged paths")
+    if output("status", "--porcelain"):
+        raise RuntimeError("conflict resolver left unpublished working-tree changes")
+    head = output("rev-parse", "HEAD")
+    if not head or head == previous_head:
+        raise RuntimeError("conflict resolver did not create a new commit")
+    for ancestor in (previous_head, f"origin/{base}"):
+        result = git_ops._git(
+            repo_path, "merge-base", "--is-ancestor", ancestor, head,
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"conflict commit does not contain {ancestor}")
+    return head
+
 
 class MergeMixin:
     """Merge the current PR and return to IDLE."""
 
-    async def handle_merge(self) -> None:
+    def _merge_gates_satisfied(self, pr: PRInfo) -> bool:
+        """Apply the same final admission rule in WATCH and MERGE."""
+        return (
+            pr.ci_status == CIStatus.SUCCESS
+            and (
+                pr.review_status == ReviewStatus.APPROVED
+                or self.repo_config.allow_merge_without_review
+                and pr.review_status == ReviewStatus.PENDING
+            )
+            and (not pr.publication_observed or pr.publication_at is not None)
+        )
+
+    def _read_final_merge_pr(self, policy: ReviewerPolicy) -> PRInfo | None:
+        """Reuse canonical CI/review readers with a single actor-policy snapshot."""
+        pr = next((pr for pr in gh_prs.get_open_prs(
+            self.owner_repo,
+            allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+            required_checks=self.repo_config.required_checks,
+            reviewer_policy=policy,
+        ) if pr.number == self.state.current_pr.number), None)
+        if pr is not None:
+            if pr.publication_observed:
+                pr.publication_at, pr.publication_reason = self._validate_publication_observation(
+                    pr.number, pr.head_sha, pr.publication_at, pr.publication_reason,
+                    head_repo=pr.publication_head_repo, ref=pr.publication_ref,
+                    observed_repo=pr.publication_repo,
+                    observed_head_sha=pr.publication_head_sha,
+                    provenance=pr.publication_provenance,
+                )
+            pr.ci_status = gh_checks._classify_ci_retrieval(
+                gh_checks._retrieve_ci_status_evidence(self.owner_repo, pr.head_sha, fresh=True),
+                empty_is_success=self.repo_config.allow_merge_without_checks,
+                required_contexts=self.repo_config.required_checks,
+            )
+        return pr
+
+    async def handle_merge(self, reviewer_policy: ReviewerPolicy | None = None) -> None:
         """Merge the current PR and return to IDLE."""
         if self.state.current_pr is None:
             self.state.state = PipelineState.IDLE
@@ -124,6 +223,9 @@ class MergeMixin:
                     self.repo_path,
                     "reset", "--hard", f"origin/{pr_branch}",
                 )
+                previous_head = git_ops._git(
+                    self.repo_path, "rev-parse", "HEAD"
+                ).stdout.strip()
                 merge_result = git_ops._git(
                     self.repo_path,
                     "merge", f"origin/{base}", "--no-edit",
@@ -135,7 +237,7 @@ class MergeMixin:
                         merge_result.stdout + merge_result.stderr
                     ):
                         await self._refresh_auth_status_cache()
-                        selected = self._get_auxiliary_coder()
+                        selected = self._select_coder(allow_exploration=False)
                         if selected is None:
                             git_ops._git(
                                 self.repo_path,
@@ -149,9 +251,11 @@ class MergeMixin:
                                 ),
                                 publish=False,
                                 log_prefix="[MERGE]",
+                                commit_task_status=True,
                             )
                             return
                         coder_name, plugin = selected
+                        self.state.coder = coder_name
                         if not await self.usage_gate(
                             proactive_coder=coder_name
                         ):
@@ -178,9 +282,10 @@ class MergeMixin:
                         if self._current_run_record is not None:
                             self._current_run_record.had_merge_conflict = True
                         prompt = (
-                            "Resolve all merge conflicts in the working "
-                            "tree. Keep both sides where possible. "
-                            "Run scripts/ci.sh to verify."
+                            "Resolve the current merge conflicts, stage the "
+                            "resolution, and create one local merge commit. "
+                            "Keep both sides where possible. Do not push, run "
+                            "CI, or request review; the daemon owns those gates."
                         )
                         plugin_run_kwargs = plugin.build_run_kwargs(
                             daemon_config=self.app_config.daemon
@@ -220,27 +325,34 @@ class MergeMixin:
                             credential_reservation_held=True,
                         )
                         if auxiliary_result is None:
-                            if self.state.state == PipelineState.PAUSED:
-                                git_ops._git(
-                                    self.repo_path,
-                                    "merge", "--abort",
-                                    check=False,
+                            if self._stop_requested and self.state.state == PipelineState.PAUSED:
+                                await self._transition_to_error(
+                                    "Merge conflict resolution interrupted by operator Stop; "
+                                    "unpublished work retained; operator Retry required",
+                                    save_run_record_as=None,
+                                    publish=False,
+                                    log_prefix="[MERGE]",
+                                    commit_task_status=True,
                                 )
+                                self.state.user_paused = True
+                                self.state.state = PipelineState.PAUSED
                             return
                         code, _stdout, _stderr = auxiliary_result
                         if code != 0:
                             self._detect_rate_limit(_stderr, coder_name=coder_name)
-                            git_ops._git(
-                                self.repo_path,
-                                "merge", "--abort",
-                                check=False,
+                            failure = _resolver_failure_message(
+                                coder_name, code, _stdout, _stderr,
+                                rate_limited=self.state.rate_limited_until is not None,
                             )
                             if self.state.rate_limited_until is not None:
-                                self.state.state = PipelineState.PAUSED
-                                await self._clear_error_message_on_recovery(
+                                await self._transition_to_error(
+                                    failure,
+                                    save_run_record_as=None,
+                                    publish=False,
                                     log_prefix="[MERGE]",
-                                    reason="rate-limit pause during merge conflict resolution",
+                                    commit_task_status=True,
                                 )
+                                self.state.state = PipelineState.PAUSED
                                 await self._save_current_run_record("rate_limit")
                                 self.log_event(
                                     f"[RATE-LIMIT] Rate limit pause "
@@ -249,9 +361,24 @@ class MergeMixin:
                                 )
                                 return
                             await self._transition_to_error(
-                                "Merge conflict resolution failed",
+                                failure,
                                 publish=False,
                                 log_prefix="[MERGE]",
+                                commit_task_status=True,
+                            )
+                            return
+                        try:
+                            _validated_conflict_commit(
+                                self.repo_path, pr_branch, previous_head, base
+                            )
+                        except (subprocess.CalledProcessError,
+                                subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
+                            await self._transition_to_error(
+                                f"Merge conflict resolution incomplete: {exc}; "
+                                "operator Retry required",
+                                publish=False,
+                                log_prefix="[MERGE]",
+                                commit_task_status=True,
                             )
                             return
                         sync_produced_commit = True
@@ -271,6 +398,11 @@ class MergeMixin:
                     )
 
                 if sync_produced_commit:
+                    new_head_sha = git_ops._git(
+                        self.repo_path, "rev-parse", "HEAD"
+                    ).stdout.strip()
+                    if not new_head_sha or new_head_sha == previous_head:
+                        raise RuntimeError("pre-merge sync did not change HEAD")
                     retry_transient(
                         lambda: git_ops._git(
                             self.repo_path,
@@ -279,6 +411,14 @@ class MergeMixin:
                         ),
                         operation_name=f"git push origin {pr_branch}",
                     )
+                    remote = git_ops._git(
+                        self.repo_path, "ls-remote", "origin",
+                        f"refs/heads/{pr_branch}", timeout=60,
+                    ).stdout.split()
+                    if not remote or remote[0] != new_head_sha:
+                        raise RuntimeError(
+                            "pre-merge sync remote HEAD does not match local HEAD"
+                        )
                     # Pre-merge sync just rewrote the PR's head SHA;
                     # the cached ``repos/{repo}/pulls`` pages still hold
                     # the prior ``updated_at`` and ``head.sha`` values,
@@ -286,18 +426,16 @@ class MergeMixin:
                     gh_cache._invalidate_etag_cache(
                         f"repos/{self.owner_repo}/pulls"
                     )
+                    self.state.current_pr.head_sha = new_head_sha
+                    self.state.current_pr.review_status = ReviewStatus.PENDING
+                    self.state.current_pr.ci_status = CIStatus.PENDING
+                    self.state.current_pr.diff_scanned_at_sha = None
                     self.state.state = PipelineState.WATCH
                     self.log_event(
                         f"[MERGE] Pre-merge sync pushed new commits to PR "
                         f"#{number}; returning to WATCH to re-verify "
                         f"gates."
                     )
-                    try:
-                        new_head_sha = git_ops._git(
-                            self.repo_path, "rev-parse", "HEAD"
-                        ).stdout.strip()
-                    except Exception:
-                        new_head_sha = ""
                     self.log_event(
                         f"[MERGE] Bypass-requesting fresh @codex review on "
                         f"new head "
@@ -326,8 +464,34 @@ class MergeMixin:
                     f"Pre-merge sync failed: {exc}",
                     publish=False,
                     log_prefix="[MERGE]",
+                    commit_task_status=True,
                 )
                 return
+
+        # Synchronization and external pushes can invalidate the WATCH verdict.
+        # Keep the bound identity until WATCH has admitted and scanned a new HEAD.
+        try:
+            policy = reviewer_policy or reviewer_policy_from_config(load_config())
+            fresh = self._read_final_merge_pr(policy)
+            if fresh is not None:
+                fresh = self._approval_filtered_pr(fresh)
+        except Exception as exc:
+            fresh = None
+            self.log_event(f"[MERGE] Final gate evidence unavailable for PR #{number}: {exc}.")
+        current = self.state.current_pr
+        if (
+            fresh is None or fresh.head_sha != current.head_sha
+            or fresh.branch != current.branch
+            or not self._merge_gates_satisfied(fresh)
+            or blocking_quarantine_labels(fresh.quarantine_labels)
+        ):
+            current.review_status = ReviewStatus.PENDING
+            current.ci_status = CIStatus.PENDING
+            self.state.state = PipelineState.WATCH
+            gh_cache._invalidate_etag_cache(f"repos/{self.owner_repo}/pulls")
+            self.log_event(f"[MERGE] PR #{number} needs fresh current-HEAD gates; returning to WATCH.")
+            await self.publish_state()
+            return
 
         merged_diff_stats = self._compute_diff_stats(base)
         self.log_event(
@@ -384,6 +548,7 @@ class MergeMixin:
             self.owner_repo, self.repo_config.branch, pr.number, pr.head_sha
         )
         if outcome.state == gh_prs.ExactPRState.MERGED:
+            self._confirmed_merge_outcome = outcome
             self._confirmed_merge_at = outcome.merged_at
             return True
         if outcome.state == gh_prs.ExactPRState.CLOSED:
@@ -416,15 +581,16 @@ class MergeMixin:
         await self.publish_state()
         current_task = self.state.current_task
         if current_task is not None:
-            if self._current_run_record is None:
+            try:
                 await self._restore_current_run_record(recover_missing_merge=True)
-            record = self._current_run_record
-            invocation = self.state.active_invocation
-            if (record is None or record.task_id != current_task.pr_id
-                    or record.repo_name != self.name
-                    or invocation is not None and invocation.run_id is not None
-                    and record.run_id != invocation.run_id):
-                self.log_event(f"[MERGE] Run record unavailable for PR #{number}; retaining ownership.")
+            except MergeIdentityConflict as exc:
+                await self._transition_to_error(
+                    f"Merge accounting conflict: {exc}; operator Retry required",
+                    save_run_record_as=None,
+                )
+                return
+            except Exception as exc:
+                self.log_event(f"[MERGE] Accounting proof deferred for PR #{number}: {exc}.")
                 return
 
         # Persist the validated run and task index before the terminal header.
@@ -442,12 +608,19 @@ class MergeMixin:
                     current_task,
                     "DONE",
                     "PR merged",
+                    raise_identity_conflict=True,
                 )
                 if not written:
                     self.log_event(
                         f"[MERGE] Remote merge confirmed but status:DONE was not written to {current_task.task_file}."
                     )
                     return
+            except MergeIdentityConflict as exc:
+                await self._transition_to_error(
+                    f"Merge accounting conflict: {exc}; operator Retry required",
+                    save_run_record_as=None,
+                )
+                return
             except Exception as exc:
                 self.log_event(
                     f"[ERROR] Failed to write status:DONE to "
@@ -458,11 +631,12 @@ class MergeMixin:
         self._mark_task_done_in_snapshot()
 
         try:
-            await self._save_current_run_record(
-                "success_merged",
-                diff_stats=merged_diff_stats,
-                base_branch=base,
-            )
+            if self._current_run_record is None or self._current_run_record.exit_reason != "success_merged":
+                await self._save_current_run_record(
+                    "success_merged",
+                    diff_stats=merged_diff_stats,
+                    base_branch=base,
+                )
         except Exception as exc:
             self.log_event(f"[MERGE] Confirmed merge bookkeeping deferred for PR #{number}: {exc}.")
             return
