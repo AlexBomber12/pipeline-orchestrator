@@ -324,3 +324,112 @@ as CI failures but do not launch a coder.
 When GitHub's combined-status response omits a configured status producer,
 the daemon binds that status by ID, context, state, and timestamp to the
 complete status-history response for the same commit before admission.
+
+## Automatic review replacement investigation (PR-406)
+
+Result: **insufficient linkage; no automatic replacement is authorized**. Reusing
+an existing request and posting a fresh exact `@codex review` both leave missing
+publication provenance unknown. No runtime policy, review gate, Redis state,
+operator confirmation, or migration code changes in this investigation.
+
+### Recorded evidence and replay boundary
+
+`tests/fixtures/review_provenance_cases.json` records selected public #620 REST
+responses read on 2026-10-26: issue comments, body reactions, PR head projection,
+and repository activity. User objects retain only numeric ID and login. Comment
+IDs, timestamps, full SHAs, hidden connector metadata, and reaction identity are
+retained. This is read-only evidence collection, not a live review experiment.
+Sources are the repository's `/issues/620/comments`, `/issues/620/reactions`,
+`/pulls/620`, and `/activity?ref=refs%2Fheads%2Fpr-459-e2e-failure-evidence`
+REST endpoints. Existing `review_receipt_620.json`,
+`review_summary_structured.json`, and `test_activity_api_url_syntax.py` remain
+unchanged and supply the prior sanitized receipt/summary and activity contracts.
+
+The component replay calls production `get_pr_head_publication`,
+`get_pr_review_status`, `latest_codex_review_request_time`, and `post_comment`
+with controlled external transport. It exercises the publication metadata reader
+from #622, reused by #623's Retry/WATCH admission. It does not simulate a daemon
+migration confirmation or claim that a reader verdict initializes a safety floor.
+The recorded deletion is excluded only for a labeled pre-merge control; the
+fixture retains it. Replaying today's complete activity would report deletion,
+not a current publication.
+
+The positive control is actual #620 data: full HEAD
+`bd7bd1ea89766790981bd3f8749d2c407132db38`, push at
+`2026-10-19T18:56:08Z`, exact request comment `6274859306` at `18:56:12Z`,
+summary `6241079517` updated at `18:58:30Z`, and trusted actor ID `199175422`
+body reaction `580423677` at `18:58:33Z`. With known publication the existing
+reader returns APPROVED. This proves the existing freshness contract only.
+The actual branch-creation event at `2026-10-17T21:06:35Z` proves full-SHA/ref/
+head-repository publication metadata; the recorded abbreviated receipt alone
+returns PENDING. Neither control proves an automatic trust migration.
+
+### Supported and unsupported variants
+
+| Evidence or replay | Observed result / limit |
+| --- | --- |
+| Known current publication plus recorded trusted body +1 | Existing review reader APPROVED; no request/invocation identity in the reaction. |
+| Recorded `branch_creation` with full SHA, ref, head repository, timestamp | Publication reader returns `github-activity:branch_creation`; historical safety-floor initialization still requires existing admission policy. |
+| Reuse latest exact request with missing activity | PENDING; discovering a request timestamp supplies no publication boundary. |
+| Fresh exact request with missing activity | PENDING; successful posting supplies no provider review-result linkage. |
+| Same SHA repeated requests | Recorded comments `6274750173` and `6274764254` precede receipt `6274795896` for `b40534d8f4`; no receipt field names either request. Another same-SHA request cannot identify the invocation. |
+| Same SHA republished later (synthetic negative) | Later activity resets freshness; the old +1 is PENDING even though SHA is unchanged. |
+| Old body +1 with new mutable full-SHA summary (synthetic negative) | PENDING, with and without known publication. Updating the summary cannot renew the reaction timestamp. |
+| HEAD changes during post (injected race) | Re-read with expected full SHA reports `observed PR HEAD changed`; PENDING. A successful comment write is not a HEAD compare-and-swap. |
+| Accepted post with lost response (injected failure) | Posting raises; exact comment is discoverable, but publication stays unknown/PENDING. Readback cannot identify which competing identical write was accepted. |
+| Unknown numeric actor ID (synthetic negative) | PENDING even with known publication; a familiar login cannot substitute for trusted identity. |
+| Abbreviated receipt with two possible full-SHA candidates (synthetic negative) | PENDING; the receipt classifier is not a full-SHA or invocation resolver. |
+
+The structured summary supplies a full `commit_sha`, completion status and finding
+flags, but its stable comment ID spans updates (`created_at` on October 17,
+`updated_at` on October 19). Its current bytes do not retain earlier versions or
+a request ID. The receipt supplies an abbreviated reviewed commit. The body
+reaction supplies user, content, ID and creation time, without SHA, request ID,
+run ID or summary-version binding. Joining those records by actor, chronology
+and SHA cannot distinguish repeated reviews of the same SHA. A reaction on a
+specific anchor would identify its comment target, but no positive recorded
+anchor +1 is supplied here; that variant remains unproved, including its binding
+to the full HEAD and a recovery invocation. No synthetic positive is admitted.
+
+### Missing delta, operator panel and bounded follow-up
+
+No operator panel behavior can safely disappear on this evidence. Retain the
+exact publication migration proposal/confirmation, unknown-evidence blocking,
+Retry behavior, and normal Approve semantics. A fresh request does not replace
+confirmation. This result is not approval to issue requests or confirm trust
+without the operator under current policy.
+
+Minimum additional provider evidence is a durable, verifiable association of a
+trusted +1 with the exact repository/PR, full reviewed HEAD, and particular
+request/invocation (including a version if a mutable summary participates).
+The association must survive same-SHA retries, reordered responses, accepted
+writes with lost responses, and concurrent HEAD changes. The observed endpoints
+do not deliver that association. Timestamp comparison alone cannot fill it.
+An anchor-target reaction could be investigated only with an actual supported
+recording and explicit full-HEAD/invocation evidence; no undocumented connector
+field or future provider behavior should be assumed.
+
+Follow-up scope: one evidence-only task, estimated 150–250 test/fixture lines and
+60–100 documentation lines, zero production changes, to replay an operator-
+supplied supported recording carrying that missing association. No live provider
+experiment is implied. If it proves linkage, separately specify and estimate a
+protocol for durable request identity, write reconciliation, HEAD revalidation,
+restart safety and atomic state admission before implementation. A reliable
+runtime implementation estimate is premature until that evidence exists.
+Potential replacement paths are recovery's `_initialize_publication_admission`,
+`_offer_publication_migration` and `_consume_publication_migration_command`, the
+existing `src/publication_migration.py` command/receipt path, and the dashboard's
+confirmation route/panel. None is removed now; ordinary watermark validation,
+CI gates, trusted review checks and process ownership rules remain required.
+
+Verification: `python -m pytest tests/test_github_client.py -q`. Before generating
+review artifacts, ensure the checkout has the review base (`origin/main` for
+this repository); fetch it with `git fetch origin main` if needed. After the
+intended commit, run `bash scripts/make-review-artifacts.sh` and confirm that
+`artifacts/ci.log`, `artifacts/structure.txt`, and a nonempty `artifacts/pr.patch`
+exist. A focused test pass alone does not establish a successful full gate.
+Controlled
+transport proves reader behavior only, not real account access, provider delivery
+guarantees, deployment, or restart behavior of a future protocol. Any eventual
+provider smoke requires a separate operator release action; this investigation
+has no deployment prerequisite and performs no production operation.

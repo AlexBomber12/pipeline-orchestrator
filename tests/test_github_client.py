@@ -7834,3 +7834,175 @@ def test_gh_process_boundary_uses_real_process_and_shared_output_contract(monkey
     else:
         assert run_gh(["run", "rerun", "--failed", "12"], repo="octo/demo") == expected
     assert observed == [["gh", "run", "rerun", "--failed", "12", "-R", "octo/demo"]]
+
+
+@pytest.fixture
+def provenance_replay(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Recorded #620 responses, with explicitly synthetic negative mutations only."""
+    recorded = json.loads(
+        (Path(__file__).parent / "fixtures/review_provenance_cases.json").read_text()
+    )
+    recorded["activity"] = [
+        e for e in recorded["activity"] if e["activity_type"] != "branch_deletion"
+    ]  # Replay immediately before the recorded merge/deletion, not today's PR.
+    recorded["posts"] = []
+    recorded["lose_response"] = False
+    recorded["change_head"] = False
+
+    def transport(args: list[str], **_kwargs: Any) -> Any:
+        if args[:2] == ["pr", "comment"]:
+            assert args[-1] == "@codex review"
+            recorded["posts"].append(args[-1])
+            # Simulate an accepted write whose response is lost, or a concurrent push.
+            recorded["comments"].append({
+                "id": 999, "user": {"login": "AlexBomber12", "id": 48256657},
+                "body": args[-1], "created_at": "2026-10-19T19:00:00Z",
+            })
+            if recorded["change_head"]:
+                recorded["head"]["sha"] = "f" * 40
+            if recorded["lose_response"]:
+                raise RuntimeError("post response lost after acceptance")
+            return ""
+        if args[1].endswith("/pulls/620"):
+            return recorded["head"]
+        if "/activity?" in args[1]:
+            return recorded["activity"]
+        raise AssertionError(args)
+
+    def paginated(path: str) -> list[dict]:
+        if path.endswith("/issues/620/comments"):
+            return recorded["comments"]
+        if path.endswith("/issues/620/reactions"):
+            return recorded["body_reactions"]
+        if path.endswith(("/pulls/620/comments", "/pulls/620/reviews")):
+            return []
+        if "/issues/comments/" in path and path.endswith("/reactions"):
+            return []  # No recorded anchor +1; do not invent a positive one.
+        raise AssertionError(path)
+
+    monkeypatch.setattr("src.github.gh_runner.run_gh", transport)
+    monkeypatch.setattr(cache, "_gh_api_paginated", paginated)
+    recorded["policy"] = ReviewerPolicy([TrustedReviewerIdentity(user_id=199175422)])
+    return recorded
+
+
+def _replay_provenance_status(recorded: dict, head: str) -> tuple[Any, ReviewStatus]:
+    evidence = prs.get_pr_head_publication(
+        "AlexBomber12/pipeline-orchestrator", 620, expected_head_sha=head,
+    )
+    reviews.clear_review_status_cache()
+    status = reviews.get_pr_review_status(
+        evidence.repo, 620, "AlexBomber12", head,
+        policy=recorded["policy"], publication_evidence=evidence,
+    )
+    return evidence, status
+
+
+def test_recorded_provenance_known_publication_control(provenance_replay: dict) -> None:
+    """Actual final #620 body +1 passes the existing gate with known publication."""
+    head = provenance_replay["head"]["sha"]
+    evidence, status = _replay_provenance_status(provenance_replay, head)
+    assert evidence.head_sha == "bd7bd1ea89766790981bd3f8749d2c407132db38"
+    assert evidence.provenance == "github-activity:push"
+    assert evidence.published_at == _parse_iso("2026-10-19T18:56:08Z")
+    assert status == ReviewStatus.APPROVED
+    # This is publication freshness, not proof of which invocation produced +1.
+    reaction = provenance_replay["body_reactions"][0]
+    assert set(reaction) == {"id", "content", "created_at", "user"}
+
+
+def test_recorded_branch_creation_metadata(provenance_replay: dict) -> None:
+    creation = provenance_replay["activity"][-1]
+    provenance_replay["activity"] = [creation]
+    provenance_replay["head"]["sha"] = creation["after"]
+    provenance_replay["body_reactions"] = []
+    evidence, status = _replay_provenance_status(provenance_replay, creation["after"])
+    assert evidence.provenance == "github-activity:branch_creation"
+    assert (evidence.head_repo, evidence.ref, evidence.published_at) == (
+        "AlexBomber12/pipeline-orchestrator", creation["ref"],
+        _parse_iso("2026-10-17T21:06:35Z"),
+    )
+    assert status == ReviewStatus.PENDING  # The real abbreviated receipt is not +1.
+
+
+@pytest.mark.parametrize("variant", [
+    "reuse", "fresh", "same_sha_repeated", "changed_head", "lost_response",
+    "old_body_new_summary", "unknown_actor", "ambiguous_abbreviation",
+])
+def test_recorded_requests_do_not_replace_missing_publication(
+    provenance_replay: dict, variant: str,
+) -> None:
+    recorded = provenance_replay
+    head = recorded["head"]["sha"]
+    recorded["activity"] = []  # Missing provenance is the investigation's premise.
+    if variant in {"fresh", "changed_head", "lost_response", "same_sha_repeated"}:
+        recorded["lose_response"] = variant == "lost_response"
+        recorded["change_head"] = variant == "changed_head"
+        if recorded["lose_response"]:
+            with pytest.raises(RuntimeError, match="response lost"):
+                comments.post_comment("AlexBomber12/pipeline-orchestrator", 620, "@codex review")
+        else:
+            comments.post_comment("AlexBomber12/pipeline-orchestrator", 620, "@codex review")
+        assert recorded["posts"] == ["@codex review"]
+        assert comments.latest_codex_review_request_time(
+            "AlexBomber12/pipeline-orchestrator", 620,
+            after=_parse_iso("2026-10-19T18:56:08Z"),
+        ) == _parse_iso("2026-10-19T19:00:00Z")
+    if variant == "unknown_actor":
+        recorded["body_reactions"][0]["user"]["id"] = 987654
+    if variant == "old_body_new_summary":
+        recorded["body_reactions"][0]["created_at"] = "2026-10-17T21:09:00Z"
+    if variant == "ambiguous_abbreviation":
+        # Two potential full SHAs can share this receipt prefix; never resolve it
+        # by guessing. The existing receipt classifier deliberately does not.
+        prefix = "63f07ef48a"
+        candidates = [prefix + "0" * 30, prefix + "1" * 30]
+        assert all(sha.startswith(prefix) for sha in candidates)
+        recorded["comments"] = [
+            c for c in recorded["comments"] if c["id"] in {6241083708, 6241119187}
+        ]
+        recorded["body_reactions"] = []
+    evidence, status = _replay_provenance_status(recorded, head)
+    assert evidence.published_at is None
+    assert evidence.unknown_reason == (
+        "observed PR HEAD changed" if variant == "changed_head"
+        else "no publication activity for head ref"
+    )
+    assert status == ReviewStatus.PENDING
+
+
+@pytest.mark.parametrize("variant", ["old_body_new_summary", "unknown_actor", "same_sha_republished"])
+def test_recorded_negative_linkage_with_publication(
+    provenance_replay: dict, variant: str,
+) -> None:
+    recorded = provenance_replay
+    if variant == "old_body_new_summary":
+        recorded["body_reactions"][0]["created_at"] = "2026-10-17T21:09:00Z"
+    elif variant == "unknown_actor":
+        recorded["body_reactions"][0]["user"]["id"] = 987654
+    else:
+        recorded["activity"].insert(0, {
+            **recorded["activity"][0], "timestamp": "2026-10-19T19:00:00Z",
+        })  # Synthetic replay of a later publication of the identical SHA.
+    evidence, status = _replay_provenance_status(recorded, recorded["head"]["sha"])
+    assert evidence.published_at is not None
+    assert status == ReviewStatus.PENDING
+
+
+def test_recorded_current_request_can_be_reused_but_is_not_approval(
+    provenance_replay: dict, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class RecordedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 19, 18, 59, tzinfo=_tz.utc)
+
+    monkeypatch.setattr(comments, "datetime", RecordedClock)
+    assert comments.get_recent_codex_review_request_time(
+        "AlexBomber12/pipeline-orchestrator", 620, "AlexBomber12",
+        after_iso="2026-10-19T18:56:08Z",
+    ) == _parse_iso("2026-10-19T18:56:12Z")
+    provenance_replay["activity"] = []
+    _, status = _replay_provenance_status(provenance_replay, provenance_replay["head"]["sha"])
+    assert status == ReviewStatus.PENDING
+    assert provenance_replay["posts"] == []
