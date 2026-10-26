@@ -15,7 +15,8 @@ from src.daemon.guardrails import scan_stdout
 from src.github import checks as gh_checks
 from src.github import comments as gh_comments
 from src.github import prs as gh_prs
-from src.models import CIStatus, PipelineState, PublicationAttempt, ReviewStatus
+from src.keyspace import control_stop, pipeline_state
+from src.models import CIStatus, PipelineState, PublicationAttempt, RepoState, ReviewStatus
 from src.subsource_registry import SuppressionReason
 
 if TYPE_CHECKING:
@@ -142,11 +143,41 @@ async def resolve(runner: PipelineRunner, *, resolve_terminal: bool) -> bool:
         return False
 
 
+async def _operator_paused(runner: PipelineRunner) -> bool:
+    """Latch Stop durably before consuming its expiring control signal."""
+    await runner._refresh_user_paused_from_redis()
+    if not runner.state.user_paused:
+        state_key, stop_key = pipeline_state(runner.name), control_stop(runner.name)
+
+        async def latch(pipe) -> bool:
+            if not await pipe.get(stop_key):
+                return False
+            raw = await pipe.get(state_key)
+            persisted = RepoState.model_validate_json(raw) if raw else runner.state.model_copy(deep=True)
+            persisted.user_paused = True
+            persisted.state = PipelineState.PAUSED
+            pipe.multi()
+            pipe.set(state_key, persisted.model_dump_json())
+            pipe.delete(stop_key)
+            return True
+
+        # Watch both keys so a concurrent Play cannot be overwritten by a
+        # stale Stop read. Persistence errors leave reconciliation fail-closed.
+        if await runner.redis.transaction(latch, state_key, stop_key, value_from_callable=True):
+            runner._stop_requested = True
+            runner.state.user_paused = True
+            runner.state.state = PipelineState.PAUSED
+            runner.log_event("[INFRA] Stop latched during publication reconciliation -> PAUSED.")
+    if runner.state.user_paused:
+        await runner.publish_state()
+        return True
+    return False
+
+
 async def hold(runner: PipelineRunner) -> bool:
     """One bounded reconciliation tick, shared by every lifecycle entry point."""
     attempt = runner.state.publication_attempt
-    if runner.state.user_paused:
-        await runner.publish_state()
+    if await _operator_paused(runner):
         return True
     owned_terminal = attempt.exhausted and attempt.terminal_message is not None
     if (not runner._publication_attempt_matches_dispatch()
@@ -179,9 +210,7 @@ async def hold(runner: PipelineRunner) -> bool:
     if not resolved:
         await runner.publish_state()
         return True
-    await runner._refresh_user_paused_from_redis()
-    if runner.state.user_paused or await runner._pop_stop_request():
-        await runner.publish_state()
+    if await _operator_paused(runner):
         return True
     attempt = runner.state.publication_attempt
     pr = runner.state.current_pr
@@ -221,9 +250,7 @@ async def hold(runner: PipelineRunner) -> bool:
             )
         attempt.continuation_saved = True
         await runner.publish_state()
-    await runner._refresh_user_paused_from_redis()
-    if runner.state.user_paused or await runner._pop_stop_request():
-        await runner.publish_state()
+    if await _operator_paused(runner):
         return True
     # A crash after POST but before its checkpoint must query provider history
     # before posting again. Unavailable history cannot authorize a duplicate.
@@ -243,9 +270,7 @@ async def hold(runner: PipelineRunner) -> bool:
     elif needs_review:
         attempt.review_handoff_started = True
         await runner.publish_state()
-    await runner._refresh_user_paused_from_redis()
-    if runner.state.user_paused or await runner._pop_stop_request():
-        await runner.publish_state()
+    if await _operator_paused(runner):
         return True
     if (needs_review and runner.state.review_requested_at is None
         and not runner._should_skip_codex_review_post(pr.number)):

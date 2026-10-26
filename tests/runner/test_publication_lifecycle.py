@@ -7,16 +7,15 @@ from __future__ import annotations
 
 import subprocess
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock
 
 import pytest
-
 from src.daemon import publication
 from src.daemon.handlers import coding
 from src.github import checks, prs
-from src.keyspace import pipeline_state
-from src.models import CIStatus, PipelineState, PRInfo, QueueTask, ReviewStatus, TaskStatus
+from src.keyspace import control_stop, pipeline_state
+from src.models import CIStatus, PipelineState, PRInfo, QueueTask, RepoState, ReviewStatus, TaskStatus
+
 from tests.runner import _helpers as h
 
 
@@ -226,7 +225,8 @@ async def test_publication_cannot_erase_real_failure(lifecycle, failure):
     provider['head'] = expected
     await publication.record_exit(
         runner, 1 if failure == 'implementation' else 0,
-        'gh repo create forbidden' if failure == 'guardrail' else 'ESCALATE: blocked' if failure == 'escalation' else '', '',
+        ('gh repo create forbidden' if failure == 'guardrail'
+         else 'ESCALATE: blocked' if failure == 'escalation' else ''), '',
     )
     await runner._capture_published_attempt()
     if failure != 'cleanup':
@@ -422,7 +422,9 @@ async def test_auto_pr_discovery_uses_bound_dispatch_without_recreating(lifecycl
         assert provider['requests'] == []
 
 
-@pytest.mark.parametrize('problem', ['missing_candidate', 'probe_failure', 'ci_error', 'unknown', 'deadline', 'binding'])
+@pytest.mark.parametrize('problem', [
+    'missing_candidate', 'probe_failure', 'ci_error', 'unknown', 'deadline', 'binding',
+])
 async def test_partial_observations_fail_closed(lifecycle, monkeypatch, problem):
     runner, provider, _, _, expected, _ = lifecycle
     await finish(runner)
@@ -474,7 +476,8 @@ async def test_lost_review_response_requires_available_provider_history(lifecycl
     await finish(runner)
     provider['head'] = expected
     runner.state.publication_attempt.review_handoff_started = True
-    unavailable = lambda *a, **kw: (_ for _ in ()).throw(OSError('comments unavailable'))
+    def unavailable(*a, **kw):
+        raise OSError('comments unavailable')
     monkeypatch.setattr(publication.gh_comments, 'latest_codex_review_request_time', unavailable)
     await runner._hold_unresolved_publication()
     assert runner.state.publication_attempt.pending
@@ -523,6 +526,91 @@ async def test_stop_arriving_during_reconciliation_defers_effects(lifecycle, mon
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr.push_count == 2
     assert len(provider['requests']) == 1
+
+
+@pytest.mark.parametrize('boundary', ['entry', 'observation', 'accounting', 'review'])
+async def test_global_stop_latches_pause_until_play_across_restart(lifecycle, monkeypatch, boundary):
+    runner, provider, _, _, expected, configure = lifecycle
+    await finish(runner)
+    provider['head'] = expected
+    deadline = runner.state.publication_attempt.reconcile_deadline
+    invocation = runner.state.active_invocation
+    publish = runner.publish_state
+    signalled = False
+
+    async def checkpoint():
+        nonlocal signalled
+        a = runner.state.publication_attempt
+        reached = (a.reconcile_polls > 0 if boundary == 'observation' else
+                   a.push_accounted if boundary == 'accounting' else a.review_handoff_started)
+        if reached and not signalled:
+            # /daemon/stop writes only this key, without changing RepoState.
+            await runner.redis.set(control_stop(runner.name), '1', ex=60)
+            signalled = True
+        await publish()
+
+    if boundary == 'entry':
+        await runner.redis.set(control_stop(runner.name), '1', ex=60)
+    else:
+        monkeypatch.setattr(runner, 'publish_state', checkpoint)
+    await runner._hold_unresolved_publication()
+    monkeypatch.setattr(runner, 'publish_state', publish)
+    persisted = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert persisted.user_paused
+    assert persisted.state == PipelineState.PAUSED
+    assert persisted.publication_attempt.pending
+    assert runner._stop_requested
+    assert await runner.redis.get(control_stop(runner.name)) is None
+    polls = persisted.publication_attempt.reconcile_polls
+    Clock.value += timedelta(seconds=61)  # the original Stop TTL cannot resume work
+    await runner._run_cycle_body()
+    fresh = await restart(runner, configure)
+    await fresh._run_cycle_body()
+    assert fresh.state.user_paused
+    assert fresh.state.state == PipelineState.PAUSED
+    assert fresh.state.publication_attempt.reconcile_polls == polls
+    assert fresh.state.publication_attempt.reconcile_deadline == deadline
+    assert fresh.state.active_invocation == invocation
+    assert provider['requests'] == []
+    # Play clears the durable pause; continuation retains the existing budget.
+    fresh.state.user_paused = False
+    await fresh.redis.set(pipeline_state(fresh.name), fresh.state.model_dump_json())
+    await fresh._run_cycle_body()
+    assert fresh.state.state == PipelineState.WATCH
+    assert fresh.state.publication_attempt.reconcile_deadline == deadline
+    assert fresh.state.current_pr.push_count == 2
+    assert len(provider['requests']) == 1
+
+
+@pytest.mark.parametrize('snapshot_present', [False, True])
+async def test_stop_pause_persistence_failure_retains_signal(lifecycle, monkeypatch, snapshot_present):
+    runner, provider, _, _, expected, _ = lifecycle
+    await finish(runner)
+    provider['head'] = expected
+    if not snapshot_present:
+        await runner.redis.delete(pipeline_state(runner.name))
+    await runner.redis.set(control_stop(runner.name), '1', ex=60)
+    transaction = runner.redis.transaction
+
+    async def unavailable(callback, *keys, **kwargs):
+        # Read and prepare the transaction, then fail before EXEC commits it.
+        await callback(runner.redis.pipeline())
+        raise OSError('Redis transaction unavailable')
+
+    monkeypatch.setattr(runner.redis, 'transaction', unavailable)
+    with pytest.raises(OSError, match='Redis transaction unavailable'):
+        await runner._hold_unresolved_publication()
+    assert await runner.redis.get(control_stop(runner.name)) == '1'
+    assert not runner.state.user_paused
+    assert runner.state.publication_attempt.pending
+    assert provider['requests'] == []
+    monkeypatch.setattr(runner.redis, 'transaction', transaction)
+    await runner._hold_unresolved_publication()
+    persisted = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert persisted.user_paused
+    assert persisted.state == PipelineState.PAUSED
+    assert persisted.publication_attempt == runner.state.publication_attempt
+    assert await runner.redis.get(control_stop(runner.name)) is None
 
 
 async def test_exhaustion_status_exception_retains_terminal_incident(lifecycle, monkeypatch):
@@ -649,6 +737,7 @@ async def test_header_recovery_defers_if_snapshot_read_is_unavailable(lifecycle,
                                      'cleanup', 'unknown_pr', 'invalid', 'api', 'converged'])
 async def test_retry_retains_exhausted_expected_head_after_independent_work(lifecycle, monkeypatch, problem):
     from types import SimpleNamespace
+
     from src.cancellation import cause_key, get_cancellation_cause
     runner, provider, repo, old, expected, _ = lifecycle
     await finish(runner)

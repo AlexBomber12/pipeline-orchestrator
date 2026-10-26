@@ -30,6 +30,11 @@ re-runs the coder, pushes, changes a remote ref, or consumes a no-push FIX retry
 | Operator Stop | Pause flag, attempt, counters and deadline | Defer polls and continuation effects until Play | Pause does not replenish the wall-clock budget |
 | Exact intended PR externally closed or merged | Exact terminal evidence and confirmed cleanup | Existing terminal bookkeeping | No inference from disappearance or commit subjects |
 
+Publication reconciliation atomically persists the operator pause before
+consuming the global Stop key. The pause survives that key's expiry and daemon
+restart; only Play clears it. A failed Redis transaction retains the Stop key
+and blocks continuation.
+
 The deadline uses the existing review timeout policy; the next poll uses the
 existing FIX polling interval. Both are persisted before observation. Restarts
 and pauses do not grant fresh budgets. GitHub budget admission still gates ticks.
