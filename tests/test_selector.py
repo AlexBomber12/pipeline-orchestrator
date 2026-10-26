@@ -484,6 +484,7 @@ def test_unified_resource_blocker_is_binding_on_actual_coder_choice() -> None:
     from src.inhibitor import InhibitorType, WorkInhibitor
 
     ctx = _ctx(epsilon=0.0)
+    ctx.check_inhibitors = True
     ctx.repo_config.feature_flags.use_unified_inhibitor_check = True
     ctx.state.active_inhibitors = [WorkInhibitor(
         inhibitor_type=InhibitorType.RATE_LIMIT,

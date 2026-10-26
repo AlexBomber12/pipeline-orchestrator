@@ -32,6 +32,9 @@ class SelectionContext:
     # the existing auto_fallback behavior.
     task_coder_pin: str | None = None
     exclusion_reasons: dict[str, str] = field(default_factory=dict)
+    # Dispatch preflight must enforce typed resource blockers. PAUSED recovery
+    # retains its own selected-resource inhibitor evaluation.
+    check_inhibitors: bool = False
 
 
 class CoderPurpose(str, Enum):
@@ -124,7 +127,7 @@ def _coder_runtime_ok(name: str, ctx: SelectionContext) -> bool:
         reason = "rate_limited"
     elif _is_disabled_for_repo(name, ctx.repo_config):
         reason = "disabled"
-    elif ctx.repo_config.feature_flags.use_unified_inhibitor_check and any(
+    elif ctx.check_inhibitors and ctx.repo_config.feature_flags.use_unified_inhibitor_check and any(
         inh.inhibitor_type != InhibitorType.GITHUB_BUDGET_SLOWDOWN
         and (inh.inhibitor_type != InhibitorType.USER_PAUSE or ctx.state.user_paused)
         for inh in is_work_inhibited(ctx.state, coder=name)[1]

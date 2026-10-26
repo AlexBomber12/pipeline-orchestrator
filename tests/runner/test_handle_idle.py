@@ -4537,7 +4537,7 @@ def test_idle_attachment_retains_canonical_ci_policy(monkeypatch, scenario):
     finally:
         checks.clear_ci_status_cache()
 
-@pytest.mark.parametrize("unavailable", ["quota", "auth", "unknown", "disabled", "invalid"])
+@pytest.mark.parametrize("unavailable", ["quota", "auth", "unknown", "disabled", "invalid", "default"])
 @pytest.mark.parametrize("unified", [False, True])
 def test_idle_skips_unavailable_pin_and_dispatches_independent_task(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, unavailable: str, unified: bool,
@@ -4551,7 +4551,7 @@ def test_idle_skips_unavailable_pin_and_dispatches_independent_task(
     monkeypatch.setattr("src.github.prs.get_merged_prs", lambda *a, **kw: [])
     tasks = tmp_path / "tasks"
     tasks.mkdir()
-    pin = {"unknown": "not-loaded", "invalid": "bad pin"}.get(unavailable, "claude")
+    pin = {"unknown": "not-loaded", "invalid": "bad pin", "default": "any"}.get(unavailable, "claude")
     for number, coder, deps in [(1, pin, "none"), (2, "codex", "none"), (3, "codex", "PR-001")]:
         (tasks / f"PR-{number:03}.md").write_text(
             f"---\nstatus: TODO\n---\n# PR-{number:03}: Task {number}\n\n"
@@ -4562,7 +4562,7 @@ def test_idle_skips_unavailable_pin_and_dispatches_independent_task(
     runner.repo_path = str(tmp_path)
     runner.repo_config.feature_flags.use_unified_inhibitor_check = unified
     runner.app_config.daemon.auto_fallback = False
-    runner.state.rate_limited_coders = {"claude"} if unavailable == "quota" else set()
+    runner.state.rate_limited_coders = {"claude"} if unavailable in {"quota", "default"} else set()
     if unavailable == "auth":
         runner._auth_status_cache["claude"] = {"status": "error", "failure_reason": "probe_timeout"}
     # The stale pin must not gate examination of the real candidates.

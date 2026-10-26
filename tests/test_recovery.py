@@ -6,7 +6,7 @@ import asyncio
 import json
 import subprocess
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -969,6 +969,10 @@ def test_crash_recovery_blocks_todo_task_and_selects_independent_work(
         active_runner.repo_path, active_runner.redis = str(tmp_path), runner.redis
         if active_runner is not runner:
             asyncio.run(active_runner.recover_state())
+        # DAG selection now checks real coder availability before committing
+        # to a task. Keep provider auth controlled in this recovery regression.
+        active_runner._auth_status_cache = {"claude": {"status": "ok"}, "codex": {"status": "ok"}}
+        active_runner._auth_status_cache_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
         assert asyncio.run(active_runner._select_next_task_from_dag()).pr_id == "PR-101"
         assert active_runner._idle_dag_statuses["PR-100"] == TaskStatus.ERROR
 

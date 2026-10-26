@@ -610,6 +610,7 @@ class IdleMixin:
     def _idle_task_coder_available(self, pr_id: str, pin: str | None) -> bool:
         """Probe a candidate without selecting a coder or consuming exploration."""
         ctx = self._selection_context(task_coder_pin=pin or "any")
+        ctx.check_inhibitors = True
         candidates = candidate_coders(ctx)
         if not candidates:
             self.log_event(
@@ -792,6 +793,7 @@ class IdleMixin:
                 self.log_event(
                     "[INFRA] IDLE inhibited by no eligible coder"
                 )
+                self.log_event("[INFRA] Coder configuration requires action: load/enable a plugin.")
                 return
             # ``GITHUB_BUDGET_SLOWDOWN`` is a polling-cadence throttle
             # enforced by ``_check_github_api_budget`` at the runner-cycle
