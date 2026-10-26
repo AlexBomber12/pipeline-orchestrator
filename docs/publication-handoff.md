@@ -42,6 +42,11 @@ terminal bookkeeping. This cancellation permits no open-PR WATCH handoff or
 review request, including after restart or operator Retry. Implementation,
 Stop, breach and idle-timeout failures retain their existing classification.
 
+When the existing safety checks release an interrupted unpublished attempt,
+recovery still completes task ERROR bookkeeping before selecting queue work.
+The bound task and invocation survive further restarts while header/provider
+reads defer that bookkeeping. Unknown local work continues to block release.
+
 The deadline uses the existing review timeout policy; the next poll uses the
 existing FIX polling interval. Both are persisted before observation. Restarts
 and pauses do not grant fresh budgets. GitHub budget admission still gates ticks.

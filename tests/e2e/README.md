@@ -49,6 +49,10 @@ the preceding scenario must establish its terminal assertions before reset.
 Reset then waits for an empty, unpaused IDLE snapshot published after resume.
 The web control's initial IDLE snapshot is insufficient: daemon startup migrations
 must finish before a test injects a runtime fault such as a Redis outage.
+SIGKILL tests also require the `crash_before_publish` shim's matching task/branch
+handshake. CODING admission alone precedes CLI launch and cannot establish a
+mid-invocation crash. The shim waits before Git side effects and fails without
+publication if the fault is not injected; crash/ERROR assertions stay unchanged.
 Retain failure evidence; the integration workflow uploads `e2e-evidence` with
 bounded failure records, screenshots for tests that requested a Playwright page,
 and the last 200 test-stack log lines when available. Each failure record names

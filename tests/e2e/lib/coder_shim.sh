@@ -251,6 +251,14 @@ run_slow() {
     gh pr comment "${pr_url}" --body "@codex review"
 }
 
+run_crash_before_publish() {
+    # Signal an actual CLI launch before creating any task ref or commit.
+    # If the test fails to kill this owned process, fail without publishing.
+    printf '%s\t%s\n' "$1" "$2" > "${PO_SHIM_SCENARIO_FILE}.started"
+    sleep 120
+    return 1
+}
+
 run_escalate() {
     # PR-166: emit the ESCALATE marker so the daemon's FIX-cycle parser
     # transitions the runner to IDLE without further coder work.
@@ -384,6 +392,9 @@ main() {
             ;;
         slow)
             run_slow "${pr}" "${branch}"
+            ;;
+        crash_before_publish)
+            run_crash_before_publish "${pr}" "${branch}"
             ;;
         escalate)
             run_escalate

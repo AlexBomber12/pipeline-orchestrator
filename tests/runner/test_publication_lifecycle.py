@@ -826,6 +826,61 @@ async def test_header_recovery_defers_if_snapshot_read_is_unavailable(lifecycle,
     assert not await runner._recover_state_headers()
 
 
+@pytest.mark.parametrize('local_work,deferred', [(False, False), (False, True), (True, False)])
+async def test_prepublication_crash_finalizes_only_after_safe_release(lifecycle, monkeypatch, local_work, deferred):
+    runner, provider, repo, _, _, configure = lifecycle
+    monkeypatch.setattr('src.task_status.gh_pr_get_merged_branches', lambda *a: set())
+    monkeypatch.setattr(prs, 'get_merged_prs_discovery',
+                        lambda *a, **kw: prs.PRDiscovery('octo/demo', 'main', [], not provider.get('merged_down')))
+    provider['merged_down'] = deferred
+    remote = git(repo, 'remote', 'get-url', 'origin')
+    git(remote, 'update-ref', '-d', 'refs/heads/pr-001')
+    git(repo, 'checkout', 'main')
+    if not local_work:
+        git(repo, 'branch', '-D', 'pr-001')
+    (repo / 'tasks/PR-001.md').write_text(
+        '# PR-001: repair\n\nBranch: pr-001\n- Type: feature\n'
+        '- Complexity: low\n- Depends on: none\n- Priority: 2\n- Status: TODO\n',
+    )
+    git(repo, 'add', 'tasks/PR-001.md')
+    git(repo, 'commit', '-m', 'complete task headers')
+    git(repo, 'push', 'origin', 'main')
+    runner.state.current_pr = None
+    runner._capture_invocation_snapshot('claude', {}, phase='coding')
+    runner._begin_publication_attempt(started_at=Clock.value, baseline_numbers=set())
+    runner.state.publication_attempt.initial_branch_head_sha = ''
+    runner.state.state = PipelineState.CODING
+    await runner.publish_state()
+    status = AsyncMock(return_value=True)
+    def restore(fresh):
+        configure(fresh)
+        fresh._commit_task_status_change = status
+        return fresh
+    fresh = await restart(runner, restore)
+    if deferred:
+        assert not fresh.state.publication_attempt.pending
+        assert fresh.state.current_task.pr_id == 'PR-001'
+        assert status.await_count == 0
+        fresh = await restart(fresh, restore)
+        assert fresh.state.current_task.pr_id == 'PR-001'
+        assert status.await_count == 0
+        provider['merged_down'] = False
+        fresh = await restart(fresh, restore)
+    assert provider['requests'] == []
+    if local_work:
+        assert fresh.state.current_task is not None
+        assert fresh.state.publication_attempt.pending
+        assert fresh.state.state == PipelineState.ERROR
+        assert git(repo, 'rev-parse', 'refs/heads/pr-001')
+        assert status.await_count == 0
+    else:
+        assert fresh.state.current_task is None, [item['event'] for item in fresh.state.history]
+        assert fresh.state.state == PipelineState.IDLE
+        assert not fresh.state.publication_attempt.pending
+        assert status.call_args.args[1] == 'ERROR'
+        assert any('crashed, marking ERROR' in item['event'] for item in fresh.state.history)
+
+
 @pytest.mark.parametrize('problem', ['stale_pr', 'stale_list', 'omitted_list', 'advanced', 'identity',
                                      'cleanup', 'unknown_pr', 'invalid', 'api', 'terminal_cancelled', 'converged'])
 async def test_retry_retains_exhausted_expected_head_after_independent_work(lifecycle, monkeypatch, problem):
