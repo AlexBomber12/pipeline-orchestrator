@@ -1169,7 +1169,11 @@ class FixMixin(BreachMixin):
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
             try:
                 if coder_result is not None and not breach_flag["breached"] and not idle_flag["timed_out"]:
-                    await publication.record_exit(self, code, stdout, stderr)
+                    await publication.record_exit(
+                        self, code, stdout, stderr,
+                        terminal_cancelled=(code < 0 and external_state_flag["state"] is not None
+                                            and not self._stop_requested),
+                    )
                 elif (coder_result is None and external_state_flag["state"] is not None
                       and not stop_cancelled and not breach_flag["breached"] and not idle_flag["timed_out"]):
                     await publication.record_exit(self, code, stdout, stderr, terminal_cancelled=True)

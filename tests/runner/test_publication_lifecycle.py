@@ -364,9 +364,12 @@ async def test_actual_fix_exit_enters_same_durable_continuation(lifecycle, monke
 
 
 @pytest.mark.parametrize('terminal', ['MERGED', 'CLOSED'])
-@pytest.mark.parametrize('boundary', ['delayed', 'cleanup', 'reopened'])
+@pytest.mark.parametrize('exit_kind,boundary', [
+    ('cancel', 'delayed'), ('cancel', 'cleanup'), ('cancel', 'reopened'),
+    ('signal', 'delayed'), ('failure', 'delayed'),
+])
 async def test_supervisor_cancelled_fix_retains_terminal_only_continuation(
-    lifecycle, monkeypatch, terminal, boundary,
+    lifecycle, monkeypatch, terminal, exit_kind, boundary,
 ):
     runner, provider, repo, old, expected, configure = lifecycle
     remote = git(repo, 'remote', 'get-url', 'origin')
@@ -379,6 +382,7 @@ async def test_supervisor_cancelled_fix_retains_terminal_only_continuation(
     runner.usage_gate = AsyncMock(return_value=True)
     runner.state.current_pr.review_status = ReviewStatus.PENDING
     ready = asyncio.Event()
+    terminated, exited = asyncio.Event(), asyncio.Event()
 
     async def poll_tick(_seconds):
         await ready.wait()
@@ -390,11 +394,21 @@ async def test_supervisor_cancelled_fix_retains_terminal_only_continuation(
     ))
     monkeypatch.setattr(runner, '_monitor_fix_idle', AsyncMock())
     monkeypatch.setattr(prs, 'pr_state', lambda *a: {'state': terminal})
+    if exit_kind != 'cancel':
+        async def terminate():
+            terminated.set()
+            await exited.wait()
+            return True
+        monkeypatch.setattr(runner, '_terminate_current_coder', terminate)
     _, plugin = runner._get_coder()
     async def coder(*args, **kwargs):
         git(repo, 'reset', '--hard', expected)
         git(repo, 'push', 'origin', 'pr-001')
         ready.set()
+        if exit_kind != 'cancel':
+            await terminated.wait()
+            exited.set()
+            return (-15 if exit_kind == 'signal' else 1), 'coder exited during cleanup', ''
         await asyncio.Future()
     monkeypatch.setattr(plugin, 'fix_review', coder)
     status = AsyncMock(return_value=True)
@@ -404,8 +418,8 @@ async def test_supervisor_cancelled_fix_retains_terminal_only_continuation(
     provider['state'] = prs.ExactPRState(terminal)
     await runner.handle_fix()
     attempt = runner.state.publication_attempt
-    assert attempt.exit_classification == 'success'
-    assert attempt.terminal_cancelled
+    assert attempt.exit_classification == ('failure' if exit_kind == 'failure' else 'success')
+    assert attempt.terminal_cancelled is (exit_kind != 'failure')
     assert attempt.expected_head_sha == expected
     assert attempt.pending
     assert status.await_count == 0
@@ -420,7 +434,7 @@ async def test_supervisor_cancelled_fix_retains_terminal_only_continuation(
     fresh = await restart(runner, restore)
     Clock.value += timedelta(seconds=31)
     await fresh._run_cycle_body()
-    if boundary == 'delayed':
+    if boundary == 'delayed' and exit_kind != 'failure':
         assert fresh.state.state == PipelineState.IDLE
         assert fresh.state.current_task is None
         if terminal == 'MERGED':

@@ -589,8 +589,17 @@ def upload_zip():
 @pytest.fixture
 def reset_testbed():
     setup_error = None
+    service_stopped = False
     try:
         _stop_daemon_and_wait_paused(TESTBED_SLUG)
+        # A retained publication/error attempt deliberately survives Play.
+        # Remove the fixture-owned in-memory runner too, and prevent its
+        # heartbeat from restoring the snapshot while Redis is being cleared.
+        subprocess.run(
+            ["docker", "compose", "-f", "docker-compose.test.yml", "stop", "daemon-test"],
+            cwd=REPO_DIR, check=True, timeout=60,
+        )
+        service_stopped = True
         reset_testbed_full(TESTBED_SLUG)
         clear_testbed_redis_state(TESTBED_SLUG)
     except Exception as exc:
@@ -598,6 +607,11 @@ def reset_testbed():
         raise
     finally:
         try:
+            if service_stopped:
+                subprocess.run(
+                    ["docker", "compose", "-f", "docker-compose.test.yml", "start", "daemon-test"],
+                    cwd=REPO_DIR, check=True, timeout=60,
+                )
             _resume_daemon(TESTBED_SLUG)
         except Exception as exc:
             if setup_error is None:

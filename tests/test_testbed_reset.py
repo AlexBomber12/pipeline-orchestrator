@@ -528,6 +528,13 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
     def resume_daemon(slug: str) -> None:
         calls.append(f"resume:{slug}")
 
+    def service_command(cmd, **kwargs):
+        assert cmd[:4] == ["docker", "compose", "-f", "docker-compose.test.yml"]
+        assert cmd[-1] == "daemon-test"
+        assert kwargs["check"] is True
+        calls.append(f"service:{cmd[-2]}")
+        return _completed()
+
     sys.modules.pop(module_name, None)
     try:
         with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
@@ -538,6 +545,7 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
             patch.object(e2e_conftest, "_resume_daemon", side_effect=resume_daemon),
             patch.object(e2e_conftest, "reset_testbed_full", side_effect=reset_full),
             patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=clear_redis),
+            patch.object(e2e_conftest.subprocess, "run", side_effect=service_command),
         ):
             fixture = e2e_conftest.reset_testbed.__wrapped__()
             next(fixture)
@@ -548,8 +556,10 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
 
     assert calls == [
         f"stop:{e2e_conftest.TESTBED_SLUG}",
+        "service:stop",
         f"reset:{e2e_conftest.TESTBED_SLUG}",
         f"clear:{e2e_conftest.TESTBED_SLUG}",
+        "service:start",
         f"resume:{e2e_conftest.TESTBED_SLUG}",
         f"clear:{e2e_conftest.TESTBED_SLUG}",
     ]
@@ -592,6 +602,45 @@ def test_reset_testbed_fixture_resumes_when_stop_wait_fails() -> None:
         f"resume:{e2e_conftest.TESTBED_SLUG}",
     ]
     assert excinfo.value.__notes__ == ["resume failed after reset setup error: resume failed"]
+
+
+@pytest.mark.parametrize("failure", ["stop", "reset", "clear", "start"])
+def test_reset_fixture_does_not_run_with_partial_reset(failure: str) -> None:
+    module_name = "tests.e2e.conftest"
+    calls = []
+
+    def stage(name):
+        calls.append(name)
+        if name == failure:
+            raise RuntimeError(f"{name} unavailable")
+
+    def service_command(cmd, **kwargs):
+        stage(cmd[-2])
+        return _completed()
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            module = importlib.import_module(module_name)
+        with (
+            patch.object(module, "_stop_daemon_and_wait_paused", side_effect=lambda _: stage("paused")),
+            patch.object(module.subprocess, "run", side_effect=service_command),
+            patch.object(module, "reset_testbed_full", side_effect=lambda _: stage("reset")),
+            patch.object(module, "clear_testbed_redis_state", side_effect=lambda _: stage("clear")),
+            patch.object(module, "_resume_daemon", side_effect=lambda _: stage("resume")),
+        ):
+            fixture = module.reset_testbed.__wrapped__()
+            with pytest.raises(RuntimeError, match=f"{failure} unavailable"):
+                next(fixture)
+    finally:
+        sys.modules.pop(module_name, None)
+    expected = {
+        "stop": ["paused", "stop", "resume"],
+        "reset": ["paused", "stop", "reset", "start", "resume"],
+        "clear": ["paused", "stop", "reset", "clear", "start", "resume"],
+        "start": ["paused", "stop", "reset", "clear", "start"],
+    }
+    assert calls == expected[failure]
 
 
 def test_shared_config_fixture_resets_testbed_after_dispatch() -> None:
