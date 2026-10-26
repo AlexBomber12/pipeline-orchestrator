@@ -14,6 +14,8 @@ from src.daemon import runner as runner_module
 from src.daemon.runner import PipelineRunner
 from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
 
+from tests.runner import _helpers as h
+
 
 class _FakeRedis:
     def __init__(self) -> None:
@@ -117,6 +119,8 @@ def _patch_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
     Only the calls handle_merge takes are stubbed — diff stats, merge
     plumbing, and the queue-md probe.
     """
+
+    h._stub_final_merge_evidence(monkeypatch)
 
     class _CP:
         def __init__(self, stdout: str = "", returncode: int = 0) -> None:

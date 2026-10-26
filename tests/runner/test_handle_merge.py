@@ -1375,3 +1375,178 @@ def test_failed_merge_command_retries_only_without_admission(monkeypatch, admiss
         asyncio.run(runner.handle_merge())
         assert runner.state.state == PipelineState.WATCH
         assert command.call_count == 1
+
+
+_FINAL_MERGE_READER = merge_module.MergeMixin._read_final_merge_pr
+
+
+@pytest.mark.parametrize("entry", ["watch", "merge"])
+@pytest.mark.parametrize("case", [
+    "approved", "missing_required", "partial", "untrusted", "stale",
+    "receipt", "progress", "provider_error", "head_changed", "withdrawn",
+    "unavailable", "missing_pr", "branch_changed", "quarantined", "sync",
+    "publication_missing", "backward", "partial_status", "observed_push",
+])
+def test_final_merge_uses_production_evidence(monkeypatch, entry, case):
+    """Real list, publication, CI and review readers gate the merge command."""
+    from src.github import cache, checks, reviews
+
+    h._patch_subprocess(monkeypatch)
+    monkeypatch.setattr(merge_module.MergeMixin, "_read_final_merge_pr", _FINAL_MERGE_READER)
+    checks.clear_ci_status_cache()
+    reviews.clear_review_status_cache()
+    head = "a" * 40
+    reads = []
+    sync_pushed = False
+    refreshed = False
+    ci_reads = []
+    commands = []
+    actor = {"id": 199175422, "login": "reviewer[bot]"}
+    runner = h._make_runner()
+    if entry == "watch":
+        monkeypatch.setattr(merge_module, "load_config", lambda: pytest.fail("reuse WATCH policy snapshot"))
+    fix = AsyncMock()
+    monkeypatch.setattr(runner, "handle_fix", fix)
+    runner.repo_config.required_checks = ["unit", "integration"]
+    runner.state.state = PipelineState.WATCH if entry == "watch" else PipelineState.MERGE
+    runner.state.current_pr = PRInfo(number=5, branch="feature", head_sha=head,
+                                     diff_scanned_at_sha=head)
+    async def scan():
+        runner.state.current_pr.diff_scanned_at_sha = runner.state.current_pr.head_sha
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", scan)
+    if case == "sync":
+        def git(repo, *args, **kwargs):
+            nonlocal sync_pushed
+            if args[:2] == ("merge", "origin/main"):
+                return h._FakeCompletedProcess(stdout="Already up to date" if sync_pushed else "Merge made")
+            if args[:2] == ("rev-parse", "HEAD"):
+                return h._FakeCompletedProcess(stdout="b" * 40 if sync_pushed else head)
+            if args[:2] == ("push", "origin"):
+                return h._FakeCompletedProcess()
+            if args[:1] == ("ls-remote",):
+                return h._FakeCompletedProcess(stdout="b" * 40)
+            return h._FakeCompletedProcess()
+        original_git = git
+        revisions = iter([head, "b" * 40])
+        def sync_git(repo, *args, **kwargs):
+            nonlocal sync_pushed
+            if args[:2] == ("rev-parse", "HEAD") and not sync_pushed:
+                return h._FakeCompletedProcess(stdout=next(revisions))
+            if args[:2] == ("push", "origin"):
+                sync_pushed = True
+            return original_git(repo, *args, **kwargs)
+        monkeypatch.setattr(git_ops_module, "_git", sync_git)
+        monkeypatch.setattr(runner, "_post_codex_review", lambda *a, **kw: True)
+    monkeypatch.setattr(runner, "_maybe_remind_review", AsyncMock())
+    monkeypatch.setattr(runner, "_finish_confirmed_merge", AsyncMock())
+    monkeypatch.setattr(merge_module.gh_prs, "get_pr_state", lambda *_: "OPEN")
+    monkeypatch.setattr(merge_module.gh_prs, "merge_pr", lambda *args: commands.append(args))
+
+    def final_read():
+        return entry == "merge" or len(reads) > 1
+
+    def remote_head():
+        changed = case == "observed_push" or case == "head_changed" and final_read() or sync_pushed
+        return "b" * 40 if changed else head
+
+    def transport(args, **kwargs):
+        if args[:2] == ["pr", "list"]:
+            reads.append(1)
+            if case == "unavailable":
+                raise RuntimeError("transport unavailable")
+            if case == "missing_pr":
+                return []
+            sha = remote_head()
+            return [{"number": 5,
+                     "headRefName": "other" if case == "branch_changed" and final_read() else "feature",
+                     "headRefOid": sha, "author": {"login": "author"},
+                     "labels": [{"name": "quarantine:guardrail"}] if case == "quarantined" else []}]
+        if args[:1] == ["pr"]:
+            return None
+        if "/pulls/5" == args[1][-8:]:
+            return {"branch": "feature", "repo": runner.owner_repo,
+                    "sha": remote_head()}
+        if "/activity?" in args[1]:
+            published = "2026-10-17T21:00:00Z"
+            if sync_pushed:
+                published = "2026-10-17T21:02:00Z"
+            elif case == "backward" and final_read():
+                published = "2026-10-17T20:59:00Z"
+            if case == "publication_missing":
+                return []
+            return [{"activity_type": "branch_creation", "before": "0" * 40,
+                     "after": remote_head(),
+                     "ref": "refs/heads/feature", "timestamp": published}]
+        raise AssertionError(args)
+
+    def reactions(path):
+        approved = "2026-10-17T21:01:00Z"
+        if refreshed:
+            approved = "2026-10-17T21:03:00Z"
+        elif case == "stale":
+            approved = "2026-10-17T20:00:00Z"
+        if path.endswith("/issues/5/reactions"):
+            if case in {"receipt", "progress", "provider_error"} or case == "withdrawn" and final_read():
+                return []
+            return [{"content": "+1", "user": {**actor, "id": 123} if case == "untrusted" else actor,
+                     "created_at": approved}]
+        if path.endswith("/issues/5/comments") and case in {"receipt", "progress", "provider_error"}:
+            body = {"receipt": "<!-- codex-review-receipt:v1 --> received",
+                    "progress": "Codex Review: reviewing your PR",
+                    "provider_error": "Something went wrong while reviewing"}[case]
+            return [{"id": 10, "user": actor, "body": body, "created_at": "2026-10-17T21:01:00Z"}]
+        return []
+
+    def check_pages(path):
+        sha = path.split("/commits/")[1].split("/")[0]
+        ci_reads.append(sha)
+        names = ["unit"] if case == "missing_required" else ["unit", "integration"]
+        return cache.PaginatedEvidence([{"check_runs": [
+            {"id": i, "name": name, "head_sha": sha, "status": "completed",
+             "conclusion": "success", "app": {"id": 1}}
+            for i, name in enumerate(names, 1)
+        ]}], case != "partial", False)
+
+    def status_pages(path, key):
+        sha = path.split("/commits/")[1].split("/")[0]
+        return cache.PaginatedEvidence(
+            [{"sha": sha, "state": "pending", "statuses": []}], case != "partial_status", True,
+        )
+
+    monkeypatch.setattr(merge_module.gh_runner, "run_gh", transport)
+    monkeypatch.setattr(cache, "_gh_api_paginated", reactions)
+    monkeypatch.setattr(cache, "_gh_api_paginated_evidence", check_pages)
+    monkeypatch.setattr(cache, "_etag_get_object_pages_evidence", status_pages)
+    if case == "backward" and entry == "merge":
+        runner._last_push_at = datetime(2026, 10, 17, 21, tzinfo=timezone.utc)
+        runner._last_push_at_pr_number = 5
+        runner._last_push_at_head_sha = head
+    if entry == "watch":
+        asyncio.run(runner.handle_watch())
+    else:
+        asyncio.run(runner.handle_merge())
+    if case in {"receipt", "progress", "provider_error"}:
+        fix.assert_not_awaited()
+        assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+    assert bool(commands) is (case == "approved")
+    if commands:
+        assert commands == [(runner.owner_repo, 5, head)]
+        assert len(ci_reads) >= 2  # final CI read bypasses the earlier cache
+    if case == "head_changed":
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+
+    if case == "sync":
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_pr.head_sha == "b" * 40
+        assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+        asyncio.run(runner.handle_watch())
+        assert commands == []  # old +1 predates the synchronized publication
+        refreshed = True
+        asyncio.run(runner.handle_watch())
+        assert commands == [(runner.owner_repo, 5, "b" * 40)]
+
+    if case == "observed_push" and entry == "watch":
+        assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+        asyncio.run(runner.handle_watch())
+        assert commands == [(runner.owner_repo, 5, "b" * 40)]

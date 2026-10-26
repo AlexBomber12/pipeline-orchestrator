@@ -1516,6 +1516,7 @@ def test_handle_merge_syncs_with_main(monkeypatch: pytest.MonkeyPatch) -> None:
     """Before calling merge_pr, handle_merge fetches and merges
     origin/<base> into the PR branch. When the branch is already
     up-to-date, the sync is a no-op and merge_pr runs immediately."""
+    h._stub_final_merge_evidence(monkeypatch)
     git_calls: list[list[str]] = []
 
     def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
@@ -1617,6 +1618,7 @@ def test_handle_merge_ignores_pr_ready_failure(
 def test_handle_merge_captures_success_stats_before_queue_sync(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    h._stub_final_merge_evidence(monkeypatch)
     def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:
         if cmd[:2] == ["git", "merge"] and "origin/main" in cmd:
             return h._FakeCompletedProcess(args=cmd, stdout="Already up to date.\n", returncode=0)
@@ -2095,6 +2097,7 @@ def test_handle_merge_skips_sync_for_cross_repo_pr(
     """Fork-based PRs: the head branch is on the contributor's fork,
     not origin. Any local push of the head branch would fail. Skip the
     pre-merge sync entirely and defer to gh pr merge."""
+    h._stub_final_merge_evidence(monkeypatch)
     git_calls: list[list[str]] = []
 
     def fake_git(cmd: list[str], **kwargs: Any) -> h._FakeCompletedProcess:

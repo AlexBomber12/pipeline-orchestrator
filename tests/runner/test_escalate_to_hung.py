@@ -114,6 +114,7 @@ def test_merge_writes_status_done_to_file(
     monkeypatch.setattr(
         "src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", AsyncMock(return_value=True)
     )
+    h._stub_final_merge_evidence(monkeypatch)
     repo = _make_repo_with_task(tmp_path, "PR-701")
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
@@ -146,6 +147,7 @@ def test_merge_logs_status_commit_exception(
     monkeypatch.setattr(
         "src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", AsyncMock(return_value=True)
     )
+    h._stub_final_merge_evidence(monkeypatch)
     repo = _make_repo_with_task(tmp_path, "PR-701")
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)
     monkeypatch.setattr("src.github.gh_runner.run_gh", lambda *args, **kwargs: "")
@@ -184,6 +186,7 @@ def test_merge_status_commit_ignores_divergent_pr_branch_task_file(
     monkeypatch.setattr(
         "src.daemon.handlers.merge.MergeMixin._confirm_remote_merge", AsyncMock(return_value=True)
     )
+    h._stub_final_merge_evidence(monkeypatch)
     repo = _make_repo_with_task(tmp_path, "PR-701")
     _commit_pr_branch_task_status(repo, "PR-701", "DOING")
     monkeypatch.setattr("src.github.prs.merge_pr", lambda repo, num, expected_head_sha: None)

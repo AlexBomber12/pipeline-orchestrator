@@ -194,6 +194,7 @@ def test_coding_guardrail_populates_quarantine(
 
 
 def _stub_successful_merge(monkeypatch: pytest.MonkeyPatch) -> list[int]:
+    h._stub_final_merge_evidence(monkeypatch)
     merged: list[int] = []
 
     def fake_git(repo_path: str, *args: str, **kwargs: object):

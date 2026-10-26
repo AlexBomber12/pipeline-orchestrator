@@ -251,7 +251,7 @@ def test_structured_summary_after_trigger_does_not_dispatch_fix(
     async def fake_fix() -> None:
         calls.append("fix")
 
-    async def fake_merge() -> None:
+    async def fake_merge(**kwargs) -> None:
         calls.append("merge")
 
     async def no_scan() -> None:
@@ -354,7 +354,7 @@ def test_watch_orders_mutable_summary_and_approval_evidence(
         if finding_at and expected[0] == ReviewStatus.CHANGES_REQUESTED:
             assert runner._fix_review_feedback == "P1: repair the null check"
 
-    async def fake_merge() -> None:
+    async def fake_merge(**kwargs) -> None:
         calls.append("merge")
 
     async def no_scan() -> None:
@@ -518,6 +518,7 @@ def test_handle_watch_reuses_poll_reviewer_policy_for_feedback(
         repo: str,
         allow_merge_without_checks: bool = False,
         reviewer_policy: object = None,
+        required_checks: object = None,
     ) -> list[PRInfo]:
         observed_policies.append(reviewer_policy)
         review_status = gh_reviews.get_pr_review_status(
@@ -2196,7 +2197,7 @@ def test_handle_watch_allows_pending_review_only_when_repo_bypasses_review(
     )
     merged: list[int] = []
 
-    async def fake_handle_merge() -> None:
+    async def fake_handle_merge(**kwargs) -> None:
         merged.append(42)
 
     runner = h._make_runner(allow_merge_without_review=True)
@@ -2229,7 +2230,7 @@ def test_handle_watch_does_not_bypass_changes_requested_review(
     )
     merged: list[int] = []
 
-    async def fake_handle_merge() -> None:
+    async def fake_handle_merge(**kwargs) -> None:
         merged.append(42)
 
     runner = h._make_runner(allow_merge_without_review=True)
@@ -5518,7 +5519,7 @@ def test_recorded_branch_creation_review_reaches_watch_merge_handoff(
         )
         runner._publication_high_water_at = floor
     calls: list[str] = []
-    async def merge() -> None:
+    async def merge(**kwargs) -> None:
         calls.append("merge")
     async def scan() -> None:
         return None
@@ -5616,7 +5617,7 @@ def test_parent_snapshot_620_recovery_reaches_normal_watch_merge_handoff(
     asyncio.run(runner.redis.set(pipeline_state(runner.name), snapshot))
     merged: list[int] = []
 
-    async def merge() -> None:
+    async def merge(**kwargs) -> None:
         merged.append(620)
 
     async def no_work(*_args: object) -> None:
@@ -5880,7 +5881,7 @@ def test_contextless_failure_cannot_erase_publication_watermark(
                                      diff_scanned_at_sha=head)
     runner.state.state = PipelineState.WATCH
     merged: list[int] = []
-    async def merge() -> None:
+    async def merge(**kwargs) -> None:
         merged.append(620)
     async def no_work(*_args: object) -> None:
         return None
@@ -5947,7 +5948,7 @@ def _publication_safety_boundary(monkeypatch: pytest.MonkeyPatch):
                                      diff_scanned_at_sha=head)
     runner.state.state = PipelineState.WATCH
     merged: list[int] = []
-    async def merge() -> None:
+    async def merge(**kwargs) -> None:
         merged.append(620)
     async def no_work(*_args: object) -> None:
         return None
@@ -6027,7 +6028,7 @@ def test_recovery_restores_publication_floor_before_stale_watch(
     recovered.redis = runner.redis
     monkeypatch.setattr(recovered, "_parse_tasks_from_headers", lambda: [task])
     merged: list[int] = []
-    async def merge() -> None:
+    async def merge(**kwargs) -> None:
         merged.append(620)
     monkeypatch.setattr(recovered, "handle_merge", merge)
     monkeypatch.setattr(recovered, "_scan_pr_diff_once", no_work)
@@ -6099,7 +6100,7 @@ def test_recovery_without_usable_floor_holds_historical_approval(
     recovered.redis = runner.redis
     monkeypatch.setattr(recovered, "_parse_tasks_from_headers", lambda: [task])
     merged: list[int] = []
-    async def merge() -> None:
+    async def merge(**kwargs) -> None:
         merged.append(620)
     monkeypatch.setattr(recovered, "handle_merge", merge)
     monkeypatch.setattr(recovered, "_scan_pr_diff_once", no_work)

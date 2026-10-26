@@ -155,6 +155,7 @@ class WatchMixin:
                 self.owner_repo,
                 allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
                 reviewer_policy=reviewer_policy,
+                required_checks=self.repo_config.required_checks,
             )
         except Exception as exc:
             await self._transition_to_error(
@@ -392,15 +393,13 @@ class WatchMixin:
         await self._scan_pr_diff_once()
         if self.state.state != PipelineState.WATCH:
             return
+        if current_pr.head_sha and current_pr.head_sha != found.head_sha:
+            found.review_status = ReviewStatus.PENDING
+            self.log_event(f"[WATCH] PR #{found.number} HEAD changed; waiting for fresh evidence.")
+            return
         ci = found.ci_status
         review = found.review_status
-        review_allows_merge = review == ReviewStatus.APPROVED or (
-            self.repo_config.allow_merge_without_review
-            and review == ReviewStatus.PENDING
-        )
-        if found.publication_observed and found.publication_at is None:
-            review_allows_merge = False
-        if ci == CIStatus.SUCCESS and review_allows_merge:
+        if self._merge_gates_satisfied(found):
             # PR-290a follow-up: ``_scan_pr_diff_once`` only updates
             # ``diff_scanned_at_sha`` on a successful fetch + scan; a
             # transient ``gh pr diff`` failure leaves the cache field
@@ -422,7 +421,7 @@ class WatchMixin:
                 )
                 return
             if self.repo_config.auto_merge:
-                await self.handle_merge()
+                await self.handle_merge(reviewer_policy=reviewer_policy)
             else:
                 self.log_event(
                     f"[WATCH] PR #{found.number} green but auto_merge "
