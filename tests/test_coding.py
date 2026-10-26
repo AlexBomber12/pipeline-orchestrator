@@ -1417,7 +1417,7 @@ def _publication_transport(monkeypatch, runner, *, code=1, stdout="", stderr="co
             raise OSError("response lost")
         return {
             "number": 402, "base": {"ref": "main", "repo": {"full_name": "octo/demo"}},
-            "head": {"ref": "pr-001", "sha": remote["head"]},
+            "head": {"ref": "pr-001", "sha": remote["head"], "repo": {"full_name": "octo/demo"}},
             "state": "closed" if remote.get("terminal") else "open",
             "merged": remote.get("terminal") == "MERGED",
             "merge_commit_sha": "c" * 40 if remote.get("terminal") == "MERGED" else None,

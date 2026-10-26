@@ -7,6 +7,7 @@ import time
 import urllib.error
 import urllib.request
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -354,6 +355,34 @@ def _resume_daemon(slug: str) -> None:
         raise RuntimeError(f"failed to resume daemon for {slug}: status_code={response.status_code}")
 
 
+def _wait_for_fresh_idle(slug: str, *, after: datetime, timeout_sec: int = 60) -> None:
+    """Require a runner publication after resume, beyond the web's IDLE stub."""
+    deadline = time.monotonic() + timeout_sec
+    last_seen = None
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{TEST_DASHBOARD_URL}/api/states", timeout=5) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, OSError, json.JSONDecodeError):
+            pass
+        else:
+            entries = payload if isinstance(payload, list) else payload.get("states", [])
+            for entry in entries:
+                if entry.get("name") != slug and entry.get("slug") != slug:
+                    continue
+                last_seen = (entry.get("state"), entry.get("last_updated"))
+                try:
+                    updated = datetime.fromisoformat(entry.get("last_updated") or "")
+                except (ValueError, TypeError):
+                    continue
+                if (updated.tzinfo is not None and updated > after and entry.get("state") == "IDLE"
+                    and entry.get("user_paused") is False and entry.get("current_task") is None
+                    and entry.get("current_pr") is None):
+                    return
+        time.sleep(0.5)
+    raise RuntimeError(f"timed out waiting for fresh IDLE from restarted daemon for {slug}; last seen={last_seen!r}")
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _reset_testbed_session():
     """Reset testbed to a known-clean state at session start.
@@ -589,8 +618,17 @@ def upload_zip():
 @pytest.fixture
 def reset_testbed():
     setup_error = None
+    service_stopped = False
     try:
         _stop_daemon_and_wait_paused(TESTBED_SLUG)
+        # A retained publication/error attempt deliberately survives Play.
+        # Remove the fixture-owned in-memory runner too, and prevent its
+        # heartbeat from restoring the snapshot while Redis is being cleared.
+        subprocess.run(
+            ["docker", "compose", "-f", "docker-compose.test.yml", "stop", "daemon-test"],
+            cwd=REPO_DIR, check=True, timeout=60,
+        )
+        service_stopped = True
         reset_testbed_full(TESTBED_SLUG)
         clear_testbed_redis_state(TESTBED_SLUG)
     except Exception as exc:
@@ -598,11 +636,19 @@ def reset_testbed():
         raise
     finally:
         try:
+            if service_stopped:
+                subprocess.run(
+                    ["docker", "compose", "-f", "docker-compose.test.yml", "start", "daemon-test"],
+                    cwd=REPO_DIR, check=True, timeout=60,
+                )
             _resume_daemon(TESTBED_SLUG)
         except Exception as exc:
             if setup_error is None:
                 raise
             setup_error.add_note(f"resume failed after reset setup error: {exc}")
+    # /resume may create an IDLE RepoState before startup migrations finish.
+    # A later daemon timestamp proves that the restarted runtime is serving.
+    _wait_for_fresh_idle(TESTBED_SLUG, after=datetime.now(timezone.utc))
     yield
     clear_testbed_redis_state(TESTBED_SLUG)
 

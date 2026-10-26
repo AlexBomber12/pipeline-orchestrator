@@ -102,7 +102,9 @@ class MergeMixin:
     def _merge_gates_satisfied(self, pr: PRInfo) -> bool:
         """Apply the same final admission rule in WATCH and MERGE."""
         return (
-            pr.ci_status == CIStatus.SUCCESS
+            not (self.state.publication_attempt is not None
+                 and self.state.publication_attempt.pending)
+            and pr.ci_status == CIStatus.SUCCESS
             and (
                 pr.review_status == ReviewStatus.APPROVED
                 or self.repo_config.allow_merge_without_review
@@ -139,6 +141,9 @@ class MergeMixin:
         """Merge the current PR and return to IDLE."""
         if self.state.current_pr is None:
             self.state.state = PipelineState.IDLE
+            return
+
+        if await self._hold_unresolved_publication():
             return
 
         # PR-358: review APPROVED -> MERGE ends the review-timeout window

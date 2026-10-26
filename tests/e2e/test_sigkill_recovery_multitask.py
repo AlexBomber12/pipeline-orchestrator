@@ -27,7 +27,7 @@ PR-B (priority 2 with no unmet deps). The test asserts both ends:
 1. The dashboard's ``/repos/{slug}/tasks`` fragment reports PR-A under
    ``error`` and the remaining tasks under ``todo`` (or ``doing`` if
    the daemon already advanced).
-2. After the slow shim exits and ``success`` takes over, the daemon
+2. After the crash fixture exits and ``success`` takes over, the daemon
    dispatches PR-B — not PR-A (would mean re-entry on the crashed task)
    and not PR-C (would mean ERROR unblocked dependents, contradicting
    ``src/dag.py:get_eligible_tasks``).
@@ -45,7 +45,7 @@ import time
 
 import requests
 
-from tests.e2e.lib.coder_shim import coder_shim
+from tests.e2e.lib.coder_shim import coder_shim, crash_coder_started
 
 DAEMON_CONTAINER = "pipeline-orchestrator-daemon-test"
 COMPOSE_FILE = "docker-compose.test.yml"
@@ -147,7 +147,7 @@ def test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
     pr_c_id = f"PR-{pr_c_int}"
     pr_d_id = f"PR-{pr_d_int}"
 
-    with coder_shim("slow"):
+    with coder_shim("crash_before_publish"):
         zip_path = make_task_zip_multi(
             [
                 (pr_a_int, "e2e-multitask-recovery-root", [], 1),
@@ -177,7 +177,8 @@ def test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
                 last_state = entry.get("state")
                 task = entry.get("current_task") or {}
                 last_task_pr_id = task.get("pr_id")
-                if last_state == "CODING" and last_task_pr_id == pr_a_id:
+                if (last_state == "CODING" and last_task_pr_id == pr_a_id
+                    and crash_coder_started(pr_a_id, f"pr-{pr_a_int}-e2e-multitask-recovery-root")):
                     pre_kill_entry = entry
                     break
             time.sleep(1)
@@ -192,8 +193,8 @@ def test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
         )
         pre_kill_ts = dt.datetime.fromisoformat(pre_kill_last_updated)
 
-        # The slow shim sleeps 30s after ``git_setup_branch`` and before
-        # any commit/push, so SIGKILL here is the canonical "before push"
+        # The fixture CLI signals its launch and waits before creating any
+        # task ref or commit, so SIGKILL here is the canonical "before push"
         # crash that PR-186 codifies. The shim is a child of the daemon
         # process, so SIGKILL terminates both — no orphan can race
         # teardown to push a branch and re-create PR state.
@@ -351,7 +352,7 @@ def test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
                 f"html[:1500]={html[:1500]!r}"
             )
 
-    # Step 8: switching to ``success`` after the slow context exits
+    # Step 8: switching to ``success`` after the crash context exits
     # ensures the next CODING dispatch completes cleanly. The contract
     # under test is independent of the shim — what matters is which PR
     # the IDLE selector picks. PR-B is the load-bearing answer:

@@ -653,6 +653,14 @@ class RecoveryMixin:
         ):
             self._publication_recovery_cutoff_at = datetime.now(timezone.utc)
         self._cleanup_expected_branch()
+        if not await self._hydrate_current_task_from_persisted_state():
+            return False
+        attempt = self.state.publication_attempt
+        if (attempt is not None and attempt.pending and attempt.contract_version == 2
+            and await self._hold_unresolved_publication()):
+            return True
+        # Safe unpublished release still needs the existing crash/status
+        # bookkeeping. It cannot turn the interrupted task into a fresh run.
         return await self._recover_state_headers()
 
     async def _hydrate_current_task_from_persisted_state(self) -> bool:
@@ -708,10 +716,26 @@ class RecoveryMixin:
         if persisted.name == self.name and persisted.url == self.repo_config.url:
             self.state.ci_attempt_scope = persisted.ci_attempt_scope
             self.state.ci_attempts = dict(persisted.ci_attempts)
+        released = persisted.publication_attempt
+        task, invocation = persisted.current_task, persisted.active_invocation
+        # Publication absence can be proven before crash/status bookkeeping
+        # succeeds. Keep that interrupted identity across another restart.
+        released_crash = bool(
+            released is not None and released.contract_version == 2
+            and not released.pending and released.exit_classification is None
+            and released.pr_number is None and released.candidate is None
+            and persisted.current_pr is None and task is not None and invocation is not None
+            and invocation.phase == "coding"
+            and (released.repo, released.base, released.task_id, released.branch,
+                 released.run_id, released.attempt_index) == (
+                     self.owner_repo, self.repo_config.branch or "main", task.pr_id,
+                     task.branch, invocation.run_id, invocation.attempt_index,
+                 )
+        )
         if (
             persisted.name == self.name and persisted.url == self.repo_config.url
             and persisted.publication_attempt is not None
-            and persisted.publication_attempt.pending
+            and (persisted.publication_attempt.pending or released_crash)
         ):
             self.state.current_task = persisted.current_task
             self.state.current_pr = persisted.current_pr
@@ -722,6 +746,12 @@ class RecoveryMixin:
                 self.state.current_pr = None
             self.state.user_paused = persisted.user_paused
             self.state.rate_limited_until = persisted.rate_limited_until
+            if persisted.publication_attempt.contract_version == 2:
+                for field in (
+                    "review_request_pr", "review_request_head", "review_request_task",
+                    "review_request_generation", "review_requested_at", "review_post_attempted_at",
+                ):
+                    setattr(self.state, field, getattr(persisted, field))
             if persisted.state == PipelineState.PAUSED:
                 self.state.state = PipelineState.PAUSED
             if (self._publication_attempt_matches_dispatch()
@@ -2340,6 +2370,7 @@ class RecoveryMixin:
         if (
             attempt is not None and attempt.pending and attempt.verified
             and attempt.exit_classification == "success"
+            and not attempt.terminal_cancelled
             and attempt.unverified_head_sha is None
             and task is not None
             and (attempt.repo, attempt.base, attempt.task_id, attempt.branch,
