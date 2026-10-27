@@ -676,6 +676,25 @@
     </style>
 </head>
 <body class="bg-surface-1 text-gray-200 min-h-screen">
+    <script>
+        // Reuse the heartbeat middleware; background refresh never carries
+        // this marker. Delegation also covers controls inserted by HTMX.
+        (function () {
+            let lastInteraction = -Infinity;
+            function recordInteraction(event) {
+                if (!event.isTrusted || event.repeat) return;
+                const now = performance.now();
+                if (now - lastInteraction < 1000) return;
+                lastInteraction = now;
+                fetch('/api/availability', {
+                    headers: {'X-Operator-Interaction': 'true'},
+                    keepalive: true
+                }).catch(function () {});
+            }
+            document.addEventListener('click', recordInteraction, true);
+            document.addEventListener('keydown', recordInteraction, true);
+        })();
+    </script>
     <nav class="border-b border-white/5 bg-surface-2">
         <div class="max-w-7xl mx-auto flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6 sm:py-4">
             <div class="flex min-w-0 items-center gap-3">

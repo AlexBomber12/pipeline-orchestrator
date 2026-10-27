@@ -4310,43 +4310,29 @@ def test_heartbeat_middleware_refreshes_on_other_mutating_methods(
     assert len(redis_client.set_calls) == 1
 
 
-def test_heartbeat_middleware_refreshes_on_htmx_get() -> None:
-    """HTMX-driven GET = operator dashboard polling.
-
-    The dashboard is GET-dominated; HTMX polls carry ``HX-Request: true``
-    and must keep the heartbeat fresh while the operator watches.
-    """
+@pytest.mark.parametrize("headers", [
+    {"hx-request": "true"},
+    {"sec-fetch-site": "same-origin"},
+    {"sec-fetch-site": "same-site", "hx-request": "true"},
+    {"x-operator-interaction": "false"},
+    {"sec-fetch-mode": "navigate", "sec-fetch-dest": "document"},
+    {"sec-fetch-mode": "cors", "sec-fetch-dest": "document", "sec-fetch-user": "?1"},
+    {"sec-fetch-mode": "navigate", "sec-fetch-dest": "iframe", "sec-fetch-user": "?1"},
+])
+def test_heartbeat_middleware_skips_background_get(headers) -> None:
     redis_client = _RecordingRedis()
-    _run_heartbeat(
-        method="GET",
-        status_code=200,
-        redis_client=redis_client,
-        headers={"hx-request": "true"},
-    )
-    assert redis_client.set_calls == [
-        ("operator_heartbeat", "1", {"ex": 300})
-    ]
+    _run_heartbeat(method="GET", status_code=200, redis_client=redis_client, headers=headers)
+    assert redis_client.set_calls == []
 
 
-@pytest.mark.parametrize("fetch_site", ["same-origin", "same-site"])
-def test_heartbeat_middleware_refreshes_on_trusted_fetch_site_get(
-    fetch_site: str,
-) -> None:
-    """Browser GET with trusted Sec-Fetch-Site counts as operator.
-
-    Only ``same-origin``/``same-site`` are accepted: those imply the
-    request originated from within the dashboard itself.
-    """
+@pytest.mark.parametrize("headers", [
+    {"x-operator-interaction": "true"},
+    {"sec-fetch-mode": "navigate", "sec-fetch-dest": "document", "sec-fetch-user": "?1"},
+])
+def test_heartbeat_middleware_refreshes_on_explicit_get(headers) -> None:
     redis_client = _RecordingRedis()
-    _run_heartbeat(
-        method="GET",
-        status_code=200,
-        redis_client=redis_client,
-        headers={"sec-fetch-site": fetch_site},
-    )
-    assert redis_client.set_calls == [
-        ("operator_heartbeat", "1", {"ex": 300})
-    ]
+    _run_heartbeat(method="GET", status_code=200, redis_client=redis_client, headers=headers)
+    assert redis_client.set_calls == [("operator_heartbeat", "1", {"ex": 300})]
 
 
 @pytest.mark.parametrize("fetch_site", ["cross-site", "none", "unknown", ""])
