@@ -397,6 +397,34 @@ def test_dependency_closure_accepts_legacy_existing_task_header(
     assert (_staging_dir(uploads_dir) / "PR-002.md").is_file()
 
 
+@pytest.mark.parametrize("source", ["stored", "pending"])
+def test_unstructured_history_preserves_dependencies_without_reserving_branches(
+    repo_dir: Path, uploads_dir: Path, source: str,
+) -> None:
+    from src.queue_parser import UnstructuredLegacyTaskError, parse_existing_task_header
+
+    history = repo_dir / "tasks" if source == "stored" else uploads_dir / "pending"
+    history.mkdir()
+    for pr_id, branch in [("PR-001", "pr-002-example-task"), ("PR-old", "old-branch")]:
+        path = history / f"{pr_id}.md"
+        path.write_text(f"# {pr_id}: Legacy task\n\nBranch: {branch}\n", encoding="utf-8")
+        with pytest.raises(UnstructuredLegacyTaskError):
+            parse_existing_task_header(path)
+
+    with TestClient(app) as client:
+        if source == "pending":
+            client.app.state.redis._store[upload_pending("example__alpha")] = json.dumps({
+                "files": ["PR-001.md", "PR-old.md"], "staging_dir": str(history),
+            })
+        response = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")],
+        )
+
+    assert response.status_code == 200
+    assert (_staging_dir(uploads_dir) / "PR-002.md").is_file()
+
+
 def test_parse_existing_task_header_returns_none_for_unreadable_path(
     tmp_path: Path,
 ) -> None:

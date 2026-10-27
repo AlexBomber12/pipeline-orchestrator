@@ -329,7 +329,8 @@ def _parse_legacy_existing_task_header(path: Path) -> TaskHeader | None:
     return TaskHeader(
         pr_id=header_match.group(1),
         title=header_match.group(2),
-        branch=branch,
+        # Retain legacy dependency identity without inventing executable metadata.
+        branch="",
         task_type="feature",
         complexity="medium",
         depends_on=[],
@@ -407,8 +408,8 @@ def validate_effective_task_graph(
     """Validate identities and the executable graph using canonical DAG rules.
 
     Only positively evidenced completions are leaves; DONE frontmatter alone
-    does not prove completion. Unstructured history is ignored by the reader;
-    it cannot establish dependency completion merely by existing on disk.
+    does not prove completion. Synthetic legacy headers retain dependency
+    identity but have no executable branch to reserve.
     """
     errors: dict[str, list[str]] = {}
     known = {header.pr_id for header in headers.values()}
@@ -424,11 +425,12 @@ def validate_effective_task_graph(
             )
         if header.pr_id in completed:
             continue
-        if header.branch in branches:
+        if header.branch and header.branch in branches:
             errors.setdefault(fname, []).append(
                 f"duplicate branch {header.branch!r}: used by {branches[header.branch]} and {header.pr_id}"
             )
-        branches[header.branch] = header.pr_id
+        if header.branch:
+            branches[header.branch] = header.pr_id
         for dependency in header.depends_on:
             if dependency not in known | completed:
                 errors.setdefault(fname, []).append(
