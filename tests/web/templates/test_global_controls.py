@@ -102,8 +102,7 @@ def test_pause_all_opener_shows_modal_before_awaiting_fetch() -> None:
 
 def test_confirm_pause_all_posts_to_daemon_pause_endpoint() -> None:
     # The Confirm pause all button must fire a POST to /daemon/pause via
-    # HTMX. ``hx-target=body``/``hx-swap=none`` plus the reload hook
-    # mirrors the spec so the dashboard re-renders after the sweep.
+    # HTMX. Response feedback stays visible so partial acceptance is clear.
     rendered = _render_component()
 
     confirm_segment = rendered.split("data-pause-all-confirm", 1)[1].split(
@@ -112,7 +111,7 @@ def test_confirm_pause_all_posts_to_daemon_pause_endpoint() -> None:
     assert 'hx-post="/daemon/pause"' in confirm_segment
     assert 'hx-target="body"' in confirm_segment
     assert 'hx-swap="none"' in confirm_segment
-    assert "window.location.reload()" in confirm_segment
+    assert "handleGlobalControlResult(event)" in confirm_segment
 
 
 def test_stop_all_modal_describes_destructive_nature() -> None:
@@ -140,7 +139,7 @@ def test_confirm_stop_all_posts_to_daemon_stop_endpoint() -> None:
     assert 'hx-post="/daemon/stop"' in confirm_segment
     assert 'hx-target="body"' in confirm_segment
     assert 'hx-swap="none"' in confirm_segment
-    assert "window.location.reload()" in confirm_segment
+    assert "handleGlobalControlResult(event)" in confirm_segment
 
 
 def test_resume_all_no_modal_required() -> None:
