@@ -34,10 +34,17 @@ async def record(
     *,
     member_id: str | None = None,
 ) -> None:
-    """Record one task cancellation/error event for ``repo_slug``."""
+    """Record an event once by task identity and its original failure time.
+
+    Callers without a task identity still record independent anonymous events.
+    Replays must retain the original timestamp, including after window pruning.
+    """
     score = _timestamp(ts)
-    prefix = f"{member_id}:" if member_id is not None else ""
-    member = f"{prefix}{score:.6f}:{uuid.uuid4().hex}"
+    member = (
+        f"{member_id}:{score:.6f}"
+        if member_id is not None
+        else uuid.uuid4().hex
+    )
     await redis_client.zadd(key(repo_slug), {member: score})
 
 
