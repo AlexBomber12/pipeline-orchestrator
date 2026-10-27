@@ -409,7 +409,7 @@ def test_daemon_resume_without_redis_reports_unavailable(
     assert response.json() == _result(_REPO_SLUGS, "unavailable", "redis_unavailable")
 
 
-def test_daemon_stop_writes_control_stop_with_60s_ttl(
+def test_daemon_stop_persists_pause_and_control_stop_without_ttl(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_config(tmp_path, monkeypatch)
@@ -423,7 +423,8 @@ def test_daemon_stop_writes_control_stop_with_60s_ttl(
     assert response.json() == _result(_REPO_SLUGS)
     for slug in _REPO_SLUGS:
         assert redis_client.values[control_stop(slug)] == "1"
-        assert redis_client.ttls[control_stop(slug)] == 60
+        assert control_stop(slug) not in redis_client.ttls
+        assert _stored_state(redis_client, slug).user_paused
 
 
 def test_daemon_stop_reports_set_errors(
@@ -431,16 +432,7 @@ def test_daemon_stop_reports_set_errors(
 ) -> None:
     _write_config(tmp_path, monkeypatch)
     redis_client = _FakeRedis()
-    # Allow the heartbeat middleware to write its key by only failing
-    # the control_stop writes; ``set`` is shared so we wrap selectively.
-    real_set = redis_client.set
-
-    async def _failing_set(key: str, value: str, ex: int | None = None) -> bool:
-        if key.startswith("control:") and key.endswith(":stop"):
-            raise RuntimeError("redis stop down")
-        return await real_set(key, value, ex=ex)
-
-    redis_client.set = _failing_set  # type: ignore[assignment]
+    redis_client.pipeline_execute_error = RuntimeError("redis stop down")
     _stub_redis(monkeypatch, redis_client)
 
     with TestClient(app) as client:
@@ -784,7 +776,7 @@ def test_global_control_reports_partial_writes_and_continues(
         ]
 
 
-@pytest.mark.parametrize("action", ["pause", "resume"])
+@pytest.mark.parametrize("action", ["pause", "resume", "stop"])
 def test_corrupt_snapshot_blocks_only_its_control_and_preserves_stop(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str,
 ) -> None:
@@ -802,7 +794,7 @@ def test_corrupt_snapshot_blocks_only_its_control_and_preserves_stop(
     }
     assert redis_client.values[pipeline_state(slug)] == "{}"
     assert redis_client.values[control_stop(slug)] == "1"
-    assert len(redis_client.published) == 2
+    assert len(redis_client.published) == (0 if action == "stop" else 2)
 
 
 def test_drain_progress_partial_state_never_claims_idle_for_unknown(
@@ -822,16 +814,16 @@ def test_drain_progress_partial_state_never_claims_idle_for_unknown(
     assert all(r["state"] is None and r["draining"] is None for r in entries[1:])
 
 
-def test_stop_rejected_write_is_not_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_stop_unconfirmed_transaction_is_not_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
     redis_client = _FakeRedis()
     _stub_redis(monkeypatch, redis_client)
 
     async def rejected(*args, **kwargs):
-        return False
+        raise ConnectionError("EXEC reply unavailable")
 
-    redis_client.set = rejected
+    redis_client.transaction = rejected
     with TestClient(app) as client:
         response = client.post("/daemon/stop")
-    assert response.status_code == 409
-    assert response.json() == _result([_REPO_SLUGS[0]], "failed", "write_rejected")
+    assert response.status_code == 503
+    assert response.json() == _result([_REPO_SLUGS[0]], "unavailable", "write_unconfirmed")

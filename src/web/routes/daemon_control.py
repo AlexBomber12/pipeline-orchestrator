@@ -31,8 +31,6 @@ from src.web.services.repo_state import _default_repo_state
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-_STOP_TTL_SECONDS = 60
-
 
 @router.post("/daemon/panic/resume", status_code=204)
 async def resume_panic(request: Request) -> Response:
@@ -87,6 +85,7 @@ async def _write_user_paused(
     *,
     user_paused: bool,
     clear_stop: bool,
+    set_stop: bool = False,
 ) -> dict[str, str]:
     """Update ``user_paused`` on a single repo's pipeline state.
 
@@ -101,7 +100,7 @@ async def _write_user_paused(
     state_key = pipeline_state(name)
     stop_key = control_stop(name)
     watch_keys: tuple[str, ...] = (
-        (state_key, stop_key) if clear_stop else (state_key,)
+        (state_key, stop_key) if clear_stop or set_stop else (state_key,)
     )
 
     async def _transaction(pipe: Any) -> None:
@@ -121,6 +120,8 @@ async def _write_user_paused(
         pipe.set(state_key, state.model_dump_json())
         if clear_stop:
             pipe.delete(stop_key)
+        elif set_stop:
+            pipe.set(stop_key, "1")
 
     if redis_client is None:
         return {"name": name, "status": "unavailable", "reason": "redis_unavailable"}
@@ -205,28 +206,18 @@ async def daemon_resume(request: Request) -> JSONResponse:
 async def daemon_stop(request: Request) -> JSONResponse:
     """Request a hard stop on every configured repo at once.
 
-    Writes ``control:{name}:stop`` with a 60s TTL for each repo; the
-    daemon's ``_monitor_stop_request`` consumes the flag mid-cycle and
-    aborts any in-flight coder run.
+    Atomically persists pause intent and a non-expiring stop signal. The
+    daemon acknowledges only after supervisor cleanup is confirmed.
     """
     cfg = await asyncio.to_thread(load_config, _config_path())
     redis_client = getattr(request.app.state, "redis", None)
     results: list[dict[str, Any]] = []
     for repo in cfg.repositories:
         name = repo_slug_from_url(repo.url)
-        result = {"name": name, "status": "unavailable", "reason": "redis_unavailable"}
-        if redis_client is not None:
-            try:
-                written = await redis_client.set(
-                    control_stop(name), "1", ex=_STOP_TTL_SECONDS
-                )
-                if written:
-                    result = {"name": name, "status": "accepted"}
-                else:
-                    result = {"name": name, "status": "failed", "reason": "write_rejected"}
-            except Exception:
-                logger.warning("Failed to write stop control for %s", name, exc_info=True)
-                result["reason"] = "write_unconfirmed"
+        result = await _write_user_paused(
+            redis_client, name, repo.url,
+            user_paused=True, clear_stop=False, set_stop=True,
+        )
         results.append(result)
     return _control_response(results)
 

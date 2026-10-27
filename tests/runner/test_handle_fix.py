@@ -2427,6 +2427,9 @@ def test_handle_fix_honors_persisted_stop_after_fast_fix_exit(
     runner = h._make_runner()
     runner.state.current_pr = PRInfo(number=77, branch="pr-019")
     runner.redis.store[f"control:{runner.name}:stop"] = "1"
+    runner.redis.store[f"pipeline:{runner.name}"] = runner.state.model_copy(
+        update={"user_paused": True}
+    ).model_dump_json()
 
     async def stale_stop_monitor(
         _cli_task: asyncio.Task[tuple[int, str, str]],
@@ -2440,6 +2443,8 @@ def test_handle_fix_honors_persisted_stop_after_fast_fix_exit(
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.user_paused is True
     assert runner.state.error_message is None
+    assert f"control:{runner.name}:stop" in runner.redis.store
+    asyncio.run(runner.publish_state())
     assert f"control:{runner.name}:stop" not in runner.redis.store
     assert any(
         "deferring pause until fix bookkeeping completes" in entry["event"].lower() for entry in runner.state.history
@@ -5436,6 +5441,9 @@ def test_fix_idle_timeout_defers_to_user_stop_after_exit(
     runner.state.state = PipelineState.WATCH
     runner.state.current_pr = PRInfo(number=5, branch="pr-001")
     runner.redis.store[f"control:{runner.name}:stop"] = "1"
+    runner.redis.store[f"pipeline:{runner.name}"] = runner.state.model_copy(
+        update={"user_paused": True}
+    ).model_dump_json()
 
     async def save_log(stdout: str, stderr: str, label: str) -> None:
         saved_logs.append((stdout, stderr, label))
@@ -5448,6 +5456,8 @@ def test_fix_idle_timeout_defers_to_user_stop_after_exit(
     assert runner.state.state == PipelineState.PAUSED
     assert runner.state.user_paused is True
     assert runner.state.error_message is None
+    assert f"control:{runner.name}:stop" in runner.redis.store
+    asyncio.run(runner.publish_state())
     assert f"control:{runner.name}:stop" not in runner.redis.store
     assert saved_logs == [("", "", "FIX idle timeout")]
     assert any("user stop requested" in e["event"].lower() for e in runner.state.history)

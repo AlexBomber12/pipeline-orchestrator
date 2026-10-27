@@ -1336,7 +1336,7 @@ async def _update_repo_pause_state(
             if stop_action == "clear":
                 pipe.delete(stop_key)
             elif stop_action == "set":
-                pipe.set(stop_key, "1", ex=60)
+                pipe.set(stop_key, "1")
             return state
 
         state = await redis_client.transaction(

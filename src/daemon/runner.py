@@ -3206,7 +3206,7 @@ class PipelineRunner(
         self.state.user_paused = persisted.user_paused
 
     async def _pop_stop_request(self) -> bool:
-        """Return True when a pending stop control signal exists."""
+        """Observe Stop without acknowledging it before cleanup/persistence."""
         key = control_stop(self.name)
         try:
             raw = await self.redis.get(key)
@@ -3214,10 +3214,6 @@ class PipelineRunner(
             return False
         if not raw:
             return False
-        try:
-            await self.redis.delete(key)
-        except Exception:
-            pass
         return True
 
     async def _terminate_current_coder(self) -> bool:
@@ -3501,8 +3497,20 @@ class PipelineRunner(
                 payload = await _serialize_latest_state()
                 pipe.multi()
                 pipe.set(state_key, payload)
+                # Resume watches these same keys, so neither a stale Stop
+                # observation nor this acknowledgment can undo its intent.
+                # A launch in progress is not proof of supervisor quiescence.
+                if (
+                    self.state.user_paused
+                    and self.state.state in {PipelineState.IDLE, PipelineState.PAUSED}
+                    and not self._coder_invocation_active
+                    and self._current_coder_process is None
+                    and self._current_coder_supervised_process is None
+                    and self._coder_cleanup_failure_detail is None
+                ):
+                    pipe.delete(control_stop(self.name))
 
-            await self.redis.transaction(_transaction, state_key)
+            await self.redis.transaction(_transaction, state_key, control_stop(self.name))
         else:
             payload = await _serialize_latest_state()
             await self.redis.set(state_key, payload)
