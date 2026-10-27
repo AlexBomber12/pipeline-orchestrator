@@ -2,8 +2,12 @@ import base64
 import json
 import subprocess
 import time
+from pathlib import Path
+
+import yaml
 
 from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
+from tests.e2e.lib.review_api import MergeOutcomeApi, task_released_and_done
 
 
 def _assert_merged_task_done(repo: str, number: int, branch: str, task_id: str) -> None:
@@ -40,9 +44,17 @@ def test_full_happy_path_via_shim_succeeds(
             f"test stack did not reach IDLE before test start: {exc}"
         ) from exc
 
-    pr_id_int = int(time.time())
+    pr_id_int = time.time_ns()
     expected_pr_id = f"PR-{pr_id_int}"
     expected_branch = f"pr-{pr_id_int}-e2e-test-upload-merge"
+
+    config = yaml.safe_load((Path(__file__).parent / "data/config.test.yml").read_text())
+    repo = testbed_slug.replace("__", "/", 1)
+    configured = next(item for item in config["repositories"] if repo in item["url"])
+    # Successful-empty checks are an explicit disposable-testbed exemption;
+    # this shim route does not establish strict CI policy or real LLM access.
+    assert configured["allow_merge_without_checks"] is True
+    outcome = MergeOutcomeApi(repo, configured["branch"])
 
     with coder_shim("success"):
         zip_path = make_task_zip(
@@ -72,18 +84,24 @@ def test_full_happy_path_via_shim_succeeds(
         number = watch_pr["number"]
         assert isinstance(number, int) and number > 0
 
-        wait_for_state(["IDLE"], timeout_sec=180)
+        watch_task = watch_entry.get("current_task") or {}
+        assert watch_task.get("pr_id") == expected_pr_id and watch_task.get("branch") == expected_branch
+        head = watch_pr["head_sha"]
+        marker = outcome.published_marker(number, expected_branch, head, expected_pr_id)
 
-    state = get_state()
-    assert state is not None, "no state entry returned for testbed"
-    assert state["state"] == "IDLE", f"final state was {state['state']!r}"
-    current_pr = state.get("current_pr")
-    assert current_pr is None or current_pr.get("state") == "MERGED", (
-        f"unexpected current_pr after merge: {current_pr!r}"
-    )
-    _assert_merged_task_done(
-        testbed_slug.replace("__", "/", 1), number, expected_branch, expected_pr_id,
-    )
+        deadline = time.monotonic() + 180
+        state = None
+        while time.monotonic() < deadline:
+            state = get_state()
+            if task_released_and_done(state, expected_pr_id, expected_branch):
+                break
+            time.sleep(1)
+        assert task_released_and_done(state, expected_pr_id, expected_branch), (
+            f"task {expected_pr_id} / PR #{number} did not complete and release; "
+            f"state={state!r}"
+        )
+        evidence = outcome.assert_merged(number, expected_branch, head, expected_pr_id, marker)
+        print(f"matching merged upload outcome: {evidence}")
 
 
 def test_legacy_size_label_pr_merges_and_task_is_done(

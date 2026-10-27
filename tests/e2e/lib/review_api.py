@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import re
@@ -9,6 +10,9 @@ import subprocess
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Callable
+from urllib.parse import quote
+
+import yaml
 
 REVIEWER_TOKEN_ENV = "TESTBED_REVIEWER_TOKEN"
 MARKER_PATH = "tests/e2e-shim-marker.txt"
@@ -232,3 +236,70 @@ class ReviewApi:
             "commit_id": recorded.get("commit_id"),
             "head_sha": head_sha,
         }
+
+
+class MergeOutcomeApi:
+    """Read exact publication and merge evidence with the testbed author token."""
+
+    def __init__(self, repo: str, base: str, *, runner=None):
+        self.repo, self.base = repo, base
+        self._runner = runner or subprocess.run
+
+    def _get(self, path: str):
+        result = self._runner(
+            ["gh", "api", f"repos/{self.repo}/{path}"],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        return json.loads(result.stdout)
+
+    def _content(self, path: str, ref: str) -> str:
+        payload = self._get(f"contents/{path}?ref={quote(ref, safe='')}")
+        return base64.b64decode(payload["content"]).decode()
+
+    def assert_pull(self, number: int, branch: str, head: str) -> dict:
+        assert re.fullmatch(r"[0-9a-f]{40}", head), head
+        pull = self._get(f"pulls/{number}")
+        assert pull["number"] == number, pull
+        assert pull["head"]["ref"] == branch and pull["head"]["sha"] == head, pull
+        assert pull["head"]["repo"]["full_name"] == self.repo, pull
+        assert pull["base"]["ref"] == self.base, pull
+        assert pull["base"]["repo"]["full_name"] == self.repo, pull
+        return pull
+
+    def published_marker(self, number: int, branch: str, head: str, task_id: str) -> str:
+        self.assert_pull(number, branch, head)
+        markers = [
+            line for line in self._content(MARKER_PATH, head).splitlines()
+            if line.startswith(f"shim marker for {task_id} at ")
+        ]
+        assert len(markers) == 1, markers
+        return markers[0]
+
+    def assert_merged(
+        self, number: int, branch: str, head: str, task_id: str, marker: str,
+    ) -> dict:
+        pull = self.assert_pull(number, branch, head)
+        assert pull["merged"] is True and pull["state"] == "closed", pull
+        merge = pull.get("merge_commit_sha")
+        assert isinstance(merge, str) and re.fullmatch(r"[0-9a-f]{40}", merge), pull
+        # Pin both reads to one configured-base snapshot after bookkeeping.
+        base_sha = self._get(f"commits/{quote(self.base, safe='')}")["sha"]
+        comparison = self._get(f"compare/{merge}...{base_sha}")
+        assert comparison["status"] in {"ahead", "identical"}, comparison
+        assert marker in self._content(MARKER_PATH, merge).splitlines(), marker
+        assert marker in self._content(MARKER_PATH, base_sha).splitlines(), marker
+        task = self._content(f"tasks/{task_id}.md", base_sha)
+        metadata = yaml.safe_load(task.split("---", 2)[1])
+        assert metadata["status"] == "DONE", task[:300]
+        assert f"# {task_id}:" in task and f"Branch: {branch}\n" in task, task[:500]
+        return {"number": number, "head_sha": head, "merge_commit_sha": merge, "base_sha": base_sha}
+
+
+def task_released_and_done(state: dict | None, task_id: str, branch: str) -> bool:
+    """IDLE requires released identities and the exact positive queue outcome."""
+    if not state or state.get("state") != "IDLE":
+        return False
+    if state.get("current_task") is not None or state.get("current_pr") is not None:
+        return False
+    matches = [task for task in state.get("current_queue", []) if task.get("pr_id") == task_id]
+    return len(matches) == 1 and matches[0].get("branch") == branch and matches[0].get("status") == "DONE"
