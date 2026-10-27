@@ -3406,6 +3406,84 @@ def test_filter_dag_headers_keeps_task_when_dependency_file_exists(
     assert unresolved_deps_map == {}
 
 
+@pytest.mark.parametrize("old_dependency", ["PR-002", "PR-MISSING"])
+@pytest.mark.parametrize("evidence", ["branch", "id"])
+def test_picker_prunes_verified_completion_before_dag_validation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    old_dependency: str, evidence: str,
+) -> None:
+    """A graph accepted at upload remains selectable with obsolete inputs."""
+    from src.queue_parser import parse_existing_task_header
+    from src.web.services.upload_validation import validate_effective_task_graph
+
+    monkeypatch.setattr(
+        idle_module.IdleMixin, "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    for pr_id, dependency in [("PR-001", old_dependency), ("PR-002", "PR-001")]:
+        (tasks_dir / f"{pr_id}.md").write_text(
+            f"# {pr_id}: Task\nBranch: {pr_id.lower()}-work\n"
+            f"- Type: feature\n- Complexity: low\n- Depends on: {dependency}\n",
+            encoding="utf-8",
+        )
+    state = _merged_state(
+        pr_ids={"PR-001"} if evidence == "id" else set(),
+        branches={"pr-001-work"} if evidence == "branch" else set(),
+    )
+    monkeypatch.setattr(idle_module, "_resolve_merged_state", lambda *a, **kw: state)
+    headers = {p.name: parse_existing_task_header(p) for p in tasks_dir.glob("*.md")}
+    assert validate_effective_task_graph(headers, merged_pr_ids={"PR-001"}) == {}
+
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._idle_open_prs = []
+    runner._idle_merged_prs = []
+    task = asyncio.run(runner._select_next_task_from_dag())
+
+    assert task is not None
+    assert task.pr_id == "PR-002"
+    assert task.status == TaskStatus.TODO
+    assert runner._idle_dag_statuses["PR-001"] == TaskStatus.DONE
+    assert all(not header.depends_on for header in runner._idle_dag_headers)
+    assert all(not queued.unresolved_deps for queued in runner._idle_dag_tasks)
+    # Normalization is in memory; task specs retain their historical inputs.
+    assert parse_existing_task_header(tasks_dir / "PR-001.md").depends_on == [old_dependency]
+
+
+@pytest.mark.parametrize("branch, merged_branches", [
+    ("pr-001-work", set()),
+    ("pr-0010-other-task", {"pr-0010-other-task"}),
+])
+def test_picker_does_not_prune_cycle_without_matching_branch_evidence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    branch: str, merged_branches: set[str],
+) -> None:
+    monkeypatch.setattr(
+        idle_module.IdleMixin, "_select_next_task_from_dag",
+        h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG,
+    )
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir()
+    for pr_id, dependency, task_branch in [
+        ("PR-001", "PR-002", branch), ("PR-002", "PR-001", "pr-002-work"),
+    ]:
+        (tasks_dir / f"{pr_id}.md").write_text(
+            f"---\nstatus: DONE\n---\n# {pr_id}: Task\nBranch: {task_branch}\n"
+            f"- Type: feature\n- Complexity: low\n- Depends on: {dependency}\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setattr(
+        idle_module, "_resolve_merged_state",
+        lambda *a, **kw: _merged_state(branches=merged_branches),
+    )
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    with pytest.raises(QueueValidationError, match="dependency cycle"):
+        asyncio.run(runner._select_next_task_from_dag())
+
+
 def test_select_next_task_from_dag_wraps_dag_cycle_errors(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

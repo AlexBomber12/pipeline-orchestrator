@@ -47,6 +47,7 @@ from src.queue_parser import (
 )
 from src.task_status import (
     MergeStatusUnavailable,
+    _branch_name_matches_task_pr_id,
     _resolve_merged_state,
     derive_task_status,
     find_matching_open_pr,
@@ -419,7 +420,18 @@ class IdleMixin:
                 "positive merge or open-PR evidence will defer task selection"
             )
             self._idle_degraded_done_check_logged = True
-        merged_pr_ids = state.merged_pr_ids
+        # Match admission's completion evidence before resolving blockers or
+        # validating cycles. Completed tasks no longer need their old inputs.
+        merged_pr_ids = state.merged_pr_ids | {
+            header.pr_id
+            for header in headers
+            if header.branch in state.merged_branches
+            and _branch_name_matches_task_pr_id(header.pr_id, header.branch)
+        }
+        headers = [
+            replace(header, depends_on=[]) if header.pr_id in merged_pr_ids else header
+            for header in headers
+        ]
         headers, unresolved_deps_map = self._filter_dag_headers_with_available_dependencies(
             headers,
             skipped_unstructured_pr_ids,
