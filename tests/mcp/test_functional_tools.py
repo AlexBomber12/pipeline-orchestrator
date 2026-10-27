@@ -490,21 +490,25 @@ def test_context_unverifiable_receipts_block_admission(tmp_path, monkeypatch):
 def test_context_branch_merge_evidence_releases_only_matching_task(tmp_path, monkeypatch, merged):
     from src.config import AppConfig, RepoConfig
     from src.mcp.tools import functional
-    from src.task_status import get_merged_branch_pr_ids
+    from src.branch_completion_bridge import read_branch_completions
+    from unittest.mock import MagicMock
+    import json
 
     monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
     monkeypatch.setattr(functional, "load_config", lambda: AppConfig(
         repositories=[RepoConfig(url="https://github.com/owner/repo", branch="release")],
     ))
     monkeypatch.setattr(functional, "get_merged_pr_ids", lambda *args: set())
-    monkeypatch.setattr(functional, "get_merged_branch_pr_ids", get_merged_branch_pr_ids)
+    monkeypatch.setattr(functional, "read_branch_completions", read_branch_completions)
+    transport = MagicMock()
+    transport.__enter__.return_value = transport
+    transport.get.return_value = json.dumps(["pr-998-example"] if merged else [])
+    monkeypatch.setattr("src.branch_completion_bridge.redis.Redis.from_url", lambda *a, **kw: transport)
 
-    def branches(repo, candidates):
-        assert repo == "owner/repo"
-        assert candidates == {"pr-998-example"}
-        return candidates if merged else set()
+    def no_github(*args, **kwargs):
+        raise AssertionError("MCP must not require GitHub credentials")
 
-    monkeypatch.setattr("src.task_status.gh_pr_get_merged_branches", branches)
+    monkeypatch.setattr("src.task_status.gh_pr_get_merged_branches", no_github)
     tasks = tmp_path / "owner__repo/tasks"
     tasks.mkdir(parents=True)
     stored = _VALID_SPEC.replace("PR-999", "PR-998").replace("pr-999", "pr-998")
@@ -515,6 +519,33 @@ def test_context_branch_merge_evidence_releases_only_matching_task(tmp_path, mon
     incoming = incoming.replace("- Depends on: none", "- Depends on: PR-998")
     result = functional.validate_task_spec(incoming, repo="owner__repo")
     assert result["valid"] is merged
+    transport.get.assert_called_once_with("verified-merged-branches:owner/repo:release")
     if not merged:
         assert any("duplicate branch" in error for error in result["errors"])
         assert any("Depends on PR-001" in error for error in result["errors"])
+
+
+@pytest.mark.parametrize("raw", [None, b"invalid", b"{}", b'[1]', b'["pr-9980-wrong"]', b"\xff"])
+def test_context_branch_snapshot_fails_closed(raw, monkeypatch):
+    from unittest.mock import MagicMock
+    from src.branch_completion_bridge import read_branch_completions
+    from src.queue_parser import TaskHeader
+
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.get.return_value = raw
+    monkeypatch.setattr("src.branch_completion_bridge.redis.Redis.from_url", lambda *a, **kw: client)
+    header = TaskHeader(pr_id="PR-998", title="Task", branch="pr-9980-wrong", task_type="feature", complexity="low", depends_on=[], priority=1, coder="any")
+    assert read_branch_completions("owner/repo", "release", [header]) == set()
+    client.get.assert_called_once_with("verified-merged-branches:owner/repo:release")
+
+
+def test_context_branch_snapshot_redis_outage(monkeypatch):
+    import redis
+    from src.branch_completion_bridge import read_branch_completions
+
+    def unavailable(*args, **kwargs):
+        raise redis.ConnectionError("offline")
+
+    monkeypatch.setattr("src.branch_completion_bridge.redis.Redis.from_url", unavailable)
+    assert read_branch_completions("owner/repo", "main", []) == set()

@@ -8,6 +8,7 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import subprocess
 import time
@@ -33,7 +34,7 @@ from src.daemon.selector import (
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, WorkInhibitor, is_work_inhibited
-from src.keyspace import control_stop, upload_pending
+from src.keyspace import control_stop, upload_pending, verified_merged_branches
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.onboarding.markdown_sections import MarkerError
 from src.onboarding.reconciliation import reconcile_agents_md
@@ -412,6 +413,11 @@ class IdleMixin:
             headers,
             log_event=self.log_event,
         )
+        if state.api_available:
+            await self.redis.set(
+                verified_merged_branches(self.owner_repo, self.repo_config.branch),
+                json.dumps(sorted(state.merged_branches)),
+            )
         if not state.api_available and not getattr(
             self, "_idle_degraded_done_check_logged", False,
         ):

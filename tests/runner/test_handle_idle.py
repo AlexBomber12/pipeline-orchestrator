@@ -3443,6 +3443,10 @@ def test_picker_prunes_verified_completion_before_dag_validation(
     task = asyncio.run(runner._select_next_task_from_dag())
 
     assert task is not None
+    from src.keyspace import verified_merged_branches
+    assert json.loads(runner.redis.store[verified_merged_branches(
+        runner.owner_repo, runner.repo_config.branch,
+    )]) == sorted(state.merged_branches)
     assert task.pr_id == "PR-002"
     assert task.status == TaskStatus.TODO
     assert runner._idle_dag_statuses["PR-001"] == TaskStatus.DONE
