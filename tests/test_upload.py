@@ -795,7 +795,7 @@ def test_upload_single_file_zip_success_message(
     assert "Accepted 1 task file (PR-001)." in resp.text
 
 
-def test_upload_zip_with_duplicate_task_entries_reports_unique_task_count(
+def test_upload_zip_with_duplicate_task_entries_rejected(
     one_repo_config: Path,
     repo_dir: Path,
     uploads_dir: Path,
@@ -811,10 +811,9 @@ def test_upload_zip_with_duplicate_task_entries_reports_unique_task_count(
         ]
     )
 
-    assert resp.status_code == 200
-    assert "Accepted 1 task file (PR-001)." in resp.text
-    staging = next((uploads_dir / "example__alpha").iterdir())
-    assert [path.name for path in staging.iterdir()] == ["PR-001.md"]
+    assert resp.status_code == 400
+    assert "duplicate task id/filename" in resp.text
+    assert not (uploads_dir / "example__alpha").exists()
 
 
 test_upload_zip_with_nested_directories_rejected = _make_zip_error_test([_zip_file({"nested/PR-001.md": _task_bytes()})], 422, "path separators")  # noqa: E501
@@ -1088,7 +1087,7 @@ def test_upload_rejects_non_numeric_task_without_depends_on(
     assert "Depends on: none" in resp.text
 
 
-def test_upload_validates_only_last_duplicate_task_copy(
+def test_upload_rejects_duplicate_task_copies(
     one_repo_config: Path,
     repo_dir: Path,
     uploads_dir: Path,
@@ -1101,7 +1100,8 @@ def test_upload_validates_only_last_duplicate_task_copy(
             ],
         )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 400
+    assert "duplicate task id/filename" in resp.text
 
 
 def test_upload_task_validation_errors_reference_uploaded_filename(
@@ -1435,7 +1435,7 @@ def test_upload_writes_redis_manifest(
     with TestClient(app) as client:
         resp = client.post(
             "/repos/example__alpha/upload-tasks",
-            files=[_task_file(name="PR-002.md")],
+            files=[_task_file(name="PR-002.md", pr_id="PR-002")],
         )
 
     assert resp.status_code == 200
@@ -1630,7 +1630,7 @@ def test_upload_merge_pending_manifest_and_ignore_scan_errors(
     assert "AGENTS.md" not in resp.text
 
 
-def test_upload_ignores_pending_manifest_read_errors(
+def test_upload_blocks_on_pending_manifest_read_errors(
     one_repo_config: Path,
     repo_dir: Path,
 ) -> None:
@@ -1659,7 +1659,8 @@ def test_upload_ignores_pending_manifest_read_errors(
             files=[_task_file()],
         )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 503
+    assert "Cannot validate pending task graph" in resp.text
 
 
 def test_upload_ignores_invalid_existing_manifest_payload(

@@ -9,12 +9,21 @@ staging tree from accumulating orphaned directories.
 
 from __future__ import annotations
 
+import json
 import re
 import shutil
 import time
+from dataclasses import replace
 from pathlib import Path
 
+from src.dag import build_task_dag
 from src.models import PipelineState
+from src.queue_parser import (
+    QueueValidationError,
+    TaskHeader,
+    parse_existing_task_header,
+)
+from src.task_status import merged_split_parent_aliases
 
 _TASK_UPLOAD_PATTERN = r"^PR-[A-Za-z0-9._-]+\.md$"
 _ALLOWED_TASK_PATTERN = (
@@ -282,3 +291,130 @@ def sweep_abandoned_staging(
                 shutil.rmtree(entry, ignore_errors=True)
                 removed += 1
     return removed
+
+
+def _parse_existing_task_header(path: Path) -> TaskHeader | None:
+    try:
+        return parse_existing_task_header(path)
+    except QueueValidationError:
+        return _parse_legacy_existing_task_header(path)
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def _parse_legacy_existing_task_header(path: Path) -> TaskHeader | None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+    header_match: re.Match[str] | None = None
+    branch = ""
+    for raw_line in lines:
+        line = raw_line.rstrip()
+        if header_match is None:
+            header_match = re.match(r"^#\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$", line)
+            continue
+        if not line.strip():
+            continue
+        branch_match = re.match(r"^Branch\s*:\s*(.*?)\s*$", line)
+        if branch_match:
+            branch = branch_match.group(1).strip()
+            break
+        if line.startswith("#") or line.startswith("- "):
+            break
+    if header_match is None or not branch:
+        return None
+    return TaskHeader(
+        pr_id=header_match.group(1),
+        title=header_match.group(2),
+        branch=branch,
+        task_type="feature",
+        complexity="medium",
+        depends_on=[],
+        priority=3,
+        coder="any",
+    )
+
+
+def effective_task_headers(
+    tasks_dir: Path,
+    incoming: dict[str, TaskHeader],
+    pending_manifest: str | bytes | None = None,
+) -> dict[str, TaskHeader]:
+    """Overlay pending and incoming replacements by filename, retaining edges."""
+    paths = {path.name: path for path in tasks_dir.glob("PR-*.md") if path.is_file()}
+    if pending_manifest:
+        try:
+            manifest = json.loads(pending_manifest)
+            files = manifest.get("files", [])
+            staging = manifest.get("staging_dir")
+            if isinstance(files, list) and isinstance(staging, str):
+                for fname in files:
+                    if isinstance(fname, str) and re.fullmatch(_TASK_UPLOAD_PATTERN, fname):
+                        path = Path(staging) / fname
+                        if path.is_file():
+                            paths[fname] = path
+        except (ValueError, TypeError, AttributeError):
+            pass
+    headers = {
+        fname: header
+        for fname, path in paths.items()
+        if fname not in incoming
+        for header in [_parse_existing_task_header(path)]
+        if header is not None
+    }
+    for fname, header in incoming.items():
+        # Admission must use the same terminal-status preservation as staging.
+        if preserve_terminal_status_on_collision(tasks_dir / fname, "")[1] == "DONE":
+            header = replace(header, frontmatter_status="done")
+        headers[fname] = header
+    return headers
+
+
+def validate_effective_task_graph(
+    headers: dict[str, TaskHeader], *, merged_pr_ids: set[str],
+) -> dict[str, list[str]]:
+    """Validate identities and the executable graph using canonical DAG rules.
+
+    Completed tasks are leaves. Unstructured history is ignored by the reader;
+    it cannot establish dependency completion merely by existing on disk.
+    """
+    errors: dict[str, list[str]] = {}
+    known = {header.pr_id for header in headers.values()}
+    completed = merged_pr_ids | {
+        header.pr_id for header in headers.values() if header.frontmatter_status == "done"
+    }
+    completed |= merged_split_parent_aliases(
+        structured_pr_ids=known, merged_pr_ids=merged_pr_ids,
+    )
+    branches: dict[str, str] = {}
+    for fname, header in headers.items():
+        if Path(fname).stem != header.pr_id:
+            errors.setdefault(fname, []).append(
+                f"header PR ID {header.pr_id!r} does not match task file {Path(fname).stem!r}"
+            )
+        if header.pr_id in completed:
+            continue
+        if header.branch in branches:
+            errors.setdefault(fname, []).append(
+                f"duplicate branch {header.branch!r}: used by {branches[header.branch]} and {header.pr_id}"
+            )
+        branches[header.branch] = header.pr_id
+        for dependency in header.depends_on:
+            if dependency not in known | completed:
+                errors.setdefault(fname, []).append(
+                    f"Depends on {dependency} which is not in this upload and not in tasks/."
+                )
+    dag_headers = [
+        replace(header, depends_on=[] if header.pr_id in completed else [
+            dep for dep in header.depends_on if dep not in completed
+        ])
+        for header in headers.values()
+    ]
+    try:
+        build_task_dag(dag_headers)
+    except ValueError as exc:
+        for fname in headers:
+            errors.setdefault(fname, []).append(str(exc))
+    return errors

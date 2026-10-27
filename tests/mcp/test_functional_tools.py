@@ -304,3 +304,50 @@ def test_functional_tools_registered_with_mcp_server():
     tool_names = {t.name for t in tools}
     assert "validate_task_spec" in tool_names
     assert "suggest_next_pr_number" in tool_names
+
+
+def test_validate_task_spec_context_uses_replacement_graph(tmp_path, monkeypatch):
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    monkeypatch.setattr(functional, "get_merged_pr_ids", lambda *args: set())
+    tasks = tmp_path / "owner__repo" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "PR-998.md").write_text(_VALID_SPEC.replace("PR-999", "PR-998").replace("pr-999", "pr-998").replace(
+        "- Depends on: none", "- Depends on: PR-999"))
+    cyclic = _VALID_SPEC.replace("- Depends on: none", "- Depends on: PR-998")
+    assert functional.validate_task_spec(cyclic)["valid"]
+    result = functional.validate_task_spec(cyclic, repo="owner__repo")
+    assert not result["valid"]
+    assert any("dependency cycle" in issue for issue in result["errors"])
+    assert functional.validate_task_spec(_VALID_SPEC, repo="owner__repo")["valid"]
+    assert not functional.validate_task_spec(
+        _VALID_SPEC, repo="owner__repo", filename="PR-998.md",
+    )["valid"]
+    with pytest.raises(ValueError, match="Invalid repo slug"):
+        functional.validate_task_spec(_VALID_SPEC, repo="../escape")
+
+
+def test_validate_task_spec_context_without_git_evidence(tmp_path, monkeypatch):
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    (tmp_path / "owner__repo").mkdir()
+    def unavailable(*args):
+        raise RuntimeError("Git history unavailable")
+    monkeypatch.setattr(functional, "get_merged_pr_ids", unavailable)
+    assert functional.validate_task_spec(_VALID_SPEC, repo="owner__repo")["valid"]
+    dependent = _VALID_SPEC.replace("- Depends on: none", "- Depends on: PR-001")
+    result = functional.validate_task_spec(dependent, repo="owner__repo")
+    assert not result["valid"]
+    assert any("Depends on PR-001" in error for error in result["errors"])
+
+
+def test_validate_task_spec_rejects_unavailable_or_invalid_context(tmp_path, monkeypatch):
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    with pytest.raises(ValueError, match="context unavailable"):
+        functional.validate_task_spec(_VALID_SPEC, repo="owner__missing")
+    with pytest.raises(ValueError, match="Invalid task filename"):
+        functional.validate_task_spec(_VALID_SPEC, filename="../PR-999.md")

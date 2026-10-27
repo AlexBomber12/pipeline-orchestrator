@@ -21,6 +21,12 @@ from src.queue_parser import (
     parse_task_header,
 )
 from src.task_budget import validate_task_frontmatter_budget
+from src.task_status import get_merged_pr_ids
+from src.web.services.upload_validation import (
+    _TASK_UPLOAD_PATTERN,
+    effective_task_headers,
+    validate_effective_task_graph,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +59,9 @@ _REPO_SLUG_PATTERN = re.compile(
 
 
 @mcp.tool()
-def validate_task_spec(content: str) -> dict:
+def validate_task_spec(
+    content: str, repo: str | None = None, filename: str | None = None,
+) -> dict:
     """Validate a candidate task file body against the canonical schema.
 
     Wraps ``src.queue_parser.parse_task_header``. Returns a structured
@@ -67,6 +75,11 @@ def validate_task_spec(content: str) -> dict:
             ``- Depends on:``, ``- Priority:``, ``- Coder:``).
 
     Returns:
+        Repository context validates the candidate replacement against stored
+        tasks and Git completion evidence. Pending web uploads are not visible
+        in this read-only MCP container. Without ``repo``, only the body is
+        validated; ``filename`` defaults to the parsed ID plus ``.md``.
+
         A dict with four keys:
 
         - ``valid``: ``True`` when the header and declared budget validate
@@ -83,6 +96,12 @@ def validate_task_spec(content: str) -> dict:
           ``rule``) for each AGENTS.md anti-pattern matched in the
           spec body; empty list otherwise. PR-259.
     """
+    if repo is not None and not _REPO_SLUG_PATTERN.fullmatch(repo):
+        raise ValueError(f"Invalid repo slug: {repo!r}")
+    if filename is not None and not re.fullmatch(_TASK_UPLOAD_PATTERN, filename):
+        raise ValueError(f"Invalid task filename: {filename!r}")
+    if repo is not None and not (_REPOS_ROOT / repo).is_dir():
+        raise ValueError(f"Repository context unavailable: {repo!r}")
     # parse_task_header reads from disk; round-trip through a temp file
     # so the wrapper stays in src/mcp/ without modifying queue_parser.
     with tempfile.NamedTemporaryFile(
@@ -101,6 +120,22 @@ def validate_task_spec(content: str) -> dict:
                 content, complexity=header.complexity
             )
         )
+        if repo is not None:
+            repo_path = _REPOS_ROOT / repo
+            headers = effective_task_headers(
+                repo_path / "tasks", {filename or f"{header.pr_id}.md": header},
+            )
+            candidates = {
+                pr_id for task in headers.values() for pr_id in (task.pr_id, *task.depends_on)
+            }
+            try:
+                merged = set(get_merged_pr_ids(str(repo_path), "HEAD", candidates))
+            except (OSError, RuntimeError):
+                merged = set()
+            graph_errors = validate_effective_task_graph(headers, merged_pr_ids=merged)
+            schema_errors.extend(
+                f"{fname}: {issue}" for fname, issues in graph_errors.items() for issue in issues
+            )
     finally:
         tmp_path.unlink(missing_ok=True)
 

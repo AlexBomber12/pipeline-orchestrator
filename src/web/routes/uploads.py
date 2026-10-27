@@ -38,7 +38,7 @@ from src.queue_parser import (
     parse_task_header,
 )
 from src.task_budget import validate_task_frontmatter_budget
-from src.task_status import get_merged_pr_ids, merged_split_parent_aliases
+from src.task_status import get_merged_pr_ids
 from src.utils import repo_slug_from_url
 from src.web.services.upload_validation import (
     _ALLOWED_TASK_PATTERN,
@@ -46,8 +46,10 @@ from src.web.services.upload_validation import (
     _build_upload_success_message,
     _format_upload_message_lines,
     _upload_feedback_target,
+    effective_task_headers,
     preserve_terminal_status_on_collision,
     sweep_abandoned_staging,
+    validate_effective_task_graph,
 )
 
 router = APIRouter()
@@ -138,87 +140,6 @@ def _is_task_in_error_state(repo_state: RepoState, task_id: str) -> bool:
             for task in repo_state.current_queue
         )
     return False
-
-
-def _existing_task_ids(tasks_dir: Path) -> set[str]:
-    if not tasks_dir.is_dir():
-        return set()
-    return {
-        header.pr_id
-        for path in tasks_dir.glob("PR-*.md")
-        if path.is_file()
-        for header in [_parse_existing_task_header(path)]
-        if header is not None
-    }
-
-
-def _parse_existing_task_header(path: Path) -> TaskHeader | None:
-    try:
-        return parse_task_header(path)
-    except QueueValidationError:
-        return _parse_legacy_existing_task_header(path)
-    except (OSError, UnicodeDecodeError):
-        return None
-
-
-def _parse_legacy_existing_task_header(path: Path) -> TaskHeader | None:
-    try:
-        lines = path.read_text(encoding="utf-8").splitlines()
-    except (OSError, UnicodeDecodeError):
-        return None
-
-    header_match: re.Match[str] | None = None
-    branch = ""
-    for raw_line in lines:
-        line = raw_line.rstrip()
-        if header_match is None:
-            header_match = re.match(r"^#\s+(PR-[A-Za-z0-9_.-]+):\s*(.+?)\s*$", line)
-            continue
-        if not line.strip():
-            continue
-        branch_match = re.match(r"^Branch\s*:\s*(.*?)\s*$", line)
-        if branch_match:
-            branch = branch_match.group(1).strip()
-            break
-        if line.startswith("#") or line.startswith("- "):
-            break
-    if header_match is None or not branch:
-        return None
-    return TaskHeader(
-        pr_id=header_match.group(1),
-        title=header_match.group(2),
-        branch=branch,
-        task_type="feature",
-        complexity="medium",
-        depends_on=[],
-        priority=3,
-        coder="any",
-    )
-
-
-def _pending_upload_task_ids(raw_manifest: str | bytes | None) -> set[str]:
-    if not raw_manifest:
-        return set()
-    try:
-        manifest = json.loads(raw_manifest)
-    except (json.JSONDecodeError, TypeError, UnicodeDecodeError):
-        return set()
-    files = manifest.get("files", [])
-    staging_dir_raw = manifest.get("staging_dir")
-    if not isinstance(files, list) or not isinstance(staging_dir_raw, str):
-        return set()
-    staging_dir = Path(staging_dir_raw)
-    return {
-        header.pr_id
-        for fname in files
-        if (
-            isinstance(fname, str)
-            and re.fullmatch(_TASK_UPLOAD_PATTERN, fname)
-            and (staging_dir / fname).is_file()
-        )
-        for header in [_parse_existing_task_header(staging_dir / fname)]
-        if header is not None
-    }
 
 
 def _upload_commit_subject(subject: str, uploaded_count: int) -> str:
@@ -364,36 +285,24 @@ def _extend_validation_errors(
         errors_by_file.setdefault(fname, []).extend(issues)
 
 
-def _dependency_validation_errors(
-    parsed_headers: dict[str, TaskHeader],
-    *,
-    existing_task_ids: set[str],
-    pending_task_ids: set[str],
-    batch_task_ids: set[str],
-    merged_pr_ids: set[str],
+async def _graph_validation_errors(
+    repo_path: str, repo_branch: str, incoming: dict[str, TaskHeader],
+    pending_manifest: str | bytes | None,
 ) -> dict[str, list[str]]:
-    merged_parent_aliases = merged_split_parent_aliases(
-        structured_pr_ids=existing_task_ids | pending_task_ids | batch_task_ids,
-        merged_pr_ids=merged_pr_ids,
-    )
-    visible_task_ids = (
-        existing_task_ids
-        | pending_task_ids
-        | batch_task_ids
-        | merged_pr_ids
-        | merged_parent_aliases
-    )
-    errors_by_file: dict[str, list[str]] = {}
-    for fname, header in parsed_headers.items():
-        for dependency in header.depends_on:
-            if dependency not in visible_task_ids:
-                _add_validation_error(
-                    errors_by_file,
-                    fname,
-                    f"Depends on {dependency} which is not in this upload "
-                    "and not in tasks/.",
-                )
-    return errors_by_file
+    headers = effective_task_headers(Path(repo_path) / "tasks", incoming, pending_manifest)
+    candidates = {
+        pr_id for header in headers.values() for pr_id in (header.pr_id, *header.depends_on)
+    }
+    if candidates:
+        try:
+            merged = set(await asyncio.to_thread(
+                get_merged_pr_ids, repo_path, repo_branch, candidates,
+            ))
+        except Exception:
+            merged = set()
+    else:
+        merged = set()
+    return validate_effective_task_graph(headers, merged_pr_ids=merged)
 
 
 @router.post("/repos/{name}/upload-tasks", response_class=HTMLResponse)
@@ -587,12 +496,14 @@ async def upload_tasks(
         content = b"".join(chunks)
         file_contents.append((fname, content))
 
+    errors_by_file: dict[str, list[str]] = {}
     task_uploads: dict[str, bytes] = {}
     for fname, content in file_contents:
         if re.fullmatch(_TASK_UPLOAD_PATTERN, fname):
+            if fname in task_uploads:
+                _add_validation_error(errors_by_file, fname, "duplicate task id/filename in upload")
             task_uploads[fname] = content
 
-    errors_by_file: dict[str, list[str]] = {}
     parsed_task_ids: dict[str, str] = {}
     parsed_task_texts: dict[str, str] = {}
     parsed_headers: dict[str, TaskHeader] = {}
@@ -630,43 +541,13 @@ async def upload_tasks(
                 f"{violation.rule}",
             )
 
-    batch_task_ids = {header.pr_id for header in parsed_headers.values()}
-    existing_task_ids = _existing_task_ids(Path(repo_path) / "tasks")
     try:
-        pending_task_ids = _pending_upload_task_ids(
-            await redis_client.get(upload_pending(name))
-        )
+        pending_manifest = await redis_client.get(upload_pending(name))
     except Exception:
-        pending_task_ids = set()
-    dependency_candidates = {
-        dependency
-        for header in parsed_headers.values()
-        for dependency in header.depends_on
-    }
-    if dependency_candidates:
-        try:
-            merged_pr_ids = set(
-                await asyncio.to_thread(
-                    get_merged_pr_ids,
-                    repo_path,
-                    repo_branch,
-                    dependency_candidates,
-                )
-            )
-        except Exception:
-            merged_pr_ids = set()
-    else:
-        merged_pr_ids = set()
-    _extend_validation_errors(
-        errors_by_file,
-        _dependency_validation_errors(
-            parsed_headers,
-            existing_task_ids=existing_task_ids,
-            pending_task_ids=pending_task_ids,
-            batch_task_ids=batch_task_ids,
-            merged_pr_ids=merged_pr_ids,
-        )
-    )
+        pending_manifest = None
+    _extend_validation_errors(errors_by_file, await _graph_validation_errors(
+        repo_path, repo_branch, parsed_headers, pending_manifest,
+    ))
 
     if errors_by_file:
         validation_errors = [
@@ -758,12 +639,7 @@ async def upload_tasks(
         if not re.fullmatch(_TASK_UPLOAD_PATTERN, fname):
             rewritten_contents.append((fname, content))
             continue
-        # Reuse the validated UTF-8 text rather than re-decoding ``content``.
-        # ``task_uploads`` deduplicates by filename (last entry wins), so a zip
-        # carrying two ``PR-xxx.md`` entries where the earlier copy holds
-        # non-UTF-8 bytes still reaches this loop with the raw bytes — decoding
-        # them here would raise ``UnicodeDecodeError`` and return 500 instead of
-        # the 4xx the gate above already produced for the deduped entry.
+        # Use the text already decoded and validated above.
         upload_text = parsed_task_texts[fname]
         new_text, preserved_status = preserve_terminal_status_on_collision(
             tasks_dir / fname, upload_text
@@ -789,6 +665,26 @@ async def upload_tasks(
     # dashboard's read-only contract with the repository working trees.
     lock = _get_upload_lock(name)
     async with lock:
+        pending_key = upload_pending(name)
+        try:
+            existing_raw = await redis_client.get(pending_key)
+        except Exception:
+            return _render_upload_error(
+                request, "Cannot validate pending task graph (Redis error). Upload blocked.",
+                503, repo_name=name,
+            )
+        graph_errors = await _graph_validation_errors(
+            repo_path, repo_branch, parsed_headers, existing_raw,
+        )
+        if graph_errors:
+            validation_errors = [
+                {"file": fname, "errors": issues}
+                for fname, issues in sorted(graph_errors.items())
+            ]
+            return _render_upload_error(
+                request, _format_task_validation_errors(validation_errors), 400,
+                repo_name=name, validation_errors=validation_errors,
+            )
         # Best-effort sweep of abandoned staging directories.
         # Collect active staging dirs for ALL repos so the sweep does not
         # accidentally remove another repo's still-pending directory.
@@ -823,46 +719,6 @@ async def upload_tasks(
             uploaded_filenames = [fn for fn, _ in file_contents]
             manifest_filenames = list(uploaded_filenames)
             manifest_task_hashes: dict[str, str] = {}
-            pending_key = upload_pending(name)
-            try:
-                existing_raw = await redis_client.get(pending_key)
-            except Exception:
-                existing_raw = None
-
-            locked_existing_task_ids = _existing_task_ids(Path(repo_path) / "tasks")
-            if dependency_candidates:
-                try:
-                    locked_merged_pr_ids = set(
-                        await asyncio.to_thread(
-                            get_merged_pr_ids,
-                            repo_path,
-                            repo_branch,
-                            dependency_candidates,
-                        )
-                    )
-                except Exception:
-                    locked_merged_pr_ids = set()
-            else:
-                locked_merged_pr_ids = set()
-            locked_dependency_errors = _dependency_validation_errors(
-                parsed_headers,
-                existing_task_ids=locked_existing_task_ids,
-                pending_task_ids=_pending_upload_task_ids(existing_raw),
-                batch_task_ids=batch_task_ids,
-                merged_pr_ids=locked_merged_pr_ids,
-            )
-            if locked_dependency_errors:
-                validation_errors = [
-                    {"file": fname, "errors": issues}
-                    for fname, issues in sorted(locked_dependency_errors.items())
-                ]
-                return _render_upload_error(
-                    request,
-                    _format_task_validation_errors(validation_errors),
-                    400,
-                    repo_name=name,
-                    validation_errors=validation_errors,
-                )
 
             if existing_raw:
                 try:
