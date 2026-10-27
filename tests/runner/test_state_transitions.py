@@ -1244,20 +1244,23 @@ def test_handle_coding_honors_persisted_stop_after_fast_cli_exit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     h._patch_subprocess(monkeypatch)
-    monkeypatch.setattr(
-        claude_cli,
-        "run_auto_pr_async",
-        h._async_cli_result(1, "", "coder failed fast"),
-    )
-
     runner = h._make_runner()
+    runner.state.state = PipelineState.CODING
     runner.state.current_task = QueueTask(
         pr_id="PR-127",
         title="Pause controls",
         status=TaskStatus.DOING,
         branch="pr-127-control-endpoints-backend",
     )
-    runner.redis.store[f"control:{runner.name}:stop"] = "1"
+
+    async def fast_exit_with_stop(*args: object, **kwargs: object) -> tuple[int, str, str]:
+        runner.redis.store[f"control:{runner.name}:stop"] = "1"
+        runner.redis.store[f"pipeline:{runner.name}"] = runner.state.model_copy(
+            update={"user_paused": True}
+        ).model_dump_json()
+        return 1, "", "coder failed fast"
+
+    monkeypatch.setattr(claude_cli, "run_auto_pr_async", fast_exit_with_stop)
 
     async def stale_stop_monitor(
         _cli_task: asyncio.Task[tuple[int, str, str]],

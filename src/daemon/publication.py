@@ -150,7 +150,7 @@ async def resolve(runner: PipelineRunner, *, resolve_terminal: bool) -> bool:
 
 
 async def _operator_paused(runner: PipelineRunner) -> bool:
-    """Latch Stop durably before consuming its expiring control signal."""
+    """Latch legacy Stop durably; publish_state acknowledges after cleanup."""
     await runner._refresh_user_paused_from_redis()
     if not runner.state.user_paused:
         state_key, stop_key = pipeline_state(runner.name), control_stop(runner.name)
@@ -164,7 +164,6 @@ async def _operator_paused(runner: PipelineRunner) -> bool:
             persisted.state = PipelineState.PAUSED
             pipe.multi()
             pipe.set(state_key, persisted.model_dump_json())
-            pipe.delete(stop_key)
             return True
 
         # Watch both keys so a concurrent Play cannot be overwritten by a
