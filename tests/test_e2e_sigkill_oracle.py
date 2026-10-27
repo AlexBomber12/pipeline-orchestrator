@@ -2,6 +2,7 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -46,6 +47,11 @@ def test_sigkill_recovery_after_discovery_retry(monkeypatch, outcome):
     ))
     monkeypatch.setattr(scenario, "subprocess", SimpleNamespace(run=run))
     monkeypatch.setattr(scenario, "coder_shim", lambda mode: nullcontext())
+    # Replay the shim's matching start handshake without reading runtime files.
+    coder_started = Mock(side_effect=lambda pr_id, branch: (
+        pr_id, branch,
+    ) == ("PR-1", "pr-1-e2e-sigkill-recovery"))
+    monkeypatch.setattr(scenario, "crash_coder_started", coder_started)
     monkeypatch.setattr(scenario, "_is_daemon_running", lambda: "true" if restarted else "false")
     monkeypatch.setattr(scenario, "_daemon_exit_code", lambda: 137)
 
@@ -63,3 +69,5 @@ def test_sigkill_recovery_after_discovery_retry(monkeypatch, outcome):
         with pytest.raises(AssertionError, match=message):
             exercise()
         assert elapsed == (136 if outcome == "missing_crash" else scenario.RECOVERY_DEADLINE_SEC)
+
+    coder_started.assert_called_once_with("PR-1", "pr-1-e2e-sigkill-recovery")
