@@ -1072,3 +1072,31 @@ def test_upload_unverifiable_receipts_block_admission(repo_dir):
     response = _post_upload([_task_file()])
     assert response.status_code == 400
     assert "Cannot verify completion records" in response.text
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_branch_merge_evidence_releases_only_matching_task(
+    repo_dir, monkeypatch, merged,
+):
+    from src.task_status import get_merged_branch_pr_ids
+
+    monkeypatch.setattr(upload_routes, "get_merged_pr_ids", lambda *args: set())
+    monkeypatch.setattr(upload_routes, "get_merged_branch_pr_ids", get_merged_branch_pr_ids)
+
+    def branches(repo, candidates):
+        assert repo == "example/alpha"
+        assert candidates == {"pr-001-example-task"}
+        return candidates if merged else set()
+
+    monkeypatch.setattr("src.task_status.gh_pr_get_merged_branches", branches)
+    tasks = repo_dir / "tasks"
+    tasks.mkdir()
+    # No receipt or prefixed merge subject; the completed task has obsolete edges.
+    (tasks / "PR-001.md").write_bytes(_task_file(depends_on="PR-999")[1][1])
+    second = _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")
+    response = _post_upload([("files", ("PR-002.md", second[1][1].replace(
+        b"pr-002-example-task", b"pr-001-example-task"), "text/markdown"))])
+    assert response.status_code == (200 if merged else 400)
+    if not merged:
+        assert "duplicate branch" in response.text
+        assert "Depends on PR-999" in response.text

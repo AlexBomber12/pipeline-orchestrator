@@ -105,6 +105,23 @@ def _resolve_merged_state(
     )
 
 
+def get_merged_branch_pr_ids(owner_repo: str, headers: Iterable[TaskHeader]) -> set[str]:
+    """Return task IDs backed by the daemon's verified merged-branch evidence."""
+    headers = list(headers)
+    try:
+        branches = gh_pr_get_merged_branches(
+            owner_repo, {header.branch for header in headers if header.branch},
+        )
+    except (GhPrMergedBranchesUnavailable, ValueError, subprocess.SubprocessError, OSError):
+        # Missing evidence never releases branch reservations or dependency edges.
+        return set()
+    return {
+        header.pr_id for header in headers
+        if header.branch in branches
+        and _branch_name_matches_task_pr_id(header.pr_id, header.branch)
+    }
+
+
 def derive_task_status(
     task_header: TaskHeader,
     state: MergedState,

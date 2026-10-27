@@ -22,7 +22,7 @@ from src.queue_parser import (
     parse_task_header,
 )
 from src.task_budget import validate_task_frontmatter_budget
-from src.task_status import get_merged_pr_ids
+from src.task_status import get_merged_branch_pr_ids, get_merged_pr_ids
 from src.utils import repo_slug_from_url
 from src.web.services.upload_validation import (
     _TASK_UPLOAD_PATTERN,
@@ -146,6 +146,7 @@ def validate_task_spec(
             except (OSError, RuntimeError):
                 merged = set()
             if repo_branch is not None:
+                merged |= get_merged_branch_pr_ids(repo.replace("__", "/", 1), headers.values())
                 try:
                     merged |= effective_recorded_completions(
                         str(repo_path), repo_branch, candidates,

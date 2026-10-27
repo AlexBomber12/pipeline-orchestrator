@@ -162,3 +162,10 @@ def record_task_completion():
         git("update-ref", f"refs/remotes/origin/{base}", "HEAD")
 
     return record
+
+
+@pytest.fixture(autouse=True)
+def isolate_admission_merge_probes(monkeypatch):
+    """Admission tests opt into branch evidence without contacting GitHub."""
+    monkeypatch.setattr("src.web.routes.uploads.get_merged_branch_pr_ids", lambda *args: set())
+    monkeypatch.setattr("src.mcp.tools.functional.get_merged_branch_pr_ids", lambda *args: set())

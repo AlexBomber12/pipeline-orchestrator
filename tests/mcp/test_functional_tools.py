@@ -484,3 +484,37 @@ def test_context_unverifiable_receipts_block_admission(tmp_path, monkeypatch):
     result = functional.validate_task_spec(_VALID_SPEC, repo="owner__repo")
     assert not result["valid"]
     assert any("Cannot verify completion records" in error for error in result["errors"])
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_context_branch_merge_evidence_releases_only_matching_task(tmp_path, monkeypatch, merged):
+    from src.config import AppConfig, RepoConfig
+    from src.mcp.tools import functional
+    from src.task_status import get_merged_branch_pr_ids
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    monkeypatch.setattr(functional, "load_config", lambda: AppConfig(
+        repositories=[RepoConfig(url="https://github.com/owner/repo", branch="release")],
+    ))
+    monkeypatch.setattr(functional, "get_merged_pr_ids", lambda *args: set())
+    monkeypatch.setattr(functional, "get_merged_branch_pr_ids", get_merged_branch_pr_ids)
+
+    def branches(repo, candidates):
+        assert repo == "owner/repo"
+        assert candidates == {"pr-998-example"}
+        return candidates if merged else set()
+
+    monkeypatch.setattr("src.task_status.gh_pr_get_merged_branches", branches)
+    tasks = tmp_path / "owner__repo/tasks"
+    tasks.mkdir(parents=True)
+    stored = _VALID_SPEC.replace("PR-999", "PR-998").replace("pr-999", "pr-998")
+    (tasks / "PR-998.md").write_text(
+        stored.replace("- Depends on: none", "- Depends on: PR-001")
+    )
+    incoming = _VALID_SPEC.replace("Branch: pr-999-example", "Branch: pr-998-example")
+    incoming = incoming.replace("- Depends on: none", "- Depends on: PR-998")
+    result = functional.validate_task_spec(incoming, repo="owner__repo")
+    assert result["valid"] is merged
+    if not merged:
+        assert any("duplicate branch" in error for error in result["errors"])
+        assert any("Depends on PR-001" in error for error in result["errors"])

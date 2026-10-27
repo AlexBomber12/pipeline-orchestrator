@@ -38,7 +38,7 @@ from src.queue_parser import (
     parse_task_header,
 )
 from src.task_budget import validate_task_frontmatter_budget
-from src.task_status import get_merged_pr_ids
+from src.task_status import get_merged_branch_pr_ids, get_merged_pr_ids
 from src.utils import repo_slug_from_url
 from src.web.services.upload_validation import (
     _ALLOWED_TASK_PATTERN,
@@ -303,6 +303,9 @@ async def _graph_validation_errors(
             merged = set()
     else:
         merged = set()
+    merged |= await asyncio.to_thread(
+        get_merged_branch_pr_ids, Path(repo_path).name.replace("__", "/", 1), headers.values(),
+    )
     try:
         merged |= await asyncio.to_thread(
             effective_recorded_completions, repo_path, repo_branch, candidates,
