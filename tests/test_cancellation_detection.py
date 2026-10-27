@@ -93,6 +93,9 @@ class _FakeRedisWithPipeline:
     def pipeline(self) -> _FakePipeline:
         return _FakePipeline(self)
 
+    async def get(self, key: str) -> str | None:
+        return self.values.get(key)
+
     async def delete(self, key: str) -> int:
         if key in self.values:
             del self.values[key]

@@ -183,6 +183,23 @@ async def safe_record_cancellation_cause(
     line through ``log`` (defaults to module logger). PR-253.
     """
     try:
+        # A freshly constructed cause can be a polling/status/reason update.
+        # Keep the failure timestamp across such writes and daemon restarts.
+        # A new dispatch (or clearing the cause for retry) starts a new event.
+        # Explicit timestamps identify replays or independently dated failures.
+        if not cause.created_at:
+            existing = await get_cancellation_cause(
+                redis_client, repo_slug, task_id, refresh_ttl=False
+            )
+            if existing is not None:
+                started_at = await get_current_run_started_at(
+                    redis_client, repo_slug, task_id
+                )
+                created_at = datetime.fromisoformat(existing.created_at)
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+                if started_at is None or created_at >= started_at:
+                    cause.created_at = existing.created_at
         await record_cancellation_cause(
             redis_client, repo_slug, task_id, cause
         )
