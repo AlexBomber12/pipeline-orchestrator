@@ -2,6 +2,7 @@
 
 import asyncio
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from uuid import uuid4
 
 import redis.asyncio as aioredis
@@ -130,4 +131,7 @@ def test_global_pause_concurrency_in_isolated_redis() -> None:
         async with aioredis.Redis(host=address, db=15, decode_responses=True) as redis:
             await _exercise_concurrent_pause(redis)
 
-    asyncio.run(exercise())
+    # Playwright's session-scoped sync fixture may own this thread's event loop.
+    # Create, use and close the Redis client on a dedicated thread and loop.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pool.submit(lambda: asyncio.run(exercise())).result(timeout=30)
