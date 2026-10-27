@@ -14,6 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Annotated
 
+from src.config import load_config
 from src.mcp.scans import scan_for_conflicts
 from src.mcp.server import mcp
 from src.queue_parser import (
@@ -22,6 +23,7 @@ from src.queue_parser import (
 )
 from src.task_budget import validate_task_frontmatter_budget
 from src.task_status import get_merged_pr_ids
+from src.utils import repo_slug_from_url
 from src.web.services.upload_validation import (
     _TASK_UPLOAD_PATTERN,
     effective_task_headers,
@@ -128,8 +130,18 @@ def validate_task_spec(
             candidates = {
                 pr_id for task in headers.values() for pr_id in (task.pr_id, *task.depends_on)
             }
+            repo_branch = next(
+                (entry.branch for entry in load_config().repositories
+                 if repo_slug_from_url(entry.url) == repo),
+                None,
+            )
             try:
-                merged = set(get_merged_pr_ids(str(repo_path), "HEAD", candidates))
+                # An unconfigured checkout supplies no completion evidence.
+                # Its HEAD (or remote default) may contain unmerged coder work.
+                merged = (
+                    set(get_merged_pr_ids(str(repo_path), repo_branch, candidates))
+                    if repo_branch is not None else set()
+                )
             except (OSError, RuntimeError):
                 merged = set()
             graph_errors = validate_effective_task_graph(headers, merged_pr_ids=merged)

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -333,6 +334,11 @@ def test_validate_task_spec_context_without_git_evidence(tmp_path, monkeypatch):
 
     monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
     (tmp_path / "owner__repo").mkdir()
+    from src.config import AppConfig, RepoConfig
+
+    monkeypatch.setattr(functional, "load_config", lambda: AppConfig(
+        repositories=[RepoConfig(url="https://github.com/owner/repo")],
+    ))
     def unavailable(*args):
         raise RuntimeError("Git history unavailable")
     monkeypatch.setattr(functional, "get_merged_pr_ids", unavailable)
@@ -351,3 +357,55 @@ def test_validate_task_spec_rejects_unavailable_or_invalid_context(tmp_path, mon
         functional.validate_task_spec(_VALID_SPEC, repo="owner__missing")
     with pytest.raises(ValueError, match="Invalid task filename"):
         functional.validate_task_spec(_VALID_SPEC, filename="../PR-999.md")
+
+
+@pytest.mark.parametrize("remote_default", [False, True])
+def test_validate_task_spec_completion_uses_configured_base(
+    tmp_path, monkeypatch, remote_default,
+):
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "repositories:\n- url: https://github.com/owner/repo\n  branch: release\n"
+    )
+    monkeypatch.setenv("PO_CONFIG_PATH", str(config_path))
+    repo_path = tmp_path / "owner__repo"
+    repo_path.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=repo_path, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "-b", "release")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    git("commit", "--allow-empty", "-m", "Initial base")
+    git("checkout", "-b", "active-coder")
+    git("commit", "--allow-empty", "-m", "PR-998: unmerged task")
+    if remote_default:
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
+        git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+
+    tasks = repo_path / "tasks"
+    tasks.mkdir()
+    stored = _VALID_SPEC.replace("PR-999", "PR-998").replace("pr-999", "pr-998")
+    (tasks / "PR-998.md").write_text(
+        stored.replace("- Depends on: none", "- Depends on: PR-999")
+    )
+    cyclic = _VALID_SPEC.replace("- Depends on: none", "- Depends on: PR-998")
+    result = functional.validate_task_spec(cyclic, repo="owner__repo")
+    assert not result["valid"]
+    assert any("dependency cycle" in error for error in result["errors"])
+
+    shared_branch = _VALID_SPEC.replace("Branch: pr-999-example", "Branch: pr-998-example")
+    result = functional.validate_task_spec(shared_branch, repo="owner__repo")
+    assert not result["valid"]
+    assert any("branch" in error.lower() for error in result["errors"])
+
+    # Completion on the configured base still removes completed nodes.
+    git("update-ref", "refs/remotes/origin/release", "HEAD")
+    assert functional.validate_task_spec(cyclic, repo="owner__repo")["valid"]
+    assert functional.validate_task_spec(shared_branch, repo="owner__repo")["valid"]
