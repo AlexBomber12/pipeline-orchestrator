@@ -1,324 +1,140 @@
 from __future__ import annotations
 
+import json
+from dataclasses import asdict, replace
 from typing import Any
 
 import pytest
-
+from src.metrics import RunRecord
 from src.models import QueueTask, TaskStatus
 from src.web import app as web_app
 from src.web.routes import repo_control
 
 
-class FakeRedis:
-    def __init__(
-        self,
-        *,
-        zsets: dict[str, list[tuple[str, int]]] | None = None,
-        hashes: dict[str, dict[str, object]] | None = None,
-    ) -> None:
-        self.zsets = zsets or {}
-        self.hashes = hashes or {}
+class MetricsRedis:
+    """Only the writer's SET index and JSON string record transport."""
 
-    async def hget(self, key: str, field: str) -> str | None:
+    def __init__(self, records: list[RunRecord], *, broken_task: str = ""):
+        self.records = records
+        self.broken_task = broken_task
+
+    async def hget(self, key, field):
         return None
 
-    async def zrevrange(self, key: str, start: int, end: int) -> list[str]:
-        entries = sorted(
-            self.zsets.get(key, []),
-            key=lambda entry: entry[1],
-            reverse=True,
-        )
-        return [run_id for run_id, _score in entries][start : end + 1]
+    async def get(self, key):
+        return None
 
-    async def hgetall(self, key: str) -> dict[str, object]:
-        return self.hashes.get(key, {})
+    async def smembers(self, key):
+        if key.endswith(":" + self.broken_task):
+            raise ConnectionError("storage down")
+        return {r.run_id.encode() for r in self.records if key.endswith(":" + r.task_id)}
 
-
-class FailingMetricsRedis(FakeRedis):
-    async def zrevrange(self, key: str, start: int, end: int) -> list[str]:
-        raise RuntimeError("redis unavailable")
+    async def mget(self, keys):
+        return [json.dumps(asdict(r)).encode() for r in self.records
+                if "metrics:run:" + r.run_id in keys]
 
 
-class LegacyMetricsRedis:
-    def __init__(
-        self,
-        *,
-        sets: dict[str, set[object]] | None = None,
-        strings: dict[str, object] | None = None,
-    ) -> None:
-        self.sets = sets or {}
-        self.strings = strings or {}
-
-    async def smembers(self, key: str) -> set[object]:
-        return self.sets.get(key, set())
-
-    async def get(self, key: str) -> object | None:
-        return self.strings.get(key)
+def _record(**changes) -> RunRecord:
+    return replace(RunRecord(
+        run_id="run-1", task_id="PR-001", profile_id="codex:gpt-5:container",
+        task_type="bugfix", complexity="low", started_at="2026-05-01T10:00:00+00:00",
+        ended_at=None, duration_ms=12345, fix_iterations=2, tokens_in=0,
+        tokens_out=0, exit_reason="success_merged", operator_intervention=False,
+        repo_name="example__alpha",
+    ), **changes)
 
 
 def _task(pr_id: str, status: TaskStatus) -> QueueTask:
-    return QueueTask(
-        pr_id=pr_id,
-        title=f"{pr_id} title",
-        status=status,
-        branch=f"{pr_id.lower()}-branch",
-    )
+    return QueueTask(pr_id=pr_id, title=f"{pr_id} title", status=status,
+                     branch=f"{pr_id.lower()}-branch")
 
 
-async def _panel_context(
-    tasks: list[QueueTask],
-    redis_client: FakeRedis,
-) -> dict[str, Any]:
+async def _panel(tasks, redis_client):
     return await repo_control._build_tasks_panel_context(
-        "example__alpha",
-        tasks,
-        redis_client=redis_client,  # type: ignore[arg-type]
-        retry_cap=3,
+        "example__alpha", tasks, redis_client=redis_client, retry_cap=3,
     )
 
 
-def _views(context: dict[str, Any], status: str) -> list[dict[str, Any]]:
-    tasks_by_status = context["tasks_by_status"]
-    assert isinstance(tasks_by_status, dict)
-    views = tasks_by_status[status]
-    assert isinstance(views, list)
-    return views
-
-
-def _redis_with_metrics(
-    pr_id: str = "PR-001",
-    run_id: str = "run-1",
-    *,
-    score: int = 100,
-    record: dict[str, object] | None = None,
-) -> FakeRedis:
-    return FakeRedis(
-        zsets={
-            f"metrics:task_runs:example__alpha:{pr_id}": [(run_id, score)],
-        },
-        hashes={
-            f"metrics:run:{run_id}": record
-            or {
-                "coder": "codex",
-                "model": "gpt-5",
-                "duration_ms": "12345",
-                "fix_iterations": "2",
-                "exit_reason": "merged",
-            },
-        },
-    )
+def _views(context: dict[str, Any], status: str):
+    return context["tasks_by_status"][status]
 
 
 @pytest.mark.asyncio
-async def test_done_view_includes_metrics_when_record_exists() -> None:
-    context = await _panel_context(
-        [_task("PR-001", TaskStatus.DONE)],
-        _redis_with_metrics(),
+@pytest.mark.parametrize("status", [TaskStatus.DONE, TaskStatus.ERROR])
+async def test_latest_failed_fix_is_visible(status):
+    context = await _panel([_task("PR-001", status)], MetricsRedis([
+        _record(ended_at="2026-05-02T10:00:00+00:00"),
+        _record(run_id="run-2", started_at="2026-05-03T10:00:00+00:00",
+                run_phase="fix", exit_reason="error", outcome="failed", cause="CRASH"),
+    ]))
+    metrics = _views(context, status.value.lower())[0]["metrics"]
+    assert metrics == {"coder": "codex", "model": "gpt-5", "duration_ms": 12345,
+                       "fix_iterations": 2, "exit_reason": "error"}
+    rendered = web_app.templates.get_template("components/tasks_panel.html").render(
+        **context,
     )
-
-    assert _views(context, "done")[0]["metrics"] == {
-        "coder": "codex",
-        "model": "gpt-5",
-        "duration_ms": "12345",
-        "fix_iterations": "2",
-        "exit_reason": "merged",
-    }
+    assert "codex" in rendered and "error</span>" in rendered and "2 fix" in rendered
 
 
 @pytest.mark.asyncio
-async def test_done_view_metrics_none_when_no_record() -> None:
-    context = await _panel_context(
-        [_task("PR-001", TaskStatus.DONE)],
-        FakeRedis(),
-    )
+async def test_recency_uses_end_time_then_run_id():
+    records = [
+        _record(run_id="a", ended_at="2026-05-04", duration_ms=10),
+        _record(run_id="z", ended_at="2026-05-04", duration_ms=20),
+        _record(run_id="new-start", started_at="2026-05-03", duration_ms=30),
+    ]
+    for ordered in (records, list(reversed(records))):
+        result = await repo_control._recent_metrics_by_task_id(
+            "example__alpha", MetricsRedis(ordered), ["PR-001"],
+        )
+        assert result["PR-001"]["duration_ms"] == 20
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [TaskStatus.TODO, TaskStatus.DOING])
+async def test_active_tasks_have_no_terminal_metrics(status):
+    context = await _panel([_task("PR-001", status)], MetricsRedis([_record()]))
+    assert "metrics" not in _views(context, status.value.lower())[0]
+
+
+@pytest.mark.asyncio
+async def test_missing_and_down_storage_preserve_tasks_and_unrelated_metrics():
+    tasks = [_task(pr_id, TaskStatus.DONE) for pr_id in ("PR-001", "PR-002", "PR-003")]
+    context = await _panel(tasks, MetricsRedis([_record()], broken_task="PR-002"))
+    views = _views(context, "done")
+    assert [v["pr_id"] for v in views] == [t.pr_id for t in tasks]
+    assert views[0]["metrics"]["coder"] == "codex"
+    assert views[1]["metrics"] is None and views[2]["metrics"] is None
+    assert await repo_control._recent_metrics_by_task_id("example__alpha", None, ["PR-001"]) == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("raw", ["[]", "{", '{"run_id": "incomplete"}', None])
+async def test_bad_or_expired_record_does_not_hide_unrelated_tasks(raw):
+    class BadRecordRedis(MetricsRedis):
+        async def mget(self, keys):
+            if "metrics:run:bad" in keys:
+                return [raw]
+            return await super().mget(keys)
+
+    context = await _panel(
+        [_task("PR-002", TaskStatus.DONE), _task("PR-001", TaskStatus.DONE)],
+        BadRecordRedis([_record(), _record(run_id="bad", task_id="PR-002")]),
+    )
     assert _views(context, "done")[0]["metrics"] is None
+    assert _views(context, "done")[1]["metrics"]["coder"] == "codex"
 
 
 @pytest.mark.asyncio
-async def test_done_view_metrics_picks_most_recent_run() -> None:
-    context = await _panel_context(
-        [_task("PR-001", TaskStatus.DONE)],
-        FakeRedis(
-            zsets={
-                "metrics:task_runs:example__alpha:PR-001": [
-                    ("run-1", 100),
-                    ("run-2", 200),
-                    ("run-3", 300),
-                ],
-            },
-            hashes={
-                "metrics:run:run-1": {"coder": "claude"},
-                "metrics:run:run-2": {"coder": "codex"},
-                "metrics:run:run-3": {"coder": "latest", "model": "gpt-5"},
-            },
-        ),
+@pytest.mark.parametrize("profile,duration", [("", None), ("codex", 0)])
+async def test_unavailable_fields_are_not_defaulted(profile, duration):
+    result = await repo_control._recent_metrics_by_task_id(
+        "example__alpha", MetricsRedis([_record(profile_id=profile, duration_ms=duration)]), ["PR-001"],
     )
-
-    assert _views(context, "done")[0]["metrics"]["coder"] == "latest"
-    assert _views(context, "done")[0]["metrics"]["model"] == "gpt-5"
-
-
-@pytest.mark.asyncio
-async def test_todo_view_metrics_field_absent() -> None:
-    context = await _panel_context(
-        [_task("PR-001", TaskStatus.TODO)],
-        _redis_with_metrics(),
-    )
-
-    assert "metrics" not in _views(context, "todo")[0]
-
-
-@pytest.mark.asyncio
-async def test_doing_view_metrics_field_absent() -> None:
-    context = await _panel_context(
-        [_task("PR-001", TaskStatus.DOING)],
-        _redis_with_metrics(),
-    )
-
-    assert "metrics" not in _views(context, "doing")[0]
-
-
-@pytest.mark.asyncio
-async def test_metrics_dict_handles_missing_subset() -> None:
-    context = await _panel_context(
-        [_task("PR-001", TaskStatus.DONE)],
-        _redis_with_metrics(
-            record={
-                "coder": "codex",
-                "duration_ms": "12345",
-            },
-        ),
-    )
-
-    assert _views(context, "done")[0]["metrics"] == {
-        "coder": "codex",
-        "model": None,
-        "duration_ms": "12345",
-        "fix_iterations": None,
-        "exit_reason": None,
-    }
-
-
-@pytest.mark.asyncio
-async def test_recent_metrics_returns_empty_without_redis() -> None:
-    assert (
-        await repo_control._recent_metrics_by_task_id(
-            "example__alpha",
-            None,
-            ["PR-001"],
-        )
-        == {}
-    )
-
-
-@pytest.mark.asyncio
-async def test_recent_metrics_skips_redis_errors() -> None:
-    assert (
-        await repo_control._recent_metrics_by_task_id(
-            "example__alpha",
-            FailingMetricsRedis(),  # type: ignore[arg-type]
-            ["PR-001"],
-        )
-        == {}
-    )
-
-
-@pytest.mark.asyncio
-async def test_recent_metrics_skips_missing_record_for_run_id() -> None:
-    assert (
-        await repo_control._recent_metrics_by_task_id(
-            "example__alpha",
-            FakeRedis(
-                zsets={
-                    "metrics:task_runs:example__alpha:PR-001": [
-                        ("missing-run", 100),
-                    ],
-                }
-            ),  # type: ignore[arg-type]
-            ["PR-001"],
-        )
-        == {}
-    )
-
-
-@pytest.mark.asyncio
-async def test_metrics_lookup_decodes_bytes_hash_records() -> None:
-    context = await _panel_context(
-        [_task("PR-001", TaskStatus.DONE)],
-        FakeRedis(
-            zsets={
-                "metrics:task_runs:example__alpha:PR-001": [
-                    (b"run-bytes", 100),  # type: ignore[list-item]
-                ],
-            },
-            hashes={
-                "metrics:run:run-bytes": {
-                    b"coder": b"codex",
-                    b"duration_ms": b"12345",
-                },
-            },
-        ),
-    )
-
-    assert _views(context, "done")[0]["metrics"]["coder"] == "codex"
-    assert _views(context, "done")[0]["metrics"]["duration_ms"] == "12345"
-
-
-@pytest.mark.asyncio
-async def test_metrics_lookup_supports_legacy_set_and_json_records() -> None:
-    redis = LegacyMetricsRedis(
-        sets={
-            "metrics:task_runs:example__alpha:PR-001": {
-                "run-old",
-                b"run-new",
-            },
-        },
-        strings={
-            "metrics:run:run-old": (
-                '{"profile_id": "claude:opus:container", '
-                '"started_at": "2026-05-01T10:00:00+00:00", '
-                '"duration_ms": 1000, "fix_iterations": 0, '
-                '"exit_reason": "error"}'
-            ),
-            "metrics:run:run-new": (
-                '{"profile_id": "codex:gpt-5:container", '
-                '"ended_at": "2026-05-02T10:00:00+00:00", '
-                '"duration_ms": 2000, "fix_iterations": 1, '
-                '"exit_reason": "merged"}'
-            ),
-        },
-    )
-
-    context = await _panel_context(
-        [_task("PR-001", TaskStatus.DONE)],
-        redis,  # type: ignore[arg-type]
-    )
-
-    assert _views(context, "done")[0]["metrics"] == {
-        "coder": "codex",
-        "model": "gpt-5",
-        "duration_ms": 2000,
-        "fix_iterations": 1,
-        "exit_reason": "merged",
-    }
-
-
-@pytest.mark.asyncio
-async def test_metrics_lookup_skips_legacy_records_without_json_dict() -> None:
-    redis = LegacyMetricsRedis(
-        sets={"metrics:task_runs:example__alpha:PR-001": {"run-missing", "run-list"}},
-        strings={"metrics:run:run-list": "[]"},
-    )
-
-    assert (
-        await repo_control._recent_metrics_by_task_id(
-            "example__alpha",
-            redis,  # type: ignore[arg-type]
-            ["PR-001"],
-        )
-        == {}
-    )
+    assert result["PR-001"]["duration_ms"] == duration
+    assert result["PR-001"]["model"] is None
+    assert result["PR-001"]["coder"] == (profile or None)
+    assert "cost" not in result["PR-001"]
 
 
 def _render_tasks_panel(task_metrics: dict[str, object] | None) -> str:
@@ -367,3 +183,14 @@ def test_template_omits_metrics_row_when_absent() -> None:
     assert "codex" not in rendered
     assert "gpt-5" not in rendered
     assert "2 fix" not in rendered
+
+
+@pytest.mark.parametrize("duration,expected", [(None, False), (0, True)])
+def test_template_distinguishes_missing_duration_from_zero(duration, expected):
+    rendered = _render_tasks_panel({
+        "coder": None, "model": None, "duration_ms": duration,
+        "fix_iterations": 0, "exit_reason": "error",
+    })
+    assert ("0s</span>" in rendered) is expected
+    assert "0 fix" in rendered
+    assert "$0" not in rendered

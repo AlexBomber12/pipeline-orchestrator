@@ -52,6 +52,7 @@ from src.keyspace import (
     control_stop,
     pipeline_state,
 )
+from src.metrics import MetricsStore, RunRecord
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
 from src.publication_migration import MigrationChanged
 from src.publication_migration import enqueue as enqueue_publication_migration
@@ -936,101 +937,39 @@ async def _recent_metrics_by_task_id(
     if redis_client is None:
         return {}
 
+    store = MetricsStore(redis_client)
     result: dict[str, dict[str, object]] = {}
     for pr_id in task_ids:
         try:
-            latest = await _latest_metrics_run_id(name, redis_client, pr_id)
-            if latest is None:
+            records = await store.list_task_runs(name, pr_id)
+            if not records:
                 continue
-            record = await _load_metrics_record(redis_client, latest)
+            # SET membership has no order. Preserve completion/start recency,
+            # with a deterministic tie-breaker independent of Redis iteration.
+            latest = max(
+                records,
+                key=lambda record: (
+                    record.ended_at or record.started_at or "",
+                    record.run_id,
+                ),
+            )
+            result[pr_id] = _inline_metrics_payload(latest)
         except Exception:
+            # Missing/corrupt records or storage outages must not hide tasks
+            # or metrics belonging to other tasks. Never synthesize defaults.
             continue
-        if record is None:
-            continue
-        result[pr_id] = _inline_metrics_payload(record)
     return result
 
 
-async def _latest_metrics_run_id(
-    name: str,
-    redis_client: aioredis.Redis,
-    pr_id: str,
-) -> str | None:
-    task_runs_key = f"metrics:task_runs:{name}:{pr_id}"
-    zrevrange = getattr(redis_client, "zrevrange", None)
-    if zrevrange is not None:
-        run_ids = await zrevrange(task_runs_key, 0, 0)
-        if run_ids:
-            return _decode_redis_value(run_ids[0])
-
-    smembers = getattr(redis_client, "smembers", None)
-    if smembers is None:
-        return None
-    run_ids = await smembers(task_runs_key)
-    normalized = [_decode_redis_value(run_id) for run_id in run_ids]
-    records: list[tuple[str, dict[str, object]]] = []
-    for run_id in normalized:
-        record = await _load_metrics_record(redis_client, run_id)
-        if record is not None:
-            records.append((run_id, record))
-    if not records:
-        return None
-    records.sort(
-        key=lambda item: (
-            str(item[1].get("ended_at") or item[1].get("started_at") or ""),
-            item[0],
-        ),
-        reverse=True,
-    )
-    return records[0][0]
-
-
-async def _load_metrics_record(
-    redis_client: aioredis.Redis,
-    run_id: str,
-) -> dict[str, object] | None:
-    hgetall = getattr(redis_client, "hgetall", None)
-    if hgetall is not None:
-        record_raw = await hgetall(f"metrics:run:{run_id}")
-        if record_raw:
-            return {
-                _decode_redis_value(key): _decode_redis_value(value)
-                for key, value in record_raw.items()
-            }
-
-    get = getattr(redis_client, "get", None)
-    if get is None:
-        return None
-    raw = await get(f"metrics:run:{run_id}")
-    if raw is None:
-        return None
-    raw_text = _decode_redis_value(raw)
-    decoded = json.loads(raw_text)
-    return decoded if isinstance(decoded, dict) else None
-
-
-def _inline_metrics_payload(record: dict[str, object]) -> dict[str, object]:
-    coder = record.get("coder")
-    model = record.get("model")
-    if (not coder or not model) and isinstance(record.get("profile_id"), str):
-        profile_parts = str(record["profile_id"]).split(":")
-        if not coder and profile_parts:
-            coder = profile_parts[0]
-        if not model and len(profile_parts) > 1:
-            model = profile_parts[1]
+def _inline_metrics_payload(record: RunRecord) -> dict[str, object]:
+    profile_parts = record.profile_id.split(":")
     return {
-        "coder": coder,
-        "model": model,
-        "duration_ms": record.get("duration_ms"),
-        "fix_iterations": record.get("fix_iterations"),
-        "exit_reason": record.get("exit_reason"),
+        "coder": profile_parts[0] or None,
+        "model": profile_parts[1] if len(profile_parts) > 1 else None,
+        "duration_ms": record.duration_ms,
+        "fix_iterations": record.fix_iterations,
+        "exit_reason": record.exit_reason,
     }
-
-
-def _decode_redis_value(value: object) -> str:
-    if isinstance(value, bytes):
-        return value.decode("utf-8")
-    return str(value)
 
 
 def _load_git_merged_at(repo_name: str, pr_id: str) -> str | None:
@@ -1154,6 +1093,7 @@ async def _build_tasks_panel_context(
         ]
         if status == TaskStatus.DONE:
             views.sort(key=lambda view: view.get("merged_at") or "", reverse=True)
+        if status in (TaskStatus.DONE, TaskStatus.ERROR):
             metrics_by_task = await _recent_metrics_by_task_id(
                 name,
                 redis_client,
