@@ -1445,8 +1445,17 @@ class PipelineRunner(
             or len(ref) <= len("refs/heads/")
         ):
             return None, reason or "publication identity unavailable or mismatched"
+        attempt = self.state.publication_attempt
+        bound_attempt = bool(
+            attempt is not None and attempt.contract_version == 2 and attempt.verified
+            and self._publication_attempt_matches_dispatch()
+            and (attempt.repo, attempt.pr_number, attempt.branch, attempt.expected_head_sha)
+            == (reported_repo, pr_number, ref.removeprefix("refs/heads/"), head_sha)
+            and observed_at >= attempt.started_at
+        )
         if (
             self._publication_recovery_cutoff_at is not None
+            and not bound_attempt
             and observed_at <= self._publication_recovery_cutoff_at
             and not (
                 prior_identity is not None
@@ -2029,15 +2038,21 @@ class PipelineRunner(
         pr = self.state.current_pr
         # Merge cleanup and fresh-clone recovery can run on the base branch.
         # The retained PR identity supplies the head proved merged by GitHub.
+        attempt = self.state.publication_attempt
+        frozen_head = (
+            attempt.expected_head_sha if attempt is not None and attempt.contract_version == 2
+            and attempt.run_id == record.run_id and self._publication_attempt_matches_dispatch() else None
+        )
         record.head_sha = (
             pr.head_sha if exit_reason == "success_merged" and pr is not None
-            and pr.head_sha else self._git_rev_parse("HEAD")
+            and pr.head_sha else frozen_head or self._git_rev_parse("HEAD")
         )
         if exit_reason in ("success_merged", "coding_complete", "closed_unmerged"):
             resolved_base_branch = base_branch or self.repo_config.branch or "main"
             stats = diff_stats
             if stats is None:
-                stats = self._compute_diff_stats(resolved_base_branch)
+                stats = (self._compute_diff_stats(resolved_base_branch, frozen_head)
+                         if frozen_head else self._compute_diff_stats(resolved_base_branch))
             self._apply_diff_stats(record, stats, resolved_base_branch)
         await self._metrics_store.save(record)
         # SSE notification is best-effort: a Redis pub/sub or list-op
@@ -4112,6 +4127,15 @@ class PipelineRunner(
             and self.state.merge_phase in {"merging", "post_merge_cleanup"}
         ):
             await self.handle_merge()
+            await self.publish_state()
+            return
+
+        # Publication continuation precedes generic ERROR diagnosis and transient
+        # state resets, independent of the selected error-policy feature flags.
+        attempt = self.state.publication_attempt
+        if (attempt is not None and attempt.pending and attempt.contract_version == 2
+            and attempt.exit_classification == "success"):
+            await self._hold_unresolved_publication()
             await self.publish_state()
             return
 

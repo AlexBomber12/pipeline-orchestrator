@@ -14,6 +14,7 @@ from pathlib import Path
 
 REPO_DIR = Path(__file__).resolve().parents[3]
 SHIM_SCENARIO_PATH = REPO_DIR / "tests/e2e/data/shim-scenario"
+SHIM_STARTED_PATH = Path(str(SHIM_SCENARIO_PATH) + ".started")
 
 VALID_SCENARIOS = {
     "success",
@@ -24,6 +25,7 @@ VALID_SCENARIOS = {
     "hang",
     "malformed_pr",
     "slow",
+    "crash_before_publish",
     "escalate",
 }
 
@@ -37,14 +39,27 @@ def coder_shim(scenario: str):
     previous = (
         SHIM_SCENARIO_PATH.read_text() if SHIM_SCENARIO_PATH.exists() else None
     )
+    if scenario == "crash_before_publish":
+        SHIM_STARTED_PATH.unlink(missing_ok=True)
     SHIM_SCENARIO_PATH.write_text(scenario + "\n")
     try:
         yield
     finally:
+        if scenario == "crash_before_publish":
+            SHIM_STARTED_PATH.unlink(missing_ok=True)
         if previous is None:
             SHIM_SCENARIO_PATH.write_text("success\n")
         else:
             SHIM_SCENARIO_PATH.write_text(previous)
+
+
+def crash_coder_started(pr_id: str, branch: str) -> bool:
+    """Match the fixture CLI's pre-side-effect handshake, beyond CODING admission."""
+    try:
+        started = SHIM_STARTED_PATH.read_text().strip().split("\t")
+    except OSError:
+        return False
+    return started == [pr_id, branch]
 
 
 def verify_shim_installed(compose_file: str = "docker-compose.test.yml") -> None:

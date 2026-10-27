@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,7 +20,7 @@ from src.cancellation import (
 from src.daemon import retry_commands as retry_module
 from src.daemon.retry_commands import RetryDispatch
 from src.inhibitor import InhibitorType, WorkInhibitor
-from src.keyspace import pipeline_state, retry_command, retry_command_pending
+from src.keyspace import control_stop, pipeline_state, retry_command, retry_command_pending
 from src.models import (
     CIStatus,
     PipelineState,
@@ -39,9 +40,11 @@ from src.retry_commands import (
     enqueue_retry_command,
     load_retry_command,
     new_retry_command,
+    retry_failure_identity,
 )
 from src.subsource_registry import SuppressionReason
 from src.suppression import SuppressionRecord
+from src.usage import UsageSnapshot
 
 from tests.runner import _helpers as h
 
@@ -73,6 +76,9 @@ def _command(
     branch: str = "fix/pr-42",
     bound_pr: PRInfo | None = None,
 ):
+    task = QueueTask(pr_id=task_id, title="Retry", status=TaskStatus.ERROR)
+    state = RepoState(name="octo__demo", url="https://github.com/octo/demo",
+                      current_task=task, current_pr=bound_pr, error_message="prior failure")
     return new_retry_command(
         repo_slug="octo__demo",
         task_id=task_id,
@@ -80,10 +86,8 @@ def _command(
         task_branch=branch,
         task_fingerprint=task_spec_content_hash(text),
         request_binding="b" * 64,
-        failure_id="f" * 64,
+        failure_id=retry_failure_identity(task, state, None),
         retry_cap=3,
-        failure_subsource="crash",
-        failure_created_at=NOW.isoformat(),
         bound_pr_number=bound_pr.number if bound_pr else None,
         bound_pr_branch=bound_pr.branch if bound_pr else None,
         bound_pr_head_sha=bound_pr.head_sha if bound_pr else None,
@@ -117,6 +121,11 @@ async def _prepared_runner(
     runner.state.current_queue = [task]
     runner.state.error_message = "prior failure"
     command = command or _command(text)
+    if command.bound_pr_number is not None:
+        runner.state.current_pr = PRInfo(
+            number=command.bound_pr_number, branch=command.bound_pr_branch,
+            pr_id=command.task_id, head_sha=command.bound_pr_head_sha,
+        )
     await enqueue_retry_command(runner.redis, command)
     return runner, command, task, repo
 
@@ -683,6 +692,11 @@ async def test_coding_retry_applies_once_and_clears_only_task_local_state(
         category="ERROR",
         payload={"subsource": "crash"},
     ).to_redis()
+    command.failure_id = retry_failure_identity(
+        runner.state.current_task, runner.state,
+        CancellationCause.from_redis(runner.redis.store[cause_key(runner.name, command.task_id)]),
+    )
+    runner.redis.store[retry_command(runner.name, command.command_id)] = command.model_dump_json()
     runner.redis.store[f"diagnose_exhausted:{runner.name}:{command.task_id}"] = "1"
     runner.redis.store["error_rate_events"] = "global-history-must-survive"
     runner._crashed_task_pr_ids.add(command.task_id)
@@ -1437,6 +1451,10 @@ async def test_deferred_retry_allows_active_watch_and_later_resumes_once(
         branch=retry_branch,
         bound_pr=retry_pr,
     )
+    cause = CancellationCause(category="ERROR", payload={"subsource": "crash"})
+    command.failure_id = retry_failure_identity(
+        QueueTask(pr_id=retry_task_id, title="Retry", status=TaskStatus.ERROR), None, cause
+    )
     runner = h._make_runner()
     repo = tmp_path / "repo"
     task_path = repo / command.task_file
@@ -1469,6 +1487,7 @@ async def test_deferred_retry_allows_active_watch_and_later_resumes_once(
     runner.state.current_pr = active_pr
     runner._last_push_at = datetime.now(timezone.utc) - timedelta(minutes=10)
     runner._last_push_at_pr_number = active_pr.number
+    runner.redis.store[cause_key(runner.name, retry_task_id)] = cause.to_redis()
     await enqueue_retry_command(runner.redis, command)
 
     monkeypatch.setattr(runner, "ensure_repo_cloned", _async_value(None))
@@ -1794,3 +1813,538 @@ async def test_retry_does_not_rebind_retained_work_to_a_different_command(
     assert stored.status == RetryCommandStatus.FAILED
     assert attempt.pending
     assert runner.state.current_pr.number == 42
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["cause", "message", "state", "pr", "storage"])
+async def test_delayed_retry_preserves_new_failure_without_reserving(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    runner, command, task, repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    original = (repo / command.task_file).read_bytes()
+    if change == "cause":
+        cause = CancellationCause(category="ERROR", payload={"subsource": "crash", "run_id": "new"})
+        runner.redis.store[cause_key(runner.name, task.pr_id)] = cause.to_redis()
+    elif change == "message":
+        runner.state.error_message = "a newer failure"
+    elif change == "state":
+        runner.state.state = PipelineState.CODING
+    elif change == "pr":
+        runner.state.current_pr = PRInfo(number=99, branch=task.branch, pr_id=task.pr_id)
+    else:
+        async def unavailable(*args, **kwargs):
+            raise RuntimeError("failure storage unavailable")
+        monkeypatch.setattr(retry_module, "get_cancellation_cause", unavailable)
+    before = runner.state.model_copy(deep=True)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == (RetryCommandStatus.DEFERRED if change == "storage" else RetryCommandStatus.FAILED)
+    assert stored.retry_count is None
+    assert stored.effect_stage == RetryEffectStage.NONE
+    assert runner.state.model_dump(exclude={"history"}) == before.model_dump(exclude={"history"})
+    assert (repo / command.task_file).read_bytes() == original
+    if change == "cause":
+        assert runner.redis.store[cause_key(runner.name, task.pr_id)] == cause.to_redis()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", [
+    RetryEffectStage.RETRY_RESERVED, RetryEffectStage.STATUS_COMMITTED, RetryEffectStage.APPLIED,
+])
+async def test_new_cause_is_stale_even_after_retry_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: RetryEffectStage,
+) -> None:
+    runner, command, task, _repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    command.effect_stage = stage
+    command.retry_count = 1
+    runner.redis.store[retry_command(runner.name, command.command_id)] = command.model_dump_json()
+    cause = CancellationCause(category="ERROR", payload={"subsource": "crash", "run_id": "new"})
+    runner.redis.store[cause_key(runner.name, task.pr_id)] = cause.to_redis()
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.FAILED
+    assert stored.retry_count == 1
+    assert runner.redis.store[cause_key(runner.name, task.pr_id)] == cause.to_redis()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold", ["other_coder", "pause", "cleanup", "storage"])
+async def test_owned_pr_retry_scopes_inhibitors_and_preserves_repo_holds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hold: str,
+) -> None:
+    pr = PRInfo(number=42, branch="fix/pr-42", pr_id="PR-42", head_sha="abc")
+    runner, command, _task, _repo = await _prepared_runner(
+        tmp_path, command=_command(_task_text(), bound_pr=pr),
+    )
+    _allow_validation(monkeypatch, runner, _task_text())
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *args: [pr])
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
+    runner.state.rate_limited_coder_until = {"claude": datetime.now(timezone.utc) + timedelta(hours=1)}
+    runner.app_config.daemon.spend_ceiling_session_percent = 80
+    runner.state.usage_session_percent = 100
+    if hold == "pause":
+        runner.state.user_paused = True
+    elif hold == "cleanup":
+        monkeypatch.setattr(runner, "_hold_for_coder_cleanup", _async_value(True))
+    elif hold == "storage":
+        async def unavailable(*args, **kwargs):
+            raise RuntimeError("storage unavailable")
+        monkeypatch.setattr(retry_module, "derive_active_inhibitors", unavailable)
+    outcome = await runner._consume_retry_command()
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    if hold == "other_coder":
+        assert outcome == RetryDispatch.WATCH
+        assert stored.status == RetryCommandStatus.APPLIED
+        assert stored.retry_count == 1
+        assert runner.state.current_pr.number == pr.number
+    else:
+        assert outcome == RetryDispatch.HANDLED
+        assert stored.status == RetryCommandStatus.DEFERRED
+        assert stored.retry_count is None
+
+
+@pytest.mark.asyncio
+async def test_coding_retry_only_checks_selected_coder_inhibitor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner, command, task, _repo = await _prepared_runner(tmp_path)
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", _async_value(None))
+    monkeypatch.setattr(retry_module, "resolve_active_coder", lambda *args, **kwargs:
+                        SimpleNamespace(name="codex", plugin=object()))
+    monkeypatch.setattr(runner, "usage_gate", _async_value(True))
+    header = SimpleNamespace(coder="codex")
+    runner.app_config.daemon.spend_ceiling_session_percent = 80
+    runner.state.usage_session_percent = 100
+    runner.state.rate_limited_coder_until = {"claude": datetime.now(timezone.utc) + timedelta(hours=1)}
+    assert isinstance(await runner._ensure_retry_coder_available(command, header, task), tuple)
+    runner.state.rate_limited_coder_until["codex"] = datetime.now(timezone.utc) + timedelta(hours=1)
+    assert await runner._ensure_retry_coder_available(command, header, task) == RetryDispatch.HANDLED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["pr", "status"])
+async def test_same_cause_does_not_override_changed_pr_or_terminal_task(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str,
+) -> None:
+    runner, command, task, repo = await _prepared_runner(tmp_path)
+    cause = CancellationCause(category="ERROR", payload={"subsource": "crash"})
+    command.failure_id = retry_failure_identity(task, runner.state, cause)
+    runner.redis.store[cause_key(runner.name, task.pr_id)] = cause.to_redis()
+    runner.redis.store[retry_command(runner.name, command.command_id)] = command.model_dump_json()
+    text = _task_text()
+    if change == "pr":
+        runner.state.current_pr = PRInfo(number=99, branch=task.branch, pr_id=task.pr_id)
+    else:
+        text = text.replace("status: ERROR", "status: DONE").replace("blocked_reason: daemon\n", "")
+        (repo / command.task_file).write_text(text)
+    _allow_validation(monkeypatch, runner, text)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.FAILED
+    assert "stale" in stored.outcome_reason
+    assert stored.retry_count is None
+
+
+@pytest.mark.asyncio
+async def test_retry_restart_after_cleanup_deferral_keeps_one_allowance_and_commit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pr = PRInfo(number=42, branch="fix/pr-42", pr_id="PR-42", head_sha="abc")
+    runner, command, _task, _repo = await _prepared_runner(
+        tmp_path, command=_command(_task_text(), bound_pr=pr),
+    )
+    commits = []
+
+    async def commit(*args, **kwargs):
+        commits.append(args[1])
+        return True
+
+    async def cleanup_failure(*args):
+        raise RuntimeError("cleanup store unavailable")
+
+    _allow_validation(monkeypatch, runner, _task_text())
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *args: [pr])
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit)
+    monkeypatch.setattr(runner, "_clear_retry_failure_evidence", cleanup_failure)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    deferred = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert deferred.effect_stage == RetryEffectStage.STATUS_COMMITTED
+    assert deferred.retry_count == 1
+
+    restarted = h._make_runner()
+    restarted.redis, restarted.repo_path = runner.redis, runner.repo_path
+    restarted.state = RepoState.model_validate_json(runner.state.model_dump_json())
+    _allow_validation(monkeypatch, restarted, _task_text())
+    monkeypatch.setattr(restarted, "_commit_task_status_change", commit)
+    assert await restarted._consume_retry_command() == RetryDispatch.WATCH
+    stored = await load_retry_command(restarted.redis, restarted.name, command.command_id)
+    assert stored.command_id == command.command_id
+    assert stored.request_binding == command.request_binding
+    assert stored.status == RetryCommandStatus.APPLIED
+    assert stored.retry_count == 1
+    assert commits == ["TODO"]
+    assert restarted.redis.store[f"metrics:retry_count:{runner.name}:{command.task_id}"] == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("applied", [False, True])
+@pytest.mark.parametrize("hold", ["pause", "stop", "budget"])
+async def test_global_holds_precede_publication_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, applied: bool, hold: str,
+) -> None:
+    runner, command, _task, _repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    runner._start_current_run_record("codex", "")
+    runner._capture_invocation_snapshot("codex", {}, phase="coding")
+    runner._begin_publication_attempt(started_at=NOW, baseline_numbers=set())
+    attempt = runner.state.publication_attempt
+    attempt.head_sha = "a" * 40
+    attempt.exit_classification = "failure"
+    if applied:
+        command.effect_stage = RetryEffectStage.APPLIED
+    if hold == "pause":
+        runner.state.user_paused = True
+    elif hold == "stop":
+        runner.redis.store[control_stop(runner.name)] = "1"
+    else:
+        monkeypatch.setattr(retry_module, "derive_active_inhibitors", _async_value([
+            WorkInhibitor(inhibitor_type=InhibitorType.GITHUB_BUDGET_PAUSE,
+                          source_key="github-budget", reason_text="budget exhausted"),
+        ]))
+    recovered = []
+
+    async def recover():
+        recovered.append(True)
+        return False
+
+    monkeypatch.setattr(runner, "_resolve_published_attempt", _async_value(False))
+    monkeypatch.setattr(runner, "_recover_branch_without_pr", recover)
+    method = runner._reconcile_applied_retry if applied else runner._apply_retry_command
+    assert await method(command) == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.DEFERRED
+    assert stored.retry_count is None
+    assert attempt.pending
+    assert recovered == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_failure", [False, True])
+async def test_reserved_retry_restart_after_lost_status_checkpoint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, new_failure: bool,
+) -> None:
+    runner, command, task, repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    monkeypatch.setattr(runner, "_select_retry_continuation", _async_value(("coding", None)))
+    monkeypatch.setattr(runner, "_ensure_retry_coder_available", _async_value(("codex", object())))
+    commits = []
+    todo = _task_text().replace("status: ERROR", "status: TODO").replace("blocked_reason: daemon\n", "")
+
+    async def commit(*args):
+        commits.append(args[1])
+        (repo / command.task_file).write_text(todo)
+        return True
+
+    async def lost_checkpoint(*args):
+        raise RuntimeError("checkpoint storage unavailable")
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit)
+    monkeypatch.setattr(runner, "_record_retry_stage", lost_checkpoint)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    reserved = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert reserved.effect_stage == RetryEffectStage.RETRY_RESERVED
+    assert reserved.retry_count == 1
+
+    restarted = h._make_runner()
+    restarted.redis, restarted.repo_path = runner.redis, runner.repo_path
+    restarted.state = RepoState.model_validate_json(runner.state.model_dump_json())
+    restarted.state.current_queue = [task.model_copy(update={"status": TaskStatus.TODO})]
+    if new_failure:
+        restarted.state.error_message = "a newer failure"
+    _allow_validation(monkeypatch, restarted, todo)
+    monkeypatch.setattr(restarted, "_select_retry_continuation", _async_value(("coding", None)))
+    monkeypatch.setattr(restarted, "_ensure_retry_coder_available", _async_value(("codex", object())))
+    monkeypatch.setattr(restarted, "_commit_task_status_change", commit)
+    outcome = await restarted._consume_retry_command()
+    stored = await load_retry_command(restarted.redis, restarted.name, command.command_id)
+    assert stored.command_id == command.command_id
+    assert stored.request_binding == command.request_binding
+    assert stored.retry_count == 1
+    assert restarted.redis.store[f"metrics:retry_count:{runner.name}:{command.task_id}"] == "1"
+    assert outcome == (RetryDispatch.HANDLED if new_failure else RetryDispatch.CODING)
+    assert stored.status == (RetryCommandStatus.FAILED if new_failure else RetryCommandStatus.APPLIED)
+    assert commits == (["TODO"] if new_failure else ["TODO", "TODO"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", [None, "message", "cause", "pr", "head"])
+@pytest.mark.parametrize("lost_checkpoint", [False, True])
+async def test_recovered_retry_publication_preserves_fallback_failure_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str | None,
+    lost_checkpoint: bool,
+) -> None:
+    runner, command, task, repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    runner._start_current_run_record("codex", "")
+    runner._capture_invocation_snapshot("codex", {}, phase="coding")
+    runner._begin_publication_attempt(started_at=NOW, baseline_numbers=set())
+    pr = PRInfo(number=42, branch=task.branch, pr_id=task.pr_id, head_sha="a" * 40)
+    attempt = runner.state.publication_attempt
+    attempt.pr_number, attempt.candidate, attempt.head_sha = pr.number, pr, pr.head_sha
+    attempt.exit_classification = "failure"
+    monkeypatch.setattr(retry_module.gh_prs, "get_exact_pr_outcome", lambda *args:
+        retry_module.gh_prs.ExactPROutcome("octo/demo", "main", 42, pr.head_sha,
+                                         retry_module.gh_prs.ExactPRState.OPEN, True))
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *args: [pr])
+    commits = []
+    record_stage = runner._record_retry_stage
+    todo = _task_text().replace("status: ERROR", "status: TODO").replace("blocked_reason: daemon\n", "")
+
+    async def commit(*args):
+        commits.append(args[1])
+        if lost_checkpoint:
+            (repo / command.task_file).write_text(todo)
+        return lost_checkpoint or len(commits) > 1
+
+    async def checkpoint(*args):
+        if len(commits) == 1:
+            raise RuntimeError("checkpoint unavailable")
+        return await record_stage(*args)
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit)
+    monkeypatch.setattr(runner, "_record_retry_stage", checkpoint)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    reserved = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert reserved.effect_stage == RetryEffectStage.RETRY_RESERVED
+    assert reserved.bound_pr_number == pr.number
+    assert reserved.failure_id == command.failure_id
+    assert runner.state.current_pr.number == pr.number
+    assert not attempt.pending
+    if lost_checkpoint:
+        runner.state.current_queue = [task.model_copy(update={"status": TaskStatus.TODO})]
+        _allow_validation(monkeypatch, runner, todo)
+    if change == "message":
+        runner.state.error_message = "new failure"
+    elif change == "cause":
+        runner.redis.store[cause_key(runner.name, task.pr_id)] = CancellationCause(
+            category="ERROR", payload={"subsource": "crash", "run_id": "new"},
+        ).to_redis()
+    elif change == "pr":
+        runner.state.current_pr = pr.model_copy(update={"number": 99})
+    elif change == "head":
+        runner.state.current_pr = pr.model_copy(update={"head_sha": "b" * 40})
+
+    result = await runner._consume_retry_command()
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.failure_id == command.failure_id
+    assert stored.request_binding == command.request_binding
+    assert stored.retry_count == 1
+    assert runner.redis.store[f"metrics:retry_count:{runner.name}:{task.pr_id}"] == "1"
+    if change:
+        assert result == RetryDispatch.HANDLED
+        assert stored.status == RetryCommandStatus.FAILED
+        assert "stale" in stored.outcome_reason
+        assert commits == ["TODO"]
+    else:
+        assert result == RetryDispatch.WATCH
+        assert stored.status == RetryCommandStatus.APPLIED
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_pr.number == pr.number
+        assert commits == ["TODO", "TODO"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit_kind", ["session", "weekly"])
+@pytest.mark.parametrize("single_error_exit", [False, True])
+async def test_spend_deferred_coding_retry_preserves_failure_and_resumes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, limit_kind: str,
+    single_error_exit: bool,
+) -> None:
+    from src.task_status import MergedState
+
+    runner, command, task, repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(retry_module.gh_prs, "get_merged_prs", lambda *args, **kw: [])
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", _async_value(None))
+    monkeypatch.setattr(retry_module, "resolve_active_coder", lambda *args, **kw:
+                        SimpleNamespace(name="codex", plugin=object()))
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
+    setattr(runner.app_config.daemon, f"spend_ceiling_{limit_kind}_percent", 50)
+    resets_at = int((datetime.now(timezone.utc) + timedelta(hours=1)).timestamp())
+    snapshot = UsageSnapshot(**{
+        "session_percent": None, "session_resets_at": None,
+        "weekly_percent": None, "weekly_resets_at": None,
+        f"{limit_kind}_percent": 60,
+        f"{limit_kind}_resets_at": resets_at,
+        "fetched_at": 0,
+    })
+    runner._codex_usage_provider = h._FakeUsageProvider(snapshot=snapshot)
+    original = (repo / command.task_file).read_bytes()
+
+    # The real spend gate publishes PAUSED; neither that snapshot nor another
+    # consumption may lose the fallback failure identity or reserve an attempt.
+    for _ in range(2):
+        assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+        stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+        assert stored.status == RetryCommandStatus.DEFERRED
+        assert stored.failure_id == command.failure_id
+        assert stored.request_binding == command.request_binding
+        assert stored.retry_count is None
+        assert stored.effect_stage == RetryEffectStage.NONE
+        assert runner.state.state == PipelineState.PAUSED
+        assert runner.state.error_message == "prior failure"
+        assert task.status == TaskStatus.ERROR
+        assert (repo / command.task_file).read_bytes() == original
+        published = RepoState.model_validate_json(runner.redis.store[pipeline_state(runner.name)])
+        assert published.error_message == "prior failure"
+        assert retry_failure_identity(task, published, None) == command.failure_id
+
+    # Restart from the resource-paused snapshot twice, without copying live
+    # state. Recovery must retain the failure and must not create a new cause.
+    monkeypatch.setattr(
+        "src.daemon.recovery._resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+    for _ in range(2):
+        restarted = h._make_runner()
+        restarted.repo_config.feature_flags.use_single_error_exit = single_error_exit
+        restarted.redis, restarted.repo_path = runner.redis, str(repo)
+        setattr(restarted.app_config.daemon, f"spend_ceiling_{limit_kind}_percent", 50)
+        assert await restarted.recover_state()
+        assert restarted.state.state == PipelineState.PAUSED
+        assert restarted.state.current_task.pr_id == task.pr_id
+        assert restarted.state.current_pr is None
+        assert restarted.state.error_message == "prior failure"
+        assert cause_key(runner.name, task.pr_id) not in restarted.redis.store
+        assert retry_failure_identity(task, restarted.state, None) == command.failure_id
+        _allow_validation(monkeypatch, restarted, _task_text())
+        monkeypatch.setattr(restarted, "_refresh_auth_status_cache", _async_value(None))
+        monkeypatch.setattr(restarted, "_commit_task_status_change", _async_value(True))
+        restarted._codex_usage_provider = h._FakeUsageProvider(snapshot=snapshot)
+        assert await restarted._consume_retry_command() == RetryDispatch.HANDLED
+        stored = await load_retry_command(restarted.redis, restarted.name, command.command_id)
+        assert stored.status == RetryCommandStatus.DEFERRED
+        assert stored.failure_id == command.failure_id
+        assert stored.request_binding == command.request_binding
+        assert stored.retry_count is None
+        assert stored.effect_stage == RetryEffectStage.NONE
+        assert (repo / command.task_file).read_bytes() == original
+        assert restarted.redis.store.get(f"metrics:retry_count:{runner.name}:{task.pr_id}") is None
+        await restarted.publish_state()
+        runner = restarted
+
+    # Once the recorded window expires, the same command checks fresh usage
+    # and resumes exactly once. No cancellation cause supplies an alternate ID.
+    expired = datetime.now(timezone.utc) - timedelta(seconds=1)
+    runner.state.rate_limited_until = expired
+    runner.state.rate_limited_coder_until["codex"] = expired
+    runner._codex_usage_provider = h._FakeUsageProvider(
+        snapshot=replace(snapshot, **{f"{limit_kind}_percent": 10})
+    )
+    assert await runner._consume_retry_command() == RetryDispatch.CODING
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.APPLIED
+    assert stored.command_id == command.command_id
+    assert stored.failure_id == command.failure_id
+    assert stored.request_binding == command.request_binding
+    assert stored.retry_count == 1
+    assert runner.state.error_message is None
+    assert runner.state.state == PipelineState.CODING
+    assert runner.redis.store[f"metrics:retry_count:{runner.name}:{command.task_id}"] == "1"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("single_error_exit", [False, True])
+@pytest.mark.parametrize("reserved", [False, True])
+@pytest.mark.parametrize("changed_failure", [False, True])
+async def test_fallback_retry_survives_actual_startup_recovery(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    single_error_exit: bool, reserved: bool, changed_failure: bool,
+) -> None:
+    from src.task_status import MergedState
+
+    runner, command, task, repo = await _prepared_runner(tmp_path)
+    _allow_validation(monkeypatch, runner, _task_text())
+    monkeypatch.setattr(runner, "_select_retry_continuation", _async_value(("coding", None)))
+    monkeypatch.setattr(runner, "_ensure_retry_coder_available", _async_value(("codex", object())))
+    monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(False))
+    if reserved:
+        assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    if changed_failure:
+        runner.state.error_message = "a newer failure"
+    await runner.publish_state()
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "src.daemon.recovery._resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+
+    # Start with a genuinely fresh runner twice: recovery and publication must
+    # retain the fallback evidence, without copying the previous live state.
+    for _ in range(2):
+        restarted = h._make_runner()
+        restarted.repo_config.feature_flags.use_single_error_exit = single_error_exit
+        restarted.redis, restarted.repo_path = runner.redis, str(repo)
+        assert restarted.state.current_task is None
+        assert await restarted.recover_state()
+        assert restarted.state.state == PipelineState.ERROR
+        assert restarted.state.current_task.pr_id == task.pr_id
+        assert restarted.state.error_message == runner.state.error_message
+        assert restarted.state.current_pr is None
+        assert cause_key(runner.name, task.pr_id) not in restarted.redis.store
+        await restarted.publish_state()
+
+    assert (repo / command.task_file).read_text() == _task_text()
+    _allow_validation(monkeypatch, restarted, _task_text())
+    monkeypatch.setattr(restarted, "_select_retry_continuation", _async_value(("coding", None)))
+    monkeypatch.setattr(restarted, "_ensure_retry_coder_available", _async_value(("codex", object())))
+    commits = []
+
+    async def commit(*args):
+        commits.append(args[1])
+        return True
+
+    monkeypatch.setattr(restarted, "_commit_task_status_change", commit)
+    outcome = await restarted._consume_retry_command()
+    stored = await load_retry_command(restarted.redis, restarted.name, command.command_id)
+    assert outcome == (RetryDispatch.HANDLED if changed_failure else RetryDispatch.CODING)
+    assert stored.status == (RetryCommandStatus.FAILED if changed_failure else RetryCommandStatus.APPLIED)
+    assert stored.failure_id == command.failure_id
+    assert stored.request_binding == command.request_binding
+    assert commits == ([] if changed_failure else ["TODO"])
+    count = restarted.redis.store.get(f"metrics:retry_count:{runner.name}:{command.task_id}")
+    assert count == (None if changed_failure and not reserved else "1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("snapshot_state", [PipelineState.ERROR, PipelineState.PAUSED])
+@pytest.mark.parametrize("mismatch", ["name", "url", "task_file", "branch", "status"])
+async def test_startup_does_not_restore_unbound_fallback_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mismatch: str,
+    snapshot_state: PipelineState,
+) -> None:
+    from src.task_status import MergedState
+
+    runner, _command_value, _task_value, repo = await _prepared_runner(tmp_path)
+    runner.state.state = snapshot_state
+    if mismatch in {"name", "url"}:
+        setattr(runner.state, mismatch, "other")
+    elif mismatch == "status":
+        runner.state.state = PipelineState.IDLE
+    else:
+        setattr(runner.state.current_task, mismatch, "other")
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "src.daemon.recovery._resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+    restarted = h._make_runner()
+    restarted.redis, restarted.repo_path = runner.redis, str(repo)
+    assert await restarted.recover_state()
+    assert restarted.state.state == PipelineState.IDLE
+    assert restarted.state.current_task is None
+    assert restarted.state.error_message is None

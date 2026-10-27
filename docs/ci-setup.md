@@ -99,7 +99,7 @@ The workflow file alone does not block merges; GitHub branch protection settings
 - Under "Require status checks to pass before merging", check the box, then add `unit` and `integration` to the required checks list (they appear as searchable options once the workflow has run on `main`).
 - Save.
 
-From this point, all PRs to `main` require both checks green plus a Codex review +1 to merge.
+From this point, all PRs to `main` require both checks green plus valid current-HEAD Codex review approval (a trusted reaction or explicitly successful bound review) to merge.
 
 ## Token rotation
 

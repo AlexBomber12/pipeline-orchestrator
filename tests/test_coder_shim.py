@@ -1,5 +1,10 @@
+import os
 import subprocess
 from pathlib import Path
+
+import pytest
+
+from tests.e2e.lib import coder_shim as shim_control
 
 SHIM = Path(__file__).parent / "e2e" / "lib" / "coder_shim.sh"
 
@@ -205,3 +210,110 @@ run_success PR-42 pr-42-success
     assert created[1] == base and pushed[0] == base and pushed[1] == head
     created_at, pushed_at = (int(event.split("\t", 1)[0].rsplit(" ", 2)[1]) for event in events)
     assert pushed_at > created_at
+
+
+def test_crash_shim_signals_before_wait_and_never_publishes_on_timeout(tmp_path: Path) -> None:
+    scenario = tmp_path / "scenario"
+    result = subprocess.run(
+        ["bash", "-c", '''
+source "$1"
+git() { echo "unexpected git side effect" >&2; exit 9; }
+sleep() {
+    [[ "$1" == 120 ]] || exit 8
+    [[ "$(cat "${PO_SHIM_SCENARIO_FILE}.started")" == $'PR-42\tpr-42-crash' ]] || exit 7
+}
+run_crash_before_publish PR-42 pr-42-crash
+''', "bash", str(SHIM.resolve())],
+        cwd=tmp_path, capture_output=True, text=True, timeout=5,
+        env={**os.environ, "PO_SHIM_SCENARIO_FILE": str(scenario)},
+    )
+    assert result.returncode == 1, result.stderr
+    assert not result.stderr
+    assert Path(str(scenario) + ".started").read_text() == "PR-42\tpr-42-crash\n"
+
+
+def test_crash_shim_handshake_is_bound_and_cleaned_on_failure(tmp_path: Path, monkeypatch) -> None:
+    scenario, started = tmp_path / "scenario", tmp_path / "scenario.started"
+    monkeypatch.setattr(shim_control, "SHIM_SCENARIO_PATH", scenario)
+    monkeypatch.setattr(shim_control, "SHIM_STARTED_PATH", started)
+    scenario.write_text("success\n")
+    started.write_text("PR-42\tpr-42-crash\n")
+    with pytest.raises(RuntimeError, match="fixture failure"):
+        with shim_control.coder_shim("crash_before_publish"):
+            assert not shim_control.crash_coder_started("PR-42", "pr-42-crash")
+            started.write_text("partial")
+            assert not shim_control.crash_coder_started("PR-42", "pr-42-crash")
+            started.write_text("PR-42\tpr-42-crash\n")
+            assert shim_control.crash_coder_started("PR-42", "pr-42-crash")
+            assert not shim_control.crash_coder_started("PR-43", "pr-42-crash")
+            assert not shim_control.crash_coder_started("PR-42", "other")
+            raise RuntimeError("fixture failure")
+    assert not started.exists()
+    assert scenario.read_text() == "success\n"
+
+
+@pytest.mark.parametrize("outcome", [
+    "recovered", "stale", "missing_crash", "root_redispatched", "dependency_dispatched",
+])
+def test_multitask_crash_oracle_handles_delayed_recovery_without_accepting_wrong_outcomes(monkeypatch, outcome):
+    """Replay the 120-second CI boundary through the complete e2e assertion path."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tests.e2e import test_sigkill_recovery_multitask as scenario
+
+    now = [0.0]
+    phase = ["initial"]
+    root = "PR-42"
+    before = "2026-10-27T00:17:12+00:00"
+    after = "2026-10-27T00:19:14+00:00"
+    monkeypatch.setattr(scenario, "time", SimpleNamespace(
+        time=lambda: 42, monotonic=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    ))
+
+    @contextmanager
+    def shim(name):
+        if name == "success":
+            phase[0] = "next_dispatch"
+        yield
+
+    def command(args, **kwargs):
+        if args[:2] == ["docker", "kill"]:
+            phase[0] = "recovering"
+        return SimpleNamespace(returncode=0)
+
+    def state():
+        if phase[0] == "next_dispatch":
+            next_task = {"root_redispatched": root, "dependency_dispatched": "PR-44"}.get(outcome, "PR-43")
+            return {"state": "CODING", "current_task": {"pr_id": next_task}, "last_updated": after}
+        if phase[0] == "initial" or now[0] < 121:
+            return {"state": "CODING", "current_task": {"pr_id": root}, "last_updated": before}
+        return {"state": "IDLE", "current_task": None,
+                "last_updated": before if outcome == "stale" else after,
+                "history": [] if outcome == "missing_crash" else [{
+                    "event": f"[INFRA] Task {root} crashed, marking ERROR. Manually re-upload to retry.",
+                }]}
+
+    monkeypatch.setattr(scenario, "coder_shim", shim)
+    monkeypatch.setattr(scenario, "crash_coder_started", lambda pr_id, branch: pr_id == root)
+    monkeypatch.setattr(scenario.subprocess, "run", command)
+    running = iter(["false", "true"])
+    monkeypatch.setattr(scenario, "_is_daemon_running", lambda: next(running))
+    monkeypatch.setattr(scenario, "_daemon_exit_code", lambda: 137)
+    monkeypatch.setattr(scenario, "_fetch_tasks_panel", lambda *args: (200, '\n'.join(
+        f'<div id="task-content-{status}-PR-{number}"></div>'
+        for status, number in [("error", 42), ("todo", 43), ("todo", 44), ("todo", 45)]
+    )))
+
+    def run():
+        scenario.test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
+            "http://test.invalid", "testbed", lambda *args, **kwargs: None,
+            state, lambda path: 201, lambda *args, **kwargs: "fixture.zip", None,
+        )
+
+    if outcome == "recovered":
+        run()
+        assert 120 < now[0] < 150
+    else:
+        with pytest.raises(AssertionError):
+            run()

@@ -337,7 +337,8 @@ class RecoveryMixin:
         else:
             try:
                 prs = gh_prs.get_open_prs(
-                    self.owner_repo, self.repo_config.allow_merge_without_checks
+                    self.owner_repo, self.repo_config.allow_merge_without_checks,
+                    required_checks=self.repo_config.required_checks,
                 )
                 pr = next((item for item in prs if item.number == bound.pr_number), None)
                 if (
@@ -652,6 +653,14 @@ class RecoveryMixin:
         ):
             self._publication_recovery_cutoff_at = datetime.now(timezone.utc)
         self._cleanup_expected_branch()
+        if not await self._hydrate_current_task_from_persisted_state():
+            return False
+        attempt = self.state.publication_attempt
+        if (attempt is not None and attempt.pending and attempt.contract_version == 2
+            and await self._hold_unresolved_publication()):
+            return True
+        # Safe unpublished release still needs the existing crash/status
+        # bookkeeping. It cannot turn the interrupted task into a fresh run.
         return await self._recover_state_headers()
 
     async def _hydrate_current_task_from_persisted_state(self) -> bool:
@@ -668,7 +677,9 @@ class RecoveryMixin:
         ``TODO`` rather than ``DOING``.
 
         CODING snapshots retain pre-publication crash identity. Selected
-        WATCH/FIX/ERROR snapshots retain fix ownership. MERGE snapshots in
+        WATCH/FIX/ERROR snapshots retain fix ownership. ERROR snapshots without
+        a PR retain fallback failure context when the parsed ERROR task matches.
+        MERGE snapshots in
         ``merging`` or ``post_merge_cleanup`` retain an attempted merge:
         an already merged PR disappears from the open PR list, but its
         status write or run-record save may still need reconciliation.
@@ -686,6 +697,7 @@ class RecoveryMixin:
         still overwrites ``current_task`` from parsed headers, and the
         invocation is used only when its task and unfinished run record match.
         """
+        self._persisted_error_without_pr = None
         self._persisted_fix_recovery = None
         self._persisted_merge_recovery = None
         self._persisted_merge_error_recovery = None
@@ -707,10 +719,26 @@ class RecoveryMixin:
         if persisted.name == self.name and persisted.url == self.repo_config.url:
             self.state.ci_attempt_scope = persisted.ci_attempt_scope
             self.state.ci_attempts = dict(persisted.ci_attempts)
+        released = persisted.publication_attempt
+        task, invocation = persisted.current_task, persisted.active_invocation
+        # Publication absence can be proven before crash/status bookkeeping
+        # succeeds. Keep that interrupted identity across another restart.
+        released_crash = bool(
+            released is not None and released.contract_version == 2
+            and not released.pending and released.exit_classification is None
+            and released.pr_number is None and released.candidate is None
+            and persisted.current_pr is None and task is not None and invocation is not None
+            and invocation.phase == "coding"
+            and (released.repo, released.base, released.task_id, released.branch,
+                 released.run_id, released.attempt_index) == (
+                     self.owner_repo, self.repo_config.branch or "main", task.pr_id,
+                     task.branch, invocation.run_id, invocation.attempt_index,
+                 )
+        )
         if (
             persisted.name == self.name and persisted.url == self.repo_config.url
             and persisted.publication_attempt is not None
-            and persisted.publication_attempt.pending
+            and (persisted.publication_attempt.pending or released_crash)
         ):
             self.state.current_task = persisted.current_task
             self.state.current_pr = persisted.current_pr
@@ -721,6 +749,12 @@ class RecoveryMixin:
                 self.state.current_pr = None
             self.state.user_paused = persisted.user_paused
             self.state.rate_limited_until = persisted.rate_limited_until
+            if persisted.publication_attempt.contract_version == 2:
+                for field in (
+                    "review_request_pr", "review_request_head", "review_request_task",
+                    "review_request_generation", "review_requested_at", "review_post_attempted_at",
+                ):
+                    setattr(self.state, field, getattr(persisted, field))
             if persisted.state == PipelineState.PAUSED:
                 self.state.state = PipelineState.PAUSED
             if (self._publication_attempt_matches_dispatch()
@@ -894,6 +928,13 @@ class RecoveryMixin:
             and persisted.current_pr.pr_id in {None, persisted.current_task.pr_id}
         ):
             self._persisted_merge_recovery = persisted
+        if (
+            persisted.name == self.name and persisted.url == self.repo_config.url
+            and persisted.state in {PipelineState.ERROR, PipelineState.PAUSED}
+            and persisted.current_task is not None
+            and persisted.current_pr is None
+        ):
+            self._persisted_error_without_pr = persisted
         if persisted.state != PipelineState.CODING:
             return True
         if self.state.current_task is None and persisted.current_task is not None:
@@ -975,6 +1016,7 @@ class RecoveryMixin:
             prs = gh_prs.get_open_prs(
                 self.owner_repo,
                 allow_merge_without_checks=self.repo_config.allow_merge_without_checks,
+                required_checks=self.repo_config.required_checks,
             )
         except Exception as exc:
             await self._transition_to_error(
@@ -1311,9 +1353,24 @@ class RecoveryMixin:
             return
         await self._rehydrate_quarantines_from_labels(prs)
 
+        # A completed failure is not a new crash. Keep its fallback Retry
+        # identity only while headers and GitHub still confirm the same failure.
+        saved_error = getattr(self, "_persisted_error_without_pr", None)
+        retained_error = next((
+            task for task in tasks
+            if saved_error is not None
+            and task.pr_id == saved_error.current_task.pr_id
+            and task.task_file == saved_error.current_task.task_file
+            and task.branch == saved_error.current_task.branch
+            and task.status == TaskStatus.ERROR
+            and find_matching_open_pr(task.pr_id, task.branch, prs) is None
+        ), None)
+        if any(task.status == TaskStatus.DOING for task in tasks):
+            retained_error = None
+
         if self.repo_config.feature_flags.use_single_error_exit:
             for queued in tasks:
-                if queued.status != TaskStatus.ERROR:
+                if queued.status != TaskStatus.ERROR or queued is retained_error:
                     continue
                 if unresolved_error_pr is not None and queued.pr_id == unresolved_error_pr[0].pr_id and (
                     self._recovery_task_headers[queued.pr_id].blocked_reason
@@ -1355,6 +1412,7 @@ class RecoveryMixin:
             for queued in tasks:
                 if (
                     queued.status == TaskStatus.ERROR
+                    and queued is not retained_error
                     and not (
                         unresolved_error_pr is not None
                         and queued.pr_id == unresolved_error_pr[0].pr_id
@@ -1388,6 +1446,13 @@ class RecoveryMixin:
                 f"[INFRA] Recovered pending queue-sync branch: "
                 f"{pending_sync.branch}."
             )
+
+        if retained_error is not None:
+            self.state.current_task = retained_error
+            self.state.current_pr = None
+            self.state.error_message = saved_error.error_message
+            self.state.state = saved_error.state
+            return
 
         saved_merge = getattr(self, "_persisted_merge_recovery", None)
         if saved_merge is not None:
@@ -2338,6 +2403,7 @@ class RecoveryMixin:
         if (
             attempt is not None and attempt.pending and attempt.verified
             and attempt.exit_classification == "success"
+            and not attempt.terminal_cancelled
             and attempt.unverified_head_sha is None
             and task is not None
             and (attempt.repo, attempt.base, attempt.task_id, attempt.branch,

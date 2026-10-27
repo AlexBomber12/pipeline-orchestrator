@@ -22,6 +22,7 @@ from src.daemon import (
     fix_push_verify,
     fix_supervision,
     git_ops,
+    publication,
 )
 from src.daemon.approval_commands import (
     bound_checkout_work_blocker_for_ref,
@@ -512,6 +513,9 @@ class FixMixin(BreachMixin):
     async def handle_fix(self) -> None:
         """Run ``FIX FEEDBACK`` via the active coder CLI and return to WATCH."""
         if self.state.publication_attempt is not None and self.state.publication_attempt.pending:
+            if self.state.publication_attempt.contract_version == 2:
+                await self._hold_unresolved_publication()
+                return
             resolved = await self._resolve_published_attempt()
             if resolved and self.state.current_task is None:
                 return
@@ -1035,6 +1039,8 @@ class FixMixin(BreachMixin):
                     await self._checkpoint_current_run_record()
             if not self._publication_attempt_matches_dispatch():
                 self._begin_publication_attempt(started_at=datetime.now(timezone.utc))
+                if self.state.publication_attempt is not None:
+                    self.state.publication_attempt.initial_branch_head_sha = head_before or None
             await self.publish_state()
             if approved_continuation is not None and not await self._approved_fix_checkout_safe(
                 approved_continuation, current_pr, require_fetched_head=True,
@@ -1162,6 +1168,15 @@ class FixMixin(BreachMixin):
                 )
                 self._cleanup_breach_marker(breach_dir, breach_run_id)
             try:
+                if coder_result is not None and not breach_flag["breached"] and not idle_flag["timed_out"]:
+                    await publication.record_exit(
+                        self, code, stdout, stderr,
+                        terminal_cancelled=(code < 0 and external_state_flag["state"] is not None
+                                            and not self._stop_requested),
+                    )
+                elif (coder_result is None and external_state_flag["state"] is not None
+                      and not stop_cancelled and not breach_flag["breached"] and not idle_flag["timed_out"]):
+                    await publication.record_exit(self, code, stdout, stderr, terminal_cancelled=True)
                 await self._capture_published_attempt()
             finally:
                 cleanup_confirmed = await self._confirm_current_coder_cleanup(
@@ -1171,12 +1186,16 @@ class FixMixin(BreachMixin):
             raise pending_cancellation
         if not cleanup_confirmed:
             return
+        await publication.record_cleanup(self)
         if run_record is not None:
             # A same-process completed no-push FIX may run another iteration
             # before the cycle publishes WATCH. Restart has no such proof.
             self._completed_fix_run_id = run_record.run_id
         if external_state_flag["state"] is not None and not stop_cancelled:
             attempt = self.state.publication_attempt
+            if attempt is not None and attempt.contract_version == 2:
+                await self._hold_unresolved_publication()
+                return
             if attempt is not None:
                 attempt.exit_classification = "failure"
             if attempt is not None and (
@@ -1557,6 +1576,13 @@ class FixMixin(BreachMixin):
             await self.publish_state()
 
         attempt = self.state.publication_attempt
+        if (attempt is not None and attempt.contract_version == 2
+            and (attempt.expected_head_sha != attempt.initial_pr_head_sha or not attempt.verified)):
+            await capture_stop_requested_after_exit()
+            if await pause_for_stop_after_bookkeeping():
+                return
+            await self._hold_unresolved_publication()
+            return
         if attempt is not None and attempt.unverified_head_sha is not None:
             # Capture retained the candidate commit without exact remote proof.
             # Do not advertise it or clear the hold through optimistic git

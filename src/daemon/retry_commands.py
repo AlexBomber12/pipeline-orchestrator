@@ -18,7 +18,7 @@ from src.cancellation import (
     task_spec_content_hash,
 )
 from src.config import normalize_repo_url
-from src.daemon import git_ops
+from src.daemon import git_ops, publication
 from src.daemon.recovery import MergeIdentityConflict
 from src.daemon.selector import CoderPurpose, resolve_active_coder
 from src.github import prs as gh_prs
@@ -33,8 +33,11 @@ from src.retry_commands import (
     RetryEffectStage,
     RetryExecutionState,
     claim_retry_command,
+    is_merge_accounting_retry,
     list_pending_retry_commands,
+    relevant_retry_pr,
     reserve_retry_attempt,
+    retry_failure_identity,
     update_retry_command,
 )
 from src.subsource_registry import SuppressionReason
@@ -451,11 +454,104 @@ class RetryCommandMixin:
             branch=header.branch,
             priority=header.priority,
         )
+        try:
+            cause = await get_cancellation_cause(
+                self.redis, self.name, command.task_id, refresh_ttl=False
+            )
+        except Exception as exc:
+            return await self._defer_retry_command(
+                command, f"Cannot verify current Retry failure binding: {exc}."
+            )
+        # After our status/cleanup checkpoint, missing evidence can be our own
+        # effect. A present cause must still identify the original failure.
+        before_cleanup = command.effect_stage in {
+            RetryEffectStage.NONE, RetryEffectStage.RETRY_RESERVED,
+        }
+        accounting_retry = is_merge_accounting_retry(
+            self.state, self.name, command.task_id, command.task_file,
+        )
+        if cause is not None or before_cleanup:
+            bound_task = task if accounting_retry else next(
+                (item for item in self.state.current_queue or [] if item.pr_id == task.pr_id),
+                task,
+            )
+            identity = retry_failure_identity(bound_task, self.state, cause)
+            # A crash can leave the reservation durable but lose the checkpoint
+            # after our TODO commit. Recovery then rebuilds the queue as TODO.
+            # Only normalize that status; the message and PR must still match.
+            if (
+                cause is None
+                and command.effect_stage == RetryEffectStage.RETRY_RESERVED
+                and header.frontmatter_status == "todo"
+                and bound_task.status == TaskStatus.TODO
+                and identity != command.failure_id
+            ):
+                identity = retry_failure_identity(
+                    bound_task.model_copy(update={"status": TaskStatus.ERROR}),
+                    self.state, cause,
+                )
+            # Selection can recover a verified publication that was absent
+            # from the accepted fallback identity. Binding it is our own effect,
+            # even if the TODO commit subsequently fails. Preserve the original
+            # hash and require the exact durable binding before removing that
+            # recovered PR from the comparison.
+            pr = relevant_retry_pr(self.state, bound_task)
+            if (
+                cause is None
+                and identity != command.failure_id
+                and pr is not None
+                and (pr.number, pr.branch, pr.head_sha) == (
+                    command.bound_pr_number, command.bound_pr_branch,
+                    command.bound_pr_head_sha,
+                )
+            ):
+                identity_task = bound_task
+                if (
+                    command.effect_stage == RetryEffectStage.RETRY_RESERVED
+                    and header.frontmatter_status == "todo"
+                    and bound_task.status == TaskStatus.TODO
+                ):
+                    identity_task = bound_task.model_copy(update={"status": TaskStatus.ERROR})
+                identity = retry_failure_identity(
+                    identity_task, self.state.model_copy(update={"current_pr": None}), cause,
+                )
+            if identity != command.failure_id:
+                return await self._fail_retry_command(
+                    command, "Retry is stale: current failure identity changed."
+                )
+        if command.effect_stage == RetryEffectStage.NONE:
+            snapshot_error = any(
+                item.pr_id == task.pr_id and item.status in {TaskStatus.ERROR, TaskStatus.TODO}
+                for item in self.state.current_queue or []
+            )
+            if (
+                header.frontmatter_status not in {"error", "todo"}
+                and (header.frontmatter_status is not None or not snapshot_error)
+                and not accounting_retry
+            ) or (
+                active_task is not None and active_task.pr_id == task.pr_id
+                and self.state.state in _ACTIVE_TASK_STATES
+            ):
+                return await self._fail_retry_command(
+                    command, "Retry is stale: task is no longer in its failed state."
+                )
+            pr = relevant_retry_pr(self.state, task)
+            if pr is not None and (pr.number, pr.branch, pr.head_sha) != (
+                command.bound_pr_number, command.bound_pr_branch,
+                command.bound_pr_head_sha,
+            ):
+                return await self._fail_retry_command(
+                    command, "Retry is stale: current attempt/PR binding changed."
+                )
         return header, task
 
     async def _retry_blocker(
-        self, command: RetryCommand
+        self, command: RetryCommand, continuation: str = "coding", coder: str | None = None
     ) -> RetryDispatch | None:
+        if await self._hold_for_coder_cleanup():
+            return await self._defer_retry_command(
+                command, "Coder cleanup ownership is unresolved."
+            )
         try:
             record = await self._suppression_record_for_task(command.task_id)
         except Exception as exc:
@@ -478,10 +574,18 @@ class RetryCommandMixin:
             return await self._defer_retry_command(
                 command, f"Cannot evaluate active inhibitors: {exc}."
             )
+        # The aggregate spend display can belong to a different credential.
+        # CODING checks the selected coder's quota through usage_gate below;
+        # observing an owned PR consumes no coder quota.
         blocking = [
             inhibitor
             for inhibitor in inhibitors
-            if inhibitor.inhibitor_type != InhibitorType.GITHUB_BUDGET_SLOWDOWN
+            if inhibitor.inhibitor_type not in {
+                InhibitorType.GITHUB_BUDGET_SLOWDOWN, InhibitorType.SPEND_CEILING,
+            }
+            and (not inhibitor.is_per_coder() or (
+                continuation == "coding" and inhibitor.coder_affected == coder
+            ))
         ]
         if blocking:
             details = ", ".join(
@@ -539,9 +643,28 @@ class RetryCommandMixin:
                 return await self._defer_retry_command(command, f"Merge accounting Retry proof unavailable: {exc}.")
             return "merge", pr
         attempt = self.state.publication_attempt
+        if (attempt is not None and attempt.pending and attempt.contract_version == 2
+            and not attempt.cleanup_confirmed):
+            return await self._defer_retry_command(
+                command, "Prior invocation process cleanup is unconfirmed; publication cannot authorize Retry.",
+            )
+        try:
+            floor = await publication.retry_floor(self, command)
+        except Exception as exc:
+            return await self._defer_retry_command(command, f"Publication Retry admission deferred: {exc}.")
         resolved = False
         if attempt is not None and attempt.pending:
-            resolved = await self._resolve_published_attempt()
+            if attempt.contract_version == 2 and attempt.exit_classification == "success":
+                await self._hold_unresolved_publication()
+                if self.state.current_task is None:
+                    return await self._fail_retry_command(
+                        command, "Retained publication reached its terminal boundary.",
+                    )
+                if self.state.publication_attempt.pending:
+                    return await self._defer_retry_command(command, "Publication convergence remains unresolved.")
+                resolved = True
+            else:
+                resolved = await self._resolve_published_attempt()
             attempt = self.state.publication_attempt
             if (not resolved and command.task_id == attempt.task_id
                 and command.task_branch == attempt.branch
@@ -583,6 +706,12 @@ class RetryCommandMixin:
                 command, f"GitHub open-PR state is unavailable: {exc}."
             )
 
+        if floor is not None:
+            matches = [pr for pr in open_prs if pr.number == floor.pr_number or pr.branch == floor.branch]
+            if len(matches) != 1 or (matches[0].number, matches[0].branch, matches[0].head_sha) != (
+                floor.pr_number, floor.branch, floor.expected_head_sha,
+            ):
+                return await self._defer_retry_command(command, "Retained publication has inconsistent PR discovery.")
         if command.bound_pr_number is not None:
             bound_open = next(
                 (pr for pr in open_prs if pr.number == command.bound_pr_number),
@@ -673,7 +802,12 @@ class RetryCommandMixin:
             return await self._defer_retry_command(
                 command, "No authenticated, enabled coder is currently available."
             )
-        if not await self.usage_gate(proactive_coder=resolution.name):
+        blocker = await self._retry_blocker(command, "coding", resolution.name)
+        if blocker is not None:
+            return blocker
+        if not await self.usage_gate(
+            proactive_coder=resolution.name, preserve_error_message=True
+        ):
             return await self._defer_retry_command(
                 command,
                 f"Provider or spend limit currently blocks {resolution.name}.",
@@ -789,7 +923,6 @@ class RetryCommandMixin:
         self, command: RetryCommand, task: QueueTask, pr: PRInfo,
     ) -> RetryDispatch:
         """Transfer an admitted operator command to restart-safe bookkeeping."""
-        await self._clear_retry_failure_evidence(command)
         self._current_run_record = None
         self.state.active_invocation = None
         self._set_retry_task_snapshot(task)
@@ -798,6 +931,9 @@ class RetryCommandMixin:
         self.state.state = PipelineState.MERGE
         self.state.merge_phase = "post_merge_cleanup"
         await self.publish_state()
+        # Keep the bound cause until the handoff is durable; otherwise a lost
+        # publication would make recovery manufacture a different crash cause.
+        await self._clear_retry_failure_evidence(command)
         return RetryDispatch.MERGE
 
     async def _apply_retry_command(self, command: RetryCommand) -> RetryDispatch:
@@ -806,9 +942,12 @@ class RetryCommandMixin:
             return validated
         header, task = validated
 
-        blocker = await self._retry_blocker(command)
+        # Publication recovery during selection can create a PR. Repository
+        # holds must apply before that; coder checks follow actual selection.
+        blocker = await self._retry_blocker(command, "watch")
         if blocker is not None:
             return blocker
+
         continuation = await self._select_retry_continuation(command)
         if isinstance(continuation, RetryDispatch):
             return continuation
@@ -980,7 +1119,7 @@ class RetryCommandMixin:
         if isinstance(validated, RetryDispatch):
             return validated
         header, task = validated
-        blocker = await self._retry_blocker(command)
+        blocker = await self._retry_blocker(command, "watch")
         if blocker is not None:
             return blocker
         continuation = await self._select_retry_continuation(command)

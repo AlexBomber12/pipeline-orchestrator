@@ -2,7 +2,7 @@ import datetime as dt
 import subprocess
 import time
 
-from tests.e2e.lib.coder_shim import coder_shim
+from tests.e2e.lib.coder_shim import coder_shim, crash_coder_started
 
 DAEMON_CONTAINER = "pipeline-orchestrator-daemon-test"
 COMPOSE_FILE = "docker-compose.test.yml"
@@ -65,8 +65,9 @@ def test_sigkill_during_coding_recovers_correctly(
 
     pr_id_int = int(time.time())
     expected_pr_id = f"PR-{pr_id_int}"
+    expected_branch = f"pr-{pr_id_int}-e2e-sigkill-recovery"
 
-    with coder_shim("slow"):
+    with coder_shim("crash_before_publish"):
         zip_path = make_task_zip(
             pr_id_int, "e2e-sigkill-recovery", coder="any", priority=2
         )
@@ -85,7 +86,8 @@ def test_sigkill_during_coding_recovers_correctly(
                 last_state = entry.get("state")
                 task = entry.get("current_task") or {}
                 last_task_pr_id = task.get("pr_id")
-                if last_state == "CODING" and last_task_pr_id == expected_pr_id:
+                if (last_state == "CODING" and last_task_pr_id == expected_pr_id
+                    and crash_coder_started(expected_pr_id, expected_branch)):
                     pre_kill_entry = entry
                     break
             time.sleep(1)
@@ -139,7 +141,7 @@ def test_sigkill_during_coding_recovers_correctly(
         # SIGKILL/OOM/restart-mid-CODING. Recovery now marks that task
         # ERROR and parks the runner in IDLE rather than re-running
         # CODING (which used to loop the same crash forever); the user
-        # re-uploads the task file to retry. The slow shim was a child
+        # re-uploads the task file to retry. The fixture CLI was a child
         # of the killed daemon process, so SIGKILL terminated it too —
         # there is no orphan shim left racing teardown to push a PR,
         # which is the leakage case the previous WATCH-only gate guarded

@@ -35,7 +35,7 @@ These rules apply to every PR and every task in this repo.
   and every remaining failure. Never describe that gate as green; an unexplained
   failure does not qualify. Do not repeat an unchanged full-gate run.
 - Always generate `artifacts/ci.log`, `artifacts/pr.patch`, and `artifacts/structure.txt`, and confirm the review patch is nonempty before publication. These are for review only and must not appear in commits (.gitignore handles this).
-- Codex Review is "green" only when the Codex bot reacts with thumbs up (`+1`) on the PR body or the review anchor comment (see Codex Review gate). Do not use screenshots.
+- Codex Review is "green" with a valid trusted approval reaction or an explicit successful review bound to the current HEAD (see Codex Review gate). Do not use screenshots.
 - Do not drift from the approved outcome and do not add "nice-to-have" work.
 <!-- pipeline-orchestrator: managed END quick_rules -->
 
@@ -64,22 +64,23 @@ When triggered by the pipeline orchestrator daemon (non-interactive):
 - NEVER use `git add -f` or explicitly stage files matched by .gitignore.
 - Artifacts (ci.log, pr.patch, structure.txt) are generated for Codex review but must not appear in commits. The .gitignore already excludes them.
 - NEVER commit .patch files to the repository under any circumstances.
-- For `AUTO PR`, finish after the ready PR is published and its repository, base, head branch, and HEAD SHA are verified. Report the evidence and exit; do not trigger or poll review, start a FIX round, or merge.
+- For `AUTO PR`, implement, push, and attempt ready PR publication. Make one bounded branch/PR observation, report the evidence, and exit promptly. The daemon independently reconciles delayed PR observations; do not poll synchronization, trigger or poll review, start a FIX round, or merge.
 - For daemon `FIX FEEDBACK`, address the supplied feedback and any necessary
   small, self-contained blocker in one iteration, publish to the same branch,
-  verify the remote PR HEAD, report the evidence, and exit. Do not wait for
+  report expected SHA, observed branch/PR SHAs and failed operations, then exit. Do not wait for
   another review or act on findings that arrive during the invocation.
 - Green GitHub CI and current-change Codex approval are still merge requirements. After publication, the daemon owns review triggering, CI/review waiting, any later FIX dispatch, and merge decisions.
 - A baseline-failure publication exception does not relax merge requirements or
   authorize unconfirmed coder-process cleanup. Cleanup still requires confirmed
   process ownership.
-- If implementation or publication cannot complete, report the real blocker and follow the `ESCALATE:` protocol. Never fabricate a PR, successful push, gate result, or approval.
+- Publication uncertainty after completed implementation is a normal handoff, not an `ESCALATE:` reason. Report expected SHA, observed branch SHA, PR identity/SHA if known, and unresolved operations separately. Preserve genuine implementation, authorization, guardrail, and process ownership failures.
+- If implementation cannot complete, report the real blocker and follow the `ESCALATE:` protocol. Never fabricate a PR, successful push, gate result, or approval.
 <!-- pipeline-orchestrator: managed END daemon_mode -->
 
 <!-- pipeline-orchestrator: managed BEGIN ci_gates -->
 ## CI gates and merge criteria
 
-The pipeline-orchestrator repo runs CI on GitHub Actions for every pull request. The workflow has two jobs that both must pass for merge eligibility, in addition to the existing Codex review +1 requirement.
+The pipeline-orchestrator repo runs CI on GitHub Actions for every pull request. The workflow has two jobs that both must pass for merge eligibility, in addition to the existing Codex review approval requirement.
 
 The unit job runs `scripts/ci.sh` in a clean environment: ruff check, pytest with 100 percent coverage requirement, no integration tests. This is intentional duplication of what the coder ran locally before opening the PR. Three reasons make the duplication valuable:
 
@@ -102,7 +103,7 @@ The integration job runs the e2e suite under `tests/e2e/` against an isolated do
 
 Coder responsibility for the integration job: NONE. The coder cannot invoke docker compose from inside the daemon container that runs it; integration tests are GHA's responsibility, never the coder's.
 
-Merge contract: a PR is merge-eligible when all three are true. (1) Unit job green. (2) Integration job green. (3) Codex review +1 valid (non-stale per the review anchor rules). The daemon's auto-merge logic reads `statusCheckRollup` from the GitHub API, which aggregates all required checks; the daemon already handles multi-check workflows correctly via the existing `CIStatus` enum logic in `src/task_status.py`.
+Merge contract: a PR is merge-eligible when all three are true. (1) Unit job green. (2) Integration job green. (3) Codex review approval valid (current HEAD, per the review evidence rules). The daemon's auto-merge logic reads `statusCheckRollup` from the GitHub API, which aggregates all required checks; the daemon already handles multi-check workflows correctly via the existing `CIStatus` enum logic in `src/task_status.py`.
 
 Failure handling: if the unit job fails, a later FIX FEEDBACK invocation fixes it the same as a `scripts/ci.sh` local failure, using the feedback supplied for that invocation. If the integration job fails, the failure is treated identically to a Codex review failure: a later FIX FEEDBACK invocation examines the supplied GHA failure context and `e2e-evidence`, fixes the issue, and publishes one changed HEAD. Daemon coders do not wait for the re-run; the daemon performs that waiting and dispatches another invocation if needed. Integration test failures must be fixed by code change, never by disabling or skipping the test. If a test is genuinely flaky and the failure is not reproducible, the human reviewer may rerun the failed job manually via the GHA UI.
 
@@ -124,17 +125,20 @@ Pass signal
 - thumbs up (`+1`) reaction from the Codex bot on either:
   - the PR body (description), OR
   - the review anchor comment
+- A trusted review comment with the stable verdict `Codex Review: Didn't find any major issues.` also passes when explicitly bound to the current PR HEAD through GitHub commit metadata or the supported `**Reviewed commit:**` field. Conversational suffixes and the standard provider footer may vary. Abbreviated SHAs must resolve unambiguously to HEAD; missing, conflicting, malformed, or stale bindings do not pass.
+- A newer successful current-HEAD review supersedes older findings and historical unresolved-summary flags. A summary update alone does not prove a new finding. Later actionable findings or negative reviews still block approval; repeated review requests do not erase a valid verdict. A changed HEAD requires fresh approval.
+- The receipt marker, a completed summary, progress text, and arbitrary LGTM text are not approval signals.
 - The daemon compares the reaction timestamp against the latest push timestamp. A +1 that predates the most recent push is stale and does not count as a pass.
 
 In-progress signal
 - eyes (`eyes`) reaction from the Codex bot.
 
 Feedback
-- If there is no valid (non-stale) thumbs up, assume the PR is not approved yet.
-- Codex may post a comment with findings (often labeled `P1` or `P2`). Fix all `P1` and `P2` by default to obtain thumbs up.
+- If there is no valid trusted reaction or successful current-HEAD review, assume the PR is not approved yet.
+- Codex may post a comment with findings (often labeled `P1` or `P2`). Fix all `P1` and `P2` by default to obtain current-HEAD approval.
 
 Definitions
-- Codex bot: any GitHub user or app whose login contains `codex` (case-insensitive), for example `chatgpt-codex-conn`.
+- Codex bot: a GitHub user whose stable numeric ID is included in the configured trusted reviewer identities. A matching login alone does not establish trust.
 - Review anchor comment: the most recent PR conversation comment authored by the PR author that matches at least one:
   - contains `@codex review`
   If none exist, use the first PR author comment in the conversation.
@@ -143,8 +147,8 @@ In `PLANNED PR` and `MICRO PR` flows, the coder posts `@codex review` as a PR co
 
 Manual fix loop (used only when `FIX FEEDBACK` does not contain the daemon handoff marker)
 1. Fetch PR comments, reviews, and reactions via GitHub CLI (`gh`). No screenshots.
-2. Check for Codex thumbs up on both the PR body and the review anchor comment.
-3. If a non-stale thumbs up exists (reaction created after the latest push), stop. The PR is green.
+2. Check trusted approval reactions on the PR body and review anchor, and explicitly successful current-HEAD review comments.
+3. If valid current-HEAD approval exists without later blocking review evidence, stop. The review gate is green.
 4. Otherwise, collect the latest Codex feedback after the most recent push:
    - review comments
    - top-level PR comments
@@ -158,7 +162,7 @@ Manual fix loop (used only when `FIX FEEDBACK` does not contain the daemon hando
 8. Push to the same PR branch.
 9. Post `@codex review` as a new PR comment; the comment body must be exactly `@codex review` with no other text, prefix, or artifact list.
 10. Poll the PR for up to 15 minutes:
-   - if a non-stale thumbs up appears, stop
+   - if valid current-HEAD approval appears, stop
    - if a new Codex feedback comment appears after the push, repeat the loop
 <!-- pipeline-orchestrator: managed END codex_review_gate -->
 
@@ -280,9 +284,9 @@ When invoked with prompt starting with `AUTO PR`:
    `scripts/make-review-artifacts.sh`, and confirm the review artifacts are
    complete and `artifacts/pr.patch` is nonempty. A nonzero result permits
    publication only under the documented confirmed-baseline exception.
-8. Push the task branch and open a ready (not draft) PR. Verify the PR repository, base branch, head branch, and HEAD SHA against the intended repository and local HEAD.
-9. Report the PR URL and verified publication evidence, then exit. Do not post `@codex review`, poll GitHub CI or review, start another review-fix round, or merge; the daemon owns all post-publication orchestration.
-10. If implementation or publication genuinely cannot complete under this
+8. Push the task branch and open a ready (not draft) PR. Make one bounded observation of repository, base, branch, and HEAD SHA; report expected and observed evidence separately and let the daemon reconcile uncertainty.
+9. Report the PR URL if known, expected SHA, observed branch/PR SHAs, and unresolved operations, then exit promptly. Do not post `@codex review`, poll GitHub CI or review, start another review-fix round, or merge; the daemon owns all post-publication orchestration.
+10. If implementation genuinely cannot complete under this
     policy, report the blocker and use the `ESCALATE:` protocol as its strict
     last-line rule requires. Estimate deviation, an unexpected necessary path,
     or a small incidental gate repair is not by itself a reason to escalate.
@@ -378,9 +382,9 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
   and `artifacts/pr.patch` is nonempty. Fix introduced failures; a nonzero result
   permits publication only under the documented confirmed-baseline exception.
 - Push to the same PR branch.
-- For a daemon invocation (identified by its handoff marker), perform exactly one iteration. Verify the remote PR HEAD equals the pushed local HEAD, report the evidence, and exit without triggering or waiting for review, handling newly arriving findings, or merging.
-- For a manual invocation, post `@codex review` after the push and use the manual Codex Review gate above until a non-stale thumbs up is present.
-- If the daemon iteration genuinely cannot implement or publish the change under
+- For a daemon invocation (identified by its handoff marker), perform exactly one iteration. Make one bounded branch/PR observation, report expected and observed SHAs separately, and exit promptly without triggering or waiting for review, handling newly arriving findings, or merging.
+- For a manual invocation, post `@codex review` after the push and use the manual Codex Review gate above until valid current-HEAD approval is present.
+- If the daemon iteration genuinely cannot implement the change under
   the execution policy, report the real blocker and follow the `ESCALATE:`
   protocol. Estimate deviation, an unexpected necessary path, or a small
   incidental gate repair is not by itself a reason to escalate. Never fabricate

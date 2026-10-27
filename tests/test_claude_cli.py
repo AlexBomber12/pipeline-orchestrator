@@ -380,7 +380,7 @@ def test_fix_review_uses_fix_review_prompt(monkeypatch: pytest.MonkeyPatch) -> N
     assert "OPERATOR-AUTHORIZED EXECUTION POLICY" in prompt
     assert "one iteration" in prompt
     assert "scripts/make-review-artifacts.sh" in prompt
-    assert "remote PR HEAD is the pushed local HEAD" in prompt
+    assert "do not poll" in prompt
     assert "daemon owns review triggering" in prompt
     assert "Do not wait for a new review" in prompt
     assert captured["kwargs"]["cwd"] == "/data/repos/demo"
@@ -1194,7 +1194,7 @@ async def test_run_auto_pr_async_formats_prompt_with_headers(
     assert "ready (not draft) PR" in prompt
     assert "scripts/make-review-artifacts.sh" in prompt
     assert "artifacts/pr.patch must be nonempty" in prompt
-    assert "repository, base branch, head branch, and HEAD SHA" in prompt
+    assert "daemon independently" in prompt
     assert "daemon owns review triggering" in prompt
     assert "Do not trigger or poll review" in prompt
     assert "Never fabricate a PR, push, gate, or approval" in prompt

@@ -1858,6 +1858,7 @@ def test_handle_merge_falls_back_to_codex_for_conflict_resolution(
     async def fake_check_rate_limit(
         self,
         proactive_coder: str | None = None,
+        *, preserve_error_message: bool = False,
     ) -> bool:
         proactive_coders.append(proactive_coder)
         return True

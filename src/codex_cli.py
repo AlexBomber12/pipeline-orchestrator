@@ -66,13 +66,17 @@ Completion boundary for this invocation:
   under the confirmed-baseline policy above. The review artifacts must be
   complete and artifacts/pr.patch must be nonempty. Do not repeat an unchanged
   full gate.
-- Push the task branch, publish a ready (not draft) PR, and verify the PR's
-  repository, base branch, head branch, and HEAD SHA against the intended
-  repository and local HEAD. Report that evidence, then exit.
+- Push the task branch and attempt to publish a ready (not draft) PR. Make one
+  bounded observation of the branch and PR. Report the expected local SHA,
+  observed remote branch SHA, PR number/URL if known, observed PR SHA, and any
+  failed operation separately, then exit promptly. The daemon independently
+  verifies repository/base/branch/head and owns post-publication convergence.
+  A delayed or unavailable PR view is publication uncertainty: exit normally
+  after a completed implementation; do not poll it or emit ESCALATE for it.
 - Green GitHub CI and current-change Codex approval remain merge requirements,
   but the daemon owns review triggering, CI/review waiting, later FIX dispatch,
   and merge decisions. Do not trigger or poll review, start a FIX round, or merge.
-- If implementation or publication genuinely cannot complete under this policy,
+- If implementation genuinely cannot complete under this policy,
   report the blocker and use the repository's ESCALATE protocol. Estimate or path
   deviation and a small incidental repair are not by themselves escalation
   reasons. Never fabricate a PR, push, gate, or approval."""
@@ -89,13 +93,17 @@ Completion boundary for this invocation:
   Normally it must exit 0; a nonzero result permits publication only under the
   confirmed-baseline policy above. The review artifacts must be complete and
   artifacts/pr.patch must be nonempty. Do not repeat an unchanged full gate.
-- Push to the same PR branch, verify the remote PR HEAD is the pushed local HEAD,
-  report the PR and HEAD evidence, then exit.
+- Push to the same PR branch. Make one bounded branch/PR observation, report
+  the expected local SHA, observed branch SHA, PR number/URL, observed PR SHA,
+  and failed operations separately, then exit promptly. The daemon independently
+  verifies identity and owns convergence. Delayed or unavailable PR observations
+  after completed implementation are normal handoff uncertainty; do not poll
+  PR synchronization or emit ESCALATE for it.
 - Green GitHub CI and current-change Codex approval remain merge requirements,
   but the daemon owns review triggering, CI/review waiting, later FIX dispatch,
   and merge decisions. Do not wait for a new review or act on newly arriving
   findings in this invocation, and do not merge.
-- If implementation or publication genuinely cannot complete under this policy,
+- If implementation genuinely cannot complete under this policy,
   report the blocker and use the repository's ESCALATE protocol. Estimate or path
   deviation and a small incidental repair are not by themselves escalation
 reasons. Never fabricate a push, gate, or approval."""

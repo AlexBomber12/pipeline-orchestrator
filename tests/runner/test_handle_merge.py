@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1386,6 +1387,7 @@ _FINAL_MERGE_READER = merge_module.MergeMixin._read_final_merge_pr
     "receipt", "progress", "provider_error", "head_changed", "withdrawn",
     "unavailable", "missing_pr", "branch_changed", "quarantined", "sync",
     "publication_missing", "backward", "partial_status", "observed_push",
+    "success_receipt", "success_pending_ci", "success_failed_ci", "success_later_finding",
 ])
 def test_final_merge_uses_production_evidence(monkeypatch, entry, case):
     """Real list, publication, CI and review readers gate the merge command."""
@@ -1480,6 +1482,18 @@ def test_final_merge_uses_production_evidence(monkeypatch, entry, case):
         raise AssertionError(args)
 
     def reactions(path):
+        if case.startswith("success_"):
+            if path.endswith("/issues/5/comments"):
+                fixture = json.loads((Path(__file__).parents[1] / "fixtures/review_receipt_651.json").read_text())
+                receipt = fixture["issue_comments"][-1]
+                receipt["body"] = receipt["body"].replace(fixture["head"][:10], head[:10])
+                receipt["created_at"] = "2026-10-17T21:01:00Z"
+                comments = [receipt]
+                if case == "success_later_finding":
+                    comments.append({"id": 11, "user": actor, "commit_id": head,
+                                     "body": "[P1] Fix later defect", "created_at": "2026-10-17T21:02:00Z"})
+                return comments
+            return []
         approved = "2026-10-17T21:01:00Z"
         if refreshed:
             approved = "2026-10-17T21:03:00Z"
@@ -1502,8 +1516,9 @@ def test_final_merge_uses_production_evidence(monkeypatch, entry, case):
         ci_reads.append(sha)
         names = ["unit"] if case == "missing_required" else ["unit", "integration"]
         return cache.PaginatedEvidence([{"check_runs": [
-            {"id": i, "name": name, "head_sha": sha, "status": "completed",
-             "conclusion": "success", "app": {"id": 1}}
+            {"id": i, "name": name, "head_sha": sha,
+             "status": "in_progress" if case == "success_pending_ci" else "completed",
+             "conclusion": "failure" if case == "success_failed_ci" else "success", "app": {"id": 1}}
             for i, name in enumerate(names, 1)
         ]}], case != "partial", False)
 
@@ -1515,6 +1530,7 @@ def test_final_merge_uses_production_evidence(monkeypatch, entry, case):
 
     monkeypatch.setattr(merge_module.gh_runner, "run_gh", transport)
     monkeypatch.setattr(cache, "_gh_api_paginated", reactions)
+    monkeypatch.setattr(cache, "_etag_get", lambda path: {"sha": head})
     monkeypatch.setattr(cache, "_gh_api_paginated_evidence", check_pages)
     monkeypatch.setattr(cache, "_etag_get_object_pages_evidence", status_pages)
     if case == "backward" and entry == "merge":
@@ -1528,7 +1544,10 @@ def test_final_merge_uses_production_evidence(monkeypatch, entry, case):
     if case in {"receipt", "progress", "provider_error"}:
         fix.assert_not_awaited()
         assert runner.state.current_pr.review_status == ReviewStatus.PENDING
-    assert bool(commands) is (case == "approved")
+    assert bool(commands) is (case in {"approved", "success_receipt"})
+    if case in {"success_receipt", "success_pending_ci"}:
+        fix.assert_not_awaited()
+        runner._maybe_remind_review.assert_not_awaited()
     if commands:
         assert commands == [(runner.owner_repo, 5, head)]
         assert len(ci_reads) >= 2  # final CI read bypasses the earlier cache

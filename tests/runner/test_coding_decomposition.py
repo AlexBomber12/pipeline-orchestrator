@@ -1909,7 +1909,9 @@ def test_handle_coding_rate_limit_runs_before_branch_guard(
 
     rate_limit_calls: list[str | None] = []
 
-    async def fake_rate_limit(proactive_coder: str | None = None) -> bool:
+    async def fake_rate_limit(
+        proactive_coder: str | None = None, *, preserve_error_message: bool = False
+    ) -> bool:
         rate_limit_calls.append(proactive_coder)
         return False
 
