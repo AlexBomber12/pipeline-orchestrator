@@ -23,7 +23,7 @@
             hx-post="/daemon/resume"
             hx-target="body"
             hx-swap="none"
-            hx-on::after-request="window.location.reload()"
+            hx-on::after-request="handleGlobalControlResult(event)"
             class="text-xs px-3 py-1 rounded border border-ok/50 text-ok hover:bg-ok/10">
         Resume All
     </button>
@@ -34,22 +34,24 @@
         Stop All
     </button>
 </div>
+<p id="global-control-result" data-global-control-result role="status" aria-live="polite"></p>
 
 <dialog id="pause-all-modal" data-pause-all-modal
         class="modal bg-surface-2 rounded-lg p-6 max-w-md w-full border border-warn/50 text-gray-200">
     <h3 class="text-lg font-semibold mb-2 text-warn">Pause all repos</h3>
     <p class="text-sm">
-        All repos transition to PAUSED state. Coders mid-cycle FINISH their current PR
+        Pause requests are saved for each available repo. Coders mid-cycle FINISH their current PR
         cycle naturally (no kill). New work does not start until Resume All.
     </p>
     <p class="text-xs text-gray-400 mt-2">Affected repos: <span data-affected-count id="pause-all-affected-count">-</span></p>
+    <p data-global-control-result role="status" aria-live="polite"></p>
     <div class="flex gap-2 mt-3">
         <button type="button"
                 data-pause-all-confirm
                 hx-post="/daemon/pause"
                 hx-target="body"
                 hx-swap="none"
-                hx-on::after-request="window.location.reload()"
+                hx-on::after-request="handleGlobalControlResult(event)"
                 class="px-4 py-2 rounded bg-warn/10 text-warn border border-warn/50">
             Confirm pause all
         </button>
@@ -66,20 +68,22 @@
         class="modal bg-surface-2 rounded-lg p-6 max-w-md w-full border border-fail/50 text-gray-200">
     <h3 class="text-lg font-semibold mb-2 text-fail">Stop all repos - destructive</h3>
     <p class="text-sm">
-        All in-flight coders KILLED via SIGTERM within 5 seconds (then SIGKILL).
+        Stop requests ask the daemon to have in-flight coders KILLED via SIGTERM
+        (then SIGKILL). Acceptance confirms the request was saved, not that a coder stopped.
         Working trees may be left dirty. Resume All does NOT auto-recover dirty trees;
         operator must reset working dir manually after Stop All.
     </p>
     <p class="text-xs text-gray-400 mt-2">
         This is the deploy-time emergency stop. Use Pause All for graceful shutdown.
     </p>
+    <p data-global-control-result role="status" aria-live="polite"></p>
     <div class="flex gap-2 mt-3">
         <button type="button"
                 data-stop-all-confirm
                 hx-post="/daemon/stop"
                 hx-target="body"
                 hx-swap="none"
-                hx-on::after-request="window.location.reload()"
+                hx-on::after-request="handleGlobalControlResult(event)"
                 class="px-4 py-2 rounded bg-fail/10 text-fail border border-fail/50">
             Confirm stop all
         </button>
@@ -93,6 +97,26 @@
 </dialog>
 
 <script>
+    window.handleGlobalControlResult = function (event) {
+        const scope = event.target.closest('dialog') || document;
+        const output = scope.querySelector('[data-global-control-result]');
+        try {
+            const data = JSON.parse(event.detail.xhr.responseText);
+            if (!Array.isArray(data.results)) {
+                throw new Error('Missing results');
+            }
+            const accepted = data.results.filter(r => r.status === 'accepted');
+            const rejected = data.results.filter(r => r.status !== 'accepted');
+            output.textContent = 'Accepted ' + accepted.length + '/' + data.results.length +
+                ' requests. Daemon application is pending.' +
+                (rejected.length ? ' Not accepted: ' + rejected.map(
+                    r => r.name + ' (' + r.status + ': ' + r.reason + ')'
+                ).join(', ') : '');
+        } catch (_) {
+            output.textContent = 'Control result unavailable. Requests are unconfirmed; check state before retrying.';
+        }
+    };
+
     // PR-340: Pause All opener shows the modal immediately with a "-"
     // placeholder in the affected-count slot, then updates that slot
     // asynchronously once /daemon/drain-progress resolves. Awaiting the
@@ -142,15 +166,11 @@
 
     // PR-340: in-flight UX. While the confirm button's HTMX request is
     // pending the operator should see that the action is running and not
-    // be able to fire it a second time. The buttons live inside the
-    // <dialog> elements that close on htmx:afterRequest -> reload, so the
-    // listener only needs to flip ``disabled`` and a text label between
-    // beforeRequest and afterRequest. Scoped to ``[data-global-controls]``
-    // siblings via the dialogs' data attributes so unrelated HTMX swaps
-    // elsewhere on the page do not toggle these buttons.
+    // be able to fire it a second time. Scope loading state to the three
+    // global controls so unrelated HTMX swaps do not toggle these buttons.
     (function () {
         const confirmButtons = document.querySelectorAll(
-            '[data-pause-all-confirm], [data-stop-all-confirm]'
+            '[data-pause-all-confirm], [data-stop-all-confirm], [data-action="resume-all"]'
         );
         confirmButtons.forEach(function (button) {
             const originalText = button.textContent;

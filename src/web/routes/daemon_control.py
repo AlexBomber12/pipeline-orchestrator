@@ -19,6 +19,7 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, Response
+from pydantic import ValidationError
 
 from src.config import load_config
 from src.events import publish_wake
@@ -61,29 +62,22 @@ def _config_path() -> str:
     return _app.CONFIG_PATH
 
 
-async def _load_repo_state(
-    redis_client: Any, name: str, url: str
-) -> RepoState:
-    """Return the current ``RepoState`` for ``name`` or a default IDLE one.
+def _http_status(results: list[dict[str, Any]], success: str) -> int:
+    """207 means partial completion; no success means conflict or outage."""
+    if all(result["status"] == success for result in results):
+        return 200
+    if any(result["status"] == success for result in results):
+        return 207
+    return 503 if any(r["status"] == "unavailable" for r in results) else 409
 
-    Falls back to a fresh default on Redis errors and decode failures so a
-    single corrupt repo entry does not break a daemon-wide sweep. The
-    daemon-wide endpoints walk every configured repo sequentially; treating
-    one bad payload as terminal would leave later repos untouched and the
-    operator with no signal about which calls succeeded.
-    """
-    try:
-        raw = await redis_client.get(pipeline_state(name))
-    except Exception:
-        logger.warning("Failed to read state for %s", name, exc_info=True)
-        return _default_repo_state(name, url)
-    if raw is None:
-        return _default_repo_state(name, url)
-    try:
-        return RepoState.model_validate_json(raw)
-    except Exception:
-        logger.warning("State decode failed for %s", name, exc_info=True)
-        return _default_repo_state(name, url)
+
+def _control_response(results: list[dict[str, Any]]) -> JSONResponse:
+    # Keep affected/count for existing readers, counting confirmed writes only.
+    affected = [r["name"] for r in results if r["status"] == "accepted"]
+    return JSONResponse(
+        {"affected": affected, "count": len(affected), "results": results},
+        status_code=_http_status(results, "accepted"),
+    )
 
 
 async def _write_user_paused(
@@ -93,7 +87,7 @@ async def _write_user_paused(
     *,
     user_paused: bool,
     clear_stop: bool,
-) -> None:
+) -> dict[str, str]:
     """Update ``user_paused`` on a single repo's pipeline state.
 
     Uses Redis WATCH/MULTI/EXEC so a concurrent daemon ``publish_state``
@@ -121,25 +115,26 @@ async def _write_user_paused(
         if raw is None:
             state = _default_repo_state(name, url)
         else:
-            try:
-                state = RepoState.model_validate_json(raw)
-            except Exception:
-                logger.warning(
-                    "State decode failed for %s", name, exc_info=True
-                )
-                state = _default_repo_state(name, url)
+            state = RepoState.model_validate_json(raw)
         state.user_paused = user_paused
         pipe.multi()
         pipe.set(state_key, state.model_dump_json())
         if clear_stop:
             pipe.delete(stop_key)
 
+    if redis_client is None:
+        return {"name": name, "status": "unavailable", "reason": "redis_unavailable"}
     try:
         await redis_client.transaction(_transaction, *watch_keys)
+    except ValidationError:
+        logger.warning("Corrupt pipeline state for %s", name, exc_info=True)
+        return {"name": name, "status": "failed", "reason": "corrupt_state"}
     except Exception:
         logger.warning(
             "Failed to update pipeline state for %s", name, exc_info=True
         )
+        return {"name": name, "status": "unavailable", "reason": "write_unconfirmed"}
+    return {"name": name, "status": "accepted"}
 
 
 async def _publish_wake_safe(
@@ -170,20 +165,17 @@ async def daemon_pause(request: Request) -> JSONResponse:
     """
     cfg = await asyncio.to_thread(load_config, _config_path())
     redis_client = getattr(request.app.state, "redis", None)
-    affected: list[str] = []
+    results: list[dict[str, Any]] = []
     for repo in cfg.repositories:
         name = repo_slug_from_url(repo.url)
-        if redis_client is not None:
-            await _write_user_paused(
-                redis_client,
-                name,
-                repo.url,
-                user_paused=True,
-                clear_stop=False,
-            )
+        result = await _write_user_paused(
+            redis_client, name, repo.url,
+            user_paused=True, clear_stop=False,
+        )
+        results.append(result)
+        if result["status"] == "accepted":
             await _publish_wake_safe(redis_client, name, "daemon_pause_all")
-        affected.append(name)
-    return JSONResponse({"affected": affected, "count": len(affected)})
+    return _control_response(results)
 
 
 @router.post("/daemon/resume")
@@ -196,20 +188,17 @@ async def daemon_resume(request: Request) -> JSONResponse:
     """
     cfg = await asyncio.to_thread(load_config, _config_path())
     redis_client = getattr(request.app.state, "redis", None)
-    affected: list[str] = []
+    results: list[dict[str, Any]] = []
     for repo in cfg.repositories:
         name = repo_slug_from_url(repo.url)
-        if redis_client is not None:
-            await _write_user_paused(
-                redis_client,
-                name,
-                repo.url,
-                user_paused=False,
-                clear_stop=True,
-            )
+        result = await _write_user_paused(
+            redis_client, name, repo.url,
+            user_paused=False, clear_stop=True,
+        )
+        results.append(result)
+        if result["status"] == "accepted":
             await _publish_wake_safe(redis_client, name, "daemon_resume_all")
-        affected.append(name)
-    return JSONResponse({"affected": affected, "count": len(affected)})
+    return _control_response(results)
 
 
 @router.post("/daemon/stop")
@@ -222,22 +211,24 @@ async def daemon_stop(request: Request) -> JSONResponse:
     """
     cfg = await asyncio.to_thread(load_config, _config_path())
     redis_client = getattr(request.app.state, "redis", None)
-    affected: list[str] = []
+    results: list[dict[str, Any]] = []
     for repo in cfg.repositories:
         name = repo_slug_from_url(repo.url)
+        result = {"name": name, "status": "unavailable", "reason": "redis_unavailable"}
         if redis_client is not None:
             try:
-                await redis_client.set(
+                written = await redis_client.set(
                     control_stop(name), "1", ex=_STOP_TTL_SECONDS
                 )
+                if written:
+                    result = {"name": name, "status": "accepted"}
+                else:
+                    result = {"name": name, "status": "failed", "reason": "write_rejected"}
             except Exception:
-                logger.warning(
-                    "Failed to write stop control for %s",
-                    name,
-                    exc_info=True,
-                )
-        affected.append(name)
-    return JSONResponse({"affected": affected, "count": len(affected)})
+                logger.warning("Failed to write stop control for %s", name, exc_info=True)
+                result["reason"] = "write_unconfirmed"
+        results.append(result)
+    return _control_response(results)
 
 
 @router.get("/daemon/drain-progress")
@@ -258,10 +249,22 @@ async def daemon_drain_progress(request: Request) -> JSONResponse:
     repos: list[dict[str, Any]] = []
     for repo in cfg.repositories:
         name = repo_slug_from_url(repo.url)
-        if redis_client is not None:
-            state = await _load_repo_state(redis_client, name, repo.url)
-        else:
-            state = _default_repo_state(name, repo.url)
+        entry = {"name": name, "state": None, "draining": None, "current_task_id": None}
+        try:
+            if redis_client is None:
+                raise ConnectionError("Redis unavailable")
+            raw = await redis_client.get(pipeline_state(name))
+            if raw is None:
+                repos.append({**entry, "status": "failed", "reason": "missing_state"})
+                continue
+            state = RepoState.model_validate_json(raw)
+        except ValidationError:
+            repos.append({**entry, "status": "failed", "reason": "corrupt_state"})
+            continue
+        except Exception:
+            logger.warning("Failed to read state for %s", name, exc_info=True)
+            repos.append({**entry, "status": "unavailable", "reason": "redis_unavailable"})
+            continue
         current_task_id = (
             state.current_task.pr_id if state.current_task is not None else None
         )
@@ -273,9 +276,10 @@ async def daemon_drain_progress(request: Request) -> JSONResponse:
         repos.append(
             {
                 "name": name,
+                "status": "available",
                 "state": state.state.value,
                 "draining": draining,
                 "current_task_id": current_task_id,
             }
         )
-    return JSONResponse({"repos": repos})
+    return JSONResponse({"repos": repos}, status_code=_http_status(repos, "available"))

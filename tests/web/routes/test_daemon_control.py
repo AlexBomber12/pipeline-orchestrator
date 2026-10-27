@@ -4,8 +4,8 @@ PR-339 adds four daemon-level endpoints that compose the per-repo
 controls (``pause_repo``, ``stop_repo``, ``resume_repo``) into one
 sweep across every configured repo. The tests in this module exercise
 the success paths, the operator-visible payload shape, and the
-defensive fallbacks (Redis offline, decode failure, empty config) that
-make the dashboard's planned daemon-wide buttons safe to re-click.
+confirmed acceptance and explicit failures (Redis offline, corrupt snapshots,
+partial results) that let operators assess daemon-wide requests.
 """
 
 from __future__ import annotations
@@ -198,6 +198,14 @@ def _stored_state(redis_client: _FakeRedis, slug: str) -> RepoState:
     return RepoState.model_validate_json(redis_client.values[pipeline_state(slug)])
 
 
+def _result(slugs: list[str], status: str = "accepted", reason: str | None = None) -> dict:
+    affected = slugs if status == "accepted" else []
+    return {"affected": affected, "count": len(affected), "results": [
+        {"name": slug, "status": status, **({"reason": reason} if reason else {})}
+        for slug in slugs
+    ]}
+
+
 def test_daemon_pause_sets_user_paused_for_all_repos(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -212,7 +220,7 @@ def test_daemon_pause_sets_user_paused_for_all_repos(
 
     assert response.status_code == 200
     body = response.json()
-    assert body == {"affected": _REPO_SLUGS, "count": 3}
+    assert body == _result(_REPO_SLUGS)
     for slug in _REPO_SLUGS:
         assert _stored_state(redis_client, slug).user_paused is True
 
@@ -244,11 +252,11 @@ def test_daemon_pause_empty_config_returns_zero(
         response = client.post("/daemon/pause")
 
     assert response.status_code == 200
-    assert response.json() == {"affected": [], "count": 0}
+    assert response.json() == _result([])
     assert redis_client.published == []
 
 
-def test_daemon_pause_without_redis_still_returns_affected(
+def test_daemon_pause_without_redis_reports_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_config(tmp_path, monkeypatch)
@@ -257,8 +265,8 @@ def test_daemon_pause_without_redis_still_returns_affected(
     with TestClient(app) as client:
         response = client.post("/daemon/pause")
 
-    assert response.status_code == 200
-    assert response.json() == {"affected": _REPO_SLUGS, "count": 3}
+    assert response.status_code == 503
+    assert response.json() == _result(_REPO_SLUGS, "unavailable", "redis_unavailable")
 
 
 def test_daemon_pause_swallows_publish_wake_errors(
@@ -280,7 +288,7 @@ def test_daemon_pause_swallows_publish_wake_errors(
     )
 
 
-def test_daemon_pause_swallows_state_write_errors(
+def test_daemon_pause_reports_state_write_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_config(tmp_path, monkeypatch)
@@ -291,11 +299,11 @@ def test_daemon_pause_swallows_state_write_errors(
     with TestClient(app) as client:
         response = client.post("/daemon/pause")
 
-    # All repos accounted for even when writes fail; failure is logged.
-    assert response.json() == {"affected": _REPO_SLUGS, "count": 3}
+    assert response.status_code == 503
+    assert response.json() == _result(_REPO_SLUGS, "unavailable", "write_unconfirmed")
 
 
-def test_daemon_pause_recovers_from_state_decode_failure(
+def test_daemon_pause_reports_corrupt_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
@@ -306,23 +314,15 @@ def test_daemon_pause_recovers_from_state_decode_failure(
     with TestClient(app) as client:
         response = client.post("/daemon/pause")
 
-    assert response.status_code == 200
-    rewritten = _stored_state(redis_client, _REPO_SLUGS[0])
-    assert rewritten.user_paused is True
-    assert rewritten.state == PipelineState.IDLE
+    assert response.status_code == 409
+    assert response.json() == _result([_REPO_SLUGS[0]], "failed", "corrupt_state")
+    assert redis_client.values[pipeline_state(_REPO_SLUGS[0])] == "{not valid json"
+    assert redis_client.published == []
 
 
 def test_daemon_pause_skips_write_on_redis_get_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A transient ``pipe.get`` failure must not overwrite live repo state.
-
-    Falling back to a synthesized default would erase ``current_task``,
-    ``current_pr``, and rate-limit metadata on the active repo. The
-    endpoint instead skips the write for that repo (the outer
-    try/except logs and continues the sweep), leaving the existing
-    payload intact for the next pause attempt once Redis recovers.
-    """
     _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
     redis_client = _FakeRedis()
     _seed_state(
@@ -346,12 +346,8 @@ def test_daemon_pause_skips_write_on_redis_get_failure(
     with TestClient(app) as client:
         response = client.post("/daemon/pause")
 
-    assert response.status_code == 200
-    # Sweep still reports the repo as affected; the outer handler logs
-    # the failure and moves on rather than aborting the request.
-    assert response.json() == {"affected": [_REPO_SLUGS[0]], "count": 1}
-    # The seeded state is unchanged — no synthesized default clobbered
-    # the live ``current_task`` / ``user_paused`` fields.
+    assert response.status_code == 503
+    assert response.json() == _result([_REPO_SLUGS[0]], "unavailable", "write_unconfirmed")
     assert (
         redis_client.values[pipeline_state(_REPO_SLUGS[0])] == seeded_payload
     )
@@ -372,7 +368,7 @@ def test_daemon_resume_clears_user_paused_for_all(
         response = client.post("/daemon/resume")
 
     assert response.status_code == 200
-    assert response.json() == {"affected": _REPO_SLUGS, "count": 3}
+    assert response.json() == _result(_REPO_SLUGS)
     for slug in _REPO_SLUGS:
         assert _stored_state(redis_client, slug).user_paused is False
         # Resume also clears any stop flag so the previous daemon stop
@@ -384,7 +380,7 @@ def test_daemon_resume_clears_user_paused_for_all(
     ]
 
 
-def test_daemon_resume_swallows_pipeline_failures(
+def test_daemon_resume_reports_pipeline_failures(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
@@ -396,11 +392,11 @@ def test_daemon_resume_swallows_pipeline_failures(
     with TestClient(app) as client:
         response = client.post("/daemon/resume")
 
-    # Pipeline failure does not mask the affected list.
-    assert response.json() == {"affected": [_REPO_SLUGS[0]], "count": 1}
+    assert response.status_code == 503
+    assert response.json() == _result([_REPO_SLUGS[0]], "unavailable", "write_unconfirmed")
 
 
-def test_daemon_resume_without_redis_returns_affected(
+def test_daemon_resume_without_redis_reports_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_config(tmp_path, monkeypatch)
@@ -409,7 +405,8 @@ def test_daemon_resume_without_redis_returns_affected(
     with TestClient(app) as client:
         response = client.post("/daemon/resume")
 
-    assert response.json() == {"affected": _REPO_SLUGS, "count": 3}
+    assert response.status_code == 503
+    assert response.json() == _result(_REPO_SLUGS, "unavailable", "redis_unavailable")
 
 
 def test_daemon_stop_writes_control_stop_with_60s_ttl(
@@ -423,13 +420,13 @@ def test_daemon_stop_writes_control_stop_with_60s_ttl(
         response = client.post("/daemon/stop")
 
     assert response.status_code == 200
-    assert response.json() == {"affected": _REPO_SLUGS, "count": 3}
+    assert response.json() == _result(_REPO_SLUGS)
     for slug in _REPO_SLUGS:
         assert redis_client.values[control_stop(slug)] == "1"
         assert redis_client.ttls[control_stop(slug)] == 60
 
 
-def test_daemon_stop_swallows_set_errors(
+def test_daemon_stop_reports_set_errors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_config(tmp_path, monkeypatch)
@@ -449,12 +446,13 @@ def test_daemon_stop_swallows_set_errors(
     with TestClient(app) as client:
         response = client.post("/daemon/stop")
 
-    assert response.json() == {"affected": _REPO_SLUGS, "count": 3}
+    assert response.status_code == 503
+    assert response.json() == _result(_REPO_SLUGS, "unavailable", "write_unconfirmed")
     for slug in _REPO_SLUGS:
         assert control_stop(slug) not in redis_client.values
 
 
-def test_daemon_stop_without_redis_returns_affected(
+def test_daemon_stop_without_redis_reports_unavailable(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_config(tmp_path, monkeypatch)
@@ -463,7 +461,8 @@ def test_daemon_stop_without_redis_returns_affected(
     with TestClient(app) as client:
         response = client.post("/daemon/stop")
 
-    assert response.json() == {"affected": _REPO_SLUGS, "count": 3}
+    assert response.status_code == 503
+    assert response.json() == _result(_REPO_SLUGS, "unavailable", "redis_unavailable")
 
 
 def test_drain_progress_returns_per_repo_state(
@@ -597,75 +596,83 @@ def test_drain_progress_rate_limit_pause_not_draining(
     assert entry["draining"] is False
 
 
-def test_drain_progress_recovers_from_redis_get_failure(
+def test_drain_progress_reports_redis_get_failure(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Drain-progress falls back to a default IDLE entry when ``get`` raises.
-
-    The endpoint walks every configured repo sequentially; a transient
-    Redis read failure for one repo must not abort the sweep or surface
-    a 500 to the deploy operator polling this endpoint.
-    """
     _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
     redis_client = _FakeRedis()
     redis_client.get_error = RuntimeError("redis read down")
     _stub_redis(monkeypatch, redis_client)
 
     with TestClient(app) as client:
-        body = client.get("/daemon/drain-progress").json()
+        response = client.get("/daemon/drain-progress")
+        body = response.json()
 
     entry = body["repos"][0]
-    assert entry["state"] == PipelineState.IDLE.value
-    assert entry["draining"] is False
+    assert entry["state"] is None
+    assert entry["draining"] is None
+
+    assert response.status_code == 503
+    assert all(r["reason"] == "redis_unavailable" for r in body["repos"])
 
 
-def test_drain_progress_recovers_from_state_decode_failure(
+def test_drain_progress_reports_corrupt_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Drain-progress falls back to a default entry on corrupt JSON."""
     _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
     redis_client = _FakeRedis()
     redis_client.values[pipeline_state(_REPO_SLUGS[0])] = "{not valid json"
     _stub_redis(monkeypatch, redis_client)
 
     with TestClient(app) as client:
-        body = client.get("/daemon/drain-progress").json()
+        response = client.get("/daemon/drain-progress")
+        body = response.json()
 
     entry = body["repos"][0]
-    assert entry["state"] == PipelineState.IDLE.value
-    assert entry["draining"] is False
+    assert entry["state"] is None
+    assert entry["draining"] is None
+
+    assert response.status_code == 409
+    assert all(r["reason"] == "corrupt_state" for r in body["repos"])
 
 
-def test_drain_progress_returns_default_for_unseeded_repo(
+def test_drain_progress_reports_missing_for_unseeded_repo(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Repos with no pipeline state in Redis report a default IDLE entry."""
     _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
     redis_client = _FakeRedis()
     _stub_redis(monkeypatch, redis_client)
 
     with TestClient(app) as client:
-        body = client.get("/daemon/drain-progress").json()
+        response = client.get("/daemon/drain-progress")
+        body = response.json()
 
     entry = body["repos"][0]
-    assert entry["state"] == PipelineState.IDLE.value
+    assert entry["state"] is None
     assert entry["current_task_id"] is None
-    assert entry["draining"] is False
+    assert entry["draining"] is None
+
+    assert response.status_code == 409
+    assert all(r["reason"] == "missing_state" for r in body["repos"])
 
 
-def test_drain_progress_without_redis_returns_default_state(
+def test_drain_progress_without_redis_reports_unknown_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _write_config(tmp_path, monkeypatch)
     _stub_redis(monkeypatch, None)
 
     with TestClient(app) as client:
-        body = client.get("/daemon/drain-progress").json()
+        response = client.get("/daemon/drain-progress")
+        body = response.json()
 
     assert [entry["name"] for entry in body["repos"]] == _REPO_SLUGS
-    assert all(entry["state"] == PipelineState.IDLE.value for entry in body["repos"])
-    assert all(entry["draining"] is False for entry in body["repos"])
+    assert all(entry["state"] is None for entry in body["repos"])
+    assert all(entry["draining"] is None for entry in body["repos"])
     assert all(entry["current_task_id"] is None for entry in body["repos"])
+
+    assert response.status_code == 503
+    assert all(r["reason"] == "redis_unavailable" for r in body["repos"])
 
 
 def test_daemon_pause_uses_cas_watch_on_state_key(
@@ -739,3 +746,92 @@ def test_daemon_endpoints_idempotent(
 def test_config_path_helper_reads_app_setting(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(web_app, "CONFIG_PATH", "/custom/path/config.yml")
     assert daemon_control_routes._config_path() == "/custom/path/config.yml"
+
+
+@pytest.mark.parametrize("action", ["pause", "resume", "stop"])
+def test_global_control_reports_partial_writes_and_continues(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str,
+) -> None:
+    _write_config(tmp_path, monkeypatch)
+    redis_client = _FakeRedis()
+    _stub_redis(monkeypatch, redis_client)
+    original_transaction = redis_client.transaction
+    original_set = redis_client.set
+
+    async def transaction(callback, *keys, **kwargs):
+        if pipeline_state(_REPO_SLUGS[1]) in keys:
+            raise ConnectionError("selective outage")
+        return await original_transaction(callback, *keys, **kwargs)
+
+    async def set_value(key, value, **kwargs):
+        if key == control_stop(_REPO_SLUGS[1]):
+            raise ConnectionError("selective outage")
+        return await original_set(key, value, **kwargs)
+
+    redis_client.transaction = transaction
+    redis_client.set = set_value
+    with TestClient(app) as client:
+        response = client.post(f"/daemon/{action}")
+    assert response.status_code == 207
+    assert response.json()["affected"] == [_REPO_SLUGS[0], _REPO_SLUGS[2]]
+    assert response.json()["count"] == 2
+    assert [r["status"] for r in response.json()["results"]] == [
+        "accepted", "unavailable", "accepted",
+    ]
+    if action != "stop":
+        assert [channel for channel, _ in redis_client.published] == [
+            f"orchestrator:wake:{slug}" for slug in [_REPO_SLUGS[0], _REPO_SLUGS[2]]
+        ]
+
+
+@pytest.mark.parametrize("action", ["pause", "resume"])
+def test_corrupt_snapshot_blocks_only_its_control_and_preserves_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, action: str,
+) -> None:
+    _write_config(tmp_path, monkeypatch)
+    redis_client = _FakeRedis()
+    _stub_redis(monkeypatch, redis_client)
+    slug = _REPO_SLUGS[1]
+    redis_client.values[pipeline_state(slug)] = "{}"
+    redis_client.values[control_stop(slug)] = "1"
+    with TestClient(app) as client:
+        response = client.post(f"/daemon/{action}")
+    assert response.status_code == 207
+    assert response.json()["results"][1] == {
+        "name": slug, "status": "failed", "reason": "corrupt_state",
+    }
+    assert redis_client.values[pipeline_state(slug)] == "{}"
+    assert redis_client.values[control_stop(slug)] == "1"
+    assert len(redis_client.published) == 2
+
+
+def test_drain_progress_partial_state_never_claims_idle_for_unknown(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _write_config(tmp_path, monkeypatch)
+    redis_client = _FakeRedis()
+    _stub_redis(monkeypatch, redis_client)
+    _seed_state(redis_client, _REPO_SLUGS[0], url=_REPO_URLS[0])
+    redis_client.values[pipeline_state(_REPO_SLUGS[1])] = "bad json"
+    with TestClient(app) as client:
+        response = client.get("/daemon/drain-progress")
+    assert response.status_code == 207
+    entries = response.json()["repos"]
+    assert entries[0]["status"] == "available"
+    assert [r["reason"] for r in entries[1:]] == ["corrupt_state", "missing_state"]
+    assert all(r["state"] is None and r["draining"] is None for r in entries[1:])
+
+
+def test_stop_rejected_write_is_not_accepted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _write_config(tmp_path, monkeypatch, repo_urls=[_REPO_URLS[0]])
+    redis_client = _FakeRedis()
+    _stub_redis(monkeypatch, redis_client)
+
+    async def rejected(*args, **kwargs):
+        return False
+
+    redis_client.set = rejected
+    with TestClient(app) as client:
+        response = client.post("/daemon/stop")
+    assert response.status_code == 409
+    assert response.json() == _result([_REPO_SLUGS[0]], "failed", "write_rejected")
