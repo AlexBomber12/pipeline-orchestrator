@@ -53,12 +53,15 @@ def get_recorded_completions(
     candidate_pr_ids: set[str],
     *,
     remote_ref: str | None = None,
+    task_contents: dict[str, bytes] | None = None,
 ) -> set[str]:
     """Verify matching task bytes and commit ancestry, without network or writes.
 
     The reviewed manifest attests which PR implemented the task. Runtime
     verifies that the exact task is still present and the recorded commit
     belongs to the configured base. A changed task does not inherit a receipt.
+    Admission callers may supply effective task bytes keyed by PR ID, so pending
+    and incoming replacements are checked before they reach the worktree.
     """
     try:
         if remote_ref is None:
@@ -102,7 +105,9 @@ def get_recorded_completions(
         if pr_id not in candidate_pr_ids:
             continue
         try:
-            if remote_ref is None:
+            if task_contents is not None and pr_id in task_contents:
+                task_bytes = task_contents[pr_id]
+            elif remote_ref is None:
                 task_bytes = (Path(repo_path) / "tasks" / f"{pr_id}.md").read_bytes()
             else:
                 result = subprocess.run(

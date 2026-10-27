@@ -409,3 +409,78 @@ def test_validate_task_spec_completion_uses_configured_base(
     git("update-ref", "refs/remotes/origin/release", "HEAD")
     assert functional.validate_task_spec(cyclic, repo="owner__repo")["valid"]
     assert functional.validate_task_spec(shared_branch, repo="owner__repo")["valid"]
+
+
+@pytest.mark.parametrize("done_source", ["stored", "incoming"])
+@pytest.mark.parametrize("conflict", ["cycle", "branch"])
+def test_context_done_requires_completion_evidence(tmp_path, monkeypatch, done_source, conflict):
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    tasks = tmp_path / "owner__repo/tasks"
+    tasks.mkdir(parents=True)
+    stored = _VALID_SPEC.replace("PR-999", "PR-998").replace("pr-999", "pr-998")
+    incoming = _VALID_SPEC.replace("- Depends on: none", "- Depends on: PR-998")
+    if conflict == "cycle":
+        stored = stored.replace("- Depends on: none", "- Depends on: PR-999")
+    else:
+        incoming = incoming.replace("Branch: pr-999-example", "Branch: pr-998-example")
+    if done_source == "stored":
+        stored = stored.replace("status: TODO", "status: DONE")
+    else:
+        incoming = incoming.replace("status: TODO", "status: DONE")
+    (tasks / "PR-998.md").write_text(stored)
+    result = functional.validate_task_spec(incoming, repo="owner__repo")
+    assert not result["valid"]
+    assert any(("dependency cycle" if conflict == "cycle" else "branch") in error for error in result["errors"])
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+@pytest.mark.parametrize("conflict", ["cycle", "branch"])
+def test_context_receipts_use_effective_bytes(
+    tmp_path, monkeypatch, record_task_completion, replacement, conflict,
+):
+    from src.config import AppConfig, RepoConfig
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    monkeypatch.setattr(functional, "load_config", lambda: AppConfig(
+        repositories=[RepoConfig(url="https://github.com/owner/repo", branch="release")],
+    ))
+    repo = tmp_path / "owner__repo"
+    tasks = repo / "tasks"
+    tasks.mkdir(parents=True)
+    stored = _VALID_SPEC.replace("PR-999", "PR-998").replace("pr-999", "pr-998")
+    if conflict == "cycle":
+        stored = stored.replace("- Depends on: none", "- Depends on: PR-999")
+    (tasks / "PR-998.md").write_text(stored)
+    record_task_completion(repo, "PR-998", "owner/repo", "release")
+    if replacement:
+        # Replace the completed task itself: a stale receipt must not prune its edges.
+        incoming = stored + "\nChanged requirements\n"
+        other = _VALID_SPEC.replace("- Depends on: none", "- Depends on: PR-998")
+        if conflict == "branch":
+            other = other.replace("Branch: pr-999-example", "Branch: pr-998-example")
+        (tasks / "PR-999.md").write_text(other)
+    else:
+        incoming = _VALID_SPEC.replace("- Depends on: none", "- Depends on: PR-998")
+        if conflict == "branch":
+            incoming = incoming.replace("Branch: pr-999-example", "Branch: pr-998-example")
+    result = functional.validate_task_spec(incoming, repo="owner__repo")
+    assert result["valid"] is not replacement
+
+
+def test_context_unverifiable_receipts_block_admission(tmp_path, monkeypatch):
+    from src.config import AppConfig, RepoConfig
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    monkeypatch.setattr(functional, "load_config", lambda: AppConfig(
+        repositories=[RepoConfig(url="https://github.com/owner/repo")],
+    ))
+    tasks = tmp_path / "owner__repo/tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "completions.json").write_text("invalid")
+    result = functional.validate_task_spec(_VALID_SPEC, repo="owner__repo")
+    assert not result["valid"]
+    assert any("Cannot verify completion records" in error for error in result["errors"])

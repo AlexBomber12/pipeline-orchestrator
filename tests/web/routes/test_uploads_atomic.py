@@ -925,7 +925,8 @@ def test_replacement_removes_old_edges_and_ignores_unstructured_history(repo_dir
     assert response.status_code == 200
 
 
-def test_completed_predecessor_is_a_leaf_and_does_not_reserve_branch(repo_dir):
+def test_completed_predecessor_is_a_leaf_and_does_not_reserve_branch(repo_dir, monkeypatch):
+    monkeypatch.setattr(upload_routes, "get_merged_pr_ids", lambda *args: {"PR-001"})
     tasks = repo_dir / "tasks"
     tasks.mkdir()
     (tasks / "PR-001.md").write_bytes(_task_file(depends_on="PR-999")[1][1].replace(
@@ -998,3 +999,76 @@ def test_pending_same_id_replacement_removes_old_edges(uploads_dir):
         manifest = json.loads(client.app.state.redis._store[upload_pending("example__alpha")])
     assert response.status_code == 200
     assert Path(manifest["staging_dir"], "PR-001.md").read_bytes() == _task_file()[1][1]
+
+
+@pytest.mark.parametrize("source", ["batch", "stored", "pending"])
+@pytest.mark.parametrize("conflict", ["cycle", "branch"])
+def test_done_declaration_without_evidence_keeps_executable_edges(
+    repo_dir, uploads_dir, source, conflict,
+):
+    first = _task_file(depends_on="PR-002" if conflict == "cycle" else "none")
+    first = ("files", ("PR-001.md", first[1][1].replace(b"status: TODO", b"status: DONE"), "text/markdown"))
+    second = _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")
+    if conflict == "branch":
+        second = ("files", ("PR-002.md", second[1][1].replace(
+            b"pr-002-example-task", b"pr-001-example-task"), "text/markdown"))
+    with TestClient(app) as client:
+        files = [second]
+        if source == "batch":
+            files.append(first)
+        elif source == "stored":
+            (repo_dir / "tasks").mkdir()
+            (repo_dir / "tasks/PR-001.md").write_bytes(first[1][1])
+        else:
+            pending = uploads_dir / "pending"
+            pending.mkdir()
+            (pending / "PR-001.md").write_bytes(first[1][1])
+            client.app.state.redis._store[upload_pending("example__alpha")] = json.dumps({
+                "files": ["PR-001.md"], "staging_dir": str(pending),
+            })
+        before = dict(client.app.state.redis._store)
+        response = client.post("/repos/example__alpha/upload-tasks", files=files)
+        assert client.app.state.redis._store == before
+    assert response.status_code == 400
+    assert ("dependency cycle" if conflict == "cycle" else "duplicate branch") in response.text
+    assert not (uploads_dir / "example__alpha").exists()
+
+
+@pytest.mark.parametrize("replacement", ["stored", "identical", "incoming", "pending"])
+@pytest.mark.parametrize("conflict", ["cycle", "branch"])
+def test_upload_receipts_use_effective_task_bytes(
+    repo_dir, uploads_dir, record_task_completion, replacement, conflict,
+):
+    (repo_dir / "tasks").mkdir()
+    first = _task_file(depends_on="PR-002" if conflict == "cycle" else "none")
+    (repo_dir / "tasks/PR-001.md").write_bytes(first[1][1])
+    record_task_completion(repo_dir, "PR-001", "example/alpha")
+    second = _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")
+    if conflict == "branch":
+        second = ("files", ("PR-002.md", second[1][1].replace(
+            b"pr-002-example-task", b"pr-001-example-task"), "text/markdown"))
+    with TestClient(app) as client:
+        files = [second]
+        changed = first[1][1] + b"\nChanged requirements\n"
+        if replacement in {"incoming", "identical"}:
+            replacement_bytes = changed if replacement == "incoming" else first[1][1]
+            files.append(("files", ("PR-001.md", replacement_bytes, "text/markdown")))
+        elif replacement == "pending":
+            pending = uploads_dir / "pending"
+            pending.mkdir()
+            (pending / "PR-001.md").write_bytes(changed)
+            client.app.state.redis._store[upload_pending("example__alpha")] = json.dumps({
+                "files": ["PR-001.md"], "staging_dir": str(pending),
+            })
+        response = client.post("/repos/example__alpha/upload-tasks", files=files)
+    assert response.status_code == (200 if replacement in {"stored", "identical"} else 400)
+    if response.status_code == 400:
+        assert ("dependency cycle" if conflict == "cycle" else "duplicate branch") in response.text
+
+
+def test_upload_unverifiable_receipts_block_admission(repo_dir):
+    (repo_dir / "tasks").mkdir()
+    (repo_dir / "tasks/completions.json").write_text("invalid")
+    response = _post_upload([_task_file()])
+    assert response.status_code == 400
+    assert "Cannot verify completion records" in response.text

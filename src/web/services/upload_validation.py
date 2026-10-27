@@ -16,6 +16,7 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+from src.completion_evidence import get_recorded_completions
 from src.dag import build_task_dag
 from src.models import PipelineState
 from src.queue_parser import (
@@ -337,12 +338,10 @@ def _parse_legacy_existing_task_header(path: Path) -> TaskHeader | None:
     )
 
 
-def effective_task_headers(
-    tasks_dir: Path,
-    incoming: dict[str, TaskHeader],
-    pending_manifest: str | bytes | None = None,
-) -> dict[str, TaskHeader]:
-    """Overlay pending and incoming replacements by filename, retaining edges."""
+def _effective_task_paths(
+    tasks_dir: Path, pending_manifest: str | bytes | None,
+) -> dict[str, Path]:
+    """Resolve stored and pending task paths with pending replacements winning."""
     paths = {path.name: path for path in tasks_dir.glob("PR-*.md") if path.is_file()}
     if pending_manifest:
         try:
@@ -357,6 +356,36 @@ def effective_task_headers(
                             paths[fname] = path
         except (ValueError, TypeError, AttributeError):
             pass
+    return paths
+
+
+def effective_recorded_completions(
+    repo_path: str, base_branch: str, candidates: set[str],
+    incoming: dict[str, str], pending_manifest: str | bytes | None = None,
+) -> set[str]:
+    """Verify receipts against the exact effective bytes that will be committed."""
+    tasks_dir = Path(repo_path) / "tasks"
+    paths = _effective_task_paths(tasks_dir, pending_manifest)
+    contents = {
+        Path(fname).stem: path.read_bytes()
+        for fname, path in paths.items() if fname not in incoming
+    }
+    for fname, content in incoming.items():
+        content, _ = preserve_terminal_status_on_collision(tasks_dir / fname, content)
+        contents[Path(fname).stem] = content.encode("utf-8")
+    return get_recorded_completions(
+        repo_path, base_branch, Path(repo_path).name.replace("__", "/", 1),
+        candidates, task_contents=contents,
+    )
+
+
+def effective_task_headers(
+    tasks_dir: Path,
+    incoming: dict[str, TaskHeader],
+    pending_manifest: str | bytes | None = None,
+) -> dict[str, TaskHeader]:
+    """Overlay pending and incoming replacements by filename, retaining edges."""
+    paths = _effective_task_paths(tasks_dir, pending_manifest)
     headers = {
         fname: header
         for fname, path in paths.items()
@@ -377,14 +406,13 @@ def validate_effective_task_graph(
 ) -> dict[str, list[str]]:
     """Validate identities and the executable graph using canonical DAG rules.
 
-    Completed tasks are leaves. Unstructured history is ignored by the reader;
+    Only positively evidenced completions are leaves; DONE frontmatter alone
+    does not prove completion. Unstructured history is ignored by the reader;
     it cannot establish dependency completion merely by existing on disk.
     """
     errors: dict[str, list[str]] = {}
     known = {header.pr_id for header in headers.values()}
-    completed = merged_pr_ids | {
-        header.pr_id for header in headers.values() if header.frontmatter_status == "done"
-    }
+    completed = set(merged_pr_ids)
     completed |= merged_split_parent_aliases(
         structured_pr_ids=known, merged_pr_ids=merged_pr_ids,
     )

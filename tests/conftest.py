@@ -128,3 +128,37 @@ def isolate_events_dir(
     target = tmp_path / "events"
     monkeypatch.setenv("PO_EVENTS_DIR", str(target))
     return target
+
+
+@pytest.fixture
+def record_task_completion():
+    """Create a real base commit and a byte-bound receipt for an existing task."""
+    import hashlib
+    import json
+    import subprocess
+
+    def record(repo: Path, pr_id: str, owner_repo: str, base: str = "main"):
+        def git(*args):
+            return subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.name=Fixture",
+                 "-c", "user.email=fixture@example.invalid", *args],
+                check=True, capture_output=True, text=True,
+            ).stdout.strip()
+
+        git("init", "-b", base)
+        git("add", "tasks")
+        git("commit", "-m", "MICRO: implement existing task")
+        manifest = {
+            "schema_version": 1, "repository": owner_repo, "base_branch": base,
+            "completions": {pr_id: {
+                "task_sha256": hashlib.sha256((repo / "tasks" / f"{pr_id}.md").read_bytes()).hexdigest(),
+                "merge_commit": git("rev-parse", "HEAD"), "pull_request": 1,
+                "reason": "Implemented through a separately reviewed MICRO PR",
+            }},
+        }
+        (repo / "tasks/completions.json").write_text(json.dumps(manifest))
+        git("add", "tasks/completions.json")
+        git("commit", "-m", "Record completion")
+        git("update-ref", f"refs/remotes/origin/{base}", "HEAD")
+
+    return record

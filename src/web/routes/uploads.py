@@ -46,6 +46,7 @@ from src.web.services.upload_validation import (
     _build_upload_success_message,
     _format_upload_message_lines,
     _upload_feedback_target,
+    effective_recorded_completions,
     effective_task_headers,
     preserve_terminal_status_on_collision,
     sweep_abandoned_staging,
@@ -287,7 +288,7 @@ def _extend_validation_errors(
 
 async def _graph_validation_errors(
     repo_path: str, repo_branch: str, incoming: dict[str, TaskHeader],
-    pending_manifest: str | bytes | None,
+    pending_manifest: str | bytes | None, incoming_texts: dict[str, str],
 ) -> dict[str, list[str]]:
     headers = effective_task_headers(Path(repo_path) / "tasks", incoming, pending_manifest)
     candidates = {
@@ -302,6 +303,13 @@ async def _graph_validation_errors(
             merged = set()
     else:
         merged = set()
+    try:
+        merged |= await asyncio.to_thread(
+            effective_recorded_completions, repo_path, repo_branch, candidates,
+            incoming_texts, pending_manifest,
+        )
+    except (OSError, RuntimeError) as exc:
+        return {fname: [f"Cannot verify completion records: {exc}"] for fname in incoming}
     return validate_effective_task_graph(headers, merged_pr_ids=merged)
 
 
@@ -546,7 +554,7 @@ async def upload_tasks(
     except Exception:
         pending_manifest = None
     _extend_validation_errors(errors_by_file, await _graph_validation_errors(
-        repo_path, repo_branch, parsed_headers, pending_manifest,
+        repo_path, repo_branch, parsed_headers, pending_manifest, parsed_task_texts,
     ))
 
     if errors_by_file:
@@ -674,7 +682,7 @@ async def upload_tasks(
                 503, repo_name=name,
             )
         graph_errors = await _graph_validation_errors(
-            repo_path, repo_branch, parsed_headers, existing_raw,
+            repo_path, repo_branch, parsed_headers, existing_raw, parsed_task_texts,
         )
         if graph_errors:
             validation_errors = [

@@ -26,6 +26,7 @@ from src.task_status import get_merged_pr_ids
 from src.utils import repo_slug_from_url
 from src.web.services.upload_validation import (
     _TASK_UPLOAD_PATTERN,
+    effective_recorded_completions,
     effective_task_headers,
     validate_effective_task_graph,
 )
@@ -144,6 +145,14 @@ def validate_task_spec(
                 )
             except (OSError, RuntimeError):
                 merged = set()
+            if repo_branch is not None:
+                try:
+                    merged |= effective_recorded_completions(
+                        str(repo_path), repo_branch, candidates,
+                        {filename or f"{header.pr_id}.md": content},
+                    )
+                except (OSError, RuntimeError) as exc:
+                    schema_errors.append(f"Cannot verify completion records: {exc}")
             graph_errors = validate_effective_task_graph(headers, merged_pr_ids=merged)
             schema_errors.extend(
                 f"{fname}: {issue}" for fname, issues in graph_errors.items() for issue in issues
