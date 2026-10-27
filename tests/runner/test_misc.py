@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import subprocess
+import sys
 import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,6 +24,7 @@ from src.config import AppConfig, CoderType
 from src.daemon import git_ops as git_ops_module
 from src.daemon import recovery_policy as recovery_policy_module
 from src.daemon import runner as runner_module
+from src.daemon.approval_commands import checkout_process_blocker
 from src.daemon.runner import PipelineRunner
 from src.models import (
     PipelineState,
@@ -30,6 +32,7 @@ from src.models import (
     QueueTask,
     TaskStatus,
 )
+from src.process_supervisor import launch_process
 
 from tests.runner import _helpers as h
 
@@ -1247,6 +1250,63 @@ def test_restore_current_run_record_rehydrates_latest_invocation() -> None:
 
     assert runner._current_run_record is not None
     assert runner.state.active_invocation == latest
+
+
+@pytest.mark.asyncio
+async def test_restored_invocation_is_not_restart_process_ownership(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = h._make_runner()
+    original.state.current_task = QueueTask(
+        pr_id="PR-001", title="t", status=TaskStatus.DOING,
+        branch="pr-001", task_file="tasks/PR-001.md",
+    )
+    original._start_current_run_record("codex", "gpt-5.4")
+    snapshot = original._capture_invocation_snapshot("codex", {}, phase="coding")
+    await original._checkpoint_current_run_record()
+    managed = await launch_process(
+        sys.executable, "-c",
+        "import signal\nprint('ready', flush=True)\nwhile True: signal.pause()",
+        cwd=tmp_path, stdout=asyncio.subprocess.PIPE,
+    )
+    try:
+        # Model this fixture's process namespace: hosted CI can have unrelated
+        # same-UID processes whose cwd is unreadable. Keep the owned child's
+        # real /proc entry and cwd inspection, including after it is reaped.
+        original_iterdir = Path.iterdir
+
+        def owned_process_entries(path: Path):
+            if path == Path("/proc"):
+                return iter([path / str(managed.process.pid)])
+            return original_iterdir(path)
+
+        monkeypatch.setattr(Path, "iterdir", owned_process_entries)
+        assert managed.process.stdout is not None
+        assert await asyncio.wait_for(managed.process.stdout.readline(), 2) == b"ready\n"
+        original._track_current_coder_supervised_process(managed)
+        fresh = h._make_runner()
+        # Actual serialization boundary: a fresh runner restores persisted
+        # state and the same Redis-backed metrics, not the original handle.
+        fresh.state = type(original.state).model_validate_json(original.state.model_dump_json())
+        fresh._metrics_store = type(original._metrics_store)(original.redis)
+        await fresh._restore_current_run_record()
+        assert fresh.state.active_invocation == snapshot
+        assert fresh._current_run_record == original._current_run_record
+        assert fresh._current_coder_supervised_process is None
+        assert fresh._current_coder_process is None
+        # Characterize the missing-handle fast path without treating it as
+        # proof: the real, fixture-owned process still blocks the checkout.
+        assert await fresh._terminate_current_coder()
+        assert managed.process.returncode is None
+        assert checkout_process_blocker(str(tmp_path)) == (
+            f"Process {managed.process.pid} still uses the checkout; waiting for it to exit."
+        )
+    finally:
+        async with asyncio.timeout(3):
+            result = await managed.cleanup(term_grace=0.05, kill_grace=0.5)
+            assert result.quiescent
+            await managed.process.communicate()
+    assert checkout_process_blocker(str(tmp_path)) is None
 
 
 def test_restore_current_run_record_preserves_newer_state_snapshot() -> None:

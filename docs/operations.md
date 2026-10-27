@@ -579,3 +579,106 @@ restore and ownership smoke, without production failure drills here.
 Verification: `python -m pytest tests/test_work_preservation_contract.py -q`;
 `python -m pytest tests/test_backups.py -q`; final gate and review artifacts via
 `bash scripts/make-review-artifacts.sh` after the intended commit.
+
+## Cleanup lifetime evidence (PR-408)
+
+This inventory describes the implementation at base
+`21e93658df99edad759ca77a6c0b0ae21682de89`. It reuses the delivered supervisor;
+it does not implement restart ownership or change process control. Historical
+scope references PR-416/419/420/421/422/454 refer to the retired specifications
+at `7167c2e916a2bbb843ecb6a6ce7fc15795e61802`, not current task dependencies.
+
+### Producers and consumers
+
+| Boundary | Ownership produced or consumed | Remaining delta |
+| --- | --- | --- |
+| `process_supervisor.launch_process` / `launch_pty_process` | Dedicated session/group, leader birth token, internal same-session witness with pidfd/control pipe, known member birth tokens; constructor requires launch proof | These are live daemon objects/descriptors, not a durable restart receipt. |
+| Supervisor witness launcher | Forks witness before target exec; witness survives ordinary leader exit and exits on control-pipe EOF | Daemon death closes the pipe; witness exit alone does not terminate the workload. |
+| `claude_cli.run_claude_async` / `codex_cli.run_codex_async` | Optional bwrap command from `daemon/sandbox.py`, then supervised async launch; raw and supervised callbacks go through `run_supervised_process` | Wrapper PID/exit and pipe EOF alone are insufficient; no proof for descendants escaping the owned session/group or crossing containment boundaries. |
+| Legacy synchronous `claude_cli.run_claude` and prompt wrappers | `subprocess.run` with timeout, optionally bwrap; no supervised ownership callback | Not the built-in daemon async coder path; no group-quiescence result. A future migration would replace this invocation boundary, not add a second supervisor. |
+| `coder_auth.isolated_auth_probe` / `terminate_plugin_worker` | Raw new-session worker; timeout/cancellation kills numeric process group and awaits leader | No supervisor witness or retained failure receipt; replace launch/termination with existing supervisor in a separately scoped migration. Ordinary worker exit does not prove descendant quiescence. |
+| `coders/codex_models.discover_codex_models` / `_close_process` | Raw app-server child; closes stdin, kills leader, communicates in finally | No dedicated owned group or descendant cleanup proof; migrate this producer/consumer pair separately. |
+| `run_supervised_process` | Leader returncode, group cleanup, then bounded reader settlement; structured supervision failure retained on handle | A tuple result is not independently a process ownership receipt. Launch errors before callback publication are flattened by CLI adapters; runner conservatively retains a failure detail. |
+| Runner `_track_current_coder_process` / `_track_current_coder_supervised_process` | Retain matching handles; reject replacement while outstanding | No rehydration from serialized invocation metadata. |
+| CODING and FIX handler `finally` paths | `_record_unconfirmed_launch_cleanup`, then `_confirm_current_coder_cleanup` before lifecycle/publication handling | Require actual cleanup success; leave handles and ERROR park on failure. |
+| Runner Stop monitor; FIX idle and GitHub-terminal pollers in `fix_supervision.py` | `_terminate_current_coder` before cancelling the coder await; handler finally confirms cleanup | Cancellation is not the proof. Cached cleanup failure still blocks. |
+| Runner `_await_auxiliary_coder` | Stop/cancellation/finally cleanup for MERGE conflict resolution and ERROR diagnosis; credentials released only after confirmation | Uses the same runner owner, not a separate helper lifecycle. |
+| Publication recovery, Retry PR creation and IDLE retained-publication upload | `_confirm_current_coder_cleanup` before consuming retained publication evidence; CODING timeout also terminates the current coder | Publication context is evidence of dispatch/publication identity, not independent process identity. |
+| Runner `_hold_for_coder_cleanup` | Blocks commands, checkout work and handlers before each cycle when tracked cleanup is unresolved | Missing raw+managed handles and failure detail take a fast path; that is only local bookkeeping, not restart quiescence evidence. |
+| `coder_login` terminal/device sessions | Supervised PTY/pipe launch; retained session and credential reservation on failure; fresh observation via `reconcile_cleanup` on subsequent cleanup | In-memory session lifetime only; reader settlement also required before release. |
+| `coders/claude_models.py`, `model_catalog_bridge.py` | Supervised model probes/configured worker wrapper; structured unavailable errors retain owner; `ModelCatalogProcessOwner` serializes retained holds and observes before relaunch/shutdown | Catalog reconciliation can release a later-quiet hold without signalling; no durable daemon-restart owner. |
+| `daemon/main.py` removal/shutdown; catalog bridge finally | Cancels and awaits owned cycles; SIGTERM requests cancellation and finally gathers owned tasks, reaching handler/adapter cleanup; bridge drains requests then shuts down login and catalog owners | Graceful shutdown is supported; abrupt daemon death bypasses Python finally blocks. |
+| `InvocationSnapshot`, `RunRecord`, `RepoState`, publication context | Persist run/attempt, plugin/settings, phase/FIX count, task/branch and GitHub publication identity for recovery | No kernel lifetime identity, boot token, witness descriptor or cleanup receipt is restored. |
+| `approval_commands.checkout_process_blocker` and its approval/recovery/retry callers | Conservative `/proc` cwd blocker, including orphan processes still using this checkout | Not a signal authority or global descendant inventory; cannot exclude escaped/chdir'd children. Never kill by its reported PID. |
+
+### Tested positive proof and limits
+
+For PR-431, the positive proof available **while the owner survives** is a
+`CleanupResult.quiescent` from the retained, launch-proven `SupervisedProcess`,
+with its leader reaped and owned-group snapshots reconciled. Signal delivery
+uses freshly revalidated member birth tokens and pidfds, never a numeric group
+ID as the delivery target. The witness preserves continuity when the leader
+exits before a child. The supervisor excludes its own witness from workload
+liveness, then closes/reaps that witness. A successful execution also settles
+owned output readers; leader returncode, EOF, IDLE, cancellation, or a missing
+handle alone cannot substitute for the cleanup result.
+
+`test_runner_consumes_live_cleanup_proof_across_leader_exit` uses the existing
+fixture-owned process pool and real supervisor/runner consumer for ordinary
+exit, an exited leader with a TERM-ignoring child, and a leader killed through
+its pidfd with that child still alive. It asserts child liveness before cleanup,
+the surviving witness, KILL escalation where needed, terminal returncode,
+quiescence and handle release. Existing supervisor tests additionally cover
+lost/recycled identity, witness failure, cancellation, retained pipes and PTYs.
+
+`test_real_failed_cleanup_retains_runner_owner_after_external_exit` denies only
+pidfd signal delivery while leaving process inspection real. The live process
+causes a retained ERROR hold. A fixture release file then permits real exit;
+observation-only reconciliation proves later quiescence, but `cleanup()` still
+returns its original cached failure and the runner still retains both handles.
+The runner currently never calls `reconcile_cleanup`. Repeated cycles alone
+therefore cannot release this hold even after external exit; login/catalog
+consumers already have an explicit observation path.
+
+`test_restored_invocation_is_not_restart_process_ownership` checkpoints a run
+and serializes state, then restores both into a fresh runner while a real
+fixture-owned process remains alive in a temporary checkout. Restored run and
+invocation identity match, but neither process handle survives. The fresh
+runner's missing-handle cleanup fast path returns true while the cwd blocker
+still detects that process. This characterizes the gap; it is not restart
+cleanup approval. The original fixture owner performs and verifies cleanup.
+The test models the serialization boundary, not an actual daemon crash or
+container restart. No test signals an unowned process or another worktree.
+
+### Separately estimated follow-up
+
+A restart implementation needs a durable invocation-bound ownership record
+(repository/task generation, run/attempt, host/boot and process birth identity),
+an explicit unknown/owned/quiet recovery decision, and a containment/continuity
+mechanism that survives the owner disappearing. Numeric PID/PGID, saved settings
+or absence from a cwd scan cannot provide that mechanism. Specify how to handle
+crash windows before handle publication, PID reuse, reboot, lost witness,
+chdir/session escape, stale receipts and persisted cleanup failure before
+authorizing any signal or new launch. Ambiguous ownership must remain parked
+for an operator; unrelated checkouts/worktrees are outside the authority.
+
+Planning estimate for that separate outcome: 350–550 production lines across
+supervisor ownership serialization/reconciliation, models and runner/recovery
+admission; 450–700 test lines for isolated crash/restart and identity races;
+80–120 documentation lines (roughly 6–9 files). This is a provisional range,
+contingent on choosing the durable containment mechanism, not work delivered
+here. Reuse supervisor signalling and existing login/catalog observation paths.
+Replace the restart assumption implicit in runner missing-handle fast paths
+with explicit recovery admission, and add runner reconciliation of retained
+failures without overwriting the original failure evidence. CLI launch-error
+string handoff is a candidate for structured ownership transfer. These are
+replacement targets, not permission to remove legacy paths in this PR.
+The raw auth-worker, Codex app-server and synchronous Claude migrations above
+are additional scope, excluded from this restart estimate; each needs its own
+caller compatibility and real-descendant verification estimate before execution.
+
+Verification: `python -m pytest tests/test_process_supervisor.py
+tests/runner/test_misc.py -q`. This investigation has no deployment prerequisite.
+It does not prove real provider, bwrap/container, credential, or production
+shutdown behavior. Operator release verification is separate; no deployment,
+restart drill, runtime migration, or process-control code is delivered here.
