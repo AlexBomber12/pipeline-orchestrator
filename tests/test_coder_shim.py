@@ -250,3 +250,70 @@ def test_crash_shim_handshake_is_bound_and_cleaned_on_failure(tmp_path: Path, mo
             raise RuntimeError("fixture failure")
     assert not started.exists()
     assert scenario.read_text() == "success\n"
+
+
+@pytest.mark.parametrize("outcome", [
+    "recovered", "stale", "missing_crash", "root_redispatched", "dependency_dispatched",
+])
+def test_multitask_crash_oracle_handles_delayed_recovery_without_accepting_wrong_outcomes(monkeypatch, outcome):
+    """Replay the 120-second CI boundary through the complete e2e assertion path."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tests.e2e import test_sigkill_recovery_multitask as scenario
+
+    now = [0.0]
+    phase = ["initial"]
+    root = "PR-42"
+    before = "2026-10-27T00:17:12+00:00"
+    after = "2026-10-27T00:19:14+00:00"
+    monkeypatch.setattr(scenario, "time", SimpleNamespace(
+        time=lambda: 42, monotonic=lambda: now[0], sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    ))
+
+    @contextmanager
+    def shim(name):
+        if name == "success":
+            phase[0] = "next_dispatch"
+        yield
+
+    def command(args, **kwargs):
+        if args[:2] == ["docker", "kill"]:
+            phase[0] = "recovering"
+        return SimpleNamespace(returncode=0)
+
+    def state():
+        if phase[0] == "next_dispatch":
+            next_task = {"root_redispatched": root, "dependency_dispatched": "PR-44"}.get(outcome, "PR-43")
+            return {"state": "CODING", "current_task": {"pr_id": next_task}, "last_updated": after}
+        if phase[0] == "initial" or now[0] < 121:
+            return {"state": "CODING", "current_task": {"pr_id": root}, "last_updated": before}
+        return {"state": "IDLE", "current_task": None,
+                "last_updated": before if outcome == "stale" else after,
+                "history": [] if outcome == "missing_crash" else [{
+                    "event": f"[INFRA] Task {root} crashed, marking ERROR. Manually re-upload to retry.",
+                }]}
+
+    monkeypatch.setattr(scenario, "coder_shim", shim)
+    monkeypatch.setattr(scenario, "crash_coder_started", lambda pr_id, branch: pr_id == root)
+    monkeypatch.setattr(scenario.subprocess, "run", command)
+    running = iter(["false", "true"])
+    monkeypatch.setattr(scenario, "_is_daemon_running", lambda: next(running))
+    monkeypatch.setattr(scenario, "_daemon_exit_code", lambda: 137)
+    monkeypatch.setattr(scenario, "_fetch_tasks_panel", lambda *args: (200, '\n'.join(
+        f'<div id="task-content-{status}-PR-{number}"></div>'
+        for status, number in [("error", 42), ("todo", 43), ("todo", 44), ("todo", 45)]
+    )))
+
+    def run():
+        scenario.test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
+            "http://test.invalid", "testbed", lambda *args, **kwargs: None,
+            state, lambda path: 201, lambda *args, **kwargs: "fixture.zip", None,
+        )
+
+    if outcome == "recovered":
+        run()
+        assert 120 < now[0] < 150
+    else:
+        with pytest.raises(AssertionError):
+            run()

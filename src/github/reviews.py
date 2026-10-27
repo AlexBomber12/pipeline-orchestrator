@@ -12,6 +12,7 @@ import json
 import logging
 import re
 import subprocess
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -38,8 +39,10 @@ CODEX_BOT_ERROR_PATTERNS = (
 )
 
 _PRIORITY_FINDING = re.compile(r"(?:^|\n)\s*(?:\*\*)?\[?P[0-3]\b", re.I)
+_RECEIPT_MARKER = "<!-- codex-review-receipt:v1 -->"
+_SUCCESS = re.compile(r"^Codex Review: Didn't find any major issues\.(?:[^\n]*)$", re.I)
+_REVIEWED_COMMIT = re.compile(r"^\*\*Reviewed commit:\*\* `([0-9a-fA-F]{7,40})`$", re.M)
 _RECEIPT = re.compile(
-    r"^<!-- codex-review-receipt:v1 -->|"
     r"^(?:codex review:\s*)?(?:didn't find any major issues(?:\. delightful!)?|"
     r"no (?:major )?(?:issues|findings))[.!\s]*$|"
     r"^(?:lgtm|looks good overall)[.!\s]*$", re.I,
@@ -71,6 +74,7 @@ class ReviewFeedback:
     latest_finding_at: datetime | None = None
     provider_error_only: bool = False
     undated_finding: bool = False
+    successful_at: datetime | None = None
 
 
 def format_review_feedback(findings: tuple[str, ...]) -> str | None:
@@ -98,7 +102,7 @@ def _structured_summary_state(body: str) -> tuple[str, str | None]:
         if raw_sha is not None and commit_sha is None:
             return "unknown", None
         status = state["status"]
-        if status == "in_progress":
+        if status in ("in_progress", "running"):
             return "summary", commit_sha
         if status != "completed" or commit_sha is None:
             return "unknown", commit_sha
@@ -120,7 +124,19 @@ def classify_review_comment(comment: dict, *, inline: bool = False) -> str:
         return "unknown"
     if body.startswith(_STRUCTURED_SUMMARY):
         return _structured_summary_state(body)[0]
-    if _RECEIPT.search(body):
+    # The marker also occurs on suggestions. Only the stable verdict line
+    # indicates success; the provider footer and conversational suffix vary.
+    message = body.removeprefix(_RECEIPT_MARKER).strip()
+    content = re.sub(
+        r"<details>\s*<summary>[^<]*About Codex in GitHub</summary>(?:(?!</details>).)*</details>\s*\Z",
+        "", message, flags=re.I | re.S,
+    ).strip()
+    lines = content.split("\n\n")
+    if _SUCCESS.fullmatch(lines[0]) and not re.search(r"\bP[0-3]\b", content, re.I):
+        remainder = "\n\n".join(lines[1:]).strip()
+        if not remainder or _REVIEWED_COMMIT.fullmatch(remainder):
+            return "success"
+    if _RECEIPT.search(message):
         return "receipt"
     if _reactions._is_codex_onboarding_comment(comment):
         return "onboarding"
@@ -128,14 +144,66 @@ def classify_review_comment(comment: dict, *, inline: bool = False) -> str:
         return "finding"
     if _SUMMARY.search(body):
         return "summary"
-    message = re.sub(r"^codex review:\s*", "", body, flags=re.I)
+    message = re.sub(r"^codex review:\s*", "", message, flags=re.I)
     if _PROVIDER_ERROR.search(message) or any(
         message.lower().startswith(pattern.lower()) for pattern in CODEX_BOT_ERROR_PATTERNS
     ):
         return "provider_error"
     if _PROGRESS.search(message):
         return "progress"
+    if body.startswith(_RECEIPT_MARKER) and "Here are some automated review suggestions" not in content:
+        return "unknown"
     return "finding"
+
+
+def _review_commit_binding(
+    comment: dict, head_sha: str, resolve_commit: Callable[[str], str | None] | None,
+) -> str:
+    """Return current/old/unknown, rejecting conflicting or ambiguous bindings."""
+    body = comment.get("body") or ""
+    fields = _REVIEWED_COMMIT.findall(body)
+    if "Reviewed commit:" in body and len(fields) != 1:
+        return "unknown"
+    metadata = comment.get("commit_id")
+    if metadata is not None and (
+        not isinstance(metadata, str) or not _COMMIT_SHA.fullmatch(metadata)
+    ):
+        return "unknown"
+    bindings = ([metadata.lower()] if metadata else []) + [sha.lower() for sha in fields]
+    if not bindings:
+        return "unknown"
+    longest = max(bindings, key=len)
+    if any(not longest.startswith(sha) for sha in bindings):
+        return "unknown"
+    if not _COMMIT_SHA.fullmatch(head_sha):
+        return "unknown"
+    if not head_sha.lower().startswith(longest):
+        return "old"
+    if len(longest) < 40:
+        # GitHub resolves the abbreviation in the repository object database;
+        # a prefix match alone cannot establish that it is unambiguous.
+        if resolve_commit is None:
+            return "unknown"
+        resolved = resolve_commit(longest)
+        if not resolved or not _COMMIT_SHA.fullmatch(resolved) or not resolved.lower().startswith(longest):
+            return "unknown"
+        longest = resolved.lower()
+    return "current" if longest == head_sha.lower() else "old"
+
+
+def _commit_resolver(repo: str) -> Callable[[str], str | None]:
+    resolved: dict[str, str | None] = {}
+
+    def resolve(sha: str) -> str | None:
+        if sha not in resolved:
+            try:
+                payload = cache._etag_get(f"repos/{repo}/commits/{sha}")
+                resolved[sha] = payload.get("sha") if isinstance(payload, dict) else None
+            except (RuntimeError, subprocess.TimeoutExpired, OSError):
+                resolved[sha] = None
+        return resolved[sha]
+
+    return resolve
 
 
 def feedback_from_comments(
@@ -145,6 +213,10 @@ def feedback_from_comments(
     policy: ReviewerPolicy,
     after: datetime | None = None,
     head_sha: str = "",
+    *,
+    review_events: list[dict] | None = None,
+    resolve_commit: Callable[[str], str | None] | None = None,
+    accept_success: bool = True,
 ) -> ReviewFeedback:
     """Use the latest author anchor and optional push floor for both verdict and FIX."""
     anchor = next(
@@ -161,6 +233,25 @@ def feedback_from_comments(
         anchor_time = anchor_time.replace(tzinfo=timezone.utc)
     if after is not None and after.tzinfo is None:
         after = after.replace(tzinfo=timezone.utc)
+    events = [
+        dict(event, created_at=event.get("submitted_at"))
+        for event in (review_events or [])
+        if event.get("state") not in ("PENDING", "DISMISSED")
+        and ((event.get("body") or "").strip() or event.get("state") == "CHANGES_REQUESTED")
+    ]
+    successful_at = None
+    for comment in ([*issue_comments, *events] if accept_success else []):
+        if not _reactions._is_codex_user(comment.get("user"), policy=policy):
+            continue
+        if comment.get("state") == "CHANGES_REQUESTED" or classify_review_comment(comment) != "success":
+            continue
+        if _review_commit_binding(comment, head_sha, resolve_commit) != "current":
+            continue
+        stamp = _parse_iso(comment.get("created_at"))
+        if stamp is not None:
+            stamp = stamp.replace(tzinfo=timezone.utc) if stamp.tzinfo is None else stamp
+            if (after is None or stamp > after) and (successful_at is None or stamp > successful_at):
+                successful_at = stamp
     findings: list[str] = []
     ids: list[int] = []
     sources: list[tuple[str, int, int]] = []
@@ -172,13 +263,20 @@ def feedback_from_comments(
     undated_blocking = False
     latest_finding_at: datetime | None = None
     undated_finding = False
-    for inline, comments in ((False, issue_comments), (True, review_comments)):
+    for inline, comments in ((False, issue_comments), (True, review_comments), (False, events)):
         for comment in comments:
             if not _reactions._is_codex_user(comment.get("user"), policy=policy):
                 continue
             body = (comment.get("body") or "").strip()
             structured = not inline and body.startswith(_STRUCTURED_SUMMARY)
             kind = classify_review_comment(comment, inline=inline)
+            if comment.get("state") == "CHANGES_REQUESTED":
+                kind = "finding" if body else "unknown"
+            binding = _review_commit_binding(comment, head_sha, resolve_commit) if head_sha else "unknown"
+            if binding == "old":
+                continue
+            if kind == "success" and binding != "current":
+                kind = "unknown"
             commit_sha: str | None = None
             if structured:
                 kind, commit_sha = _structured_summary_state(body)
@@ -188,6 +286,12 @@ def feedback_from_comments(
             if created is not None and created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
             effective = created
+            if kind == "finding":
+                updated = _parse_iso(comment.get("updated_at"))
+                if updated is not None:
+                    updated = updated.replace(tzinfo=timezone.utc) if updated.tzinfo is None else updated
+                    if created is not None and updated > created:
+                        effective = updated
             uncertain_version = False
             if structured:
                 updated = _parse_iso(comment.get("updated_at"))
@@ -202,9 +306,16 @@ def feedback_from_comments(
                     uncertain_version = True
                 if kind == "unknown" and commit_sha is None:
                     uncertain_version = True  # No supported HEAD binding for this version.
+            if successful_at is not None:
+                # Summary flags describe unresolved history, not a new review event.
+                # Unsupported metadata remains ambiguous and blocking.
+                if structured and commit_sha == head_sha.lower() and kind != "unknown":
+                    continue
+                if not structured and effective is not None and effective < successful_at:
+                    continue
             current_blocking_summary = structured and kind in ("unknown", "summary_blocking")
             if not current_blocking_summary and (
-                (anchor_time and (effective is None or effective <= anchor_time))
+                (not successful_at and anchor_time and (effective is None or effective <= anchor_time))
                 or (after and (effective is None or effective <= after))
             ):
                 continue
@@ -214,17 +325,17 @@ def feedback_from_comments(
                 elif latest_blocking_at is None or effective > latest_blocking_at:
                     latest_blocking_at = effective
             if kind == "finding":
-                if created is None:
+                if effective is None:
                     undated_finding = True
-                if created is not None and (
-                    latest_finding_at is None or created > latest_finding_at
+                if effective is not None and (
+                    latest_finding_at is None or effective > latest_finding_at
                 ):
-                    latest_finding_at = created
+                    latest_finding_at = effective
                 findings.append((comment.get("body") or "").strip())
                 comment_id = comment.get("id") or 0
                 ids.append(comment_id)
                 sources.append((
-                    "review" if inline else "issue", comment_id,
+                    "review_event" if comment.get("submitted_at") else "review" if inline else "issue", comment_id,
                     (comment.get("user") or {}).get("id") or 0,
                 ))
             elif kind == "unknown":
@@ -252,6 +363,7 @@ def feedback_from_comments(
         latest_finding_at,
         provider_error and not unsupported_unknown and not unresolved_summary,
         undated_finding,
+        successful_at,
     )
 
 
@@ -267,9 +379,13 @@ def read_review_feedback(
     try:
         issues = cache._gh_api_paginated(f"repos/{repo}/issues/{pr_number}/comments") or []
         inline = cache._gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/comments") or []
+        events = cache._gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews") or []
     except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
         return ReviewFeedback((), (), f"review feedback unavailable: {exc}")
-    return feedback_from_comments(issues, inline, pr_author, policy, after, head_sha)
+    return feedback_from_comments(
+        issues, inline, pr_author, policy, after, head_sha,
+        review_events=events, resolve_commit=_commit_resolver(repo),
+    )
 
 
 _review_status_cache: dict[str, "ReviewStatus"] = {}
@@ -343,11 +459,10 @@ def get_pr_review_status(
     """Derive a Codex review status from PR issue comments, review comments, and reactions.
 
     Logic:
-    1. Find the latest ``@codex review`` trigger comment by the PR author.
-    2. Check reactions on that comment from Codex: +1 → APPROVED, eyes → EYES.
-    3. If neither reaction, scan Codex comments (issue + review) posted after
-       the anchor for P1/P2 → CHANGES_REQUESTED.
-    4. Otherwise → PENDING.
+    Trusted, fresh reactions and explicit successful current-HEAD reviews can
+    approve. A successful review supersedes older findings and mutable summary
+    history, but later actionable evidence blocks approval. Repeated requests
+    do not erase a commit-bound verdict. Status and FIX share admitted evidence.
     """
     reviewer_policy = (
         policy if policy is not None else reviewer_policy_from_config(load_config())
@@ -536,13 +651,39 @@ def _compute_review_status(
                 else:
                     raise
 
+    events_error = None
+    try:
+        review_events = cache._gh_api_paginated(f"repos/{repo}/pulls/{pr_number}/reviews") or []
+    except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
+        review_events = []
+        events_error = f"review feedback unavailable: {exc}"
+    if not last_push_time_loaded and any(
+        classify_review_comment(c) == "success" for c in [*issue_comments, *review_events]
+        if _reactions._is_codex_user(c.get("user"), policy=reviewer_policy)
+    ):
+        last_push_time = (
+            publication_evidence.published_at if publication_evidence is not None
+            else _get_pr_push_time(repo, pr_number, head_sha)
+        )
     feedback = feedback_from_comments(
-        issue_comments, review_comments, pr_author, reviewer_policy, head_sha=head_sha
+        issue_comments, review_comments, pr_author, reviewer_policy, head_sha=head_sha,
+        review_events=review_events, resolve_commit=_commit_resolver(repo),
+        accept_success=last_push_time is not None,
     )
+    successful_at = feedback.successful_at
+    if successful_at is not None and successful_at < last_push_time:
+        feedback = feedback_from_comments(
+            issue_comments, review_comments, pr_author, reviewer_policy, head_sha=head_sha,
+            review_events=review_events, accept_success=False,
+        )
+        successful_at = None
+    if events_error and not (body_approved or anchor_approved):
+        feedback = ReviewFeedback((), (), events_error)
+        successful_at = None
     if head_sha:
         _review_feedback_cache[_cache_key(repo, pr_number, head_sha, reviewer_policy)] = feedback
     approved_at = max(
-        (t for t in (body_approval_at, anchor_approval_at) if t is not None),
+        (t for t in (body_approval_at, anchor_approval_at, successful_at) if t is not None),
         default=None,
     )
     if approved_at and (feedback.findings or feedback.unknown_reason):
@@ -563,11 +704,11 @@ def _compute_review_status(
         if feedback.latest_finding_at is not None and feedback.latest_finding_at > approved_at:
             return ReviewStatus.CHANGES_REQUESTED
         logger.info(
-            "PR #%s review pending: +1 does not supersede current review text (%s)",
+            "PR #%s review pending: approval does not supersede current review text (%s)",
             pr_number, feedback.unknown_reason or "evidence order is ambiguous",
         )
         return ReviewStatus.PENDING
-    if body_approved:
+    if successful_at or body_approved:
         return ReviewStatus.APPROVED
     if anchor_approved:
         return ReviewStatus.APPROVED

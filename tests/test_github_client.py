@@ -736,8 +736,8 @@ def test_get_pr_review_status_approved_via_first_author_comment_reaction(
     )
 
     paginated_invocations = [cmd for cmd in invocations if not _is_commits_path(cmd)]
-    assert len(paginated_invocations) == 4
-    assert not any(cmd[-1].endswith("/pulls/42/reviews") for cmd in invocations)
+    assert len(paginated_invocations) == 5
+    assert any(cmd[-1].endswith("/pulls/42/reviews") for cmd in invocations)
     for cmd in paginated_invocations:
         assert "--paginate" in cmd, f"missing --paginate in {cmd}"
 
@@ -1728,7 +1728,7 @@ def test_compute_review_status_propagates_non_transient_body_reactions_error(
                     "created_at": "2026-01-01T00:00:00Z",
                 }
             ]
-        if path.endswith("/pulls/42/comments"):
+        if path.endswith(("/pulls/42/comments", "/pulls/42/reviews")):
             return []
         raise AssertionError(f"unexpected path: {path}")
 
@@ -1753,7 +1753,7 @@ def test_compute_review_status_degrades_when_anchor_reactions_fail(
                     "created_at": "2026-01-01T00:00:00Z",
                 }
             ]
-        if path.endswith("/pulls/42/comments"):
+        if path.endswith(("/pulls/42/comments", "/pulls/42/reviews")):
             return []
         if path.endswith("/issues/comments/10/reactions"):
             raise RuntimeError("i/o timeout")
@@ -1779,7 +1779,7 @@ def test_compute_review_status_propagates_non_transient_anchor_reactions_error(
                     "created_at": "2026-01-01T00:00:00Z",
                 }
             ]
-        if path.endswith("/pulls/42/comments"):
+        if path.endswith(("/pulls/42/comments", "/pulls/42/reviews")):
             return []
         if path.endswith("/issues/comments/10/reactions"):
             raise RuntimeError("HTTP 403 rate limit exceeded")
@@ -1954,7 +1954,7 @@ def test_no_plus_one_does_not_fetch_latest_push_time(
             raise AssertionError("commit lookup should not run without +1")
         path = _find_api_path(cmd)
         if path.endswith("/pulls/42/reviews"):
-            raise AssertionError("review lookup should not run without +1")
+            return _FakeCompletedProcess(stdout="[]")
         elif "issues" in path and path.endswith("/comments"):
             data = [
                 [
@@ -1990,7 +1990,7 @@ def test_body_eyes_without_conflicting_comments_stays_eyes(
     def fake_run(cmd: list[str], **kwargs: Any) -> _FakeCompletedProcess:
         path = _find_api_path(cmd)
         if path.endswith("/pulls/42/reviews"):
-            raise AssertionError("review lookup should not run for body eyes only")
+            return _FakeCompletedProcess(stdout="[]")
         if path.endswith("/comments"):
             return _FakeCompletedProcess(stdout=_json.dumps([]))
         if path.endswith("/reactions"):
@@ -2675,7 +2675,7 @@ def test_anchor_plus_one_requires_verifiable_current_head_freshness(
                     "created_at": "2026-02-01T00:00:00Z",
                 }
             ]
-        if path.endswith("/pulls/42/comments"):
+        if path.endswith(("/pulls/42/comments", "/pulls/42/reviews")):
             return []
         if path.endswith("/issues/comments/10/reactions"):
             return [
@@ -2717,7 +2717,7 @@ def test_anchor_plus_one_with_fresh_timestamp_approves_current_head(
                     "created_at": "2026-02-01T00:00:00Z",
                 }
             ]
-        if path.endswith("/pulls/42/comments"):
+        if path.endswith(("/pulls/42/comments", "/pulls/42/reviews")):
             return []
         if path.endswith("/issues/comments/10/reactions"):
             return [
@@ -4112,7 +4112,7 @@ def test_get_pr_review_status_ignores_anchor_reaction_404(
             return []
         if path.endswith("/issues/42/comments"):
             return [anchor]
-        if path.endswith("/pulls/42/comments"):
+        if path.endswith(("/pulls/42/comments", "/pulls/42/reviews")):
             return []
         if path.endswith("/issues/comments/99/reactions"):
             raise RuntimeError("HTTP 404 not found")
@@ -6391,6 +6391,7 @@ def test_recorded_620_receipt_requires_current_plus_one_provenance(
     }
     body_reactions: list[dict] = []
     anchor_reactions: list[dict] = []
+    receipt["body"] = receipt["body"].replace("63f07ef48a", "0000000000")
     issue_comments = [anchor, receipt]
 
     def transport(path: str) -> list[dict]:
@@ -6876,7 +6877,7 @@ def test_get_latest_codex_feedback_returns_none_when_no_codex_comments(
                     "created_at": "2026-04-27T00:00:00Z",
                 }
             ]
-        if path.endswith("/pulls/42/comments"):
+        if path.endswith(("/pulls/42/comments", "/pulls/42/reviews")):
             return []
         raise AssertionError(f"unexpected path: {path}")
 
@@ -6906,7 +6907,7 @@ def test_get_latest_codex_feedback_skips_onboarding_comment(
                     "created_at": "2026-04-27T01:00:00Z",
                 },
             ]
-        if path.endswith("/pulls/42/comments"):
+        if path.endswith(("/pulls/42/comments", "/pulls/42/reviews")):
             return []
         raise AssertionError(f"unexpected path: {path}")
 
@@ -6931,7 +6932,7 @@ def test_get_latest_codex_feedback_returns_all_codex_comments_when_no_anchor(
                     "created_at": "2026-04-27T01:00:00Z",
                 }
             ]
-        if path.endswith("/pulls/42/comments"):
+        if path.endswith(("/pulls/42/comments", "/pulls/42/reviews")):
             return []
         raise AssertionError(f"unexpected path: {path}")
 
@@ -6963,7 +6964,7 @@ def test_get_latest_codex_feedback_skips_non_author_anchor(
                     "created_at": "2026-04-27T02:00:00Z",
                 },
             ]
-        if path.endswith("/pulls/42/comments"):
+        if path.endswith(("/pulls/42/comments", "/pulls/42/reviews")):
             return []
         raise AssertionError(f"unexpected path: {path}")
 
@@ -7039,7 +7040,7 @@ def test_get_latest_codex_feedback_truncates_oversized_output(
                     "created_at": "2026-04-27T01:00:00Z",
                 },
             ]
-        if path.endswith("/pulls/42/comments"):
+        if path.endswith(("/pulls/42/comments", "/pulls/42/reviews")):
             return []
         raise AssertionError(f"unexpected path: {path}")
 
@@ -7073,7 +7074,7 @@ def test_get_latest_codex_feedback_skips_empty_codex_body(
                     "created_at": "2026-04-27T01:00:00Z",
                 },
             ]
-        if path.endswith("/pulls/42/comments"):
+        if path.endswith(("/pulls/42/comments", "/pulls/42/reviews")):
             return []
         raise AssertionError(f"unexpected path: {path}")
 
@@ -7882,6 +7883,13 @@ def provenance_replay(monkeypatch: pytest.MonkeyPatch) -> dict:
 
     monkeypatch.setattr("src.github.gh_runner.run_gh", transport)
     monkeypatch.setattr(cache, "_gh_api_paginated", paginated)
+    def resolve_recorded_commit(path):
+        prefix = path.rsplit("/", 1)[-1]
+        shas = {item[key] for item in recorded["activity"] for key in ("before", "after")}
+        shas.update({"63f07ef48a035c9aa31c37e0fbf3dc215ba0045e", "bd7bd1ea89766790981bd3f8749d2c407132db38"})
+        matches = [sha for sha in shas if sha.startswith(prefix)]
+        return {"sha": matches[0]} if len(matches) == 1 else {}
+    monkeypatch.setattr(cache, "_etag_get", resolve_recorded_commit)
     recorded["policy"] = ReviewerPolicy([TrustedReviewerIdentity(user_id=199175422)])
     return recorded
 
@@ -7922,7 +7930,7 @@ def test_recorded_branch_creation_metadata(provenance_replay: dict) -> None:
         "AlexBomber12/pipeline-orchestrator", creation["ref"],
         _parse_iso("2026-10-17T21:06:35Z"),
     )
-    assert status == ReviewStatus.PENDING  # The real abbreviated receipt is not +1.
+    assert status == ReviewStatus.APPROVED  # The bound successful receipt now satisfies review.
 
 
 @pytest.mark.parametrize("variant", [
@@ -7986,7 +7994,7 @@ def test_recorded_negative_linkage_with_publication(
         })  # Synthetic replay of a later publication of the identical SHA.
     evidence, status = _replay_provenance_status(recorded, recorded["head"]["sha"])
     assert evidence.published_at is not None
-    assert status == ReviewStatus.PENDING
+    assert status == (ReviewStatus.PENDING if variant == "same_sha_republished" else ReviewStatus.APPROVED)
 
 
 def test_recorded_current_request_can_be_reused_but_is_not_approval(
@@ -8006,3 +8014,224 @@ def test_recorded_current_request_can_be_reused_but_is_not_approval(
     _, status = _replay_provenance_status(provenance_replay, provenance_replay["head"]["sha"])
     assert status == ReviewStatus.PENDING
     assert provenance_replay["posts"] == []
+
+
+@pytest.fixture
+def receipt_651(monkeypatch):
+    """Replay the real receipt, old findings and later mutable summary without +1."""
+    recorded = json.loads((Path(__file__).parent / "fixtures/review_receipt_651.json").read_text())
+    recorded["resolved"] = {recorded["head"][:10]: recorded["head"]}
+    recorded["publication"] = _parse_iso("2026-10-26T22:00:00Z")
+
+    def transport(path):
+        if path.endswith("/issues/651/comments"):
+            return recorded["issue_comments"]
+        if path.endswith("/pulls/651/comments"):
+            return recorded["review_comments"]
+        if path.endswith("/pulls/651/reviews"):
+            return recorded["review_events"]
+        return []
+
+    monkeypatch.setattr(cache, "_gh_api_paginated", transport)
+    def commit(path):
+        value = recorded["resolved"].get(path.rsplit("/", 1)[-1])
+        if isinstance(value, Exception):
+            raise value
+        return {"sha": value}
+    monkeypatch.setattr(cache, "_etag_get", commit)
+    monkeypatch.setattr(reviews, "_get_pr_push_time", lambda *_: recorded["publication"])
+    reviews.clear_review_status_cache()
+    return recorded
+
+
+def _receipt_status(recorded, head=None):
+    reviews._begin_review_cache_cycle("owner/name")
+    return reviews.get_pr_review_status(
+        "owner/name", 651, recorded["author"], head or recorded["head"],
+        ReviewerPolicy([TrustedReviewerIdentity(user_id=199175422)]),
+    )
+
+
+def test_651_success_supersedes_unresolved_history_and_summary_update(receipt_651):
+    assert receipt_651["reactions"] == []
+    assert _receipt_status(receipt_651) == ReviewStatus.APPROVED
+    evidence = reviews.cached_review_feedback(
+        "owner/name", 651, receipt_651["head"],
+        ReviewerPolicy([TrustedReviewerIdentity(user_id=199175422)]),
+    )
+    assert evidence.findings == ()
+    assert evidence.unknown_reason is None
+    assert evidence.successful_at == _parse_iso("2026-10-26T23:16:57Z")
+    assert reviews.read_review_feedback(
+        "owner/name", 651, receipt_651["author"],
+        ReviewerPolicy([TrustedReviewerIdentity(user_id=199175422)]),
+        head_sha=receipt_651["head"],
+    ) == evidence
+
+
+@pytest.mark.parametrize("suffix", ["Hooray!", "What shall we delve into next?", "You're on a roll.", ""])
+@pytest.mark.parametrize("metadata", [False, True])
+def test_successful_receipt_variations(receipt_651, suffix, metadata):
+    receipt = receipt_651["issue_comments"][-1]
+    receipt["body"] = receipt["body"].replace("What shall we delve into next?", suffix)
+    receipt_651["issue_comments"] = [receipt]
+    if metadata:
+        receipt_651["review_events"] = [{**receipt, "commit_id": receipt_651["head"],
+            "submitted_at": receipt["created_at"], "state": "COMMENTED"}]
+        receipt_651["issue_comments"] = []
+    assert _receipt_status(receipt_651) == ReviewStatus.APPROVED
+
+
+@pytest.mark.parametrize("variant", [
+    "untrusted", "stale", "missing", "conflict", "malformed", "duplicate", "ambiguous",
+    "unavailable", "bad_resolution", "suggestions", "progress", "failure", "onboarding", "lgtm",
+    "completed", "missing_time", "missing_publication", "republished", "metadata_bad", "metadata_only",
+])
+def test_receipt_rejects_unsupported_or_unbound_success(receipt_651, variant):
+    receipt = receipt_651["issue_comments"][-1]
+    receipt_651["issue_comments"] = [receipt]
+    receipt_651["review_comments"] = []
+    receipt_651["review_events"] = []
+    if variant == "untrusted":
+        receipt["user"]["id"] = 123
+    elif variant == "stale":
+        receipt["body"] = receipt["body"].replace("96b8724103", "b" * 40)
+    elif variant == "missing":
+        receipt["body"] = receipt["body"].replace('**Reviewed commit:** `96b8724103`', '')
+    elif variant == "conflict":
+        receipt["commit_id"] = "b" * 40
+    elif variant == "metadata_bad":
+        receipt["commit_id"] = 123
+    elif variant == "metadata_only":
+        receipt["body"] = receipt["body"].replace('**Reviewed commit:** `96b8724103`', '')
+        receipt["commit_id"] = receipt_651["head"]
+    elif variant == "malformed":
+        receipt["body"] = receipt["body"].replace('`96b8724103`', '`not-a-sha`')
+    elif variant == "duplicate":
+        receipt["body"] += '\n**Reviewed commit:** `bbbbbbbbbb`'
+    elif variant in {"ambiguous", "unavailable", "bad_resolution"}:
+        receipt_651["resolved"]["96b8724103"] = {
+            "ambiguous": RuntimeError("ambiguous commit prefix"), "unavailable": OSError("offline"),
+            "bad_resolution": "b" * 40,
+        }[variant]
+    elif variant == "missing_time":
+        receipt["created_at"] = None
+    elif variant == "missing_publication":
+        receipt_651["publication"] = None
+    elif variant == "republished":
+        receipt_651["publication"] = _parse_iso("2026-10-26T23:30:00Z")
+    else:
+        message = {"suggestions": "Here are some automated review suggestions for this pull request.",
+                   "progress": "Review is in progress", "failure": "unable to complete review",
+                   "onboarding": "create a Codex account and connect to github",
+                   "lgtm": "An arbitrary LGTM substring", "completed": "Review complete"}[variant]
+        receipt["body"] = ("<!-- codex-review-receipt:v1 -->\n\nCodex Review: " + message
+                           + '\n\n**Reviewed commit:** `96b8724103`')
+    status = _receipt_status(receipt_651)
+    assert (status == ReviewStatus.APPROVED) is (variant == "metadata_only")
+
+
+@pytest.mark.parametrize("source", ["issue", "inline", "review"])
+@pytest.mark.parametrize("when", ["before", "equal", "after", "undated"])
+def test_success_and_later_findings_share_feedback_precedence(receipt_651, source, when):
+    stamp = {"before": "2026-10-26T23:16:56Z", "equal": "2026-10-26T23:16:57Z",
+             "after": "2026-10-26T23:16:58Z", "undated": None}[when]
+    finding = {"id": 99, "user": receipt_651["issue_comments"][-1]["user"],
+               "body": "[P1] Fix the new current-HEAD defect", "commit_id": receipt_651["head"],
+               "created_at": stamp}
+    if source == "review":
+        finding.update(state="CHANGES_REQUESTED", submitted_at=stamp)
+    key = {"issue": "issue_comments", "inline": "review_comments", "review": "review_events"}[source]
+    receipt_651[key].append(finding)
+    # Reminders must neither erase success nor conceal later findings.
+    receipt_651["issue_comments"].append({"id": 100, "user": {"login": receipt_651["author"]},
+        "body": "@codex review", "created_at": "2026-10-26T23:20:00Z"})
+    expected = {"before": ReviewStatus.APPROVED, "equal": ReviewStatus.PENDING,
+                "after": ReviewStatus.CHANGES_REQUESTED, "undated": ReviewStatus.PENDING}[when]
+    assert _receipt_status(receipt_651) == expected
+    feedback = reviews.read_review_feedback(
+        "owner/name", 651, receipt_651["author"], ReviewerPolicy([TrustedReviewerIdentity(user_id=199175422)]),
+        head_sha=receipt_651["head"],
+    )
+    assert feedback.findings == (() if when == "before" else (finding["body"],))
+
+
+def test_success_cache_is_bound_to_head_and_poll_generation(receipt_651):
+    assert _receipt_status(receipt_651) == ReviewStatus.APPROVED
+    # Keep the previous HEAD cached while reading a different current HEAD.
+    assert reviews.get_pr_review_status(
+        "owner/name", 651, receipt_651["author"], "b" * 40,
+        ReviewerPolicy([TrustedReviewerIdentity(user_id=199175422)]),
+    ) != ReviewStatus.APPROVED
+    assert _receipt_status(receipt_651) == ReviewStatus.APPROVED
+    receipt_651["issue_comments"] = []
+    assert _receipt_status(receipt_651) != ReviewStatus.APPROVED
+
+
+def test_finding_edited_after_success_remains_actionable(receipt_651):
+    receipt_651["review_comments"].append({
+        "id": 99, "user": receipt_651["issue_comments"][-1]["user"],
+        "commit_id": receipt_651["head"], "body": "[P1] Newly edited actionable feedback",
+        "created_at": "2026-10-26T23:10:00Z", "updated_at": "2026-10-26T23:18:00Z",
+    })
+    assert _receipt_status(receipt_651) == ReviewStatus.CHANGES_REQUESTED
+
+
+@pytest.mark.parametrize("failure", [RuntimeError("offline"), OSError("offline")])
+def test_unavailable_review_events_cannot_approve_comment(receipt_651, monkeypatch, failure):
+    transport = cache._gh_api_paginated
+    def unavailable(path):
+        if path.endswith("/reviews"):
+            raise failure
+        return transport(path)
+    monkeypatch.setattr(cache, "_gh_api_paginated", unavailable)
+    assert _receipt_status(receipt_651) == ReviewStatus.PENDING
+    feedback = reviews.read_review_feedback(
+        "owner/name", 651, receipt_651["author"], ReviewerPolicy([TrustedReviewerIdentity(user_id=199175422)]),
+        head_sha=receipt_651["head"],
+    )
+    assert feedback.findings == ()
+    assert "unavailable" in feedback.unknown_reason
+
+
+@pytest.mark.parametrize("extra", [
+    '\n\n[P1] Fix the later finding',
+    '\n\n<details><summary>Findings</summary>[P1] Fix bug</details>',
+])
+def test_success_verdict_does_not_hide_extra_actionable_text(receipt_651, extra):
+    receipt = receipt_651["issue_comments"][-1]
+    receipt["body"] += extra
+    receipt_651["issue_comments"] = [receipt]
+    assert _receipt_status(receipt_651) != ReviewStatus.APPROVED
+
+
+@pytest.mark.parametrize("summary_status", ["running", "in_progress", "completed"])
+@pytest.mark.parametrize("result", ["approved", "later_finding", "summary_only"])
+def test_repeated_request_summary_does_not_replace_completed_verdict(receipt_651, summary_status, result):
+    """Aggregate activity after a reminder neither approves nor retracts a review."""
+    summary = receipt_651["issue_comments"][0]
+    state = {
+        "code_review": {"commit_sha": receipt_651["head"], "status": summary_status,
+                        "has_any_findings": True if summary_status == "completed" else None,
+                        "has_unresolved_findings": True if summary_status == "completed" else None},
+    }
+    summary["body"] = ('<!-- codex-pull-request-review-summary -->\n'
+                       + '<!-- codex-review-state:v1 ' + json.dumps(state) + ' -->')
+    summary["updated_at"] = "2026-10-26T23:25:00Z"
+    receipt = receipt_651["issue_comments"][-1]
+    receipt_651["issue_comments"] = [summary]
+    if result != "summary_only":
+        receipt_651["issue_comments"].append(receipt)
+    receipt_651["issue_comments"].append({
+        "id": 100, "user": {"login": receipt_651["author"]}, "body": "@codex review",
+        "created_at": "2026-10-26T23:20:00Z",
+    })
+    if result == "later_finding":
+        # This finding predates the new request, which must not hide it.
+        receipt_651["review_comments"].append({
+            "id": 101, "user": receipt["user"], "commit_id": receipt_651["head"],
+            "created_at": "2026-10-26T23:18:00Z", "body": "[P1] New actionable defect",
+        })
+    expected = {"approved": ReviewStatus.APPROVED, "later_finding": ReviewStatus.CHANGES_REQUESTED,
+                "summary_only": ReviewStatus.PENDING}[result]
+    assert _receipt_status(receipt_651) == expected

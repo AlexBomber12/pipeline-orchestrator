@@ -3489,3 +3489,47 @@ def test_migration_refresh_uses_required_ci_policy(
     assert len(observed) == 1
     assert observed[0].head_sha == head
     assert observed[0].ci_status == (CIStatus.SUCCESS if mode == "passing" else CIStatus.PENDING)
+
+
+def test_recovery_retains_canonical_successful_comment_verdict(monkeypatch, tmp_path):
+    """Restart uses the same bound receipt evidence as WATCH and final admission."""
+    from src.github import cache, reviews
+    from src.models import ReviewStatus
+
+    recorded = json.loads((Path(__file__).parents[1] / "fixtures/review_receipt_651.json").read_text())
+    head = recorded["head"]
+    branch = "receipt-recovery-test"
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner._parse_tasks_from_headers = lambda: [QueueTask(
+        pr_id="PR-001", title="test", status=TaskStatus.DOING, branch=branch, task_file="tasks/PR-001.md",
+    )]
+    publication = datetime(2026, 10, 26, 22, tzinfo=timezone.utc)
+
+    def transport(args, **kwargs):
+        if args[:2] == ["pr", "list"]:
+            return [{"number": 651, "title": "PR-001: test", "headRefName": branch,
+                     "headRefOid": head, "author": {"login": recorded["author"]}}]
+        raise AssertionError(args)
+
+    def pages(path):
+        for suffix, key in (("/issues/651/comments", "issue_comments"),
+                            ("/pulls/651/comments", "review_comments"),
+                            ("/pulls/651/reviews", "review_events")):
+            if path.endswith(suffix):
+                return recorded[key]
+        return []
+
+    monkeypatch.setattr(recovery_module.gh_runner, "run_gh", transport)
+    monkeypatch.setattr(cache, "_gh_api_paginated", pages)
+    monkeypatch.setattr(cache, "_etag_get", lambda path: {"sha": head})
+    monkeypatch.setattr(gh_prs, "get_pr_head_publication", lambda repo, number, **kwargs:
+        gh_prs.HeadPublicationEvidence(repo, number, repo, f"refs/heads/{branch}", head,
+                                      publication, "github-activity:branch_creation"))
+    monkeypatch.setattr(gh_checks, "_retrieve_ci_status_evidence", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gh_checks, "_classify_ci_retrieval", lambda *args, **kwargs: CIStatus.PENDING)
+    reviews.clear_review_status_cache()
+    assert asyncio.run(runner.recover_state()) is True
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.number == 651
+    assert runner.state.current_pr.review_status == ReviewStatus.APPROVED

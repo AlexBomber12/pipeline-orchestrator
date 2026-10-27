@@ -50,7 +50,12 @@ from tests.e2e.lib.coder_shim import coder_shim, crash_coder_started
 DAEMON_CONTAINER = "pipeline-orchestrator-daemon-test"
 COMPOSE_FILE = "docker-compose.test.yml"
 
-RECOVERY_DEADLINE_SEC = 120
+# Recovery can defer a stale merged-PR discovery after a slow GitHub page
+# walk, then retry on the 60-second daemon poll. In run 40422105811 the
+# expected crash/ERROR was published just after 120 seconds. Use the same
+# two-poll-plus-provider-retry budget as the dispatch observations below;
+# freshness, exact task ERROR/history, and sibling ordering remain required.
+RECOVERY_DEADLINE_SEC = 150
 # The shared testbed's merged-PR lookup can retry after a 30-second GitHub
 # timeout, and the daemon polls every 60 seconds. Allow two poll intervals
 # plus that retry before treating a missing dispatch as a failure.

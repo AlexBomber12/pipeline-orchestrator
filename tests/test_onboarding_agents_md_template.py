@@ -122,3 +122,19 @@ def test_quick_rules_mentions_auto_pr_for_daemon() -> None:
     quick_rules = daemon_managed_content()["quick_rules"]
     assert "AUTO PR" in quick_rules
     assert "pipeline-orchestrator daemon" in quick_rules
+
+
+def test_onboarded_review_contract_allows_bound_success_and_preserves_later_blockers():
+    generated = apply_managed_regions("# Project instructions\n", daemon_managed_content())
+    regions = extract_managed_regions(generated)
+    assert "explicit successful review bound to the current HEAD" in regions["quick_rules"]
+    assert "Codex review approval valid" in regions["ci_gates"]
+    gate = regions["codex_review_gate"]
+    assert "Didn't find any major issues." in gate
+    assert "Abbreviated SHAs must resolve unambiguously to HEAD" in gate
+    assert "Later actionable findings or negative reviews still block approval" in gate
+    assert "repeated review requests do not erase a valid verdict" in gate
+    assert "A matching login alone does not establish trust" in gate
+    assert "valid current-HEAD approval" in regions["review_fix_runbook"]
+    assert 'green" only when' not in generated
+    assert "until a non-stale thumbs up" not in generated
