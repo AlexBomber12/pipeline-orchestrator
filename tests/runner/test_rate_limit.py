@@ -1513,6 +1513,7 @@ def test_handle_coding_saves_record_on_proactive_rate_limit(
 
     async def fake_check_rate_limit(
         proactive_coder: str | None = None,
+        *, preserve_error_message: bool = False,
     ) -> bool:
         runner.state.state = PipelineState.PAUSED
         runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=10)
@@ -1572,6 +1573,7 @@ def test_handle_coding_reuses_selected_coder_for_rate_limit(
 
     async def fake_check_rate_limit(
         proactive_coder: str | None = None,
+        *, preserve_error_message: bool = False,
     ) -> bool:
         seen.append(proactive_coder)
         runner.state.state = PipelineState.PAUSED
@@ -1598,6 +1600,7 @@ def test_handle_fix_reuses_selected_coder_for_rate_limit(
 
     async def fake_check_rate_limit(
         proactive_coder: str | None = None,
+        *, preserve_error_message: bool = False,
     ) -> bool:
         seen.append(proactive_coder)
         runner.state.state = PipelineState.PAUSED

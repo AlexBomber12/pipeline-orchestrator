@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
-from src.cancellation import task_spec_content_hash
+from src.cancellation import get_cancellation_cause, task_spec_content_hash
 from src.daemon import git_ops
 from src.daemon.handlers import merge as merge_module
 from src.daemon.retry_commands import RetryDispatch
@@ -22,6 +22,7 @@ from src.retry_commands import (
     enqueue_retry_command,
     load_retry_command,
     new_retry_command,
+    retry_failure_identity,
 )
 from src.task_status import MergedState
 
@@ -610,7 +611,10 @@ def accounting_retry(c):
     return new_retry_command(
         repo_slug=c.runner.name, task_id=c.task.pr_id, task_file=c.task_file, task_branch=c.task.branch,
         task_fingerprint=task_spec_content_hash(c.generation_b), request_binding="b" * 64,
-        failure_id="f" * 64, retry_cap=3, bound_pr_number=c.pr.number,
+        failure_id=retry_failure_identity(
+            c.task.model_copy(update={"status": TaskStatus.ERROR}), c.runner.state,
+            asyncio.run(get_cancellation_cause(c.runner.redis, c.runner.name, c.task.pr_id, refresh_ttl=False)),
+        ), retry_cap=3, bound_pr_number=c.pr.number,
         bound_pr_branch=c.pr.branch, bound_pr_head_sha=c.pr.head_sha,
     )
 
