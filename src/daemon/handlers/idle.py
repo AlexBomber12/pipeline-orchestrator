@@ -8,6 +8,7 @@ Mixin methods:
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 import subprocess
 import time
@@ -33,7 +34,7 @@ from src.daemon.selector import (
 from src.dag import get_eligible_tasks
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, WorkInhibitor, is_work_inhibited
-from src.keyspace import control_stop, upload_pending
+from src.keyspace import control_stop, upload_pending, verified_merged_branches
 from src.models import PipelineState, QueueTask, TaskStatus
 from src.onboarding.markdown_sections import MarkerError
 from src.onboarding.reconciliation import reconcile_agents_md
@@ -47,6 +48,7 @@ from src.queue_parser import (
 )
 from src.task_status import (
     MergeStatusUnavailable,
+    _branch_name_matches_task_pr_id,
     _resolve_merged_state,
     derive_task_status,
     find_matching_open_pr,
@@ -411,6 +413,11 @@ class IdleMixin:
             headers,
             log_event=self.log_event,
         )
+        if state.api_available:
+            await self.redis.set(
+                verified_merged_branches(self.owner_repo, self.repo_config.branch),
+                json.dumps(sorted(state.merged_branches)),
+            )
         if not state.api_available and not getattr(
             self, "_idle_degraded_done_check_logged", False,
         ):
@@ -419,7 +426,18 @@ class IdleMixin:
                 "positive merge or open-PR evidence will defer task selection"
             )
             self._idle_degraded_done_check_logged = True
-        merged_pr_ids = state.merged_pr_ids
+        # Match admission's completion evidence before resolving blockers or
+        # validating cycles. Completed tasks no longer need their old inputs.
+        merged_pr_ids = state.merged_pr_ids | {
+            header.pr_id
+            for header in headers
+            if header.branch in state.merged_branches
+            and _branch_name_matches_task_pr_id(header.pr_id, header.branch)
+        }
+        headers = [
+            replace(header, depends_on=[]) if header.pr_id in merged_pr_ids else header
+            for header in headers
+        ]
         headers, unresolved_deps_map = self._filter_dag_headers_with_available_dependencies(
             headers,
             skipped_unstructured_pr_ids,

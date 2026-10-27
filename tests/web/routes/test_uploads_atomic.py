@@ -12,6 +12,7 @@ from src.keyspace import upload_pending, upload_pending_count
 from src.web import app as web_app
 from src.web.app import app
 from src.web.routes import uploads as upload_routes
+from src.web.services import upload_validation
 
 from tests.test_upload import (
     _historical_task_bytes,
@@ -353,8 +354,8 @@ def test_dependency_closure_uses_existing_task_header_pr_id(
         [_task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-999")]
     )
 
-    assert accepted.status_code == 200
-    assert (_staging_dir(uploads_dir) / "PR-002.md").is_file()
+    assert accepted.status_code == 400
+    assert "does not match task file" in accepted.text
 
 
 def test_dependency_closure_ignores_existing_filename_when_header_differs(
@@ -396,10 +397,38 @@ def test_dependency_closure_accepts_legacy_existing_task_header(
     assert (_staging_dir(uploads_dir) / "PR-002.md").is_file()
 
 
+@pytest.mark.parametrize("source", ["stored", "pending"])
+def test_unstructured_history_preserves_dependencies_without_reserving_branches(
+    repo_dir: Path, uploads_dir: Path, source: str,
+) -> None:
+    from src.queue_parser import UnstructuredLegacyTaskError, parse_existing_task_header
+
+    history = repo_dir / "tasks" if source == "stored" else uploads_dir / "pending"
+    history.mkdir()
+    for pr_id, branch in [("PR-001", "pr-002-example-task"), ("PR-old", "old-branch")]:
+        path = history / f"{pr_id}.md"
+        path.write_text(f"# {pr_id}: Legacy task\n\nBranch: {branch}\n", encoding="utf-8")
+        with pytest.raises(UnstructuredLegacyTaskError):
+            parse_existing_task_header(path)
+
+    with TestClient(app) as client:
+        if source == "pending":
+            client.app.state.redis._store[upload_pending("example__alpha")] = json.dumps({
+                "files": ["PR-001.md", "PR-old.md"], "staging_dir": str(history),
+            })
+        response = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")],
+        )
+
+    assert response.status_code == 200
+    assert (_staging_dir(uploads_dir) / "PR-002.md").is_file()
+
+
 def test_parse_existing_task_header_returns_none_for_unreadable_path(
     tmp_path: Path,
 ) -> None:
-    assert upload_routes._parse_existing_task_header(tmp_path) is None
+    assert upload_validation._parse_existing_task_header(tmp_path) is None
 
 
 def test_parse_existing_task_header_returns_none_when_legacy_read_fails(
@@ -409,9 +438,9 @@ def test_parse_existing_task_header_returns_none_when_legacy_read_fails(
     def _raise_validation_error(path: Path) -> None:
         raise upload_routes.QueueValidationError([f"{path}: missing Branch"])
 
-    monkeypatch.setattr(upload_routes, "parse_task_header", _raise_validation_error)
+    monkeypatch.setattr(upload_validation, "parse_existing_task_header", _raise_validation_error)
 
-    assert upload_routes._parse_existing_task_header(tmp_path) is None
+    assert upload_validation._parse_existing_task_header(tmp_path) is None
 
 
 def test_parse_existing_task_header_returns_none_for_interrupted_legacy_header(
@@ -425,7 +454,7 @@ def test_parse_existing_task_header_returns_none_for_interrupted_legacy_header(
         encoding="utf-8",
     )
 
-    assert upload_routes._parse_existing_task_header(task_file) is None
+    assert upload_validation._parse_existing_task_header(task_file) is None
 
 
 def test_dependency_closure_satisfied_by_merged_on_github(
@@ -454,18 +483,26 @@ def test_dependency_closure_satisfied_by_merged_split_child(
     assert (_staging_dir(uploads_dir) / "PR-306.md").is_file()
 
 
-def test_upload_skips_merged_history_probe_without_dependencies(
-    monkeypatch: pytest.MonkeyPatch, uploads_dir: Path
+def test_upload_checks_completion_for_branch_owners_without_dependencies(
+    monkeypatch: pytest.MonkeyPatch, repo_dir: Path, uploads_dir: Path,
 ) -> None:
-    def _fail_if_called(*args: object) -> set[str]:
-        raise AssertionError("get_merged_pr_ids should not run without dependencies")
+    tasks = repo_dir / "tasks"
+    tasks.mkdir()
+    (tasks / "PR-001.md").write_bytes(_task_file()[1][1])
+    calls = []
 
-    monkeypatch.setattr(upload_routes, "get_merged_pr_ids", _fail_if_called)
+    def completed(repo, branch, candidates):
+        calls.append(candidates)
+        return {"PR-001"}
 
-    resp = _post_upload([_task_file(name="PR-001.md", pr_id="PR-001")])
+    monkeypatch.setattr(upload_routes, "get_merged_pr_ids", completed)
+    second = _task_file(name="PR-002.md", pr_id="PR-002")
+    resp = _post_upload([("files", ("PR-002.md", second[1][1].replace(
+        b"pr-002-example-task", b"pr-001-example-task"), "text/markdown"))])
 
     assert resp.status_code == 200
-    assert (_staging_dir(uploads_dir) / "PR-001.md").is_file()
+    assert calls == [{"PR-001", "PR-002"}, {"PR-001", "PR-002"}]
+    assert (_staging_dir(uploads_dir) / "PR-002.md").is_file()
 
 
 def test_dependency_closure_satisfied_by_pending_upload(
@@ -650,26 +687,12 @@ def test_dependency_closure_locked_recheck_refreshes_tasks_dir(
     assert manifest["files"] == ["PR-002.md"]
 
 
-def test_pending_upload_task_ids_ignores_invalid_manifest(tmp_path: Path) -> None:
-    staging_dir = tmp_path / "pending"
-    staging_dir.mkdir()
-    (staging_dir / "PR-001.md").write_bytes(
-        _task_bytes("PR-001.md", pr_id="PR-999")
-    )
-    assert upload_routes._pending_upload_task_ids(None) == set()
-    assert upload_routes._pending_upload_task_ids("{not-json") == set()
-    assert upload_routes._pending_upload_task_ids('{"files": "PR-001.md"}') == set()
-    assert upload_routes._pending_upload_task_ids(
-        json.dumps(
-            {
-                "files": ["PR-001.md", "QUEUE.md", 123, "PR-002.md"],
-                "staging_dir": str(staging_dir),
-            }
-        )
-    ) == {"PR-999"}
+def test_effective_headers_ignore_invalid_manifest(tmp_path: Path) -> None:
+    for raw in (None, "{not-json", '[]', '{"files": "PR-001.md"}'):
+        assert upload_validation.effective_task_headers(tmp_path, {}, raw) == {}
 
 
-def test_dependency_closure_continues_when_pending_lookup_fails(
+def test_graph_admission_blocks_when_pending_lookup_fails(
     uploads_dir: Path,
 ) -> None:
     class _PendingExplodes:
@@ -698,7 +721,8 @@ def test_dependency_closure_continues_when_pending_lookup_fails(
             ],
         )
 
-    assert resp.status_code == 200
+    assert resp.status_code == 503
+    assert not (uploads_dir / "example__alpha").exists()
 
 
 def test_error_response_lists_all_failures(uploads_dir: Path) -> None:
@@ -834,3 +858,273 @@ def test_commit_message_rejects_queue_pr_prefix() -> None:
 
     assert resp.status_code == 400
     assert "must not start with a queue PR ID prefix" in resp.text
+
+
+@pytest.mark.parametrize(
+    ("tasks", "diagnostic"),
+    [
+        ([("PR-001", "PR-001")], "dependency cycle"),
+        ([("PR-001", "PR-002"), ("PR-002", "PR-001")], "dependency cycle"),
+        ([("PR-001", "PR-999")], "Depends on PR-999"),
+    ],
+)
+def test_graph_rejection_is_atomic(uploads_dir, tasks, diagnostic):
+    with TestClient(app) as client:
+        redis = client.app.state.redis
+        redis._store[upload_pending_count("example__alpha")] = "7"
+        before = dict(redis._store)
+        response = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_task_file(name=f"{pr_id}.md", pr_id=pr_id, depends_on=deps)
+                   for pr_id, deps in tasks],
+        )
+        assert redis._store == before
+    assert response.status_code == 400
+    assert diagnostic in response.text
+    assert list(uploads_dir.iterdir()) == []
+
+
+def test_pending_stored_incoming_cycle_is_atomic(repo_dir, uploads_dir):
+    tasks = repo_dir / "tasks"
+    tasks.mkdir()
+    stored = _task_file(depends_on="PR-002")[1][1]
+    (tasks / "PR-001.md").write_bytes(stored)
+    pending = uploads_dir / "example__alpha" / "pending"
+    pending.mkdir(parents=True)
+    pending_bytes = _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-003")[1][1]
+    (pending / "PR-002.md").write_bytes(pending_bytes)
+    with TestClient(app) as client:
+        redis = client.app.state.redis
+        redis._store[upload_pending("example__alpha")] = json.dumps({
+            "files": ["PR-002.md"], "staging_dir": str(pending),
+        })
+        redis._store[upload_pending_count("example__alpha")] = "1"
+        before = dict(redis._store)
+        response = client.post(
+            "/repos/example__alpha/upload-tasks",
+            files=[_task_file(name="PR-003.md", pr_id="PR-003", depends_on="PR-001")],
+        )
+        assert redis._store == before
+    assert response.status_code == 400
+    assert "dependency cycle" in response.text
+    assert (tasks / "PR-001.md").read_bytes() == stored
+    assert (pending / "PR-002.md").read_bytes() == pending_bytes
+    assert list(pending.parent.iterdir()) == [pending]
+
+
+@pytest.mark.parametrize("source", ["batch", "stored", "pending"])
+def test_duplicate_executable_branch_rejected(repo_dir, uploads_dir, source):
+    first = _task_file()[1][1]
+    second = _task_file(name="PR-002.md", pr_id="PR-002")
+    second = ("files", ("PR-002.md", second[1][1].replace(
+        b"pr-002-example-task", b"pr-001-example-task"), "text/markdown"))
+    with TestClient(app) as client:
+        files = [second]
+        if source == "batch":
+            files.append(_task_file())
+        elif source == "stored":
+            tasks = repo_dir / "tasks"
+            tasks.mkdir()
+            (tasks / "PR-001.md").write_bytes(first)
+        else:
+            pending = uploads_dir / "pending"
+            pending.mkdir()
+            (pending / "PR-001.md").write_bytes(first)
+            client.app.state.redis._store[upload_pending("example__alpha")] = json.dumps({
+                "files": ["PR-001.md"], "staging_dir": str(pending),
+            })
+        before = dict(client.app.state.redis._store)
+        response = client.post("/repos/example__alpha/upload-tasks", files=files)
+        assert client.app.state.redis._store == before
+    assert response.status_code == 400
+    assert "duplicate branch" in response.text
+    assert not (uploads_dir / "example__alpha").exists()
+
+
+def test_replacement_removes_old_edges_and_ignores_unstructured_history(repo_dir):
+    tasks = repo_dir / "tasks"
+    tasks.mkdir()
+    (tasks / "PR-001.md").write_bytes(_task_file(depends_on="PR-002")[1][1])
+    (tasks / "PR-old.md").write_text("# Historical notes\n")
+    response = _post_upload([
+        _task_file(),
+        _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001"),
+    ])
+    assert response.status_code == 200
+
+
+def test_completed_predecessor_is_a_leaf_and_does_not_reserve_branch(repo_dir, monkeypatch):
+    monkeypatch.setattr(upload_routes, "get_merged_pr_ids", lambda *args: {"PR-001"})
+    tasks = repo_dir / "tasks"
+    tasks.mkdir()
+    (tasks / "PR-001.md").write_bytes(_task_file(depends_on="PR-999")[1][1].replace(
+        b"status: TODO", b"status: DONE"))
+    second = _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")
+    response = _post_upload([("files", ("PR-002.md", second[1][1].replace(
+        b"pr-002-example-task", b"pr-001-example-task"), "text/markdown"))])
+    assert response.status_code == 200
+
+
+def test_graph_rechecks_new_pending_edges_before_staging(repo_dir, uploads_dir):
+    tasks = repo_dir / "tasks"
+    tasks.mkdir()
+    (tasks / "PR-001.md").write_bytes(_task_file()[1][1])
+    pending = uploads_dir / "pending"
+    pending.mkdir()
+    (pending / "PR-001.md").write_bytes(_task_file(depends_on="PR-002")[1][1])
+    with TestClient(app) as client:
+        redis = client.app.state.redis
+        original_get = redis.get
+        reads = 0
+
+        async def changing_get(key):
+            nonlocal reads
+            if key == upload_pending("example__alpha"):
+                reads += 1
+                if reads == 1:
+                    return None
+                return json.dumps({"files": ["PR-001.md"], "staging_dir": str(pending)})
+            return await original_get(key)
+
+        redis.get = changing_get
+        response = client.post("/repos/example__alpha/upload-tasks", files=[
+            _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001"),
+        ])
+        assert redis._store == {}
+    assert response.status_code == 400
+    assert "duplicate branch" not in response.text
+    assert "dependency cycle" in response.text
+    assert not (uploads_dir / "example__alpha").exists()
+
+
+@pytest.mark.parametrize("duplicate_id", [False, True])
+def test_incoming_filename_identity_collision_is_atomic(uploads_dir, duplicate_id):
+    with TestClient(app) as client:
+        files = [_task_file(name="PR-002.md", pr_id="PR-001")]
+        if duplicate_id:
+            files.append(_task_file())
+        response = client.post("/repos/example__alpha/upload-tasks", files=files)
+        assert client.app.state.redis._store == {}
+    assert response.status_code == 400
+    assert "does not match task file" in response.text
+    if duplicate_id:
+        assert "duplicate task id" in response.text
+    assert list(uploads_dir.iterdir()) == []
+
+
+def test_pending_same_id_replacement_removes_old_edges(uploads_dir):
+    pending = uploads_dir / "pending"
+    pending.mkdir()
+    (pending / "PR-001.md").write_bytes(_task_file(depends_on="PR-002")[1][1])
+    with TestClient(app) as client:
+        client.app.state.redis._store[upload_pending("example__alpha")] = json.dumps({
+            "files": ["PR-001.md"], "staging_dir": str(pending),
+        })
+        response = client.post("/repos/example__alpha/upload-tasks", files=[
+            _task_file(),
+            _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001"),
+        ])
+        manifest = json.loads(client.app.state.redis._store[upload_pending("example__alpha")])
+    assert response.status_code == 200
+    assert Path(manifest["staging_dir"], "PR-001.md").read_bytes() == _task_file()[1][1]
+
+
+@pytest.mark.parametrize("source", ["batch", "stored", "pending"])
+@pytest.mark.parametrize("conflict", ["cycle", "branch"])
+def test_done_declaration_without_evidence_keeps_executable_edges(
+    repo_dir, uploads_dir, source, conflict,
+):
+    first = _task_file(depends_on="PR-002" if conflict == "cycle" else "none")
+    first = ("files", ("PR-001.md", first[1][1].replace(b"status: TODO", b"status: DONE"), "text/markdown"))
+    second = _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")
+    if conflict == "branch":
+        second = ("files", ("PR-002.md", second[1][1].replace(
+            b"pr-002-example-task", b"pr-001-example-task"), "text/markdown"))
+    with TestClient(app) as client:
+        files = [second]
+        if source == "batch":
+            files.append(first)
+        elif source == "stored":
+            (repo_dir / "tasks").mkdir()
+            (repo_dir / "tasks/PR-001.md").write_bytes(first[1][1])
+        else:
+            pending = uploads_dir / "pending"
+            pending.mkdir()
+            (pending / "PR-001.md").write_bytes(first[1][1])
+            client.app.state.redis._store[upload_pending("example__alpha")] = json.dumps({
+                "files": ["PR-001.md"], "staging_dir": str(pending),
+            })
+        before = dict(client.app.state.redis._store)
+        response = client.post("/repos/example__alpha/upload-tasks", files=files)
+        assert client.app.state.redis._store == before
+    assert response.status_code == 400
+    assert ("dependency cycle" if conflict == "cycle" else "duplicate branch") in response.text
+    assert not (uploads_dir / "example__alpha").exists()
+
+
+@pytest.mark.parametrize("replacement", ["stored", "identical", "incoming", "pending"])
+@pytest.mark.parametrize("conflict", ["cycle", "branch"])
+def test_upload_receipts_use_effective_task_bytes(
+    repo_dir, uploads_dir, record_task_completion, replacement, conflict,
+):
+    (repo_dir / "tasks").mkdir()
+    first = _task_file(depends_on="PR-002" if conflict == "cycle" else "none")
+    (repo_dir / "tasks/PR-001.md").write_bytes(first[1][1])
+    record_task_completion(repo_dir, "PR-001", "example/alpha")
+    second = _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")
+    if conflict == "branch":
+        second = ("files", ("PR-002.md", second[1][1].replace(
+            b"pr-002-example-task", b"pr-001-example-task"), "text/markdown"))
+    with TestClient(app) as client:
+        files = [second]
+        changed = first[1][1] + b"\nChanged requirements\n"
+        if replacement in {"incoming", "identical"}:
+            replacement_bytes = changed if replacement == "incoming" else first[1][1]
+            files.append(("files", ("PR-001.md", replacement_bytes, "text/markdown")))
+        elif replacement == "pending":
+            pending = uploads_dir / "pending"
+            pending.mkdir()
+            (pending / "PR-001.md").write_bytes(changed)
+            client.app.state.redis._store[upload_pending("example__alpha")] = json.dumps({
+                "files": ["PR-001.md"], "staging_dir": str(pending),
+            })
+        response = client.post("/repos/example__alpha/upload-tasks", files=files)
+    assert response.status_code == (200 if replacement in {"stored", "identical"} else 400)
+    if response.status_code == 400:
+        assert ("dependency cycle" if conflict == "cycle" else "duplicate branch") in response.text
+
+
+def test_upload_unverifiable_receipts_block_admission(repo_dir):
+    (repo_dir / "tasks").mkdir()
+    (repo_dir / "tasks/completions.json").write_text("invalid")
+    response = _post_upload([_task_file()])
+    assert response.status_code == 400
+    assert "Cannot verify completion records" in response.text
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_branch_merge_evidence_releases_only_matching_task(
+    repo_dir, monkeypatch, merged,
+):
+    from src.task_status import get_merged_branch_pr_ids
+
+    monkeypatch.setattr(upload_routes, "get_merged_pr_ids", lambda *args: set())
+    monkeypatch.setattr(upload_routes, "get_merged_branch_pr_ids", get_merged_branch_pr_ids)
+
+    def branches(repo, candidates):
+        assert repo == "example/alpha"
+        assert candidates == {"pr-001-example-task"}
+        return candidates if merged else set()
+
+    monkeypatch.setattr("src.task_status.gh_pr_get_merged_branches", branches)
+    tasks = repo_dir / "tasks"
+    tasks.mkdir()
+    # No receipt or prefixed merge subject; the completed task has obsolete edges.
+    (tasks / "PR-001.md").write_bytes(_task_file(depends_on="PR-999")[1][1])
+    second = _task_file(name="PR-002.md", pr_id="PR-002", depends_on="PR-001")
+    response = _post_upload([("files", ("PR-002.md", second[1][1].replace(
+        b"pr-002-example-task", b"pr-001-example-task"), "text/markdown"))])
+    assert response.status_code == (200 if merged else 400)
+    if not merged:
+        assert "duplicate branch" in response.text
+        assert "Depends on PR-999" in response.text

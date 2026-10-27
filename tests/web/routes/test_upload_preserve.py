@@ -577,11 +577,8 @@ def test_upload_zip_with_duplicate_entry_earlier_non_utf8(
     repo_dir: Path,
     uploads_dir: Path,
 ) -> None:
-    # A zip with two ``PR-322.md`` entries where the earlier one carries
-    # non-UTF-8 bytes must not crash the collision-preserve loop. Validation
-    # runs on the deduplicated last-wins map, so the upload completes 200 and
-    # the staged file matches the later (valid) entry with the on-disk DONE
-    # status preserved.
+    # Duplicate task identities are rejected before collision preservation,
+    # even if the final copy is valid UTF-8 and the stored task is DONE.
     (repo_dir / "tasks" / "PR-322.md").write_text(
         _historical_task_text("PR-322", status="DONE", title="Already merged"),
         encoding="utf-8",
@@ -598,7 +595,9 @@ def test_upload_zip_with_duplicate_entry_earlier_non_utf8(
 
     resp = _post([zip_field])
 
-    assert resp.status_code == 200, resp.text
-    staged = _staged_text(uploads_dir, "PR-322.md")
-    assert "status: DONE" in staged.splitlines()[1]
-    assert "Regenerated body" in staged
+    assert resp.status_code == 400, resp.text
+    assert "duplicate task id/filename" in resp.text
+    assert list(uploads_dir.iterdir()) == []
+    assert (repo_dir / "tasks" / "PR-322.md").read_text() == _historical_task_text(
+        "PR-322", status="DONE", title="Already merged",
+    )

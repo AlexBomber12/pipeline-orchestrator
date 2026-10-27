@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 from unittest.mock import patch
 
 import pytest
@@ -304,3 +305,247 @@ def test_functional_tools_registered_with_mcp_server():
     tool_names = {t.name for t in tools}
     assert "validate_task_spec" in tool_names
     assert "suggest_next_pr_number" in tool_names
+
+
+def test_validate_task_spec_context_uses_replacement_graph(tmp_path, monkeypatch):
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    monkeypatch.setattr(functional, "get_merged_pr_ids", lambda *args: set())
+    tasks = tmp_path / "owner__repo" / "tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "PR-998.md").write_text(_VALID_SPEC.replace("PR-999", "PR-998").replace("pr-999", "pr-998").replace(
+        "- Depends on: none", "- Depends on: PR-999"))
+    cyclic = _VALID_SPEC.replace("- Depends on: none", "- Depends on: PR-998")
+    assert functional.validate_task_spec(cyclic)["valid"]
+    result = functional.validate_task_spec(cyclic, repo="owner__repo")
+    assert not result["valid"]
+    assert any("dependency cycle" in issue for issue in result["errors"])
+    assert functional.validate_task_spec(_VALID_SPEC, repo="owner__repo")["valid"]
+    assert not functional.validate_task_spec(
+        _VALID_SPEC, repo="owner__repo", filename="PR-998.md",
+    )["valid"]
+    with pytest.raises(ValueError, match="Invalid repo slug"):
+        functional.validate_task_spec(_VALID_SPEC, repo="../escape")
+
+
+def test_validate_task_spec_context_without_git_evidence(tmp_path, monkeypatch):
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    (tmp_path / "owner__repo").mkdir()
+    from src.config import AppConfig, RepoConfig
+
+    monkeypatch.setattr(functional, "load_config", lambda: AppConfig(
+        repositories=[RepoConfig(url="https://github.com/owner/repo")],
+    ))
+    def unavailable(*args):
+        raise RuntimeError("Git history unavailable")
+    monkeypatch.setattr(functional, "get_merged_pr_ids", unavailable)
+    assert functional.validate_task_spec(_VALID_SPEC, repo="owner__repo")["valid"]
+    dependent = _VALID_SPEC.replace("- Depends on: none", "- Depends on: PR-001")
+    result = functional.validate_task_spec(dependent, repo="owner__repo")
+    assert not result["valid"]
+    assert any("Depends on PR-001" in error for error in result["errors"])
+
+
+def test_validate_task_spec_rejects_unavailable_or_invalid_context(tmp_path, monkeypatch):
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    with pytest.raises(ValueError, match="context unavailable"):
+        functional.validate_task_spec(_VALID_SPEC, repo="owner__missing")
+    with pytest.raises(ValueError, match="Invalid task filename"):
+        functional.validate_task_spec(_VALID_SPEC, filename="../PR-999.md")
+
+
+@pytest.mark.parametrize("remote_default", [False, True])
+def test_validate_task_spec_completion_uses_configured_base(
+    tmp_path, monkeypatch, remote_default,
+):
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    config_path = tmp_path / "config.yml"
+    config_path.write_text(
+        "repositories:\n- url: https://github.com/owner/repo\n  branch: release\n"
+    )
+    monkeypatch.setenv("PO_CONFIG_PATH", str(config_path))
+    repo_path = tmp_path / "owner__repo"
+    repo_path.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=repo_path, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git("init", "-b", "release")
+    git("config", "user.email", "test@example.com")
+    git("config", "user.name", "Test")
+    git("commit", "--allow-empty", "-m", "Initial base")
+    git("checkout", "-b", "active-coder")
+    git("commit", "--allow-empty", "-m", "PR-998: unmerged task")
+    if remote_default:
+        git("update-ref", "refs/remotes/origin/main", "HEAD")
+        git("symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+
+    tasks = repo_path / "tasks"
+    tasks.mkdir()
+    stored = _VALID_SPEC.replace("PR-999", "PR-998").replace("pr-999", "pr-998")
+    (tasks / "PR-998.md").write_text(
+        stored.replace("- Depends on: none", "- Depends on: PR-999")
+    )
+    cyclic = _VALID_SPEC.replace("- Depends on: none", "- Depends on: PR-998")
+    result = functional.validate_task_spec(cyclic, repo="owner__repo")
+    assert not result["valid"]
+    assert any("dependency cycle" in error for error in result["errors"])
+
+    shared_branch = _VALID_SPEC.replace("Branch: pr-999-example", "Branch: pr-998-example")
+    result = functional.validate_task_spec(shared_branch, repo="owner__repo")
+    assert not result["valid"]
+    assert any("branch" in error.lower() for error in result["errors"])
+
+    # Completion on the configured base still removes completed nodes.
+    git("update-ref", "refs/remotes/origin/release", "HEAD")
+    assert functional.validate_task_spec(cyclic, repo="owner__repo")["valid"]
+    assert functional.validate_task_spec(shared_branch, repo="owner__repo")["valid"]
+
+
+@pytest.mark.parametrize("done_source", ["stored", "incoming"])
+@pytest.mark.parametrize("conflict", ["cycle", "branch"])
+def test_context_done_requires_completion_evidence(tmp_path, monkeypatch, done_source, conflict):
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    tasks = tmp_path / "owner__repo/tasks"
+    tasks.mkdir(parents=True)
+    stored = _VALID_SPEC.replace("PR-999", "PR-998").replace("pr-999", "pr-998")
+    incoming = _VALID_SPEC.replace("- Depends on: none", "- Depends on: PR-998")
+    if conflict == "cycle":
+        stored = stored.replace("- Depends on: none", "- Depends on: PR-999")
+    else:
+        incoming = incoming.replace("Branch: pr-999-example", "Branch: pr-998-example")
+    if done_source == "stored":
+        stored = stored.replace("status: TODO", "status: DONE")
+    else:
+        incoming = incoming.replace("status: TODO", "status: DONE")
+    (tasks / "PR-998.md").write_text(stored)
+    result = functional.validate_task_spec(incoming, repo="owner__repo")
+    assert not result["valid"]
+    assert any(("dependency cycle" if conflict == "cycle" else "branch") in error for error in result["errors"])
+
+
+@pytest.mark.parametrize("replacement", [False, True])
+@pytest.mark.parametrize("conflict", ["cycle", "branch"])
+def test_context_receipts_use_effective_bytes(
+    tmp_path, monkeypatch, record_task_completion, replacement, conflict,
+):
+    from src.config import AppConfig, RepoConfig
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    monkeypatch.setattr(functional, "load_config", lambda: AppConfig(
+        repositories=[RepoConfig(url="https://github.com/owner/repo", branch="release")],
+    ))
+    repo = tmp_path / "owner__repo"
+    tasks = repo / "tasks"
+    tasks.mkdir(parents=True)
+    stored = _VALID_SPEC.replace("PR-999", "PR-998").replace("pr-999", "pr-998")
+    if conflict == "cycle":
+        stored = stored.replace("- Depends on: none", "- Depends on: PR-999")
+    (tasks / "PR-998.md").write_text(stored)
+    record_task_completion(repo, "PR-998", "owner/repo", "release")
+    if replacement:
+        # Replace the completed task itself: a stale receipt must not prune its edges.
+        incoming = stored + "\nChanged requirements\n"
+        other = _VALID_SPEC.replace("- Depends on: none", "- Depends on: PR-998")
+        if conflict == "branch":
+            other = other.replace("Branch: pr-999-example", "Branch: pr-998-example")
+        (tasks / "PR-999.md").write_text(other)
+    else:
+        incoming = _VALID_SPEC.replace("- Depends on: none", "- Depends on: PR-998")
+        if conflict == "branch":
+            incoming = incoming.replace("Branch: pr-999-example", "Branch: pr-998-example")
+    result = functional.validate_task_spec(incoming, repo="owner__repo")
+    assert result["valid"] is not replacement
+
+
+def test_context_unverifiable_receipts_block_admission(tmp_path, monkeypatch):
+    from src.config import AppConfig, RepoConfig
+    from src.mcp.tools import functional
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    monkeypatch.setattr(functional, "load_config", lambda: AppConfig(
+        repositories=[RepoConfig(url="https://github.com/owner/repo")],
+    ))
+    tasks = tmp_path / "owner__repo/tasks"
+    tasks.mkdir(parents=True)
+    (tasks / "completions.json").write_text("invalid")
+    result = functional.validate_task_spec(_VALID_SPEC, repo="owner__repo")
+    assert not result["valid"]
+    assert any("Cannot verify completion records" in error for error in result["errors"])
+
+
+@pytest.mark.parametrize("merged", [False, True])
+def test_context_branch_merge_evidence_releases_only_matching_task(tmp_path, monkeypatch, merged):
+    from src.config import AppConfig, RepoConfig
+    from src.mcp.tools import functional
+    from src.branch_completion_bridge import read_branch_completions
+    from unittest.mock import MagicMock
+    import json
+
+    monkeypatch.setattr(functional, "_REPOS_ROOT", tmp_path)
+    monkeypatch.setattr(functional, "load_config", lambda: AppConfig(
+        repositories=[RepoConfig(url="https://github.com/owner/repo", branch="release")],
+    ))
+    monkeypatch.setattr(functional, "get_merged_pr_ids", lambda *args: set())
+    monkeypatch.setattr(functional, "read_branch_completions", read_branch_completions)
+    transport = MagicMock()
+    transport.__enter__.return_value = transport
+    transport.get.return_value = json.dumps(["pr-998-example"] if merged else [])
+    monkeypatch.setattr("src.branch_completion_bridge.redis.Redis.from_url", lambda *a, **kw: transport)
+
+    def no_github(*args, **kwargs):
+        raise AssertionError("MCP must not require GitHub credentials")
+
+    monkeypatch.setattr("src.task_status.gh_pr_get_merged_branches", no_github)
+    tasks = tmp_path / "owner__repo/tasks"
+    tasks.mkdir(parents=True)
+    stored = _VALID_SPEC.replace("PR-999", "PR-998").replace("pr-999", "pr-998")
+    (tasks / "PR-998.md").write_text(
+        stored.replace("- Depends on: none", "- Depends on: PR-001")
+    )
+    incoming = _VALID_SPEC.replace("Branch: pr-999-example", "Branch: pr-998-example")
+    incoming = incoming.replace("- Depends on: none", "- Depends on: PR-998")
+    result = functional.validate_task_spec(incoming, repo="owner__repo")
+    assert result["valid"] is merged
+    transport.get.assert_called_once_with("verified-merged-branches:owner/repo:release")
+    if not merged:
+        assert any("duplicate branch" in error for error in result["errors"])
+        assert any("Depends on PR-001" in error for error in result["errors"])
+
+
+@pytest.mark.parametrize("raw", [None, b"invalid", b"{}", b'[1]', b'["pr-9980-wrong"]', b"\xff"])
+def test_context_branch_snapshot_fails_closed(raw, monkeypatch):
+    from unittest.mock import MagicMock
+    from src.branch_completion_bridge import read_branch_completions
+    from src.queue_parser import TaskHeader
+
+    client = MagicMock()
+    client.__enter__.return_value = client
+    client.get.return_value = raw
+    monkeypatch.setattr("src.branch_completion_bridge.redis.Redis.from_url", lambda *a, **kw: client)
+    header = TaskHeader(pr_id="PR-998", title="Task", branch="pr-9980-wrong", task_type="feature", complexity="low", depends_on=[], priority=1, coder="any")
+    assert read_branch_completions("owner/repo", "release", [header]) == set()
+    client.get.assert_called_once_with("verified-merged-branches:owner/repo:release")
+
+
+def test_context_branch_snapshot_redis_outage(monkeypatch):
+    import redis
+    from src.branch_completion_bridge import read_branch_completions
+
+    def unavailable(*args, **kwargs):
+        raise redis.ConnectionError("offline")
+
+    monkeypatch.setattr("src.branch_completion_bridge.redis.Redis.from_url", unavailable)
+    assert read_branch_completions("owner/repo", "main", []) == set()

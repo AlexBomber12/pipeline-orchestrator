@@ -25,6 +25,11 @@ def pipeline_state(repo_name: str) -> str:
     return f"pipeline:{repo_name}"
 
 
+def verified_merged_branches(owner_repo: str, base_branch: str) -> str:
+    """Daemon-owned positive branch evidence, isolated by repository and base."""
+    return f"verified-merged-branches:{owner_repo.casefold()}:{base_branch}"
+
+
 def control_stop(repo_name: str) -> str:
     """Key for the stop-request control flag set by the web layer."""
     return f"control:{repo_name}:stop"

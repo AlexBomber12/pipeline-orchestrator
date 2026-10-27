@@ -1593,3 +1593,33 @@ def test_restart_and_idle_agree_without_dispatch(
         assert asyncio.run(h._ORIGINAL_SELECT_NEXT_TASK_FROM_DAG(runner)) is None
         assert [t.status for t in runner._idle_dag_tasks] == [TaskStatus.DONE]
         assert path.read_bytes() == before
+
+
+def test_merged_branch_completion_requires_matching_task_identity(monkeypatch):
+    from src.task_status import get_merged_branch_pr_ids
+
+    def merged(repo, branches):
+        assert repo == "owner/repo"
+        assert branches == {"pr-085-custom", "pr-086-pending"}
+        return {"pr-085-custom"}
+
+    monkeypatch.setattr("src.task_status.gh_pr_get_merged_branches", merged)
+    assert get_merged_branch_pr_ids("owner/repo", iter([
+        _header("pr-085-custom"),
+        _header("pr-085-custom", pr_id="PR-084"),
+        _header("pr-086-pending", pr_id="PR-086"),
+    ])) == {"PR-085"}
+
+
+@pytest.mark.parametrize("error", [
+    GhPrMergedBranchesUnavailable("offline"), ValueError("invalid branch"),
+    subprocess.TimeoutExpired("gh", 1), OSError("missing gh"),
+])
+def test_merged_branch_completion_unavailable_preserves_tasks(monkeypatch, error):
+    from src.task_status import get_merged_branch_pr_ids
+
+    def unavailable(*args):
+        raise error
+
+    monkeypatch.setattr("src.task_status.gh_pr_get_merged_branches", unavailable)
+    assert get_merged_branch_pr_ids("owner/repo", [_header("pr-085-custom")]) == set()
