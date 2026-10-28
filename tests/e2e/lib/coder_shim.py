@@ -22,6 +22,7 @@ VALID_SCENARIOS = {
     "fix_existing_pr",
     "no_pr",
     "exit_nonzero",
+    "failure_continuity",
     "hang",
     "malformed_pr",
     "slow",
