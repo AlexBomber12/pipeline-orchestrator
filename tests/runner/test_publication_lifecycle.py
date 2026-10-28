@@ -973,6 +973,7 @@ async def test_operator_retry_uses_shared_pending_publication_continuation(lifec
 async def test_failed_unpublished_dirty_attempt_survives_preflight_and_restart(lifecycle, pending):
     from src.daemon.preflight import PreflightMixin
     from src.subsource_registry import SuppressionReason
+    from src.web.services.repo_state import compute_repo_dependents_count, load_current_queue
 
     runner, provider, repo, _, expected, configure = lifecycle
     remote = git(repo, 'remote', 'get-url', 'origin')
@@ -989,6 +990,13 @@ async def test_failed_unpublished_dirty_attempt_survives_preflight_and_restart(l
     attempt.pending = pending
     runner.state.state = PipelineState.ERROR
     runner.state.error_message = 'deterministic continuity failure'
+    queue = [
+        runner.state.current_task.model_copy(update={'status': TaskStatus.ERROR}),
+        QueueTask(pr_id='PR-002', title='independent', status=TaskStatus.TODO, branch='pr-002'),
+        QueueTask(pr_id='PR-003', title='dependent', status=TaskStatus.TODO,
+                  branch='pr-003', depends_on=['PR-001']),
+    ]
+    runner.state.current_queue = queue
     dirty = repo / 'continuity-dirty.txt'
     dirty.write_text('unpreserved failed attempt work\n')
     await runner._suppress_task('PR-001', SuppressionReason.CRASH, {})
@@ -1024,4 +1032,10 @@ async def test_failed_unpublished_dirty_attempt_survives_preflight_and_restart(l
         assert git(repo, 'branch', '--show-current') == 'pr-001'
         assert git(repo, 'rev-parse', 'HEAD') == expected
         assert runner._consecutive_dirty_cycles == 0
+        # Pending-publication recovery returns before header reconstruction.
+        # Its published queue must still expose the retained failure's edge.
+        assert await load_current_queue(runner.name, runner.redis) == queue
+        assert await compute_repo_dependents_count(
+            str(repo.parent), runner.name, {'PR-001'}, runner.redis,
+        ) == {'PR-001': 1}
     assert provider['requests'] == []

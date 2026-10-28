@@ -745,6 +745,10 @@ class RecoveryMixin:
             self.state.active_invocation = persisted.active_invocation
             self.state.publication_attempt = persisted.publication_attempt
             self.state.error_message = persisted.error_message
+            # A held publication returns before rebuilding from task headers.
+            # Retain its queue snapshot for dashboard failure/dependency visibility
+            # until normal header recovery can replace it; the hold still blocks dispatch.
+            self.state.current_queue = persisted.current_queue
             if not self._publication_attempt_matches_dispatch():
                 self.state.current_pr = None
             self.state.user_paused = persisted.user_paused
