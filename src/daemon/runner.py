@@ -3193,6 +3193,31 @@ class PipelineRunner(
             return False
         return True
 
+    async def _park_startup_stop(self) -> None:
+        """Acknowledge Stop without serializing an unrecovered runner's defaults."""
+        state_key = pipeline_state(self.name)
+        stop_key = control_stop(self.name)
+
+        async def park(pipe: Any) -> None:
+            # Watch both keys so a concurrent Resume wins over an old Stop
+            # observation. Preserve the raw snapshot, including legacy shape
+            # and publication provenance needed by subsequent recovery.
+            if not await pipe.get(stop_key):
+                return
+            raw = await pipe.get(state_key)
+            data = json.loads(raw) if raw else self.state.model_dump(mode="json")
+            data.update(
+                state=PipelineState.PAUSED.value,
+                user_paused=True,
+                last_updated=datetime.now(timezone.utc).isoformat(),
+            )
+            pipe.multi()
+            pipe.set(state_key, json.dumps(data))
+            pipe.delete(stop_key)
+
+        await self.redis.transaction(park, state_key, stop_key)
+        await self._refresh_user_paused_from_redis()
+
     async def _terminate_current_coder(self) -> bool:
         """Clean the owned coder group and clear it only after quiescence."""
         managed = self._current_coder_supervised_process
@@ -4069,10 +4094,13 @@ class PipelineRunner(
                     await self.publish_state()
                     return
 
-        # A wake hint cannot authorize work ahead of a durable Stop, including
-        # during startup recovery. Leave acknowledgment to publish/cleanup.
+        # Startup publication is suppressed until recovery has read the saved
+        # snapshot. Park Stop separately, retaining that snapshot for Resume.
         if await self._pop_stop_request():
-            await self.publish_state()
+            if not self._recovered:
+                await self._park_startup_stop()
+            else:
+                await self.publish_state()
             return
 
         if not await self._check_github_api_budget():

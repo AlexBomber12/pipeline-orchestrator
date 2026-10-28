@@ -3792,7 +3792,7 @@ def test_run_cycle_processes_pending_uploads_from_recovery_when_on_or_off_base(
 
     asyncio.run(runner.run_cycle())
 
-    assert publishes == ["published"]
+    assert publishes == ([] if inhibitor == "stop" else ["published"])
     assert upload_calls == ([] if inhibitor else [True])
     if inhibitor:
         assert not git_calls
