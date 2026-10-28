@@ -204,6 +204,18 @@ class ErrorMixin:
                 and remote == [head, f"refs/heads/{branch}"]
             )
             pr = self.state.current_pr
+            publications = []
+            if pr is None:
+                publications = await asyncio.to_thread(
+                    gh_prs.get_branch_publications, attempt.repo, attempt.base, attempt.branch,
+                )
+                if publications:
+                    # Exhaustion clears pending, so normal publication polling
+                    # cannot adopt a PR that becomes visible on a later tick.
+                    # Reuse exact dispatch/head validation without resuming the
+                    # failed task or performing terminal-success bookkeeping.
+                    await self._resolve_published_attempt(resolve_terminal=False)
+                    pr = self.state.current_pr
             if pr is not None:
                 remote_known = remote_known and (
                     pr.number == attempt.pr_number and pr.branch == attempt.branch
@@ -216,9 +228,7 @@ class ErrorMixin:
                 )
                 resolved = (outcome.discovery_complete and outcome.state == gh_prs.ExactPRState.OPEN)
             else:
-                resolved = attempt.pr_number is None and not await asyncio.to_thread(
-                    gh_prs.get_branch_publications, attempt.repo, attempt.base, attempt.branch,
-                )
+                resolved = attempt.pr_number is None and not publications
                 cleaned_branch = False
                 if (resolved and not remote and not branch
                     and attempt.initial_branch_head_sha == ""):

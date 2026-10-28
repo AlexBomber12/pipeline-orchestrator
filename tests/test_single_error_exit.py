@@ -858,6 +858,77 @@ def test_publication_exhaustion_uses_common_release_proof(terminal_repo):
     assert record.detail["terminal_failure"]["pr"]["number"] == 1
 
 
+@pytest.mark.parametrize("fault", [None, "ambiguous", "head", "task", "draft", "baseline",
+                                   "exact", "dirty", "remote"])
+def test_exhausted_publication_discovers_pr_after_github_recovers(terminal_repo, monkeypatch, fault):
+    from unittest.mock import Mock
+
+    from src.daemon import publication
+    from src.github import checks, prs
+
+    runner, git = terminal_repo
+    task = runner.state.current_task
+    attempt = runner.state.publication_attempt
+    runner.state.current_pr = None
+    attempt.pr_number = None
+    attempt.baseline_numbers = {1} if fault == "baseline" else set()
+    attempt.head_sha = attempt.expected_head_sha
+    attempt.pending = True
+    attempt.exhausted = True
+    asyncio.run(runner._commit_task_status_change(
+        task, "ERROR", "expired", blocked_reason=SuppressionReason.CRASH,
+    ))
+    asyncio.run(runner._suppress_task(task.pr_id, SuppressionReason.CRASH, {"error_message": "expired"}))
+    post = Mock()
+    monkeypatch.setattr(runner, "_post_codex_review", post)
+
+    def unavailable(*args):
+        raise OSError("GitHub unavailable")
+
+    monkeypatch.setattr(prs, "get_branch_publications", unavailable)
+    asyncio.run(publication._exhaust(runner))
+    assert runner.state.state == PipelineState.ERROR
+    assert not attempt.pending
+    assert runner.state.current_pr is None
+
+    item = prs.BranchPublication(
+        number=1, title="PR-002: other" if fault == "task" else "PR-001: repair",
+        base_branch="main", head_branch=attempt.branch,
+        head_sha="a" * 40 if fault == "head" else attempt.expected_head_sha,
+        state="OPEN", is_draft=fault == "draft", is_cross_repository=False,
+        created_at=attempt.started_at, url="https://github.com/octo/demo/pull/1",
+    )
+    monkeypatch.setattr(prs, "get_branch_publications", lambda *args:
+                        [item, item] if fault == "ambiguous" else [item])
+    monkeypatch.setattr(checks, "_retrieve_ci_status_evidence", lambda *args, **kwargs: None)
+    if fault == "exact":
+        monkeypatch.setattr(prs, "get_exact_pr_outcome", lambda *args, **kwargs: prs.ExactPROutcome(
+            runner.owner_repo, "main", 1, attempt.expected_head_sha, prs.ExactPRState.UNKNOWN, False,
+        ))
+    elif fault in {"dirty", "remote"}:
+        (Path(runner.repo_path) / "saved-work").write_text("preserve this work")
+        if fault == "remote":
+            git("add", "saved-work")
+            git("commit", "-m", "external advancement")
+            git("push", "origin", attempt.branch)
+
+    asyncio.run(runner._run_cycle_body())
+    post.assert_not_called()
+    assert not attempt.pending
+    if fault is None:
+        assert runner.state.state == PipelineState.IDLE
+        assert runner.state.current_task is None
+        retained = asyncio.run(runner._suppression_record_for_task(task.pr_id))
+        assert retained.reason == SuppressionReason.CRASH
+        evidence = retained.detail["terminal_failure"]
+        assert evidence["pr"]["number"] == 1
+        assert evidence["pr"]["head_sha"] == attempt.expected_head_sha
+        assert evidence["publication_attempt"]["pr_number"] == 1
+    else:
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.current_task.pr_id == task.pr_id
+
+
 def test_review_timeout_can_release_independent_work_without_retry(terminal_repo):
     runner, _ = terminal_repo
     task = runner.state.current_task
