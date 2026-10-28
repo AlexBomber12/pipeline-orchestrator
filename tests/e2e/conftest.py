@@ -348,7 +348,10 @@ def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 150) -> None:
                     last_user_paused = entry.get("user_paused")
                     history = entry.get("history") or []
                     last_event = history[-1].get("event") if history and isinstance(history[-1], dict) else None
-                    if last_state == "PAUSED" or (
+                    # ERROR retains its state under operator pause. This is
+                    # only a pause acknowledgement: reset callers must stop
+                    # the fixture-owned service before deleting any state.
+                    if (last_state == "ERROR" and last_user_paused is True) or last_state == "PAUSED" or (
                         last_user_paused is True
                         and last_event == "[INFRA] Paused. Press Play to resume."
                     ):
@@ -415,12 +418,18 @@ def _reset_testbed_session():
     # run before pytest starts. Pause it before deleting that task on main,
     # then restart so its in-memory state cannot resurrect the old merge.
     _stop_daemon_and_wait_paused(TESTBED_SLUG)
-    counts = reset_testbed_full(TESTBED_SLUG)
-    counts["redis_keys_deleted"] = clear_testbed_redis_state(TESTBED_SLUG)
     subprocess.run(
-        ["docker", "compose", "-f", "docker-compose.test.yml", "restart", "daemon-test"],
+        ["docker", "compose", "-f", "docker-compose.test.yml", "stop", "daemon-test"],
         cwd=REPO_DIR, check=True, timeout=60,
     )
+    try:
+        counts = reset_testbed_full(TESTBED_SLUG)
+        counts["redis_keys_deleted"] = clear_testbed_redis_state(TESTBED_SLUG)
+    finally:
+        subprocess.run(
+            ["docker", "compose", "-f", "docker-compose.test.yml", "start", "daemon-test"],
+            cwd=REPO_DIR, check=True, timeout=60,
+        )
     yield counts
 
 

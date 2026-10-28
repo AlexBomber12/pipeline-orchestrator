@@ -146,47 +146,45 @@ def test_coder_crash_records_cancellation_cause_and_propagates(
             f"runner state={get_state()!r}"
         )
 
-        # After the cause is recorded, the error handler asks the
-        # auxiliary coder to diagnose; the shim's ``FIX, SKIP, or
-        # ESCALATE`` short-circuit returns SKIP, which clears
-        # ``current_task`` and routes the runner back to IDLE
-        # (``src/daemon/handlers/error.py``). The cause itself is left in
-        # place by the SKIP branch — the dashboard surfaces it for the
-        # operator to inspect.
-        #
-        # We assert against the durable event log rather than a live
-        # ``state == IDLE and current_task is None`` snapshot: under the
-        # exit_nonzero shim PR-A keeps its DOING status in QUEUE.md, so
-        # the daemon re-picks it on the very next IDLE tick and the IDLE
-        # window between SKIP and the next CODING dispatch is sub-second
-        # — 1 Hz polling will consistently miss it. The
-        # ``[ERROR] diagnose_error: SKIP -> IDLE.`` line emitted by
-        # ``handle_error`` is the durable proof that the SKIP branch ran
-        # (which both clears ``current_task`` and sets state=IDLE), and
-        # ``state.history`` retains it across subsequent transitions.
-        skip_marker = "[ERROR] diagnose_error: SKIP -> IDLE."
-        deadline = time.monotonic() + 60
-        skip_observed = False
+        # SKIP must retain a durable failed outcome before releasing execution.
+        # The clean branch supplied by this shim is preserved on the remote base.
+        release_marker = "[RECOVERY] Failed attempt retained; independent work released."
+        deadline = time.monotonic() + 90
         last_state = None
         last_events: list[str] = []
+        released = False
         while time.monotonic() < deadline:
             entry = get_state()
             if entry is not None:
                 last_state = entry.get("state")
-                history = entry.get("history") or []
                 last_events = [
-                    item.get("event", "")
-                    for item in history
+                    item.get("event", "") for item in entry.get("history") or []
                     if isinstance(item, dict)
                 ]
-                if any(skip_marker in event for event in last_events):
-                    skip_observed = True
+                if (release_marker in last_events and last_state == "IDLE"
+                    and entry.get("current_task") is None):
+                    released = True
                     break
             time.sleep(1)
-        assert skip_observed, (
-            f"handle_error did not log {skip_marker!r} within 60s after "
-            f"the CRASH cause was recorded; last_state={last_state!r}, "
-            f"recent events={last_events[-10:]!r}, "
-            f"final cancellations="
-            f"{_fetch_cancellations(dashboard_url, testbed_slug)!r}"
+        assert released, (
+            f"clean failed attempt {pr_a_id} did not release within 90s; "
+            f"last_state={last_state!r}, recent events={last_events[-10:]!r}"
         )
+        # IDLE alone is insufficient: verify A's terminal ERROR and C's TODO
+        # through the operator surface, plus the retained blocked-set evidence.
+        url = f"{dashboard_url}/repos/{testbed_slug}/tasks"
+        deadline = time.monotonic() + 150
+        panel = ""
+        while time.monotonic() < deadline:
+            with urllib.request.urlopen(url, timeout=5) as response:
+                panel = response.read().decode("utf-8")
+            if (f'id="task-content-error-{pr_a_id}"' in panel
+                and f'id="task-content-todo-{pr_b_id}"' in panel):
+                break
+            time.sleep(1)
+        assert f'id="task-content-error-{pr_a_id}"' in panel, panel
+        assert f'id="task-content-todo-{pr_b_id}"' in panel, panel
+        retained = _entry_for(_fetch_cancellations(dashboard_url, testbed_slug), pr_a_id)
+        assert retained is not None
+        assert retained["payload"]["subsource"] == "diagnose_exhausted", retained
+        assert retained["dependents_count"] >= 1, retained
