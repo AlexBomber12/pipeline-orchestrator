@@ -59,6 +59,8 @@ def _runner(tmp_path: Path) -> PipelineRunner:
     runner.state.current_task = _task()
     runner.state.error_message = "ERROR: synthetic failure"
     _write_task(tmp_path, runner.state.current_task, SuppressionReason.GUARDRAIL)
+    # This fixture starts after the terminal ERROR status was confirmed.
+    runner._confirmed_error_task_pr_ids.add(runner.state.current_task.pr_id)
     # These dispatcher tests use a local task fixture as their base snapshot.
     runner._remote_frontmatter_error_status_for_current_task = (  # type: ignore[method-assign]
         lambda: (*runner._frontmatter_error_status_for_current_task(), "fixture")
@@ -376,6 +378,63 @@ def test_flag_off_uses_common_terminal_policy(
 
     assert calls == []
     assert runner.state.state == PipelineState.ERROR
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_unchanged_todo_diagnoses_until_bounded_exhaustion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: bool,
+) -> None:
+    from tests.runner import _helpers as h
+
+    runner = _runner(tmp_path)
+    runner.repo_config.feature_flags.use_single_error_exit = flag
+    runner.app_config.daemon.error_handler_use_ai = True
+    _stub_cycle(monkeypatch, runner)
+    _clear_task_frontmatter(runner)
+    # A prior incident's ERROR evidence cannot authorize this new failure.
+    asyncio.run(runner._transition_to_error(
+        "Coder exited with nonzero status", save_run_record_as=None,
+    ))
+    assert not runner._confirmed_error_task_pr_ids
+    h._patch_subprocess(monkeypatch)
+    calls = []
+
+    async def diagnose(*args, **kwargs):
+        calls.append(args)
+        return 1, "", "persistent diagnosis failure"
+
+    for name in ("claude", "codex"):
+        monkeypatch.setattr(runner._registry.get(name), "diagnose_error", diagnose)
+
+    async def commit_status(task, status, reason, **kwargs):
+        _write_task(tmp_path, task, kwargs["blocked_reason"], status=status)
+        return True
+
+    monkeypatch.setattr(runner, "_commit_task_status_change", commit_status)
+    for count in range(1, 5):
+        asyncio.run(runner._run_cycle_body())
+        assert runner.state.state == PipelineState.ERROR
+        assert runner._error_diagnose_count == count
+        assert runner.state.error_message == "Coder exited with nonzero status"
+        if count < 4:
+            assert runner._frontmatter_error_status_for_current_task()[0] == "todo"
+
+    assert len(calls) == 3
+    assert runner._frontmatter_error_status_for_current_task() == (
+        "error", SuppressionReason.DIAGNOSE_EXHAUSTED,
+    )
+    assert asyncio.run(runner._suppression_record_for_task(
+        runner.state.current_task.pr_id,
+    )).reason == SuppressionReason.DIAGNOSE_EXHAUSTED
+    asyncio.run(runner._run_cycle_body())
+    assert len(calls) == 3
+    assert runner._error_diagnose_count == 4
+
+    _clear_task_frontmatter(runner)
+    asyncio.run(runner._run_cycle_body())
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert len(calls) == 3
 
 
 def test_park_log_deduped(

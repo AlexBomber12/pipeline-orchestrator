@@ -2169,13 +2169,11 @@ def test_run_cycle_after_park_flag_leaked_still_invokes_handle_error(
 def test_run_cycle_in_error_with_park_flag_releases_when_cause_deleted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Operator Retry deletes the cause; the park flag releases to IDLE.
+    """An observed ERROR-to-TODO change releases the park without diagnosis.
 
-    PR-316 follow-up: ``repo_control.retry_repo_task`` clears the
-    cancellation cause record. The next ERROR cycle observes the empty
-    slot, clears ``skip_ai_error_diagnose`` and ``error_message``, and
-    transitions to IDLE so ``handle_idle``'s picker can pick up the
-    now-status:TODO task without an AI round-trip.
+    Cancellation-cause deletion alone cannot prove an operator Retry.
+    Confirm ERROR before the operator changes the remote header to TODO;
+    the subsequent cycle clears the park flag and error message.
     """
     calls: list[str] = []
     runner = h._make_runner()
@@ -2212,6 +2210,10 @@ def test_run_cycle_in_error_with_park_flag_releases_when_cause_deleted(
 
     monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
 
+    monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
+                        lambda: ("error", SuppressionReason.REVIEW_TIMEOUT, "parked"))
+    asyncio.run(runner.run_cycle())
+    assert runner.state.state == PipelineState.ERROR
     monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
                         lambda: ("todo", None, "operator-retry"))
     asyncio.run(runner.run_cycle())
@@ -2272,6 +2274,10 @@ def test_run_cycle_review_timeout_park_release_resets_repost_flag(
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
     monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
 
+    monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
+                        lambda: ("error", SuppressionReason.REVIEW_TIMEOUT, "parked"))
+    asyncio.run(runner.run_cycle())
+    assert runner.state.state == PipelineState.ERROR
     monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
                         lambda: ("todo", None, "operator-retry"))
     asyncio.run(runner.run_cycle())

@@ -490,6 +490,7 @@ class PipelineRunner(
         # crash suppressions in RedisSuppressionStore instead.
         self._crashed_task_pr_ids: set[str] = set()
         self._status_write_failed_task_pr_ids: set[str] = set()
+        self._confirmed_error_task_pr_ids: set[str] = set()
         self._status_write_failed_task_pr_ids_persist_failed = False
         self._last_error_park_log_key: tuple[str | None, str] | None = None
         self._user_pause_logged = False
@@ -2180,6 +2181,9 @@ class PipelineRunner(
             },
         )
         blocked_reason = _suppression_reason_from_cancellation(cause)
+        if task is not None:
+            # Evidence from an earlier failure must not authorize this run's retry.
+            self._confirmed_error_task_pr_ids.discard(task.pr_id)
         status_write_failed = False
         if task is not None and commit_task_status:
             try:
@@ -2195,6 +2199,8 @@ class PipelineRunner(
                     f"{getattr(task, 'task_file', None)}: {exc}"
                 )
                 status_written = False
+            if status_written:
+                self._confirmed_error_task_pr_ids.add(task.pr_id)
             if not status_written:
                 self.log_event(
                     "[INFRA] Warning: status:ERROR write failed; staying "
@@ -2613,6 +2619,8 @@ class PipelineRunner(
         frontmatter_status, _blocked, _revision = (
             self._remote_frontmatter_error_status_for_current_task()
         )
+        if task_id is not None and frontmatter_status == "error":
+            self._confirmed_error_task_pr_ids.add(task_id)
         if frontmatter_status == "error" and (reason is None or from_frontmatter):
             reason, from_frontmatter = _blocked, True
         merge_sync_error = is_retained_merge_error(self.state.error_message)
@@ -2621,9 +2629,13 @@ class PipelineRunner(
             # not evidence of an operator Retry; repair it before reading TODO.
             await self.handle_error()
             return
-        # Confirmed remote TODO authorizes Retry. Missing failure metadata
-        # is unknown evidence, not an operator decision.
-        if frontmatter_status == "todo":
+        # TODO proves an operator change only after ERROR was confirmed.
+        # Ordinary coder failures never write ERROR and still need diagnosis.
+        if (
+            frontmatter_status == "todo"
+            and task_id in self._confirmed_error_task_pr_ids
+        ):
+            self._confirmed_error_task_pr_ids.discard(task_id)
             self.state.skip_ai_error_diagnose = False
             self.state.error_message = None
             self.state.review_timeout_repost_attempted = False
@@ -2659,7 +2671,14 @@ class PipelineRunner(
                 )
             return
 
-        if reason is not None and self._task_suppression_blocks_selection(reason):
+        # Diagnosis records its attempt counter under CRASH before the task
+        # becomes terminal. An unchanged TODO must keep advancing that bound.
+        diagnosing_todo = frontmatter_status == "todo" and reason == SuppressionReason.CRASH
+        if (
+            reason is not None
+            and self._task_suppression_blocks_selection(reason)
+            and not diagnosing_todo
+        ):
             await self._release_finalized_failure(reason)
             if self.state.state == PipelineState.IDLE:
                 return
@@ -2804,6 +2823,8 @@ class PipelineRunner(
                         self.log_event(
                             f"[MERGE] No task status change to commit for {task_file}."
                         )
+                        if status == "ERROR":
+                            self._confirmed_error_task_pr_ids.add(pr_id)
                         return True
                     if diff.returncode != 1:
                         raise RuntimeError("task status diff failed")
@@ -2825,6 +2846,8 @@ class PipelineRunner(
                         "FETCH_HEAD", check=False,
                     )
                     if confirmed.returncode == 0:
+                        if status == "ERROR":
+                            self._confirmed_error_task_pr_ids.add(pr_id)
                         return True
                     if confirmed.returncode != 1:
                         raise RuntimeError("could not confirm remote status commit")
