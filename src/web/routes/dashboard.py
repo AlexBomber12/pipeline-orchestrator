@@ -530,8 +530,12 @@ async def _work_summary(
         reason = "Waiting for CI and current-change review."
     applicable = [i for i in state.active_inhibitors if i.is_blocking_now(now)
                   and (i.coder_affected is None or i.coder_affected == state.coder)]
+    # Coder limits gate WATCH review retriggers, not CI/review polling or merging.
     # Slowdown reduces cadence but does not prevent dispatch or WATCH polling.
-    blockers = [i for i in applicable if i.inhibitor_type.value != "github_budget_slowdown"]
+    informational_types = {"github_budget_slowdown"}
+    if stage == "WATCH":
+        informational_types.update({"rate_limit", "spend_ceiling"})
+    blockers = [i for i in applicable if i.inhibitor_type.value not in informational_types]
     if state.rate_limited_until and state.rate_limited_until > now and not reason:
         reason = "Waiting for the resource rate limit to reset."
     if blockers:
@@ -556,7 +560,7 @@ async def _work_summary(
         reason = state.publication_migration.reason
         next_step = "Publication evidence needs operator inspection in diagnostics; the safety fence remains active."
     for inhibitor in applicable:
-        if inhibitor.inhibitor_type.value == "github_budget_slowdown":
+        if inhibitor.inhibitor_type.value in informational_types:
             context = inhibitor.reason_text or INHIBITOR_LABELS[inhibitor.inhibitor_type.value]
             reason = "; ".join(filter(None, (reason, context)))
     if freshness != "current":
