@@ -319,6 +319,47 @@ async def test_work_summary_watch_coder_limits_preserve_progress(inhibitor_type,
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("limited_coder", ["claude", "codex"])
+@pytest.mark.parametrize("inhibitor_type", ["rate_limit", "spend_ceiling"])
+@pytest.mark.parametrize("has_expiry", [True, False])
+async def test_work_summary_idle_coder_limits_allow_fallback(
+    limited_coder, inhibitor_type, has_expiry,
+):
+    from datetime import timedelta
+
+    from src.inhibitor import WorkInhibitor
+
+    state = _summary_state(state="IDLE", coder="claude")
+    normal = await _summary(state)
+    expiry = datetime.now(timezone.utc) + timedelta(hours=1)
+    state.active_inhibitors = [WorkInhibitor(
+        inhibitor_type=inhibitor_type, source_key="coder-limit",
+        coder_affected=limited_coder, reason_text="Individual coder quota exhausted",
+        expires_at=expiry if has_expiry else None,
+    )]
+    # The last-selected coder is not a dispatch pin. An alternative may run;
+    # limits on either coder remain visible without promising a resource wait.
+    view = await _summary(state)
+    assert view["next_step"] == normal["next_step"]
+    assert view["reason"] == "Individual coder quota exhausted"
+
+    state.rate_limited_until = expiry
+    view = await _summary(state)
+    assert view["next_step"] == normal["next_step"]
+    assert "Waiting for" not in view["reason"]
+
+    # A repository-wide blocker still owns reset guidance, even when the
+    # informational coder limit has an unknown reset time.
+    state.active_inhibitors.append(WorkInhibitor(
+        inhibitor_type="github_budget_pause", source_key="budget",
+        reason_text="GitHub budget exhausted", expires_at=expiry,
+    ))
+    blocked = await _summary(state)
+    assert blocked["next_step"] == "The daemon will recheck resources after the reported reset."
+    assert blocked["reason"] == "GitHub budget exhausted; Individual coder quota exhausted"
+
+
+@pytest.mark.asyncio
 async def test_work_summary_resource_and_operator_waits():
     from datetime import timedelta
     from src.inhibitor import WorkInhibitor

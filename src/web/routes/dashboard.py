@@ -529,15 +529,22 @@ async def _work_summary(
     if stage == "WATCH" and not reason:
         reason = "Waiting for CI and current-change review."
     applicable = [i for i in state.active_inhibitors if i.is_blocking_now(now)
-                  and (i.coder_affected is None or i.coder_affected == state.coder)]
+                  and (stage == "IDLE" or i.coder_affected is None or i.coder_affected == state.coder)]
     # Coder limits gate WATCH review retriggers, not CI/review polling or merging.
     # Slowdown reduces cadence but does not prevent dispatch or WATCH polling.
     informational_types = {"github_budget_slowdown"}
     if stage == "WATCH":
         informational_types.update({"rate_limit", "spend_ceiling"})
-    blockers = [i for i in applicable if i.inhibitor_type.value not in informational_types]
+    # IDLE has no selected dispatch coder yet. The daemon may use an eligible
+    # fallback, so a per-coder inhibitor alone cannot prove a repository wait.
+    informational = [i for i in applicable if i.inhibitor_type.value in informational_types
+                     or (stage == "IDLE" and i.coder_affected is not None)]
+    blockers = [i for i in applicable if i not in informational]
     if state.rate_limited_until and state.rate_limited_until > now and not reason:
-        reason = "Waiting for the resource rate limit to reset."
+        reason = (
+            "Coder rate limit reported; task selection will check eligible coders."
+            if stage == "IDLE" else "Waiting for the resource rate limit to reset."
+        )
     if blockers:
         reason = "; ".join(i.reason_text or INHIBITOR_LABELS[i.inhibitor_type.value]
                            for i in blockers)
@@ -559,10 +566,9 @@ async def _work_summary(
     if state.publication_migration is not None:
         reason = state.publication_migration.reason
         next_step = "Publication evidence needs operator inspection in diagnostics; the safety fence remains active."
-    for inhibitor in applicable:
-        if inhibitor.inhibitor_type.value in informational_types:
-            context = inhibitor.reason_text or INHIBITOR_LABELS[inhibitor.inhibitor_type.value]
-            reason = "; ".join(filter(None, (reason, context)))
+    for inhibitor in informational:
+        context = inhibitor.reason_text or INHIBITOR_LABELS[inhibitor.inhibitor_type.value]
+        reason = "; ".join(filter(None, (reason, context)))
     if freshness != "current":
         next_step = "Waiting for a fresh daemon snapshot; the automatic next step is unconfirmed."
     return {
