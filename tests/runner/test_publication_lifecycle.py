@@ -996,7 +996,13 @@ async def test_failed_unpublished_dirty_attempt_survives_preflight_and_restart(l
         QueueTask(pr_id='PR-003', title='dependent', status=TaskStatus.TODO,
                   branch='pr-003', depends_on=['PR-001']),
     ]
-    runner.state.current_queue = queue
+    # Real dispatch publishes DOING before the failed coder exits. A pending
+    # dirty hold never reaches header reconstruction to replace that snapshot.
+    runner.state.current_queue = [
+        task.model_copy(update={'status': TaskStatus.DOING})
+        if pending and task.pr_id == 'PR-001' else task
+        for task in queue
+    ]
     dirty = repo / 'continuity-dirty.txt'
     dirty.write_text('unpreserved failed attempt work\n')
     await runner._suppress_task('PR-001', SuppressionReason.CRASH, {})
@@ -1039,3 +1045,25 @@ async def test_failed_unpublished_dirty_attempt_survives_preflight_and_restart(l
             str(repo.parent), runner.name, {'PR-001'}, runner.redis,
         ) == {'PR-001': 1}
     assert provider['requests'] == []
+
+
+@pytest.mark.parametrize('case', ['failed', 'other-branch', 'done', 'success', 'unbound', 'paused', 'absent'])
+async def test_held_failure_queue_projection_is_bound(lifecycle, case):
+    from src.web.services.repo_state import load_current_queue
+
+    runner, _, _, _, _, _ = lifecycle
+    attempt = runner.state.publication_attempt
+    attempt.exit_classification = 'success' if case == 'success' else 'failure'
+    runner.state.state = PipelineState.PAUSED if case == 'paused' else PipelineState.ERROR
+    task = runner.state.current_task.model_copy(update={
+        'branch': 'another-generation' if case == 'other-branch' else attempt.branch,
+        'status': TaskStatus.DONE if case == 'done' else TaskStatus.DOING,
+    })
+    if case == 'unbound':
+        attempt.task_id = 'PR-999'
+    runner.state.current_queue = None if case == 'absent' else [task]
+    await runner.publish_state()
+    expected = None if case == 'absent' else [task.model_copy(update={
+        'status': TaskStatus.ERROR if case == 'failed' else task.status,
+    })]
+    assert await load_current_queue(runner.name, runner.redis) == expected
