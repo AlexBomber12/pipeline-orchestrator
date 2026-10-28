@@ -266,7 +266,7 @@ def test_operator_clear_all_paths(
     assert any("operator-cleared ERROR task frontmatter" in e["event"] for e in runner.state.history)
 
 
-def test_self_healing_auto_exits(tmp_path: Path) -> None:
+def test_terminal_infra_failure_requires_safety_evidence(tmp_path: Path) -> None:
     task = _task()
     _write_task(tmp_path, task)
     runner = _runner(tmp_path, task)
@@ -275,9 +275,9 @@ def test_self_healing_auto_exits(tmp_path: Path) -> None:
 
     asyncio.run(runner._handle_single_error_exit())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert asyncio.run(runner._suppression_record_for_task(task.pr_id)) is None
-    assert any("AI diagnosis disabled for self-healing ERROR" in e["event"] for e in runner.state.history)
+    assert runner.state.state == PipelineState.ERROR
+    assert asyncio.run(runner._suppression_record_for_task(task.pr_id)) is not None
+    assert any("bound cleanup/work proof required" in e["event"] for e in runner.state.history)
 
 
 def test_unavailable_remote_status_preserves_error_evidence(tmp_path: Path) -> None:

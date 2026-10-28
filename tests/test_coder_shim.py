@@ -317,3 +317,92 @@ def test_multitask_crash_oracle_handles_delayed_recovery_without_accepting_wrong
     else:
         with pytest.raises(AssertionError):
             run()
+
+
+def test_failure_shim_leaves_bound_clean_branch_preserved_on_remote_base(tmp_path):
+    remote, repo = tmp_path / "remote.git", tmp_path / "repo"
+
+    def git(*args, cwd=tmp_path):
+        return subprocess.run(
+            ["git", *args], cwd=cwd, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    git("init", "--bare", "--initial-branch=main", str(remote))
+    git("clone", str(remote), str(repo))
+    git("config", "user.name", "Fixture", cwd=repo)
+    git("config", "user.email", "fixture@test.invalid", cwd=repo)
+    _write_task(repo, "PR-42", branch="pr-42-failure", status="DOING")
+    git("add", "tasks", cwd=repo)
+    git("commit", "-m", "task", cwd=repo)
+    git("push", "origin", "main", cwd=repo)
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; REPO_DIR="$2"; main --print fixture',
+         "claude", str(SHIM.resolve()), str(repo)],
+        cwd=repo, capture_output=True, text=True, timeout=30,
+        env={**os.environ, "SHIM_SCENARIO": "exit_nonzero", "PO_SHIM_SCENARIO_FILE": ""},
+    )
+    assert result.returncode == 1, result.stderr
+    assert "shim: simulating coder failure" in result.stderr
+    assert git("branch", "--show-current", cwd=repo) == "pr-42-failure"
+    assert git("status", "--porcelain", cwd=repo) == ""
+    assert git("rev-parse", "HEAD", cwd=repo) == git("rev-parse", "refs/heads/main", cwd=remote)
+    assert git("ls-remote", "--heads", "origin", "refs/heads/pr-42-failure", cwd=repo) == ""
+
+
+@pytest.mark.parametrize("outcome", ["released", "missing_error", "missing_dependent", "lost_cause", "idle_only"])
+def test_clean_failure_e2e_oracle_requires_retained_terminal_outcome(monkeypatch, outcome):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from tests.e2e import test_cancellation_cause_crash as scenario
+
+    now, reads = [0.0], [0]
+    monkeypatch.setattr(scenario, "time", SimpleNamespace(
+        time=lambda: 42, monotonic=lambda: now[0],
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    ))
+
+    @contextmanager
+    def shim(name):
+        yield
+
+    def cancellations(*args):
+        reads[0] += 1
+        if outcome == "lost_cause" and reads[0] > 3:
+            return []
+        return [{"task_id": "PR-42", "category": "ERROR", "dependents_count": 1,
+                 "payload": {"subsource": "crash" if reads[0] <= 3 else "diagnose_exhausted"}}]
+
+    class Panel:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def read(self):
+            return "\n".join(
+                f'<div id="task-content-{status}-PR-{number}"></div>'
+                for status, number, missing in [
+                    ("error", 42, "missing_error"), ("todo", 43, "missing_dependent"),
+                ] if outcome != missing
+            ).encode()
+
+    monkeypatch.setattr(scenario, "coder_shim", shim)
+    monkeypatch.setattr(scenario, "_fetch_cancellations", cancellations)
+    monkeypatch.setattr(scenario.urllib.request, "urlopen", lambda *a, **kw: Panel())
+
+    def run():
+        scenario.test_coder_crash_records_cancellation_cause_and_propagates(
+            "http://test.invalid", "testbed", lambda *a, **kw: None,
+            lambda: {"state": "IDLE", "current_task": None, "history": [] if outcome == "idle_only" else [{
+                "event": "[RECOVERY] Failed attempt retained; independent work released.",
+            }]},
+            lambda path: 201, lambda *a, **kw: "fixture.zip", None,
+        )
+
+    if outcome == "released":
+        run()
+    else:
+        with pytest.raises(AssertionError):
+            run()

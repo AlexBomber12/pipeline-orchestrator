@@ -477,8 +477,9 @@ def test_reset_testbed_session_resets_repo_and_redis_once() -> None:
         return 2
 
     def restart(cmd, **kwargs):
-        calls.append("restart")
-        assert cmd == ["docker", "compose", "-f", "docker-compose.test.yml", "restart", "daemon-test"]
+        calls.append(cmd[-2])
+        assert cmd == ["docker", "compose", "-f", "docker-compose.test.yml", cmd[-2], "daemon-test"]
+        assert cmd[-2] in {"stop", "start"}
         assert kwargs["check"] is True
         return _completed()
 
@@ -505,9 +506,10 @@ def test_reset_testbed_session_resets_repo_and_redis_once() -> None:
 
     assert calls == [
         f"stop:{e2e_conftest.TESTBED_SLUG}",
+        "stop",
         f"reset:{e2e_conftest.TESTBED_SLUG}",
         f"clear:{e2e_conftest.TESTBED_SLUG}",
-        "restart",
+        "start",
     ]
 
 
@@ -884,7 +886,8 @@ def test_wait_for_runner_config_ack_requires_new_runner_event(acknowledgment: st
         sys.modules.pop(module_name, None)
 
 
-def test_stop_daemon_waits_for_runner_pause_ack() -> None:
+@pytest.mark.parametrize("terminal_state", ["WATCH", "ERROR"])
+def test_stop_daemon_waits_for_runner_pause_ack(terminal_state) -> None:
     module_name = "tests.e2e.conftest"
     posts: list[tuple[str, int]] = []
     opens: list[tuple[str, int]] = []
@@ -913,17 +916,19 @@ def test_stop_daemon_waits_for_runner_pause_ack() -> None:
             e2e_conftest = importlib.import_module(module_name)
 
         slug = e2e_conftest.TESTBED_SLUG
+        pause_event = "held in ERROR" if terminal_state == "ERROR" else "[INFRA] Paused. Press Play to resume."
         responses = iter(
             [
                 f'[{{"name": "{slug}", "state": "CODING", "user_paused": true}}]'.encode(),
+                f'[{{"name": "{slug}", "state": "ERROR", "user_paused": false}}]'.encode(),
                 (
                     f'[{{"name": "{slug}", "state": "IDLE", "user_paused": true, '
                     '"history": [{"event": "Stop requested. Aborting run; working tree may be left dirty."}]'
                     "}]"
                 ).encode(),
                 (
-                    f'[{{"name": "{slug}", "state": "WATCH", "user_paused": true, '
-                    '"history": [{"event": "[INFRA] Paused. Press Play to resume."}]}]'
+                    f'[{{"name": "{slug}", "state": "{terminal_state}", "user_paused": true, '
+                    f'"history": [{{"event": "{pause_event}"}}]}}]'
                 ).encode(),
             ]
         )
@@ -941,5 +946,5 @@ def test_stop_daemon_waits_for_runner_pause_ack() -> None:
         sys.modules.pop(module_name, None)
 
     assert posts == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/repos/{slug}/stop", 10)]
-    assert opens == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/api/states", 5)] * 3
-    assert sleeps == [0.5, 0.5]
+    assert opens == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/api/states", 5)] * 4
+    assert sleeps == [0.5, 0.5, 0.5]

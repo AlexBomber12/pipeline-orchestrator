@@ -341,20 +341,37 @@ def test_different_context_resets_counter_to_one(
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — diagnose_error SKIP verdict clears task / PR / error -> IDLE
+# Test 4 — diagnose_error SKIP retains terminal failure for reconciliation
 # ---------------------------------------------------------------------------
 
 
-def test_diagnose_skip_clears_task_pr_error_and_returns_idle(
+@pytest.mark.parametrize("single_error_exit", [False, True])
+def test_diagnose_skip_without_task_returns_idle_for_queue_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    single_error_exit: bool,
+) -> None:
+    """Queue validation failures must allow IDLE to sync corrected specs."""
+    runner = h._make_runner()
+    runner.repo_config.feature_flags.use_single_error_exit = single_error_exit
+    _patch_plugin_diagnose(monkeypatch, runner, "claude", (0, "SKIP", ""))
+    _patch_plugin_diagnose(monkeypatch, runner, "codex", (0, "SKIP", ""))
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Task selection failed: invalid task specification"
+    runner._error_diagnose_count = 1
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert runner.state.current_task is None
+    assert runner.state.publication_attempt is None
+    assert runner._error_diagnose_count == 0
+
+
+def test_diagnose_skip_retains_failed_task_until_safe_finalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A SKIP verdict drops the task, the PR, and the error_message.
-
-    Branch covered: ``error.py:410-416``. SKIP signals that the active
-    task cannot be safely resumed; the daemon must drop its handle on
-    both ``current_task`` and ``current_pr`` before returning to IDLE so
-    the next cycle re-selects a task from scratch.
-    """
+    """SKIP exhausts the task; release requires separate safety evidence."""
     runner = h._make_runner()
     _patch_plugin_diagnose(monkeypatch, runner, "claude", (0, "SKIP", ""))
     _patch_plugin_diagnose(monkeypatch, runner, "codex", (0, "SKIP", ""))
@@ -369,10 +386,10 @@ def test_diagnose_skip_clears_task_pr_error_and_returns_idle(
 
     asyncio.run(runner.handle_error())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_task is None
-    assert runner.state.current_pr is None
-    assert runner.state.error_message is None
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task is not None
+    assert runner.state.current_pr is not None
+    assert runner.state.error_message is not None
 
 
 # ---------------------------------------------------------------------------
@@ -800,7 +817,7 @@ def test_handle_error_retains_auxiliary_handle_when_cleanup_is_unconfirmed(
 # ---------------------------------------------------------------------------
 
 
-def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_handle_error_skip_retains_failed_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         claude_cli,
         "diagnose_error_async",
@@ -813,9 +830,9 @@ def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     asyncio.run(runner.handle_error())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.error_message is None
-    assert runner.state.current_task is None
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message is not None
+    assert runner.state.current_task is not None
 
 
 def test_handle_error_falls_back_to_codex_for_diagnosis(
@@ -1259,9 +1276,9 @@ def test_handle_error_non_fix_dirty_tree_skips_cleanup_when_head_lookup_fails(
 
     asyncio.run(runner.handle_error())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_task is None
-    assert runner.state.current_pr is None
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task is not None
+    assert runner.state.current_pr is not None
     assert [cmd[0] for cmd in calls] == ["status", "status", "rev-parse"]
     assert not any(cmd[:1] == ("reset",) for cmd in calls)
     assert not any(cmd[:1] == ("clean",) for cmd in calls)
@@ -2082,81 +2099,6 @@ def test_run_cycle_in_error_with_review_timeout_park_skips_handle_error(
     assert runner.state.skip_ai_error_diagnose is True
 
 
-def test_review_timeout_park_cleared_returns_true_when_no_current_task() -> None:
-    """The helper reports cleared when there is no task to read a cause for.
-
-    Defensive: a runner that already dropped ``current_task`` cannot have
-    a cancellation cause to wait on, so ``run_cycle`` should release the
-    park rather than spin forever in ERROR.
-    """
-    runner = h._make_runner()
-    runner.state.current_task = None
-    assert asyncio.run(runner._review_timeout_park_cleared()) is True
-
-
-def test_review_timeout_park_cleared_returns_false_on_redis_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A Redis read failure keeps the runner parked.
-
-    Without this guard a transient Redis blip would race the operator's
-    Retry button and falsely transition the runner to IDLE while the
-    cause record is still authoritative on the server.
-    """
-    runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-099",
-        title="t",
-        status=TaskStatus.ERROR,
-    )
-
-    async def boom(*args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("redis down")
-
-    monkeypatch.setattr(
-        "src.daemon.runner.get_cancellation_cause", boom
-    )
-    assert asyncio.run(runner._review_timeout_park_cleared()) is False
-
-
-def test_review_timeout_park_cleared_does_not_refresh_ttl(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """PR-345 fix-feedback: the ERROR-cycle poll must not pin the cause.
-
-    ``run_cycle`` calls ``_review_timeout_park_cleared`` on every ERROR
-    cycle while the operator-park flag is set. If that poll inherited the
-    ``refresh_ttl=True`` default it would reset the cause TTL to the 90-day
-    forensic window each cycle and the record would never expire — the
-    park would never clear naturally for review-timeout/operator parks
-    that nobody opens in the UI. Assert the poll forwards
-    ``refresh_ttl=False`` to ``get_cancellation_cause``.
-    """
-    runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-345",
-        title="t",
-        status=TaskStatus.ERROR,
-    )
-
-    captured: dict[str, object] = {}
-
-    async def spy(
-        redis_client: Any,
-        repo_slug: str,
-        task_id: str,
-        *,
-        refresh_ttl: bool = True,
-    ) -> None:
-        captured["refresh_ttl"] = refresh_ttl
-        return None
-
-    monkeypatch.setattr("src.daemon.runner.get_cancellation_cause", spy)
-    asyncio.run(runner._review_timeout_park_cleared())
-
-    assert captured == {"refresh_ttl": False}
-
-
 def test_run_cycle_clears_review_timeout_park_flag_on_non_error_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2250,13 +2192,11 @@ def test_run_cycle_after_park_flag_leaked_still_invokes_handle_error(
 def test_run_cycle_in_error_with_park_flag_releases_when_cause_deleted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Operator Retry deletes the cause; the park flag releases to IDLE.
+    """An observed ERROR-to-TODO change releases the park without diagnosis.
 
-    PR-316 follow-up: ``repo_control.retry_repo_task`` clears the
-    cancellation cause record. The next ERROR cycle observes the empty
-    slot, clears ``skip_ai_error_diagnose`` and ``error_message``, and
-    transitions to IDLE so ``handle_idle``'s picker can pick up the
-    now-status:TODO task without an AI round-trip.
+    Cancellation-cause deletion alone cannot prove an operator Retry.
+    Confirm ERROR before the operator changes the remote header to TODO;
+    the subsequent cycle clears the park flag and error message.
     """
     calls: list[str] = []
     runner = h._make_runner()
@@ -2293,6 +2233,12 @@ def test_run_cycle_in_error_with_park_flag_releases_when_cause_deleted(
 
     monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
 
+    monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
+                        lambda: ("error", SuppressionReason.REVIEW_TIMEOUT, "parked"))
+    asyncio.run(runner.run_cycle())
+    assert runner.state.state == PipelineState.ERROR
+    monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
+                        lambda: ("todo", None, "operator-retry"))
     asyncio.run(runner.run_cycle())
 
     assert calls == []
@@ -2300,7 +2246,7 @@ def test_run_cycle_in_error_with_park_flag_releases_when_cause_deleted(
     assert runner.state.skip_ai_error_diagnose is False
     assert runner.state.error_message is None
     assert any(
-        "review_timeout park cleared by operator" in entry.get("event", "")
+        "operator-cleared ERROR task frontmatter" in entry.get("event", "")
         for entry in runner.state.history
     )
 
@@ -2310,8 +2256,8 @@ def test_run_cycle_review_timeout_park_release_resets_repost_flag(
 ) -> None:
     """PR-358 review feedback (P1): retried task gets a fresh repost slot.
 
-    When the operator presses Retry, ``_review_timeout_park_cleared``
-    returns True and ``run_cycle`` transitions ERROR -> IDLE. If the
+    When operator Retry confirms remote TODO, ``run_cycle`` transitions
+    ERROR -> IDLE. If the
     retried task re-enters WATCH on the same PR number/branch (no
     intervening CODING that would reassign ``current_pr``), the
     ``__setattr__`` PR-transition hook never fires and the repost flag
@@ -2351,6 +2297,12 @@ def test_run_cycle_review_timeout_park_release_resets_repost_flag(
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
     monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
 
+    monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
+                        lambda: ("error", SuppressionReason.REVIEW_TIMEOUT, "parked"))
+    asyncio.run(runner.run_cycle())
+    assert runner.state.state == PipelineState.ERROR
+    monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
+                        lambda: ("todo", None, "operator-retry"))
     asyncio.run(runner.run_cycle())
 
     assert runner.state.state == PipelineState.IDLE

@@ -41,7 +41,8 @@ deadline and useful last-observed state. IDLE alone can also follow ERROR or an
 unrelated task: e2e success must inspect the matching external PR, task status,
 or other outcome the scenario promises. Use deterministic fault injection and
 fixture-owned cleanup (`tests/e2e/conftest.py` and `tests/e2e/lib/testbed_reset.py`).
-Before each lifecycle test, reset confirms the operator pause, stops only the
+Before each lifecycle test, reset confirms the operator pause (a terminal
+ERROR may retain its state with `user_paused=true`), stops only the
 isolated `daemon-test` service, clears testbed state, and starts a fresh daemon.
 This discards retained in-memory attempts and prevents a paused heartbeat from
 restoring a cleared Redis snapshot. Production error-retention rules stay active;

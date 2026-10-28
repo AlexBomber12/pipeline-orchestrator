@@ -537,44 +537,30 @@ class IdleMixin:
                     continue
                 statuses[pr_id] = TaskStatus.ERROR
 
-            if self.repo_config.feature_flags.use_single_error_exit:
-                for pr_id in list(statuses.keys()):
-                    if pr_id in self._status_write_failed_task_pr_ids:
-                        continue
-                    record = await self._suppression_record_for_task(pr_id)
-                    if record is None:
-                        continue
-                    if frontmatter_statuses.get(pr_id) == "todo":
+            for pr_id in list(statuses.keys()):
+                if pr_id in self._status_write_failed_task_pr_ids:
+                    continue
+                record = await self._suppression_record_for_task(pr_id)
+                if frontmatter_statuses.get(pr_id) == "todo":
+                    crashed_task_pr_ids.discard(pr_id)
+                    if record is not None:
                         await self._clear_task_suppression(pr_id)
-                        continue
-                    if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
-                        await self._clear_task_suppression(pr_id)
-                        continue
-                    if self._task_suppression_blocks_selection(record.reason):
+                    continue
+                # An open PR must never revive a durably failed task. DONE
+                # still wins historical accounting; dependents stay blocked
+                # for every other ERROR, regardless of the legacy flag.
+                if frontmatter_statuses.get(pr_id) == "error":
+                    if statuses[pr_id] != TaskStatus.DONE:
                         statuses[pr_id] = TaskStatus.ERROR
-            else:
-                # PR-186: Recovery marks DOING-without-PR tasks crashed before
-                # transitioning to IDLE. Override their derived status to
-                # ERROR here so get_eligible_tasks excludes them and the
-                # snapshot surfaces the ERROR state to the dashboard.
-                # Existing DONE rulings (e.g. the merged PR landed before
-                # recovery resumed) win — DONE is terminal, never downgraded
-                # to ERROR. A DOING ruling means ``derive_task_status``
-                # matched a now-visible open PR (e.g. ``get_open_prs`` was
-                # stale on the recovery cycle and the PR surfaced later);
-                # preserving DOING lets the runner resume WATCH/merge for
-                # that real PR rather than stranding it behind the crashed
-                # flag, and clearing the flag ensures the next selector pick
-                # treats the task as live again.
-                for pr_id in list(statuses.keys()):
-                    if pr_id not in crashed_task_pr_ids:
-                        continue
-                    if frontmatter_statuses.get(pr_id) == "todo":
-                        crashed_task_pr_ids.discard(pr_id)
-                        continue
-                    if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
-                        crashed_task_pr_ids.discard(pr_id)
-                        continue
+                    continue
+                if statuses[pr_id] in (TaskStatus.DONE, TaskStatus.DOING):
+                    crashed_task_pr_ids.discard(pr_id)
+                    if record is not None:
+                        await self._clear_task_suppression(pr_id)
+                    continue
+                if pr_id in crashed_task_pr_ids or (
+                    record is not None and self._task_suppression_blocks_selection(record.reason)
+                ):
                     statuses[pr_id] = TaskStatus.ERROR
             eligible = [
                 header

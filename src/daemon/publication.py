@@ -329,13 +329,10 @@ async def _exhaust(runner: PipelineRunner) -> bool:
     if attempt.task_id in runner._status_write_failed_task_pr_ids:
         runner._status_write_failed_task_pr_ids.discard(attempt.task_id)
         await runner._persist_status_write_failed_task_pr_ids()
-    # The task's suppression and ERROR header retain the actionable incident.
-    # No DONE write or dependency release occurs. Its branch is never deleted.
+    # Exhaustion ends polling, but does not prove remote outcome or work safety.
+    # Use the same terminal policy as ERROR dispatch before releasing a writer.
     attempt.pending = False
-    runner.state.current_task = None
-    runner._current_run_record = None
-    runner._reset_runner_local_task_counters()
-    runner.state.state = PipelineState.IDLE
+    await runner._release_finalized_failure(SuppressionReason.CRASH)
     await runner.publish_state()
     return True
 

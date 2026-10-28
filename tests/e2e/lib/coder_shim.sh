@@ -322,11 +322,8 @@ main() {
 
     # ``handle_error`` invokes the coder with a fixed-shape diagnose prompt
     # asking for one of FIX / SKIP / ESCALATE. The real CLI replies; the
-    # shim has no LLM so it answers SKIP, which lets the daemon clear a
-    # transient ERROR (e.g. a "Base branch was modified" merge race in a
-    # prior test) and return to IDLE before the next e2e test starts.
-    # Without this, ERROR persists and downstream tests time out waiting
-    # for IDLE.
+    # shim has no LLM so it answers SKIP. The daemon retains the failed
+    # outcome and releases execution only after its safety proof succeeds.
     for arg in "$@"; do
         if [[ "${arg}" == *"FIX, SKIP, or ESCALATE"* ]]; then
             printf 'SKIP\n'
@@ -336,11 +333,6 @@ main() {
 
     local scenario
     scenario="$(read_scenario)"
-
-    if [[ "${scenario}" == "exit_nonzero" ]]; then
-        printf 'shim: simulating coder failure\n' >&2
-        exit 1
-    fi
 
     if [[ "${scenario}" == "hang" ]]; then
         sleep 120
@@ -375,6 +367,13 @@ main() {
     fi
 
     case "${scenario}" in
+        exit_nonzero)
+            # Fail with bound, clean work already preserved on the remote base.
+            # A failure before branch creation deliberately lacks release proof.
+            git_setup_branch "${branch}"
+            printf 'shim: simulating coder failure\n' >&2
+            exit 1
+            ;;
         success)
             run_success "${pr}" "${branch}"
             ;;

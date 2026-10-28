@@ -490,6 +490,7 @@ class PipelineRunner(
         # crash suppressions in RedisSuppressionStore instead.
         self._crashed_task_pr_ids: set[str] = set()
         self._status_write_failed_task_pr_ids: set[str] = set()
+        self._confirmed_error_task_pr_ids: set[str] = set()
         self._status_write_failed_task_pr_ids_persist_failed = False
         self._last_error_park_log_key: tuple[str | None, str] | None = None
         self._user_pause_logged = False
@@ -629,28 +630,22 @@ class PipelineRunner(
         """Persist that diagnose_error has exhausted retries for this task."""
         if not task_id:  # pragma: no cover
             return
-        if self.repo_config.feature_flags.use_single_error_exit:
-            await self._suppress_task(
-                task_id,
-                SuppressionReason.DIAGNOSE_EXHAUSTED,
-                {
-                    "attempt_count": self._error_diagnose_count,
-                    "diagnose_attempts": self._error_diagnose_count,
-                },
-            )
-            if self._error_diagnose_count:
-                await self.redis.set(
-                    f"diagnose_exhausted:{self.name}:{task_id}",
-                    datetime.now(timezone.utc).isoformat(),
-                    ex=7 * 24 * 3600,
-                )
-            return
-        key = f"diagnose_exhausted:{self.name}:{task_id}"
+        prior = await self._suppression_record_for_task(task_id)
+        detail = dict(prior.detail) if prior is not None else {}
+        if prior is not None and prior.reason != SuppressionReason.DIAGNOSE_EXHAUSTED:
+            detail["original_subsource"] = prior.reason.value
+        detail.update(attempt_count=self._error_diagnose_count,
+                      diagnose_attempts=self._error_diagnose_count)
+        await self._suppress_task(task_id, SuppressionReason.DIAGNOSE_EXHAUSTED, detail)
         await self.redis.set(
-            key,
-            datetime.now(timezone.utc).isoformat(),
-            ex=7 * 24 * 3600,
+            f"diagnose_exhausted:{self.name}:{task_id}",
+            datetime.now(timezone.utc).isoformat(), ex=7 * 24 * 3600,
         )
+        if self.state.current_task is not None:
+            await self._commit_and_park_in_error(
+                self.state.error_message or "Error diagnosis exhausted",
+                subsource=SuppressionReason.DIAGNOSE_EXHAUSTED.value,
+            )
 
     async def _clear_diagnose_exhausted(self, task_id: str) -> None:
         """Clear the diagnose exhaustion marker when a task leaves ERROR.
@@ -2163,6 +2158,10 @@ class PipelineRunner(
         prior_state = self.state.state
         self.state.state = PipelineState.ERROR
         self.state.error_message = message
+        task = self.state.current_task
+        if task is not None:
+            # Clear prior failure evidence before any durable checkpoint.
+            self._confirmed_error_task_pr_ids.discard(task.pr_id)
         attempt = self.state.publication_attempt
         if attempt is not None and attempt.pending:
             attempt.failure = attempt.failure or message
@@ -2201,6 +2200,8 @@ class PipelineRunner(
                     f"{getattr(task, 'task_file', None)}: {exc}"
                 )
                 status_written = False
+            if status_written:
+                self._confirmed_error_task_pr_ids.add(task.pr_id)
             if not status_written:
                 self.log_event(
                     "[INFRA] Warning: status:ERROR write failed; staying "
@@ -2329,17 +2330,9 @@ class PipelineRunner(
            frontmatter so the IDLE picker stops re-selecting the
            now-failed task — the loop-breaking fix.
 
-        PR-317 review feedback (P1): this helper does NOT set
-        ``skip_ai_error_diagnose``. That flag is reserved for the WATCH
-        ``review_timeout`` park (handled inline in ``handlers/watch.py``),
-        which is an intentional repo-wide stop-the-world event awaiting
-        operator Retry. Task-level escalations from coding/fix/idle
-        handlers must not block unrelated queued tasks on the same
-        runner: the next ERROR cycle invokes ``handle_error`` per the
-        standard routing (infra/rate-limit/timeout fall back to IDLE for
-        retry; other categories route via AI diagnose) and the
-        ``status:ERROR`` frontmatter prevents the IDLE picker from
-        re-selecting the parked task.
+        The common ERROR dispatcher applies the terminal release predicate on
+        the next cycle. A durable failure remains suppressed while only a
+        confirmed safe attempt releases execution for independent selection.
 
         The ``[ESCALATE]`` log prefix is preserved for operator/grep
         continuity with the pre-PR-317 history. ``extra_payload`` is
@@ -2451,27 +2444,6 @@ class PipelineRunner(
             return blocked_reason, True
         return None, False
 
-    async def _suppression_cleared(self, task_id: str) -> bool:
-        """Return True when the suppression store has no active record."""
-        try:
-            record = await self._suppression_record_for_task(task_id)
-        except Exception:
-            return False
-        return record is None
-
-    async def _review_timeout_park_cleared(self) -> bool:
-        """Legacy wrapper for the review-timeout park-clear check."""
-        task = self.state.current_task
-        if task is None:
-            return True
-        try:
-            cause = await get_cancellation_cause(
-                self.redis, self.name, task.pr_id, refresh_ttl=False
-            )
-        except Exception:
-            return False
-        return cause is None
-
     async def _maybe_resume_review_timeout(self) -> bool:
         """Admit a late trusted result for a retained timeout failure."""
         from src.github.reviewer_policy import reviewer_policy_from_config
@@ -2575,10 +2547,7 @@ class PipelineRunner(
                 task_id,
                 log=self.log_event,
             )
-            if self.repo_config.feature_flags.use_single_error_exit:
-                await self._clear_task_suppression(task_id)
-            else:
-                await self._clear_diagnose_exhausted(task_id)
+            await self._clear_diagnose_exhausted(task_id)
         self.state.skip_ai_error_diagnose = False
         self.state.error_message = None
         self.state.state = PipelineState.IDLE
@@ -2627,13 +2596,14 @@ class PipelineRunner(
                 return False
         return None
 
-    async def _handle_single_error_exit(self) -> None:
-        """Feature-flagged ERROR dispatcher with one visible exit per cycle."""
+    async def _handle_single_error_exit(self) -> bool | None:
+        """Common ERROR policy; True requests the existing immediate WATCH handoff."""
         if (self.state.error_message or "").startswith("Merge accounting conflict:"):
             self.log_event("[RECOVERY] Merge accounting conflict remains parked for operator Retry.")
             return
-        if await self._maybe_resume_obsolete_ci_error() is not None:
-            return
+        obsolete_ci = await self._maybe_resume_obsolete_ci_error()
+        if obsolete_ci is not None:
+            return obsolete_ci
         if self.state.rate_limited_until is not None:
             self.state.state = PipelineState.PAUSED
             self.log_event(
@@ -2647,18 +2617,30 @@ class PipelineRunner(
 
         # The coder checkout can retain TODO after the status writer commits
         # ERROR to the base branch. Only the confirmed base can clear a park.
-        frontmatter_status, _blocked, _revision = (
-            self._remote_frontmatter_error_status_for_current_task()
+        frontmatter_status, _blocked, revision = await asyncio.to_thread(
+            self._remote_frontmatter_error_status_for_current_task
         )
+        # An observed task may omit the optional status field (implicit TODO).
+        # A missing revision instead means the remote observation failed.
+        if frontmatter_status is None and revision is not None:
+            frontmatter_status = "todo"
+        if task_id is not None and frontmatter_status == "error":
+            self._confirmed_error_task_pr_ids.add(task_id)
         if frontmatter_status == "error" and (reason is None or from_frontmatter):
             reason, from_frontmatter = _blocked, True
         merge_sync_error = is_retained_merge_error(self.state.error_message)
-        if merge_sync_error and task_id in self._status_write_failed_task_pr_ids:
+        if task_id in self._status_write_failed_task_pr_ids:
             # A failed status write leaves TODO on the confirmed base. It is
             # not evidence of an operator Retry; repair it before reading TODO.
             await self.handle_error()
             return
-        if frontmatter_status == "todo":
+        # TODO proves an operator change only after ERROR was confirmed.
+        # Ordinary coder failures never write ERROR and still need diagnosis.
+        if (
+            frontmatter_status == "todo"
+            and task_id in self._confirmed_error_task_pr_ids
+        ):
+            self._confirmed_error_task_pr_ids.discard(task_id)
             self.state.skip_ai_error_diagnose = False
             self.state.error_message = None
             self.state.review_timeout_repost_attempted = False
@@ -2682,17 +2664,8 @@ class PipelineRunner(
             return
 
         if self.state.skip_ai_error_diagnose:
-            if await self._review_timeout_park_cleared():
-                self.state.skip_ai_error_diagnose = False
-                self.state.error_message = None
-                self.state.review_timeout_repost_attempted = False
-                self.state.review_timeout_repost_at = None
-                self.state.state = PipelineState.IDLE
-                self._last_error_park_log_key = None
-                self.log_event(
-                    "[ESCALATE] review_timeout park cleared by "
-                    "operator -> IDLE."
-                )
+            await self._release_finalized_failure(reason)
+            if self.state.state == PipelineState.IDLE:
                 return
             key = (task_id, SuppressionReason.REVIEW_TIMEOUT.value)
             if self._last_error_park_log_key != key:
@@ -2703,20 +2676,17 @@ class PipelineRunner(
                 )
             return
 
-        if reason is not None and self._task_suppression_blocks_selection(reason):
-            if task_id is not None and not from_frontmatter:
-                if await self._suppression_cleared(task_id):
-                    self.state.skip_ai_error_diagnose = False
-                    self.state.error_message = None
-                    self.state.review_timeout_repost_attempted = False
-                    self.state.review_timeout_repost_at = None
-                    self.state.state = PipelineState.IDLE
-                    self._last_error_park_log_key = None
-                    self.log_event(
-                        f"[ESCALATE] {reason.value} park cleared by "
-                        "operator -> IDLE."
-                    )
-                    return
+        # Diagnosis records its attempt counter under CRASH before the task
+        # becomes terminal. An unchanged TODO must keep advancing that bound.
+        diagnosing_todo = frontmatter_status == "todo" and reason == SuppressionReason.CRASH
+        if (
+            reason is not None
+            and self._task_suppression_blocks_selection(reason)
+            and not diagnosing_todo
+        ):
+            await self._release_finalized_failure(reason)
+            if self.state.state == PipelineState.IDLE:
+                return
             key = (task_id, reason.value)
             if self._last_error_park_log_key != key:
                 self._last_error_park_log_key = key
@@ -2726,6 +2696,9 @@ class PipelineRunner(
                 )
             return
 
+        if frontmatter_status == "error":
+            await self._release_finalized_failure(reason)
+            return
         self._last_error_park_log_key = None
         if self.app_config.daemon.error_handler_use_ai:
             await self.handle_error()
@@ -2855,6 +2828,8 @@ class PipelineRunner(
                         self.log_event(
                             f"[MERGE] No task status change to commit for {task_file}."
                         )
+                        if status == "ERROR":
+                            self._confirmed_error_task_pr_ids.add(pr_id)
                         return True
                     if diff.returncode != 1:
                         raise RuntimeError("task status diff failed")
@@ -2876,6 +2851,8 @@ class PipelineRunner(
                         "FETCH_HEAD", check=False,
                     )
                     if confirmed.returncode == 0:
+                        if status == "ERROR":
+                            self._confirmed_error_task_pr_ids.add(pr_id)
                         return True
                     if confirmed.returncode != 1:
                         raise RuntimeError("could not confirm remote status commit")
@@ -3435,6 +3412,12 @@ class PipelineRunner(
             # parent snapshot shape) before recovery has read it.
             return
         self.state.active = self.repo_config.active
+        task = self.state.current_task
+        self.state.error_task_status_confirmed = (
+            self.state.state == PipelineState.ERROR
+            and task is not None
+            and task.pr_id in self._confirmed_error_task_pr_ids
+        )
         ctx = self._selection_context(task_coder_pin="")
         active_coder = self.state.coder or resolve_pause_coder(ctx).name
         self.state.coder = active_coder
@@ -4203,55 +4186,12 @@ class PipelineRunner(
         elif current == PipelineState.PAUSED:
             await self.handle_paused()
         elif current == PipelineState.ERROR:
-            obsolete_ci = (
-                await self._maybe_resume_obsolete_ci_error()
-                if not self.repo_config.feature_flags.use_single_error_exit else None
-            )
-            if obsolete_ci is True:
-                await self.handle_watch()
-            elif obsolete_ci is False:
-                pass
-            elif (self.state.error_message or "").startswith("FIX idle timeout"):
+            if (self.state.error_message or "").startswith("FIX idle timeout"):
                 await self._admit_fix_idle_timeout()
             elif await self._maybe_resume_review_timeout():
                 await self.handle_watch()
-            elif self.repo_config.feature_flags.use_single_error_exit:
-                await self._handle_single_error_exit()
-            elif self.state.rate_limited_until is not None:
-                self.state.state = PipelineState.PAUSED
-                self.log_event(
-                    "[RATE-LIMIT] Legacy ERROR + rate_limited_until "
-                    "-> PAUSED."
-                )
-            elif self.state.skip_ai_error_diagnose:
-                # PR-316 review feedback: WATCH parked the runner here
-                # because of a review_timeout — a non-fixable problem the
-                # AI diagnose loop should never see. Stay in ERROR until
-                # the operator presses Retry, which deletes the
-                # cancellation cause. When the cause is gone, drop the
-                # flag and transition to IDLE so the picker can re-attempt
-                # the now status:TODO task without an AI round-trip.
-                if await self._review_timeout_park_cleared():
-                    self.state.skip_ai_error_diagnose = False
-                    self.state.error_message = None
-                    # PR-358 review feedback (P1): leaving the review_timeout
-                    # park is a per-PR-iteration boundary too. The
-                    # ``__setattr__`` PR-transition hook fires only on a
-                    # number/branch change, so a Retry that re-enters WATCH
-                    # against the same PR branch would otherwise carry the
-                    # repost flag forward and skip the one-shot repost on
-                    # the next timeout — making Retry ineffective for this
-                    # failure mode. Reset both fields in lockstep so the
-                    # restarted iteration has a clean elapsed_min floor.
-                    self.state.review_timeout_repost_attempted = False
-                    self.state.review_timeout_repost_at = None
-                    self.state.state = PipelineState.IDLE
-                    self.log_event(
-                        "[ESCALATE] review_timeout park cleared by "
-                        "operator -> IDLE."
-                    )
-            elif self.app_config.daemon.error_handler_use_ai:
-                await self.handle_error()
+            elif await self._handle_single_error_exit():
+                await self.handle_watch()
 
         if (
             current != PipelineState.ERROR

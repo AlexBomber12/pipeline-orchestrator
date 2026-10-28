@@ -10,6 +10,7 @@ Module-level:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import subprocess
@@ -19,13 +20,22 @@ from enum import Enum
 from src.branch_context import BranchContext
 from src.cancellation import get_cancellation_cause, safe_delete_cancellation_cause
 from src.daemon import git_ops
+from src.daemon.recovery_policy import (
+    TerminalReleaseDecision,
+    TerminalReleaseFacts,
+    terminal_release_decision,
+)
 from src.diagnosis import parse_diagnosis
+from src.github import prs as gh_prs
 from src.models import PipelineState
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
 
 logger = logging.getLogger(__name__)
 _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
+_UNCERTAIN_FIX_OWNERSHIP_PREFIX = (
+    "Persisted FIX invocation ownership is uncertain; operator Retry required"
+)
 
 _RETAINED_MERGE_ERROR_PREFIXES = (
     "Merge accounting conflict:",
@@ -148,6 +158,143 @@ def _classify_error(context: str) -> ErrorCategory:
 class ErrorMixin:
     """Ask the selected coder whether to FIX, SKIP, or ESCALATE the error."""
 
+    async def _release_finalized_failure(self, reason: SuppressionReason | None) -> None:
+        """Release execution only after preserving a positively proved failure.
+
+        Each ERROR tick re-observes technical holds. Legacy/restart snapshots
+        without bound cleanup evidence need operator ownership reconciliation.
+        No checkout cleanup, retry budget, or failed-task metadata is reset here.
+        """
+        task, attempt = self.state.current_task, self.state.publication_attempt
+        try:
+            if (task is None or attempt is None or attempt.contract_version != 2
+                or attempt.pending or task.pr_id in self._status_write_failed_task_pr_ids
+                or not self._publication_attempt_matches_dispatch()
+                or not attempt.cleanup_confirmed or self._coder_invocation_active
+                or self._current_coder_process is not None
+                or self._current_coder_supervised_process is not None
+                or self._coder_cleanup_failure_detail is not None
+                or (self.state.error_message or "").startswith(_UNCERTAIN_FIX_OWNERSHIP_PREFIX)
+                or is_retained_merge_error(self.state.error_message)):
+                self.log_event(
+                    f"[RECOVERY] Terminal failure {getattr(task, 'pr_id', None)} held: "
+                    "bound cleanup/work proof required."
+                )
+                return
+            status, blocked, revision = await asyncio.to_thread(
+                self._remote_frontmatter_error_status_for_current_task
+            )
+            if status != "error" or blocked != reason or revision is None:
+                return
+            dirty = (await asyncio.to_thread(
+                git_ops._git, self.repo_path, "status", "--porcelain",
+            )).stdout.strip()
+            head = (await asyncio.to_thread(
+                git_ops._git, self.repo_path, "rev-parse", "HEAD",
+            )).stdout.strip()
+            branch = (await asyncio.to_thread(
+                git_ops._git, self.repo_path, "branch", "--show-current",
+            )).stdout.strip()
+            remote = (await asyncio.to_thread(
+                git_ops._git, self.repo_path, "ls-remote", "--heads", "origin",
+                f"refs/heads/{attempt.branch}", timeout=30,
+            )).stdout.split()
+            remote_known = bool(
+                head and head == attempt.expected_head_sha and branch == attempt.branch
+                and remote == [head, f"refs/heads/{branch}"]
+            )
+            pr = self.state.current_pr
+            publications = []
+            if pr is None:
+                publications = await asyncio.to_thread(
+                    gh_prs.get_branch_publications, attempt.repo, attempt.base, attempt.branch,
+                )
+                if publications:
+                    # Exhaustion clears pending, so normal publication polling
+                    # cannot adopt a PR that becomes visible on a later tick.
+                    # Reuse exact dispatch/head validation without resuming the
+                    # failed task or performing terminal-success bookkeeping.
+                    await self._resolve_published_attempt(resolve_terminal=False)
+                    pr = self.state.current_pr
+            if pr is not None:
+                remote_known = remote_known and (
+                    pr.number == attempt.pr_number and pr.branch == attempt.branch
+                    and pr.pr_id in {None, task.pr_id} and not pr.is_cross_repository
+                    and pr.head_sha == head
+                )
+                outcome = await asyncio.to_thread(
+                    gh_prs.get_exact_pr_outcome, attempt.repo, attempt.base, pr.number, head,
+                    expected_branch=attempt.branch,
+                )
+                resolved = (outcome.discovery_complete and outcome.state in {
+                    gh_prs.ExactPRState.OPEN, gh_prs.ExactPRState.CLOSED,
+                })
+            else:
+                resolved = attempt.pr_number is None and not publications
+                cleaned_branch = False
+                if (resolved and not remote and not branch
+                    and attempt.initial_branch_head_sha == ""):
+                    cleaned_branch = (await asyncio.to_thread(
+                        git_ops._git, self.repo_path, "show-ref", "--verify", "--quiet",
+                        f"refs/heads/{attempt.branch}", check=False,
+                    )).returncode == 1
+                if (resolved and not remote and attempt.expected_head_sha
+                    and (cleaned_branch or (
+                        head == attempt.expected_head_sha and branch == attempt.branch
+                    ))):
+                    # Cleanup can delete an invocation-owned branch and detach
+                    # at the base. Prove preservation of the captured work and
+                    # the current checkout independently of that deleted ref.
+                    await asyncio.to_thread(
+                        git_ops._git, self.repo_path, "fetch", "origin", attempt.base, timeout=30,
+                    )
+                    expected_preserved = (await asyncio.to_thread(
+                        git_ops._git, self.repo_path, "merge-base", "--is-ancestor",
+                        attempt.expected_head_sha, "FETCH_HEAD", check=False,
+                    )).returncode == 0
+                    checkout_preserved = (await asyncio.to_thread(
+                        git_ops._git, self.repo_path, "merge-base", "--is-ancestor", head, "FETCH_HEAD", check=False,
+                    )).returncode == 0
+                    remote_known = expected_preserved and checkout_preserved
+            record = await self._suppression_record_for_task(task.pr_id)
+            if record is None or record.reason != reason:
+                return
+            evidence = {
+                **record.detail,
+                "terminal_failure": {
+                    "error_message": self.state.error_message,
+                    "publication_attempt": attempt.model_dump(mode="json"),
+                    "pr": pr.model_dump(mode="json") if pr is not None else None,
+                    "head_sha": head,
+                },
+            }
+            decision = terminal_release_decision(reason, TerminalReleaseFacts(
+                failure_persisted=True, remote_ownership_known=remote_known,
+                remote_outcome_resolved=resolved, cleanup_confirmed=True,
+                worktree_stable=not dirty, no_loss_confirmed=remote_known and not dirty,
+                user_paused=self.state.user_paused,
+                cost_hold=self.state.rate_limited_until is not None,
+                security_hold=task.pr_id in self._user_stopped_task_pr_ids,
+            ))
+            if decision != TerminalReleaseDecision.RELEASE:
+                self.log_event(
+                    f"[RECOVERY] Terminal release {decision.value}; re-observing safety evidence next cycle."
+                )
+                return
+            await self._suppress_task(task.pr_id, reason, evidence)
+            retained = await self._suppression_record_for_task(task.pr_id)
+            if retained is None or retained.reason != reason or retained.detail != evidence:
+                self.log_event("[RECOVERY] Terminal failure persistence unconfirmed; staying ERROR.")
+                return
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Terminal failure reconciliation deferred: {exc}.")
+            return
+        self.state.current_task = None
+        self._current_run_record = None
+        self._reset_runner_local_task_counters()
+        self.state.state = PipelineState.IDLE
+        self.log_event("[RECOVERY] Failed attempt retained; independent work released.")
+
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the selected coder whether to FIX, SKIP, or ESCALATE the error."""
         context = error_context or self.state.error_message or "Unknown error"
@@ -213,6 +360,10 @@ class ErrorMixin:
                 return
             self._status_write_failed_task_pr_ids.discard(retry_task_id)
             await self._persist_status_write_failed_task_pr_ids()
+            # Repairing storage proves persistence only. The next ERROR tick
+            # must still prove cleanup, remote outcome and work preservation.
+            self.log_event("[RECOVERY] Terminal status repaired; safety reconciliation pending.")
+            return
 
         # Repair durable task status before reconciliation can retain the
         # publication and return to ERROR again.
@@ -221,7 +372,7 @@ class ErrorMixin:
             await self._hold_unresolved_publication()
             await self._process_upload_while_publication_held()
             return
-        if context.startswith("Persisted FIX invocation ownership is uncertain; operator Retry required"):
+        if context.startswith(_UNCERTAIN_FIX_OWNERSHIP_PREFIX):
             self.log_event("[RECOVERY] Uncertain FIX invocation remains parked for operator Retry.")
             return
 
@@ -587,10 +738,19 @@ class ErrorMixin:
                 )
                 git_ops._git(self.repo_path, "clean", "-fd", check=False)
         if verdict == "SKIP":
-            self.state.current_task = None
-            self._reset_runner_local_task_counters()
-            self.state.state = PipelineState.IDLE
-            self.log_event("[ERROR] diagnose_error: SKIP -> IDLE.")
+            if retry_task_id is None:
+                # Repository-level failures (such as queue validation) have
+                # no task to finalize. Retry IDLE so it can sync corrections.
+                await self._clear_error_message_on_recovery(
+                    log_prefix="[ERROR]",
+                    reason="diagnose_error SKIP without a task",
+                )
+                self.state.state = PipelineState.IDLE
+                self._error_diagnose_policy.reset(self)
+                self.log_event("[ERROR] diagnose_error: SKIP -> IDLE (no bound task).")
+            else:
+                await self._mark_diagnose_exhausted(retry_task_id)
+                self.log_event("[ERROR] diagnose_error: SKIP -> terminal failure reconciliation.")
         elif verdict == "FIX":
             await _clear_cause_for_retry()
             await self._clear_error_message_on_recovery(

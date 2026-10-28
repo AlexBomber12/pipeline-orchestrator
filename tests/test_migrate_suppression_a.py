@@ -154,7 +154,7 @@ async def test_equivalence_flag_off_vs_on() -> None:
     )
 
 
-async def test_old_storage_removed_when_flag_on() -> None:
+async def test_legacy_diagnose_marker_retained_for_read_compatibility() -> None:
     runner = _runner(single_exit=True)
     header = _header()
 
@@ -164,7 +164,7 @@ async def test_old_storage_removed_when_flag_on() -> None:
 
     assert runner._crashed_task_pr_ids == set()
     assert runner.state.skip_ai_error_diagnose is False
-    assert f"diagnose_exhausted:{runner.name}:{header.pr_id}" not in runner.redis.store
+    assert f"diagnose_exhausted:{runner.name}:{header.pr_id}" in runner.redis.store
 
 
 async def test_idle_selector_reads_store_for_status_overrides(

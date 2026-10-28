@@ -1622,6 +1622,17 @@ class RecoveryMixin:
                 else:
                     self.state.error_message = saved.error_message
                 self.state.state = recovered_state
+                if (
+                    recovered_state == saved.state == PipelineState.ERROR
+                    and saved.error_task_status_confirmed
+                    and saved.name == self.name and saved.url == self.repo_config.url
+                    and queued.task_file == saved_task.task_file
+                    and queued.pr_id not in self._status_write_failed_task_pr_ids
+                ):
+                    # A confirmed ERROR may have been changed to TODO while
+                    # offline. Keep its evidence bound to this saved failure;
+                    # an ordinary failed invocation with unchanged TODO has none.
+                    self._confirmed_error_task_pr_ids.add(queued.pr_id)
                 await self._restore_current_run_record()
                 if pending_size_completion:
                     record = self._current_run_record
