@@ -98,7 +98,12 @@ checkout, excluding auth and diagnosis probes. Manual pause is observed across
 several test poll cycles before any task is dispatched. Clean restart follows
 production-confirmed failure release and B completion. Dirty restart is a held
 negative control: the exited shim has confirmed process cleanup before restart,
-but work preservation is unproved. Recovery must retain A's identity and dirty
+but work preservation is unproved. A dirty checkout can keep the failed
+publication pending: the test requires the bound task/branch, failed exit,
+confirmed process cleanup and the dirty-work cleanup refusal (or terminal wait),
+rather than waiting for terminal reconciliation to finish. It records that
+attempt and checks the dirty file before and after restart.
+Recovery must retain A's identity and dirty
 file, without dispatching B or C. This does not prove restart ownership takeover
 for a live or unconfirmed coder; such takeover remains unsupported/held by the
 production contract. Only the fixture-owned `daemon-test` service is restarted.

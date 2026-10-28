@@ -9,6 +9,40 @@ from tests.e2e.lib import coder_shim as shim_control
 SHIM = Path(__file__).parent / "e2e" / "lib" / "coder_shim.sh"
 
 
+@pytest.mark.parametrize("event", [
+    "[INFRA] Unpublished local branch cleanup deferred: worktree is dirty",
+    "[RECOVERY] Terminal release wait; re-observing safety evidence next cycle.",
+])
+@pytest.mark.parametrize("missing", [
+    None, "cleanup", "task", "task_branch", "attempt", "attempt_branch", "failure", "error", "hold",
+])
+def test_dirty_continuity_requires_bound_cleanup_and_dirty_hold(event, missing):
+    from tests.e2e.test_failure_continuity import _dirty_held_with_cleanup
+
+    state = {
+        "state": "ERROR",
+        "current_task": {"pr_id": "PR-42", "branch": "pr-42-dirty-root"},
+        "publication_attempt": {
+            "task_id": "PR-42", "branch": "pr-42-dirty-root", "pending": True,
+            "exit_classification": "failure", "cleanup_confirmed": True,
+        },
+        "history": [{"event": event}],
+    }
+    if missing == "cleanup":
+        state["publication_attempt"]["cleanup_confirmed"] = False
+    elif missing in {"task", "task_branch"}:
+        state["current_task"]["pr_id" if missing == "task" else "branch"] = "other"
+    elif missing in {"attempt", "attempt_branch"}:
+        state["publication_attempt"]["task_id" if missing == "attempt" else "branch"] = "other"
+    elif missing == "failure":
+        state["publication_attempt"]["exit_classification"] = "success"
+    elif missing == "error":
+        state["state"] = "IDLE"
+    elif missing == "hold":
+        state["history"] = [{"event": "bound cleanup/work proof required."}]
+    assert _dirty_held_with_cleanup(state, "PR-42", "pr-42-dirty-root") is (missing is None)
+
+
 def _write_task(
     repo: Path,
     pr_id: str,

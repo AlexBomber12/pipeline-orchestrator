@@ -56,6 +56,25 @@ def _queue(url, slug):
     return {row["pr_id"]: row for row in response.json()["queue"]}
 
 
+def _dirty_held_with_cleanup(state, task_id, branch):
+    """Require bound cleanup and an observed refusal to discard dirty work."""
+    attempt = state.get("publication_attempt") or {}
+    task = state.get("current_task") or {}
+    events = [row.get("event", "") for row in state.get("history") or []]
+    return (
+        state.get("state") == "ERROR"
+        and task.get("pr_id") == task_id and task.get("branch") == branch
+        and attempt.get("task_id") == task_id and attempt.get("branch") == branch
+        and attempt.get("cleanup_confirmed") is True
+        and attempt.get("exit_classification") == "failure"
+        and any(
+            "Unpublished local branch cleanup deferred: worktree is dirty" in event
+            or "Terminal release wait" in event
+            for event in events
+        )
+    )
+
+
 def _assert_retained(url, slug, a, c, *, exhausted):
     cause = _entry_for(_fetch_cancellations(url, slug), a)
     assert cause and cause["category"] == "ERROR", cause
@@ -121,20 +140,19 @@ def test_failed_a_independent_b(
             if dirty:
                 def held_with_cleanup():
                     state = get_state() or {}
-                    attempt = state.get("publication_attempt") or {}
-                    events = [row.get("event", "") for row in state.get("history") or []]
-                    return state if (
-                        state.get("state") == "ERROR"
-                        and (state.get("current_task") or {}).get("pr_id") == a
-                        and attempt.get("cleanup_confirmed") is True
-                        and any("Terminal release wait" in event or "bound cleanup/work proof" in event
-                                for event in events)
-                    ) else None
+                    return state if _dirty_held_with_cleanup(state, a, branches[0]) else None
 
                 held = _until(held_with_cleanup)
                 # Cleanup is proved for this exited shim; dirty work is NOT
                 # proved preserved. Restart must retain the hold and identity.
                 evidence["cleanup_confirmed"] = held["publication_attempt"]["cleanup_confirmed"]
+                evidence["held_attempt"] = {
+                    key: held["publication_attempt"].get(key)
+                    for key in ("task_id", "branch", "pending", "exit_classification", "cleanup_confirmed")
+                }
+                dirty_path = REPO_DIR / "tests/e2e/data/repos" / testbed_slug / "continuity-dirty.txt"
+                assert dirty_path.read_text() == f"unpreserved work for {a}\n"
+                assert _calls() == [expected_a], _calls()
                 restarted_after = datetime.now(timezone.utc)
                 _restart()
 
@@ -156,7 +174,6 @@ def test_failed_a_independent_b(
                 cause = _assert_retained(dashboard_url, testbed_slug, a, c, exhausted=False)
                 assert _queue(dashboard_url, testbed_slug)[b]["status"] == "TODO"
                 # Read only fixture-owned work; never clean or take over it.
-                dirty_path = REPO_DIR / "tests/e2e/data/repos" / testbed_slug / "continuity-dirty.txt"
                 assert dirty_path.read_text() == f"unpreserved work for {a}\n"
                 evidence["outcome"] = "dirty restart held; B and C never invoked"
             else:
