@@ -371,8 +371,12 @@ def _resume_daemon(slug: str) -> None:
         raise RuntimeError(f"failed to resume daemon for {slug}: status_code={response.status_code}")
 
 
-def _wait_for_fresh_idle(slug: str, *, after: datetime, timeout_sec: int = 60) -> None:
-    """Require a runner publication after resume, beyond the web's IDLE stub."""
+def _wait_for_fresh_idle(slug: str, *, after: datetime, timeout_sec: int = 180) -> None:
+    """Require a runner publication after resume, beyond the web's IDLE stub.
+
+    A cold IDLE scan includes paginated GitHub history and exceeded 60s in
+    CI. Keep a finite startup bound while allowing that scan to publish.
+    """
     deadline = time.monotonic() + timeout_sec
     last_seen = None
     while time.monotonic() < deadline:

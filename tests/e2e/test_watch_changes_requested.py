@@ -39,6 +39,10 @@ from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
 
 TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 
+# Dispatch may wait for an in-flight IDLE scan before the upload is consumed,
+# then another GitHub-backed scan before CODING. CI observed scans over 60s.
+CODING_DISPATCH_DEADLINE_SEC = 240
+
 # WATCH poll period in the test stack is 5–10s; allow two polls plus the
 # freshness round-trip plus the FIX entry transition with comfortable
 # slack before declaring failure.
@@ -129,9 +133,9 @@ def test_changes_requested_review_drives_watch_to_fix(
         status = upload_zip(zip_path)
         assert status in (200, 201), f"upload failed with status {status}"
 
-        # GitHub-backed dispatch exceeded 60s in CI after a successful upload;
-        # keep a finite bound without mistaking slow selection for no dispatch.
-        coding_entry = wait_for_state(["CODING"], timeout_sec=120)
+        coding_entry = wait_for_state(
+            ["CODING"], timeout_sec=CODING_DISPATCH_DEADLINE_SEC,
+        )
         coding_task = coding_entry.get("current_task") or {}
         assert coding_task.get("pr_id") == expected_pr_id, (
             f"CODING was for current_task={coding_task!r}, "
