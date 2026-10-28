@@ -361,7 +361,7 @@ def test_frontmatter_fallback_after_redis_loss(
     )
 
 
-def test_flag_off_uses_legacy_branch(
+def test_flag_off_uses_common_terminal_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -625,6 +625,10 @@ def test_terminal_dispatch_releases_only_independent_work(terminal_repo, flag):
     selected = asyncio.run(runner._select_next_task_or_attach([failed_pr], []))
     assert selected.pr_id == "PR-002"
     assert runner._idle_dag_statuses["PR-001"] == TaskStatus.ERROR
+    from src.dag import get_eligible_tasks
+    eligible = {item.pr_id for item in get_eligible_tasks(runner._idle_dag_headers, runner._idle_dag_statuses)}
+    assert "PR-001" not in eligible
+    assert "PR-003" not in eligible  # C depends on failed A, even while A's PR is open.
     assert runner._idle_dag_statuses["PR-003"] != TaskStatus.DONE
     assert not any(t.pr_id == "PR-003" and t.status == TaskStatus.DOING for t in runner.state.current_queue)
     assert asyncio.run(runner._suppression_record_for_task("PR-001")) is not None
@@ -715,3 +719,82 @@ def test_terminal_unpublished_attempt_requires_base_preservation(terminal_repo, 
     asyncio.run(runner._run_cycle_body())
     assert runner.state.state == PipelineState.IDLE
     assert asyncio.run(runner._suppression_record_for_task("PR-001")) is not None
+
+
+def test_status_repair_cannot_bypass_terminal_safety(terminal_repo, monkeypatch):
+    from unittest.mock import AsyncMock
+
+    runner, _ = terminal_repo
+    writer = runner._commit_task_status_change
+    runner._status_write_failed_task_pr_ids.add("PR-001")
+    scratch = Path(runner.repo_path) / "unpreserved"
+    scratch.write_text("retain")
+    monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=False))
+    asyncio.run(runner._run_cycle_body())
+    assert runner.state.state == PipelineState.ERROR
+    assert "PR-001" in runner._status_write_failed_task_pr_ids
+    monkeypatch.setattr(runner, "_commit_task_status_change", writer)
+    asyncio.run(runner._run_cycle_body())
+    assert runner.state.state == PipelineState.ERROR
+    assert "PR-001" not in runner._status_write_failed_task_pr_ids
+    asyncio.run(runner._run_cycle_body())
+    assert runner.state.state == PipelineState.ERROR
+    assert scratch.read_text() == "retain"
+    scratch.unlink()
+    asyncio.run(runner._run_cycle_body())
+    assert runner.state.state == PipelineState.IDLE
+
+
+@pytest.mark.parametrize("fault", ["header", "suppression", "legacy", "ambiguous_absence", "mismatch"])
+def test_terminal_release_requires_each_retained_identity(terminal_repo, monkeypatch, fault):
+    runner, _ = terminal_repo
+    if fault == "header":
+        monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
+                            lambda: ("error", SuppressionReason.CRASH, "revision"))
+    elif fault == "suppression":
+        asyncio.run(runner._clear_task_suppression("PR-001"))
+    elif fault == "legacy":
+        runner.state.publication_attempt.contract_version = 1
+    elif fault == "mismatch":
+        runner.state.current_pr.head_sha = "a" * 40
+    else:
+        runner.state.current_pr = None
+        runner.state.publication_attempt.pr_number = None
+        monkeypatch.setattr("src.github.prs.get_branch_publications", lambda *args: [object(), object()])
+    # Exercise the production evaluator directly so neither operator-clear
+    # compatibility nor late-review admission can supply missing safety proof.
+    asyncio.run(runner._release_finalized_failure(SuppressionReason.FIX_ITERATION_CAP))
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task.pr_id == "PR-001"
+
+
+def test_publication_exhaustion_uses_common_release_proof(terminal_repo):
+    from src.daemon import publication
+
+    runner, _ = terminal_repo
+    task = runner.state.current_task
+    asyncio.run(runner._commit_task_status_change(task, "ERROR", "expired", blocked_reason=SuppressionReason.CRASH))
+    asyncio.run(runner._suppress_task(task.pr_id, SuppressionReason.CRASH, {"error_message": "expired"}))
+    runner.state.publication_attempt.pending = True
+    runner.state.publication_attempt.exhausted = True
+    asyncio.run(publication._exhaust(runner))
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    record = asyncio.run(runner._suppression_record_for_task(task.pr_id))
+    assert record.reason == SuppressionReason.CRASH
+    assert record.detail["terminal_failure"]["publication_attempt"]["exhausted"]
+    assert record.detail["terminal_failure"]["pr"]["number"] == 1
+
+
+def test_review_timeout_can_release_independent_work_without_retry(terminal_repo):
+    runner, _ = terminal_repo
+    task = runner.state.current_task
+    asyncio.run(runner._commit_task_status_change(
+        task, "ERROR", "review timed out", blocked_reason=SuppressionReason.REVIEW_TIMEOUT,
+    ))
+    asyncio.run(runner._suppress_task(task.pr_id, SuppressionReason.REVIEW_TIMEOUT, {"error_message": "timeout"}))
+    runner.state.skip_ai_error_diagnose = True
+    asyncio.run(runner._handle_single_error_exit())
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert asyncio.run(runner._suppression_record_for_task(task.pr_id)).reason == SuppressionReason.REVIEW_TIMEOUT

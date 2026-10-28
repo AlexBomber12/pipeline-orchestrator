@@ -426,15 +426,10 @@ def test_merge_clears_task_after_successful_merge(
     assert any("Merged PR #5 -> IDLE" in e["event"] for e in runner.state.history)
 
 
-def test_error_diagnose_skip_clears_task(
+def test_error_diagnose_skip_retains_task_until_safe_finalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``error.py:411`` — ``diagnose_error`` SKIP verdict returns to IDLE.
-
-    The site is the ErrorMixin's "give up on this task" branch: drops
-    ``current_task``, ``current_pr``, ``error_message``, resets
-    ``_error_diagnose_count``, transitions to IDLE.
-    """
+    """A SKIP verdict retains task, PR and failure until safety is proved."""
     monkeypatch.setattr(
         claude_cli,
         "diagnose_error_async",

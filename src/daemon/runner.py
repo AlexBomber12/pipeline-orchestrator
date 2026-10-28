@@ -2561,10 +2561,7 @@ class PipelineRunner(
                 task_id,
                 log=self.log_event,
             )
-            if self.repo_config.feature_flags.use_single_error_exit:
-                await self._clear_task_suppression(task_id)
-            else:
-                await self._clear_diagnose_exhausted(task_id)
+            await self._clear_diagnose_exhausted(task_id)
         self.state.skip_ai_error_diagnose = False
         self.state.error_message = None
         self.state.state = PipelineState.IDLE
@@ -2613,13 +2610,14 @@ class PipelineRunner(
                 return False
         return None
 
-    async def _handle_single_error_exit(self) -> None:
-        """Common ERROR dispatcher; the legacy flag remains readable in config."""
+    async def _handle_single_error_exit(self) -> bool | None:
+        """Common ERROR policy; True requests the existing immediate WATCH handoff."""
         if (self.state.error_message or "").startswith("Merge accounting conflict:"):
             self.log_event("[RECOVERY] Merge accounting conflict remains parked for operator Retry.")
             return
-        if await self._maybe_resume_obsolete_ci_error() is not None:
-            return
+        obsolete_ci = await self._maybe_resume_obsolete_ci_error()
+        if obsolete_ci is not None:
+            return obsolete_ci
         if self.state.rate_limited_until is not None:
             self.state.state = PipelineState.PAUSED
             self.log_event(
@@ -4202,8 +4200,8 @@ class PipelineRunner(
                 await self._admit_fix_idle_timeout()
             elif await self._maybe_resume_review_timeout():
                 await self.handle_watch()
-            else:
-                await self._handle_single_error_exit()
+            elif await self._handle_single_error_exit():
+                await self.handle_watch()
 
         if (
             current != PipelineState.ERROR

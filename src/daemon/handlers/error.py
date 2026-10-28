@@ -317,6 +317,10 @@ class ErrorMixin:
                 return
             self._status_write_failed_task_pr_ids.discard(retry_task_id)
             await self._persist_status_write_failed_task_pr_ids()
+            # Repairing storage proves persistence only. The next ERROR tick
+            # must still prove cleanup, remote outcome and work preservation.
+            self.log_event("[RECOVERY] Terminal status repaired; safety reconciliation pending.")
+            return
 
         # Repair durable task status before reconciliation can retain the
         # publication and return to ERROR again.

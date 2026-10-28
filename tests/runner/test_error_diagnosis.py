@@ -341,20 +341,14 @@ def test_different_context_resets_counter_to_one(
 
 
 # ---------------------------------------------------------------------------
-# Test 4 — diagnose_error SKIP verdict clears task / PR / error -> IDLE
+# Test 4 — diagnose_error SKIP retains terminal failure for reconciliation
 # ---------------------------------------------------------------------------
 
 
-def test_diagnose_skip_clears_task_pr_error_and_returns_idle(
+def test_diagnose_skip_retains_failed_task_until_safe_finalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A SKIP verdict drops the task, the PR, and the error_message.
-
-    Branch covered: ``error.py:410-416``. SKIP signals that the active
-    task cannot be safely resumed; the daemon must drop its handle on
-    both ``current_task`` and ``current_pr`` before returning to IDLE so
-    the next cycle re-selects a task from scratch.
-    """
+    """SKIP exhausts the task; release requires separate safety evidence."""
     runner = h._make_runner()
     _patch_plugin_diagnose(monkeypatch, runner, "claude", (0, "SKIP", ""))
     _patch_plugin_diagnose(monkeypatch, runner, "codex", (0, "SKIP", ""))
@@ -800,7 +794,7 @@ def test_handle_error_retains_auxiliary_handle_when_cleanup_is_unconfirmed(
 # ---------------------------------------------------------------------------
 
 
-def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_handle_error_skip_retains_failed_state(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         claude_cli,
         "diagnose_error_async",
