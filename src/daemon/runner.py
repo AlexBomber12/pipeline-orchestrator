@@ -4042,7 +4042,6 @@ class PipelineRunner(
         await self._refresh_user_paused_from_redis()
         if not self.state.user_paused:
             self._user_pause_logged = False
-
         # Durable Retry commands are consumed before the ordinary ERROR,
         # pause, and GitHub-budget exits.  This lets a parked runner
         # acknowledge the command and report the exact inhibitor instead of
@@ -4070,6 +4069,12 @@ class PipelineRunner(
                     await self.publish_state()
                     return
 
+        # A wake hint cannot authorize work ahead of a durable Stop, including
+        # during startup recovery. Leave acknowledgment to publish/cleanup.
+        if await self._pop_stop_request():
+            await self.publish_state()
+            return
+
         if not await self._check_github_api_budget():
             await self.publish_state()
             return
@@ -4083,7 +4088,7 @@ class PipelineRunner(
                     has_pending = bool(raw)
                 except Exception:
                     pass
-                if has_pending:
+                if has_pending and not self.state.user_paused:
                     branch = self.repo_config.branch
                     on_base = False
                     try:

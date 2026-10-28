@@ -15,6 +15,13 @@ from src.cancellation import retry_count_key, task_spec_content_hash, task_spec_
 from src.daemon import repo_ops
 
 
+@pytest.fixture(autouse=True)
+def _merged_transport(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Graph admission uses production evaluators with controlled GitHub reads."""
+    monkeypatch.setattr(repo_ops, "get_merged_pr_ids", lambda *args: set())
+    monkeypatch.setattr(repo_ops, "get_merged_branch_pr_ids", lambda *args: set())
+
+
 class _FakeCompletedProcess:
     def __init__(
         self,
@@ -1337,3 +1344,68 @@ def test_recorded_completion_bytes_survive_pending_replacement(upload_git: _Runn
     assert _run(runner.process_pending_uploads()) is None
     assert task.read_bytes() == accepted
     assert runner.redis.store[retry_count_key("demo", "PR-001")] == "3"
+
+
+@pytest.mark.parametrize("inhibitor", ["pause", "stop", "memory_pause", "unreadable_pause"])
+def test_pending_upload_obeys_durable_controls(upload_git: _Runner, inhibitor: str) -> None:
+    from src.keyspace import control_stop, pipeline_state
+    from src.models import RepoState
+
+    runner = upload_git
+    staging, key = _stage_upload(runner, _upload_spec(instruction="accepted bytes"))
+    if inhibitor == "pause":
+        runner.redis.store[pipeline_state(runner.name)] = RepoState(
+            name=runner.name, url=runner.repo_config.url, user_paused=True,
+        ).model_dump_json()
+    elif inhibitor == "stop":
+        runner.redis.store[control_stop(runner.name)] = "1"
+    elif inhibitor == "memory_pause":
+        runner.state.user_paused = True
+    else:
+        runner.redis.store[pipeline_state(runner.name)] = "unreadable"
+    git = repo_ops.git_ops._git
+    before = git(runner.repo_path, "rev-parse", "HEAD").stdout
+    manifest = runner.redis.store[key]
+    assert _run(runner.process_pending_uploads()) is None
+    assert runner.redis.store[key] == manifest
+    assert (staging / "PR-001.md").read_text() == _upload_spec(instruction="accepted bytes")
+    assert git(runner.repo_path, "rev-parse", "HEAD").stdout == before
+
+
+def test_pending_upload_prunes_stale_members_without_losing_sibling(upload_git: _Runner) -> None:
+    runner = upload_git
+    runner.state.current_queue = None
+    content = _upload_spec(instruction="exact candidate\nwith trailing spaces  \n")
+    _, key = _stage_upload(runner, content)
+    manifest = json.loads(runner.redis.store[key])
+    manifest["files"] += ["PR-999.md", "../outside.md", 7, "PR-001.md"]
+    runner.redis.store[key] = json.dumps(manifest)
+    assert _run(runner.process_pending_uploads()) is True
+    assert (Path(runner.repo_path) / "tasks/PR-001.md").read_bytes() == content.encode()
+    head = repo_ops.git_ops._git(runner.repo_path, "rev-parse", "HEAD").stdout
+    assert _run(runner.process_pending_uploads()) is False
+    assert repo_ops.git_ops._git(runner.repo_path, "rev-parse", "HEAD").stdout == head
+
+
+@pytest.mark.parametrize("conflict", ["dependency", "branch", "cycle", "identity"])
+def test_pending_upload_rechecks_current_effective_graph(upload_git: _Runner, conflict: str) -> None:
+    runner = upload_git
+    content = _upload_spec(instruction="new accepted candidate")
+    if conflict == "dependency":
+        content = content.replace("Depends on: none", "Depends on: PR-999")
+    elif conflict == "identity":
+        content = content.replace("# PR-001:", "# PR-002:")
+    else:
+        sibling = _upload_spec().replace("PR-001", "PR-002")
+        if conflict == "cycle":
+            sibling = sibling.replace("Branch: task-one", "Branch: task-two")
+            sibling = sibling.replace("Depends on: none", "Depends on: PR-001")
+            content = content.replace("Depends on: none", "Depends on: PR-002")
+        (Path(runner.repo_path) / "tasks/PR-002.md").write_text(sibling)
+    staging, key = _stage_upload(runner, content)
+    before = (Path(runner.repo_path) / "tasks/PR-001.md").read_bytes()
+    assert _run(runner.process_pending_uploads()) is None
+    assert key in runner.redis.store
+    assert (staging / "PR-001.md").read_bytes() == content.encode()
+    assert (Path(runner.repo_path) / "tasks/PR-001.md").read_bytes() == before
+    assert any("current task graph invalid" in event for event in runner.events)
