@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from src.cancellation import retry_count_key, task_spec_hash_key
+from src.cancellation import retry_count_key, task_spec_content_hash, task_spec_hash_key
 from src.daemon import repo_ops
 
 
@@ -565,7 +565,7 @@ def test_process_pending_uploads_persists_task_hash_after_push(
     monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
 
     assert _run(runner.process_pending_uploads()) is True
-    assert runner.redis.store[task_spec_hash_key("demo", "PR-001")] == "new-hash"
+    assert runner.redis.store[task_spec_hash_key("demo", "PR-001")] == task_spec_content_hash("# PR-001\n")
     assert runner.redis.store[retry_count_key("demo", "PR-001")] == "0"
     assert key not in runner.redis.store
 
@@ -636,7 +636,7 @@ def test_process_pending_uploads_ignores_malformed_task_hashes(
     monkeypatch.setattr(repo_ops.shutil, "rmtree", lambda path, ignore_errors=True: None)
 
     assert _run(runner.process_pending_uploads()) is True
-    assert task_spec_hash_key("demo", "PR-001") not in runner.redis.store
+    assert runner.redis.store[task_spec_hash_key("demo", "PR-001")] == task_spec_content_hash("# PR-001\n")
 
 
 def test_process_pending_uploads_keeps_manifest_when_metadata_update_fails(
@@ -1138,3 +1138,202 @@ def test_process_pending_uploads_handles_failures_and_safe_mode(
     runner.redis.store[key] = manifest
     assert _run(runner.process_pending_uploads(_safe=True)) is None
     assert all(call[1] != "reset" for call in git_calls)
+
+
+@pytest.fixture
+def upload_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> _Runner:
+    """Real local transport; no GitHub or live daemon state."""
+    runner = _Runner(tmp_path)
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    subprocess.run(["git", "clone", str(remote), runner.repo_path], check=True, capture_output=True)
+    git = repo_ops.git_ops._git
+    git(runner.repo_path, "config", "user.email", "test@example.com")
+    git(runner.repo_path, "config", "user.name", "Test")
+    git(runner.repo_path, "checkout", "-b", "main")
+    tasks = Path(runner.repo_path) / "tasks"
+    tasks.mkdir()
+    (tasks / "PR-001.md").write_text(_upload_spec("ERROR"))
+    git(runner.repo_path, "add", ".")
+    git(runner.repo_path, "commit", "-m", "accepted task")
+    git(runner.repo_path, "push", "origin", "main")
+    _patch_retry_passthrough(monkeypatch)
+    runner.redis.store[retry_count_key("demo", "PR-001")] = "3"
+    runner.redis.store[task_spec_hash_key("demo", "PR-001")] = task_spec_content_hash(_upload_spec("ERROR"))
+    runner.redis.store["cancellation:demo:PR-001"] = "failure evidence"
+    runner._crashed_task_pr_ids = {"PR-001"}
+    runner._status_write_failed_task_pr_ids = {"PR-001"}
+    runner.state.current_queue = [SimpleNamespace(pr_id="PR-001", status=repo_ops.TaskStatus.ERROR)]
+    return runner
+
+
+def _upload_spec(status: str = "TODO", instruction: str = "original") -> str:
+    reason = "blocked_reason: crash\n" if status == "ERROR" else ""
+    return (
+        f"---\nstatus: {status}\n{reason}---\n"
+        "# PR-001: Task\nBranch: task-one\n- Type: bugfix\n"
+        "- Complexity: medium\n- Depends on: none\n"
+        f"\n{instruction}\n"
+    )
+
+
+def _stage_upload(runner: _Runner, content: str) -> tuple[Path, str]:
+    staging = Path(runner.repo_path).parent / "staging"
+    staging.mkdir(exist_ok=True)
+    (staging / "PR-001.md").write_text(content)
+    key = f"upload:{runner.name}:pending"
+    runner.redis.store[key] = json.dumps({
+        "files": ["PR-001.md"], "staging_dir": str(staging),
+        # A stale archive's manifest is not authoritative about accepted bytes.
+        "task_hashes": {"PR-001": "untrusted-hash"},
+    })
+    return staging, key
+
+
+@pytest.mark.parametrize("status", ["ERROR", "DONE", "DOING"])
+@pytest.mark.parametrize("bookkeeping_only", [False, True])
+def test_upload_replay_preserves_exact_bytes_and_history(
+    upload_git: _Runner, status: str, bookkeeping_only: bool,
+) -> None:
+    runner = upload_git
+    task = Path(runner.repo_path) / "tasks/PR-001.md"
+    task.write_text(_upload_spec(status))
+    git = repo_ops.git_ops._git
+    git(runner.repo_path, "add", ".")
+    git(runner.repo_path, "commit", "--allow-empty", "-m", "daemon bookkeeping")
+    git(runner.repo_path, "push", "origin", "main")
+    accepted = task.read_bytes()
+    head = git(runner.repo_path, "rev-parse", "HEAD").stdout
+    history = dict(runner.redis.store)
+    for _ in range(2):
+        _stage_upload(runner, _upload_spec() if bookkeeping_only else accepted.decode())
+        assert _run(runner.process_pending_uploads()) is True
+        assert task.read_bytes() == accepted
+        assert git(runner.repo_path, "rev-parse", "HEAD").stdout == head
+        assert runner.redis.store == history
+        assert runner._crashed_task_pr_ids == {"PR-001"}
+        assert runner._status_write_failed_task_pr_ids == {"PR-001"}
+        assert runner.cleared_status_write_failed_calls == 0
+        assert runner.state.current_queue[0].status == repo_ops.TaskStatus.ERROR
+
+
+def test_changed_upload_replaces_only_its_history_once(upload_git: _Runner) -> None:
+    runner = upload_git
+    runner.state.current_queue = None
+    _stage_upload(runner, _upload_spec(instruction="new instruction"))
+    assert _run(runner.process_pending_uploads()) is True
+    assert runner.redis.store[retry_count_key("demo", "PR-001")] == "0"
+    assert not runner._crashed_task_pr_ids
+    assert not runner._status_write_failed_task_pr_ids
+    assert "cancellation:demo:PR-001" not in runner.redis.store
+    assert runner.cleared_status_write_failed_calls == 1
+    runner.redis.store[retry_count_key("demo", "PR-001")] = "2"
+    _stage_upload(runner, _upload_spec(instruction="new instruction"))
+    assert _run(runner.process_pending_uploads()) is True
+    assert runner.redis.store[retry_count_key("demo", "PR-001")] == "2"
+    assert runner.cleared_status_write_failed_calls == 1
+
+
+@pytest.mark.parametrize("conflict", [
+    "done", "doing", "missing", "stale", "task", "branch", "pr", "invalid",
+    "publication-id", "publication-branch",
+])
+def test_upload_conflict_keeps_entire_batch_staged(upload_git: _Runner, conflict: str) -> None:
+    runner = upload_git
+    task = Path(runner.repo_path) / "tasks/PR-001.md"
+    incoming = _upload_spec(instruction="new instruction")
+    if conflict in {"done", "doing"}:
+        task.write_text(_upload_spec(conflict.upper()))
+    elif conflict == "missing":
+        task.unlink()
+        incoming = _upload_spec()
+    elif conflict == "stale":
+        task.write_text(_upload_spec(instruction="another accepted spec"))
+        incoming = _upload_spec()
+    elif conflict.startswith("publication-"):
+        runner.state.publication_attempt = SimpleNamespace(
+            pending=True, task_id="PR-001" if conflict == "publication-id" else "PR-002",
+            branch="task-one",
+        )
+    elif conflict in {"task", "branch", "invalid"}:
+        runner.state.current_task = SimpleNamespace(
+            pr_id="PR-001" if conflict == "task" else "PR-002",
+            branch="task-one",
+        )
+        if conflict == "invalid":
+            incoming = "invalid task"
+    else:
+        runner.state.current_pr = SimpleNamespace(branch="task-one")
+    staging, key = _stage_upload(runner, incoming)
+    (staging / "AGENTS.md").write_text("new instructions")
+    manifest = json.loads(runner.redis.store[key])
+    manifest["files"].insert(0, "AGENTS.md")
+    runner.redis.store[key] = json.dumps(manifest)
+    before = task.read_bytes() if task.exists() else None
+    history = dict(runner.redis.store)
+    assert _run(runner.process_pending_uploads()) is None
+    assert runner.redis.store == history
+    assert staging.is_dir()
+    assert (task.read_bytes() if task.exists() else None) == before
+    assert not (Path(runner.repo_path) / "AGENTS.md").exists()
+
+
+def test_ambiguous_push_replay_cannot_reset_history(
+    upload_git: _Runner, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner = upload_git
+    git = repo_ops.git_ops._git
+    staging, key = _stage_upload(runner, _upload_spec(instruction="new instruction"))
+
+    def ambiguous_push(repo: str, *args: str, **kwargs: Any) -> Any:
+        result = git(repo, *args, **kwargs)
+        if args[0] == "push":
+            raise subprocess.TimeoutExpired("git push", 60)
+        return result
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", ambiguous_push)
+    assert _run(runner.process_pending_uploads()) is None
+    assert key in runner.redis.store and staging.is_dir()
+    monkeypatch.setattr(repo_ops.git_ops, "_git", git)
+    assert _run(runner.process_pending_uploads()) is True
+    assert runner.redis.store[retry_count_key("demo", "PR-001")] == "3"
+    assert runner._crashed_task_pr_ids == {"PR-001"}
+    assert runner.redis.store["cancellation:demo:PR-001"] == "failure evidence"
+    assert runner.cleared_status_write_failed_calls == 0
+
+
+@pytest.mark.parametrize("owner", ["task", "pr", "publication", "settled-publication"])
+def test_changed_upload_with_unrelated_owner_is_admitted(upload_git: _Runner, owner: str) -> None:
+    runner = upload_git
+    runner.state.current_queue = None
+    if owner == "task":
+        runner.state.current_task = SimpleNamespace(pr_id="PR-002", branch="other")
+    elif owner == "pr":
+        runner.state.current_pr = SimpleNamespace(branch="other")
+    else:
+        runner.state.publication_attempt = SimpleNamespace(
+            pending=owner == "publication", task_id="PR-002", branch="other",
+        )
+    _stage_upload(runner, _upload_spec(instruction="changed"))
+    assert _run(runner.process_pending_uploads()) is True
+    assert runner.redis.store[retry_count_key("demo", "PR-001")] == "0"
+
+
+def test_recorded_completion_bytes_survive_pending_replacement(upload_git: _Runner) -> None:
+    runner = upload_git
+    git = repo_ops.git_ops._git
+    task = Path(runner.repo_path) / "tasks/PR-001.md"
+    accepted = task.read_bytes()
+    receipt = {
+        "schema_version": 1, "repository": "repo", "base_branch": "main",
+        "completions": {"PR-001": {
+            "task_sha256": hashlib.sha256(accepted).hexdigest(),
+            "merge_commit": git(runner.repo_path, "rev-parse", "HEAD").stdout.strip(),
+            "pull_request": 1, "reason": "completed outside task branch",
+        }},
+    }
+    (task.parent / "completions.json").write_text(json.dumps(receipt))
+    _stage_upload(runner, _upload_spec(instruction="changed"))
+    assert _run(runner.process_pending_uploads()) is None
+    assert task.read_bytes() == accepted
+    assert runner.redis.store[retry_count_key("demo", "PR-001")] == "3"

@@ -3428,7 +3428,7 @@ def test_terminal_publish_rollback_keeps_live_publication_hold(monkeypatch):
 
 @pytest.mark.parametrize("scenario", ["clean", "dirty", "base_ahead", "upload_failure"])
 @pytest.mark.parametrize("entry", ["idle", "error"])
-def test_retained_publication_allows_safe_staged_upload_without_losing_task_ref(
+def test_retained_publication_blocks_conflicting_upload_without_losing_task_ref(
     monkeypatch, tmp_path, scenario, entry,
 ):
     import json
@@ -3500,9 +3500,9 @@ def test_retained_publication_allows_safe_staged_upload_without_losing_task_ref(
         assert asyncio.run(runner.redis.get(upload_pending(runner.name))) is not None
     else:
         assert git("rev-parse", "--abbrev-ref", "HEAD") == "main"
-        uploaded = git("show", "main:tasks/PR-001.md", cwd=remote_path)
-        assert uploaded == "revised task specification"
-        assert asyncio.run(runner.redis.get(upload_pending(runner.name))) is None
+        assert git("ls-tree", "--name-only", "main", "tasks/PR-001.md", cwd=remote_path) == ""
+        assert asyncio.run(runner.redis.get(upload_pending(runner.name))) is not None
+        assert (staging_dir / "PR-001.md").read_text() == "revised task specification\n"
 
 
 @pytest.mark.parametrize("failure", ["redis", "cleanup"])
