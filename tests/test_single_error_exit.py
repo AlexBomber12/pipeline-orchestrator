@@ -962,3 +962,63 @@ def test_unavailable_remote_status_does_not_start_diagnosis(tmp_path, monkeypatc
     assert runner.state.current_task.pr_id == "PR-380"
     assert runner.state.error_message == "Coder exited with nonzero status"
     assert any("Remote ERROR task status unavailable" in event for event in _events(runner))
+
+
+@pytest.mark.parametrize("flag", [False, True])
+@pytest.mark.parametrize("evidence", ["confirmed", "ordinary_todo", "write_failed", "different_file"])
+def test_restart_accepts_offline_todo_only_after_bound_confirmed_error(
+    terminal_repo, monkeypatch, flag, evidence,
+):
+    from dataclasses import replace
+    from unittest.mock import AsyncMock
+
+    from src.keyspace import pipeline_state
+    from src.models import RepoState, TaskStatus
+    from src.queue_parser import write_frontmatter_status
+
+    runner, git = terminal_repo
+    runner.state.url = runner.repo_config.url
+    task, pr = runner.state.current_task, runner.state.current_pr
+    runner.repo_config.feature_flags.use_single_error_exit = flag
+    runner.state.active_invocation = replace(
+        runner.state.active_invocation, phase="fix", fix_trigger={"review": True},
+    )
+    if evidence == "ordinary_todo":
+        # A new ordinary failure invalidates the previous incident's proof.
+        asyncio.run(runner._transition_to_error("Ordinary coder failure", save_run_record_as=None))
+    asyncio.run(PipelineRunner.publish_state(runner))
+    raw = asyncio.run(runner.redis.get(pipeline_state(runner.name)))
+    saved = RepoState.model_validate_json(raw)
+    assert saved.error_task_status_confirmed == (evidence != "ordinary_todo")
+
+    # The operator edits the base while the task's checkout still contains TODO.
+    git("checkout", "main")
+    git("pull", "--ff-only", "origin", "main")
+    write_frontmatter_status(Path(runner.repo_path) / task.task_file, "TODO")
+    git("add", "tasks")
+    git("commit", "-m", "Operator retries failed task while daemon is offline")
+    git("push", "origin", "main")
+
+    restarted = _make_runner()
+    restarted.redis = runner.redis
+    restarted.repo_config = runner.repo_config
+    restarted.repo_path = runner.repo_path
+    assert asyncio.run(restarted._hydrate_current_task_from_persisted_state())
+    queued = task.model_copy(update={"status": TaskStatus.TODO})
+    if evidence == "write_failed":
+        restarted._status_write_failed_task_pr_ids.add(task.pr_id)
+    elif evidence == "different_file":
+        queued.task_file = "tasks/replaced.md"
+    asyncio.run(restarted._apply_recovery_decisions([queued], [pr]))
+    assert restarted.state.state == PipelineState.ERROR
+    assert (task.pr_id in restarted._confirmed_error_task_pr_ids) == (evidence == "confirmed")
+    restarted._recovered = restarted._scaffolded = True
+    _stub_cycle(monkeypatch, restarted)
+    monkeypatch.setattr(restarted, "_remote_frontmatter_error_status_for_current_task",
+                        lambda: ("todo", None, "operator-revision"))
+    # Keep unrelated status repair/diagnosis out of this recovery assertion.
+    monkeypatch.setattr(restarted, "handle_error", AsyncMock())
+    asyncio.run(restarted._run_cycle_body())
+    assert restarted.state.state == (
+        PipelineState.IDLE if evidence == "confirmed" else PipelineState.ERROR
+    )

@@ -299,6 +299,8 @@ class RepoState(BaseModel):
     publication_schema_version: int = 1
     publication_migration: PublicationMigration | None = None
     error_message: str | None = None
+    # Evidence for the current failure, persisted with its task/PR binding.
+    error_task_status_confirmed: bool = False
     last_updated: datetime = Field(
         default_factory=lambda: datetime.now(timezone.utc)
     )

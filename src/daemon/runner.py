@@ -2158,6 +2158,10 @@ class PipelineRunner(
         prior_state = self.state.state
         self.state.state = PipelineState.ERROR
         self.state.error_message = message
+        task = self.state.current_task
+        if task is not None:
+            # Clear prior failure evidence before any durable checkpoint.
+            self._confirmed_error_task_pr_ids.discard(task.pr_id)
         attempt = self.state.publication_attempt
         if attempt is not None and attempt.pending:
             attempt.failure = attempt.failure or message
@@ -2181,9 +2185,6 @@ class PipelineRunner(
             },
         )
         blocked_reason = _suppression_reason_from_cancellation(cause)
-        if task is not None:
-            # Evidence from an earlier failure must not authorize this run's retry.
-            self._confirmed_error_task_pr_ids.discard(task.pr_id)
         status_write_failed = False
         if task is not None and commit_task_status:
             try:
@@ -3411,6 +3412,12 @@ class PipelineRunner(
             # parent snapshot shape) before recovery has read it.
             return
         self.state.active = self.repo_config.active
+        task = self.state.current_task
+        self.state.error_task_status_confirmed = (
+            self.state.state == PipelineState.ERROR
+            and task is not None
+            and task.pr_id in self._confirmed_error_task_pr_ids
+        )
         ctx = self._selection_context(task_coder_pin="")
         active_coder = self.state.coder or resolve_pause_coder(ctx).name
         self.state.coder = active_coder
