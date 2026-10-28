@@ -201,12 +201,23 @@ def test_review_instructions_preserve_actor_head_and_handoff_contract(
 def test_review_regeneration_preserves_user_bytes_and_unrelated_modes() -> None:
     regions = daemon_managed_content()
     old_regions = dict(regions, codex_review_gate="\nobsolete review policy\n")
-    original = "User preamble: café\n\n" + apply_managed_regions("", old_regions)
-    original += "\n## User rules\nKeep exactly:  two spaces.\n"
+    preamble = "User preamble: café\n\n".encode("utf-8")
+    suffix = b"\n## User rules\nKeep exactly:  two spaces.\n"
+    original = preamble.decode("utf-8") + apply_managed_regions("", old_regions)
+    original += suffix.decode("utf-8")
     review_update = {"codex_review_gate": regions["codex_review_gate"]}
     updated = apply_managed_regions(original, review_update)
     assert updated == original.replace(
         old_regions["codex_review_gate"], regions["codex_review_gate"]
     )
+    updated_bytes = updated.encode("utf-8")
+    assert updated_bytes.startswith(preamble)
+    assert updated_bytes.endswith(suffix)
+    assert updated.count(
+        "<!-- pipeline-orchestrator: managed BEGIN codex_review_gate -->"
+    ) == 1
+    assert updated.count(
+        "<!-- pipeline-orchestrator: managed END codex_review_gate -->"
+    ) == 1
     assert extract_managed_regions(updated) == regions
     assert apply_managed_regions(updated, regions) == updated
