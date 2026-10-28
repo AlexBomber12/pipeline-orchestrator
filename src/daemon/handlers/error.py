@@ -219,16 +219,31 @@ class ErrorMixin:
                 resolved = attempt.pr_number is None and not await asyncio.to_thread(
                     gh_prs.get_branch_publications, attempt.repo, attempt.base, attempt.branch,
                 )
-                if (resolved and not remote and head == attempt.expected_head_sha
-                    and branch == attempt.branch):
-                    # A never-published clean attempt may have no branch at all.
-                    # Prove that all its commits already exist on the remote base.
+                cleaned_branch = False
+                if (resolved and not remote and not branch
+                    and attempt.initial_branch_head_sha == ""):
+                    cleaned_branch = (await asyncio.to_thread(
+                        git_ops._git, self.repo_path, "show-ref", "--verify", "--quiet",
+                        f"refs/heads/{attempt.branch}", check=False,
+                    )).returncode == 1
+                if (resolved and not remote and attempt.expected_head_sha
+                    and (cleaned_branch or (
+                        head == attempt.expected_head_sha and branch == attempt.branch
+                    ))):
+                    # Cleanup can delete an invocation-owned branch and detach
+                    # at the base. Prove preservation of the captured work and
+                    # the current checkout independently of that deleted ref.
                     await asyncio.to_thread(
                         git_ops._git, self.repo_path, "fetch", "origin", attempt.base, timeout=30,
                     )
-                    remote_known = (await asyncio.to_thread(
+                    expected_preserved = (await asyncio.to_thread(
+                        git_ops._git, self.repo_path, "merge-base", "--is-ancestor",
+                        attempt.expected_head_sha, "FETCH_HEAD", check=False,
+                    )).returncode == 0
+                    checkout_preserved = (await asyncio.to_thread(
                         git_ops._git, self.repo_path, "merge-base", "--is-ancestor", head, "FETCH_HEAD", check=False,
                     )).returncode == 0
+                    remote_known = expected_preserved and checkout_preserved
             record = await self._suppression_record_for_task(task.pr_id)
             if record is None or record.reason != reason:
                 return

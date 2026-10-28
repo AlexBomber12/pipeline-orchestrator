@@ -745,6 +745,54 @@ def test_terminal_unpublished_attempt_requires_base_preservation(terminal_repo, 
     assert asyncio.run(runner._suppression_record_for_task("PR-001")) is not None
 
 
+@pytest.mark.parametrize("flag", [False, True])
+@pytest.mark.parametrize("fault", [None, "expected", "checkout", "local_ref", "ownership", "missing_expected"])
+def test_terminal_release_after_unpublished_branch_cleanup(terminal_repo, monkeypatch, flag, fault):
+    runner, git = terminal_repo
+    attempt = runner.state.publication_attempt
+    runner.repo_config.feature_flags.use_single_error_exit = flag
+    runner.state.current_pr = None
+    attempt.pr_number = None
+    attempt.baseline_numbers = set()
+    attempt.initial_branch_head_sha = ""
+    attempt.head_sha = attempt.expected_head_sha
+    git("push", "origin", "--delete", attempt.branch)
+    monkeypatch.setattr("src.github.prs.get_branch_publications", lambda *args: [])
+    if fault == "expected":
+        # Cleanup may delete a captured commit that never reached the base.
+        (Path(runner.repo_path) / "work").write_text("unpublished work")
+        git("add", "work")
+        git("commit", "-m", "unpublished work")
+        attempt.head_sha = attempt.expected_head_sha = git("rev-parse", "HEAD").stdout.strip()
+    asyncio.run(runner._release_unpublished_attempt(attempt.branch))
+    assert git("branch", "--show-current").stdout.strip() == ""
+    assert git("for-each-ref", "--format=%(refname)", f"refs/heads/{attempt.branch}").stdout == ""
+    if fault == "checkout":
+        (Path(runner.repo_path) / "work").write_text("detached work")
+        git("add", "work")
+        git("commit", "-m", "detached work")
+    elif fault == "local_ref":
+        git("branch", attempt.branch)
+    elif fault == "ownership":
+        attempt.initial_branch_head_sha = None
+    elif fault == "missing_expected":
+        attempt.expected_head_sha = None
+    for _ in range(2):
+        asyncio.run(runner._run_cycle_body())
+        if fault is not None:
+            assert runner.state.state == PipelineState.ERROR
+            assert runner.state.current_task.pr_id == "PR-001"
+        else:
+            assert runner.state.state == PipelineState.IDLE
+            assert runner.state.current_task is None
+            break
+    record = asyncio.run(runner._suppression_record_for_task("PR-001"))
+    assert record.reason == SuppressionReason.FIX_ITERATION_CAP
+    if fault is None:
+        assert record.detail["terminal_failure"]["publication_attempt"]["expected_head_sha"] == attempt.expected_head_sha
+        assert record.detail["terminal_failure"]["head_sha"] == git("rev-parse", "HEAD").stdout.strip()
+
+
 def test_status_repair_cannot_bypass_terminal_safety(terminal_repo, monkeypatch):
     from unittest.mock import AsyncMock
 
