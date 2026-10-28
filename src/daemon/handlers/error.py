@@ -10,6 +10,7 @@ Module-level:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 import subprocess
@@ -180,16 +181,24 @@ class ErrorMixin:
                     "bound cleanup/work proof required."
                 )
                 return
-            status, blocked, revision = self._remote_frontmatter_error_status_for_current_task()
+            status, blocked, revision = await asyncio.to_thread(
+                self._remote_frontmatter_error_status_for_current_task
+            )
             if status != "error" or blocked != reason or revision is None:
                 return
-            dirty = git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip()
-            head = git_ops._git(self.repo_path, "rev-parse", "HEAD").stdout.strip()
-            branch = git_ops._git(self.repo_path, "branch", "--show-current").stdout.strip()
-            remote = git_ops._git(
-                self.repo_path, "ls-remote", "--heads", "origin",
+            dirty = (await asyncio.to_thread(
+                git_ops._git, self.repo_path, "status", "--porcelain",
+            )).stdout.strip()
+            head = (await asyncio.to_thread(
+                git_ops._git, self.repo_path, "rev-parse", "HEAD",
+            )).stdout.strip()
+            branch = (await asyncio.to_thread(
+                git_ops._git, self.repo_path, "branch", "--show-current",
+            )).stdout.strip()
+            remote = (await asyncio.to_thread(
+                git_ops._git, self.repo_path, "ls-remote", "--heads", "origin",
                 f"refs/heads/{attempt.branch}", timeout=30,
-            ).stdout.split()
+            )).stdout.split()
             remote_known = bool(
                 head and head == attempt.expected_head_sha and branch == attempt.branch
                 and remote == [head, f"refs/heads/{branch}"]
@@ -201,22 +210,25 @@ class ErrorMixin:
                     and pr.pr_id in {None, task.pr_id} and not pr.is_cross_repository
                     and pr.head_sha == head
                 )
-                outcome = gh_prs.get_exact_pr_outcome(
-                    attempt.repo, attempt.base, pr.number, head, expected_branch=attempt.branch,
+                outcome = await asyncio.to_thread(
+                    gh_prs.get_exact_pr_outcome, attempt.repo, attempt.base, pr.number, head,
+                    expected_branch=attempt.branch,
                 )
                 resolved = (outcome.discovery_complete and outcome.state == gh_prs.ExactPRState.OPEN)
             else:
-                resolved = attempt.pr_number is None and not gh_prs.get_branch_publications(
-                    attempt.repo, attempt.base, attempt.branch,
+                resolved = attempt.pr_number is None and not await asyncio.to_thread(
+                    gh_prs.get_branch_publications, attempt.repo, attempt.base, attempt.branch,
                 )
                 if (resolved and not remote and head == attempt.expected_head_sha
                     and branch == attempt.branch):
                     # A never-published clean attempt may have no branch at all.
                     # Prove that all its commits already exist on the remote base.
-                    git_ops._git(self.repo_path, "fetch", "origin", attempt.base, timeout=30)
-                    remote_known = git_ops._git(
-                        self.repo_path, "merge-base", "--is-ancestor", head, "FETCH_HEAD", check=False,
-                    ).returncode == 0
+                    await asyncio.to_thread(
+                        git_ops._git, self.repo_path, "fetch", "origin", attempt.base, timeout=30,
+                    )
+                    remote_known = (await asyncio.to_thread(
+                        git_ops._git, self.repo_path, "merge-base", "--is-ancestor", head, "FETCH_HEAD", check=False,
+                    )).returncode == 0
             record = await self._suppression_record_for_task(task.pr_id)
             if record is None or record.reason != reason:
                 return

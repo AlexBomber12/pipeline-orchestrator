@@ -868,3 +868,67 @@ def test_lost_failure_record_cannot_release_or_impersonate_retry(terminal_repo, 
         assert runner.state.current_pr.number == 1
     assert runner._remote_frontmatter_error_status_for_current_task()[0] == "error"
     diagnose.assert_not_awaited()
+
+
+@pytest.mark.parametrize("publication", ["pr", "branch", "unpublished"])
+def test_terminal_observations_leave_event_loop_responsive(terminal_repo, monkeypatch, publication):
+    from threading import Event, get_ident
+
+    from src.daemon import git_ops
+    from src.github import prs as gh_prs
+
+    runner, git = terminal_repo
+    if publication != "pr":
+        runner.state.current_pr = None
+        runner.state.publication_attempt.pr_number = None
+        monkeypatch.setattr(gh_prs, "get_branch_publications", lambda *args: [])
+    if publication == "unpublished":
+        git("push", "origin", "--delete", runner.state.publication_attempt.branch)
+
+    observed = set()
+    failures = []
+    persisted = []
+
+    async def reconcile():
+        loop = asyncio.get_running_loop()
+        loop_thread = get_ident()
+
+        def responsive_probe(label, original):
+            def probe(*args, **kwargs):
+                observed.add(label)
+                # A separate repo cycle/stop monitor must be able to run while
+                # any one of these synchronous observations waits on transport.
+                progressed = Event()
+                loop.call_soon_threadsafe(progressed.set)
+                if get_ident() == loop_thread or not progressed.wait(timeout=5):
+                    failures.append(label)
+                return original(*args, **kwargs)
+            return probe
+
+        monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task", responsive_probe(
+            "frontmatter", runner._remote_frontmatter_error_status_for_current_task,
+        ))
+        monkeypatch.setattr(git_ops, "_git", responsive_probe("git", git_ops._git))
+        github_probe = "get_exact_pr_outcome" if publication == "pr" else "get_branch_publications"
+        monkeypatch.setattr(gh_prs, github_probe, responsive_probe("github", getattr(gh_prs, github_probe)))
+        suppress = runner._suppress_task
+
+        async def persist(*args):
+            persisted.append(get_ident())
+            assert get_ident() == loop_thread
+            assert runner.state.state == PipelineState.ERROR
+            assert runner.state.current_task.pr_id == "PR-001"
+            await suppress(*args)
+
+        monkeypatch.setattr(runner, "_suppress_task", persist)
+        await runner._handle_single_error_exit()
+        assert persisted == [loop_thread]
+
+    asyncio.run(reconcile())
+    assert observed == {"frontmatter", "git", "github"}
+    assert failures == []
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    retained = asyncio.run(runner._suppression_record_for_task("PR-001"))
+    assert retained.reason == SuppressionReason.FIX_ITERATION_CAP
+    assert retained.detail["terminal_failure"]["head_sha"]
