@@ -300,11 +300,7 @@ def test_review_timeout_skip_flag_parks_under_single_error_exit(
         nonlocal calls
         calls += 1
 
-    async def not_cleared() -> bool:
-        return False
-
     monkeypatch.setattr(runner, "handle_error", fake_handle_error)
-    monkeypatch.setattr(runner, "_review_timeout_park_cleared", not_cleared)
 
     asyncio.run(runner._run_cycle_body())
 
@@ -328,10 +324,7 @@ def test_review_timeout_skip_flag_releases_under_single_error_exit(
     runner.state.review_timeout_repost_at = datetime.now(timezone.utc)
     _suppress(runner, SuppressionReason.REVIEW_TIMEOUT)
 
-    async def cleared() -> bool:
-        return True
-
-    monkeypatch.setattr(runner, "_review_timeout_park_cleared", cleared)
+    _clear_task_frontmatter(runner)
 
     asyncio.run(runner._run_cycle_body())
 
@@ -341,7 +334,7 @@ def test_review_timeout_skip_flag_releases_under_single_error_exit(
     assert runner.state.review_timeout_repost_attempted is False
     assert runner.state.review_timeout_repost_at is None
     assert any(
-        "review_timeout park cleared by operator -> IDLE" in event
+        "operator-cleared ERROR task frontmatter -> IDLE" in event
         for event in _events(runner)
     )
 
@@ -473,34 +466,6 @@ def test_error_suppression_reason_handles_absent_task_and_store_record(
     )
 
 
-def test_suppression_cleared_returns_false_on_store_error(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = _runner(tmp_path)
-
-    async def boom(_task_id: str) -> None:
-        raise RuntimeError("store down")
-
-    monkeypatch.setattr(runner, "_suppression_record_for_task", boom)
-
-    assert asyncio.run(runner._suppression_cleared("PR-380")) is False
-
-
-def test_suppression_cleared_returns_true_when_store_has_no_record(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    runner = _runner(tmp_path)
-
-    async def no_record(_task_id: str) -> None:
-        return None
-
-    monkeypatch.setattr(runner, "_suppression_record_for_task", no_record)
-
-    assert asyncio.run(runner._suppression_cleared("PR-380")) is True
-
-
 def test_error_suppression_reason_falls_back_after_store_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -518,7 +483,7 @@ def test_error_suppression_reason_falls_back_after_store_error(
     )
 
 
-def test_store_record_clear_path_releases_to_idle(
+def test_store_record_disappearance_cannot_authorize_retry(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -528,17 +493,13 @@ def test_store_record_clear_path_releases_to_idle(
     async def fake_reason() -> tuple[SuppressionReason, bool]:
         return SuppressionReason.GUARDRAIL, False
 
-    async def cleared(_task_id: str) -> bool:
-        return True
-
     monkeypatch.setattr(runner, "_error_suppression_reason", fake_reason)
-    monkeypatch.setattr(runner, "_suppression_cleared", cleared)
 
     asyncio.run(runner._run_cycle_body())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
     assert any(
-        "guardrail park cleared by operator -> IDLE" in event
+        "guardrail operator-clearable ERROR park active" in event
         for event in _events(runner)
     )
 
@@ -821,3 +782,30 @@ def test_uncertain_restart_owner_holds_direct_and_common_error_callers(terminal_
     assert runner.state.current_pr.number == 1
     diagnosis.assert_not_awaited()
     assert asyncio.run(runner._suppression_record_for_task("PR-001")) is not None
+
+
+@pytest.mark.parametrize("flag", [False, True])
+@pytest.mark.parametrize("reason", [SuppressionReason.REVIEW_TIMEOUT, SuppressionReason.FIX_ITERATION_CAP])
+def test_lost_failure_record_cannot_release_or_impersonate_retry(terminal_repo, monkeypatch, flag, reason):
+    from unittest.mock import AsyncMock
+
+    runner, _ = terminal_repo
+    task = runner.state.current_task
+    runner.repo_config.feature_flags.use_single_error_exit = flag
+    asyncio.run(runner._commit_task_status_change(task, "ERROR", "terminal", blocked_reason=reason))
+    asyncio.run(runner._suppress_task(task.pr_id, reason, {"error_message": "terminal"}))
+    runner.state.skip_ai_error_diagnose = reason == SuppressionReason.REVIEW_TIMEOUT
+    # Simulate an eviction/flush after the first rich-layer observation.
+    asyncio.run(runner._clear_task_suppression(task.pr_id))
+    async def first_observation():
+        return reason, False
+    monkeypatch.setattr(runner, "_error_suppression_reason", first_observation)
+    diagnose = AsyncMock()
+    monkeypatch.setattr(runner, "handle_error", diagnose)
+    for _ in range(2):
+        asyncio.run(runner._run_cycle_body())
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.current_task.pr_id == task.pr_id
+        assert runner.state.current_pr.number == 1
+    assert runner._remote_frontmatter_error_status_for_current_task()[0] == "error"
+    diagnose.assert_not_awaited()

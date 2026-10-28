@@ -2437,27 +2437,6 @@ class PipelineRunner(
             return blocked_reason, True
         return None, False
 
-    async def _suppression_cleared(self, task_id: str) -> bool:
-        """Return True when the suppression store has no active record."""
-        try:
-            record = await self._suppression_record_for_task(task_id)
-        except Exception:
-            return False
-        return record is None
-
-    async def _review_timeout_park_cleared(self) -> bool:
-        """Legacy wrapper for the review-timeout park-clear check."""
-        task = self.state.current_task
-        if task is None:
-            return True
-        try:
-            cause = await get_cancellation_cause(
-                self.redis, self.name, task.pr_id, refresh_ttl=False
-            )
-        except Exception:
-            return False
-        return cause is None
-
     async def _maybe_resume_review_timeout(self) -> bool:
         """Admit a late trusted result for a retained timeout failure."""
         from src.github.reviewer_policy import reviewer_policy_from_config
@@ -2642,6 +2621,8 @@ class PipelineRunner(
             # not evidence of an operator Retry; repair it before reading TODO.
             await self.handle_error()
             return
+        # Confirmed remote TODO authorizes Retry. Missing failure metadata
+        # is unknown evidence, not an operator decision.
         if frontmatter_status == "todo":
             self.state.skip_ai_error_diagnose = False
             self.state.error_message = None
@@ -2666,18 +2647,6 @@ class PipelineRunner(
             return
 
         if self.state.skip_ai_error_diagnose:
-            if await self._review_timeout_park_cleared():
-                self.state.skip_ai_error_diagnose = False
-                self.state.error_message = None
-                self.state.review_timeout_repost_attempted = False
-                self.state.review_timeout_repost_at = None
-                self.state.state = PipelineState.IDLE
-                self._last_error_park_log_key = None
-                self.log_event(
-                    "[ESCALATE] review_timeout park cleared by "
-                    "operator -> IDLE."
-                )
-                return
             await self._release_finalized_failure(reason)
             if self.state.state == PipelineState.IDLE:
                 return
@@ -2691,19 +2660,6 @@ class PipelineRunner(
             return
 
         if reason is not None and self._task_suppression_blocks_selection(reason):
-            if task_id is not None and not from_frontmatter:
-                if await self._suppression_cleared(task_id):
-                    self.state.skip_ai_error_diagnose = False
-                    self.state.error_message = None
-                    self.state.review_timeout_repost_attempted = False
-                    self.state.review_timeout_repost_at = None
-                    self.state.state = PipelineState.IDLE
-                    self._last_error_park_log_key = None
-                    self.log_event(
-                        f"[ESCALATE] {reason.value} park cleared by "
-                        "operator -> IDLE."
-                    )
-                    return
             await self._release_finalized_failure(reason)
             if self.state.state == PipelineState.IDLE:
                 return

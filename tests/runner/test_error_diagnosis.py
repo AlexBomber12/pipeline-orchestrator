@@ -2076,81 +2076,6 @@ def test_run_cycle_in_error_with_review_timeout_park_skips_handle_error(
     assert runner.state.skip_ai_error_diagnose is True
 
 
-def test_review_timeout_park_cleared_returns_true_when_no_current_task() -> None:
-    """The helper reports cleared when there is no task to read a cause for.
-
-    Defensive: a runner that already dropped ``current_task`` cannot have
-    a cancellation cause to wait on, so ``run_cycle`` should release the
-    park rather than spin forever in ERROR.
-    """
-    runner = h._make_runner()
-    runner.state.current_task = None
-    assert asyncio.run(runner._review_timeout_park_cleared()) is True
-
-
-def test_review_timeout_park_cleared_returns_false_on_redis_error(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """A Redis read failure keeps the runner parked.
-
-    Without this guard a transient Redis blip would race the operator's
-    Retry button and falsely transition the runner to IDLE while the
-    cause record is still authoritative on the server.
-    """
-    runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-099",
-        title="t",
-        status=TaskStatus.ERROR,
-    )
-
-    async def boom(*args: Any, **kwargs: Any) -> None:
-        raise RuntimeError("redis down")
-
-    monkeypatch.setattr(
-        "src.daemon.runner.get_cancellation_cause", boom
-    )
-    assert asyncio.run(runner._review_timeout_park_cleared()) is False
-
-
-def test_review_timeout_park_cleared_does_not_refresh_ttl(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """PR-345 fix-feedback: the ERROR-cycle poll must not pin the cause.
-
-    ``run_cycle`` calls ``_review_timeout_park_cleared`` on every ERROR
-    cycle while the operator-park flag is set. If that poll inherited the
-    ``refresh_ttl=True`` default it would reset the cause TTL to the 90-day
-    forensic window each cycle and the record would never expire — the
-    park would never clear naturally for review-timeout/operator parks
-    that nobody opens in the UI. Assert the poll forwards
-    ``refresh_ttl=False`` to ``get_cancellation_cause``.
-    """
-    runner = h._make_runner()
-    runner.state.current_task = QueueTask(
-        pr_id="PR-345",
-        title="t",
-        status=TaskStatus.ERROR,
-    )
-
-    captured: dict[str, object] = {}
-
-    async def spy(
-        redis_client: Any,
-        repo_slug: str,
-        task_id: str,
-        *,
-        refresh_ttl: bool = True,
-    ) -> None:
-        captured["refresh_ttl"] = refresh_ttl
-        return None
-
-    monkeypatch.setattr("src.daemon.runner.get_cancellation_cause", spy)
-    asyncio.run(runner._review_timeout_park_cleared())
-
-    assert captured == {"refresh_ttl": False}
-
-
 def test_run_cycle_clears_review_timeout_park_flag_on_non_error_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2306,8 +2231,8 @@ def test_run_cycle_review_timeout_park_release_resets_repost_flag(
 ) -> None:
     """PR-358 review feedback (P1): retried task gets a fresh repost slot.
 
-    When the operator presses Retry, ``_review_timeout_park_cleared``
-    returns True and ``run_cycle`` transitions ERROR -> IDLE. If the
+    When operator Retry confirms remote TODO, ``run_cycle`` transitions
+    ERROR -> IDLE. If the
     retried task re-enters WATCH on the same PR number/branch (no
     intervening CODING that would reassign ``current_pr``), the
     ``__setattr__`` PR-transition hook never fires and the repost flag
