@@ -440,3 +440,44 @@ def test_clean_failure_e2e_oracle_requires_retained_terminal_outcome(monkeypatch
     else:
         with pytest.raises(AssertionError):
             run()
+
+
+async def test_settings_shim_catalogue_uses_production_discovery(tmp_path):
+    from src.coders.claude_models import discover_claude_models
+
+    (tmp_path / "claude").symlink_to(SHIM.resolve())
+    models = await discover_claude_models(env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"})
+    assert [model.invocation_id for model in models] == ["opus", "sonnet"]
+    assert [[effort.name for effort in model.reasoning_efforts] for model in models] == [
+        ["low", "high"], ["low", "high"],
+    ]
+
+
+def test_settings_shim_records_bound_launch_without_prompt(tmp_path):
+    import json
+
+    scenario = tmp_path / "scenario"
+    scenario.write_text("hang\n")
+    _write_task(tmp_path, "PR-42", branch="pr-42-e2e-settings-first", status="DOING")
+    result = subprocess.run(
+        ["bash", "-c", '''
+source "$1"
+REPO_DIR="$2"
+sleep() { [[ "$1" == 120 ]]; }
+main --print "private prompt excluded from evidence" --model sonnet --effort high
+''', "claude", str(SHIM.resolve()), str(tmp_path)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=5,
+        env={**os.environ, "PO_SHIM_SCENARIO_FILE": str(scenario)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(Path(str(scenario) + ".settings-started").read_text()) == {
+        "pr_id": "PR-42", "branch": "pr-42-e2e-settings-first",
+        "plugin_id": "claude", "model": "sonnet", "effort": "high",
+    }
+    assert not Path(str(scenario) + ".settings-started.tmp").exists()
+
+
+def test_settings_overlay_oracle_runs_with_production_config(tmp_path):
+    from tests.e2e.test_shared_config import test_settings_overlay_precedence_is_disposable
+
+    test_settings_overlay_precedence_is_disposable(tmp_path)

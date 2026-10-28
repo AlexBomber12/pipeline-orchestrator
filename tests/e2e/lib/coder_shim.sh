@@ -293,6 +293,21 @@ main() {
         exit 0
     fi
 
+    # Synthetic catalogue over the real SDK discovery transport; no inference.
+    if [[ "${invoked}" == "claude" && " $* " == *" --input-format stream-json "* ]]; then
+        python3 -c '
+import json, sys
+request = json.loads(sys.stdin.readline())
+models = [{"value": value, "displayName": value, "supportsEffort": True,
+           "supportedEffortLevels": ["low", "high"]}
+          for value in ("opus", "sonnet")]
+print(json.dumps({"type": "control_response", "response": {
+    "subtype": "success", "request_id": request["request_id"],
+    "response": {"models": models}}}), flush=True)
+'
+        exit 0
+    fi
+
     # Only proceed when invoked with the daemon's coding flags. The daemon runs
     # `claude --print ...` and `codex ... exec ...`; any other invocation is a
     # no-op so non-coder probes cannot trigger git/gh side effects.
@@ -334,11 +349,6 @@ main() {
     local scenario
     scenario="$(read_scenario)"
 
-    if [[ "${scenario}" == "hang" ]]; then
-        sleep 120
-        exit 0
-    fi
-
     if [[ "${scenario}" == "escalate" ]]; then
         # ESCALATE bypasses the testbed-repo / DOING-task plumbing: the
         # daemon only needs the marker on stdout to enter the
@@ -363,6 +373,27 @@ main() {
     IFS=$'\t' read -r pr branch <<<"${task_info}"
     if [[ -z "${pr}" || -z "${branch}" ]]; then
         printf 'shim: no active PR task, exiting 0\n' >&2
+        exit 0
+    fi
+
+    if [[ "${scenario}" == "hang" ]]; then
+        # Record only allowlisted launch arguments, never prompts or credentials.
+        # Atomic replacement lets the host correlate a unique task with a real
+        # CLI launch independently of the daemon's pre-launch snapshot.
+        if [[ "${branch}" == *-e2e-settings-first || "${branch}" == *-e2e-settings-next ]]; then
+            python3 - "${PO_SHIM_SCENARIO_FILE}.settings-started" "${pr}" "${branch}" "${invoked}" "$@" <<'PYTHON'
+import json, os, sys
+path, task, branch, plugin, *args = sys.argv[1:]
+def flag(name):
+    return args[args.index(name) + 1] if name in args else None
+record = {"pr_id": task, "branch": branch, "plugin_id": plugin,
+          "model": flag("--model"), "effort": flag("--effort")}
+with open(path + ".tmp", "w") as output:
+    json.dump(record, output)
+os.replace(path + ".tmp", path)
+PYTHON
+        fi
+        sleep 120
         exit 0
     fi
 
