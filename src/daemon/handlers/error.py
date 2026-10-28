@@ -19,7 +19,13 @@ from enum import Enum
 from src.branch_context import BranchContext
 from src.cancellation import get_cancellation_cause, safe_delete_cancellation_cause
 from src.daemon import git_ops
+from src.daemon.recovery_policy import (
+    TerminalReleaseDecision,
+    TerminalReleaseFacts,
+    terminal_release_decision,
+)
 from src.diagnosis import parse_diagnosis
+from src.github import prs as gh_prs
 from src.models import PipelineState
 from src.retry import retry_transient
 from src.subsource_registry import SuppressionReason
@@ -147,6 +153,104 @@ def _classify_error(context: str) -> ErrorCategory:
 
 class ErrorMixin:
     """Ask the selected coder whether to FIX, SKIP, or ESCALATE the error."""
+
+    async def _release_finalized_failure(self, reason: SuppressionReason | None) -> None:
+        """Release execution only after preserving a positively proved failure.
+
+        Each ERROR tick re-observes technical holds. Legacy/restart snapshots
+        without bound cleanup evidence need operator ownership reconciliation.
+        No checkout cleanup, retry budget, or failed-task metadata is reset here.
+        """
+        task, attempt = self.state.current_task, self.state.publication_attempt
+        try:
+            if (task is None or attempt is None or attempt.contract_version != 2
+                or attempt.pending or task.pr_id in self._status_write_failed_task_pr_ids
+                or not self._publication_attempt_matches_dispatch()
+                or not attempt.cleanup_confirmed or self._coder_invocation_active
+                or self._current_coder_process is not None
+                or self._current_coder_supervised_process is not None
+                or self._coder_cleanup_failure_detail is not None
+                or is_retained_merge_error(self.state.error_message)):
+                self.log_event(
+                    f"[RECOVERY] Terminal failure {getattr(task, 'pr_id', None)} held: "
+                    "bound cleanup/work proof required."
+                )
+                return
+            status, blocked, revision = self._remote_frontmatter_error_status_for_current_task()
+            if status != "error" or blocked != reason or revision is None:
+                return
+            dirty = git_ops._git(self.repo_path, "status", "--porcelain").stdout.strip()
+            head = git_ops._git(self.repo_path, "rev-parse", "HEAD").stdout.strip()
+            branch = git_ops._git(self.repo_path, "branch", "--show-current").stdout.strip()
+            remote = git_ops._git(
+                self.repo_path, "ls-remote", "--heads", "origin",
+                f"refs/heads/{attempt.branch}", timeout=30,
+            ).stdout.split()
+            remote_known = bool(
+                head and head == attempt.expected_head_sha and branch == attempt.branch
+                and remote == [head, f"refs/heads/{branch}"]
+            )
+            pr = self.state.current_pr
+            if pr is not None:
+                remote_known = remote_known and (
+                    pr.number == attempt.pr_number and pr.branch == attempt.branch
+                    and pr.pr_id in {None, task.pr_id} and not pr.is_cross_repository
+                    and pr.head_sha == head
+                )
+                outcome = gh_prs.get_exact_pr_outcome(
+                    attempt.repo, attempt.base, pr.number, head, expected_branch=attempt.branch,
+                )
+                resolved = (outcome.discovery_complete and outcome.state == gh_prs.ExactPRState.OPEN)
+            else:
+                resolved = attempt.pr_number is None and not gh_prs.get_branch_publications(
+                    attempt.repo, attempt.base, attempt.branch,
+                )
+                if (resolved and not remote and head == attempt.expected_head_sha
+                    and branch == attempt.branch):
+                    # A never-published clean attempt may have no branch at all.
+                    # Prove that all its commits already exist on the remote base.
+                    git_ops._git(self.repo_path, "fetch", "origin", attempt.base, timeout=30)
+                    remote_known = git_ops._git(
+                        self.repo_path, "merge-base", "--is-ancestor", head, "FETCH_HEAD", check=False,
+                    ).returncode == 0
+            record = await self._suppression_record_for_task(task.pr_id)
+            if record is None or record.reason != reason:
+                return
+            evidence = {
+                **record.detail,
+                "terminal_failure": {
+                    "error_message": self.state.error_message,
+                    "publication_attempt": attempt.model_dump(mode="json"),
+                    "pr": pr.model_dump(mode="json") if pr is not None else None,
+                    "head_sha": head,
+                },
+            }
+            decision = terminal_release_decision(reason, TerminalReleaseFacts(
+                failure_persisted=True, remote_ownership_known=remote_known,
+                remote_outcome_resolved=resolved, cleanup_confirmed=True,
+                worktree_stable=not dirty, no_loss_confirmed=remote_known and not dirty,
+                user_paused=self.state.user_paused,
+                cost_hold=self.state.rate_limited_until is not None,
+                security_hold=task.pr_id in self._user_stopped_task_pr_ids,
+            ))
+            if decision != TerminalReleaseDecision.RELEASE:
+                self.log_event(
+                    f"[RECOVERY] Terminal release {decision.value}; re-observing safety evidence next cycle."
+                )
+                return
+            await self._suppress_task(task.pr_id, reason, evidence)
+            retained = await self._suppression_record_for_task(task.pr_id)
+            if retained is None or retained.reason != reason or retained.detail != evidence:
+                self.log_event("[RECOVERY] Terminal failure persistence unconfirmed; staying ERROR.")
+                return
+        except Exception as exc:
+            self.log_event(f"[RECOVERY] Terminal failure reconciliation deferred: {exc}.")
+            return
+        self.state.current_task = None
+        self._current_run_record = None
+        self._reset_runner_local_task_counters()
+        self.state.state = PipelineState.IDLE
+        self.log_event("[RECOVERY] Failed attempt retained; independent work released.")
 
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the selected coder whether to FIX, SKIP, or ESCALATE the error."""
@@ -587,10 +691,8 @@ class ErrorMixin:
                 )
                 git_ops._git(self.repo_path, "clean", "-fd", check=False)
         if verdict == "SKIP":
-            self.state.current_task = None
-            self._reset_runner_local_task_counters()
-            self.state.state = PipelineState.IDLE
-            self.log_event("[ERROR] diagnose_error: SKIP -> IDLE.")
+            await self._mark_diagnose_exhausted(retry_task_id or "")
+            self.log_event("[ERROR] diagnose_error: SKIP -> terminal failure reconciliation.")
         elif verdict == "FIX":
             await _clear_cause_for_retry()
             await self._clear_error_message_on_recovery(

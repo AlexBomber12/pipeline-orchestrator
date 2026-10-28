@@ -174,9 +174,9 @@ def test_silent_hole_removed(
 
     asyncio.run(runner._run_cycle_body())
 
-    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.state == PipelineState.ERROR
     assert any(
-        "AI diagnosis disabled for self-healing ERROR (infra_failure) -> IDLE"
+        "bound cleanup/work proof required"
         in event
         for event in _events(runner)
     )
@@ -218,8 +218,8 @@ def test_self_healing_unchanged(
 
     asyncio.run(infra._run_cycle_body())
 
-    assert infra.state.state == PipelineState.IDLE
-    assert any("Infra error detected" in event for event in _events(infra))
+    assert infra.state.state == PipelineState.ERROR
+    assert any("bound cleanup/work proof required" in event for event in _events(infra))
 
     limited = _runner(tmp_path / "limited")
     _stub_cycle(monkeypatch, limited)
@@ -381,7 +381,7 @@ def test_flag_off_uses_legacy_branch(
 
     asyncio.run(runner._run_cycle_body())
 
-    assert calls == ["handle_error"]
+    assert calls == []
     assert runner.state.state == PipelineState.ERROR
 
 
@@ -541,3 +541,177 @@ def test_store_record_clear_path_releases_to_idle(
         "guardrail park cleared by operator -> IDLE" in event
         for event in _events(runner)
     )
+
+
+@pytest.fixture
+def terminal_repo(tmp_path, monkeypatch):
+    """Real Git preservation/status transport; GitHub observation is controlled."""
+    from src.daemon import git_ops
+    from src.models import InvocationSnapshot, PRInfo, PublicationAttempt, QueueTask, TaskStatus
+    from src.github import prs as gh_prs
+    from src.task_status import MergedState
+
+    repo, remote = tmp_path / "repo", tmp_path / "remote.git"
+    repo.mkdir()
+    git = lambda *args: git_ops._git(str(repo), *args)
+    git("init", "--bare", str(remote))
+    git("init", "-b", "main")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.com")
+    git("remote", "add", "origin", str(remote))
+    for number, dependency in [(1, "none"), (2, "none"), (3, "PR-001")]:
+        task = _task(f"PR-{number:03}")
+        _write_task(repo, task, None, status="TODO")
+        path = repo / task.task_file
+        path.write_text(path.read_text().replace("Depends on: none", f"Depends on: {dependency}"))
+    git("add", "tasks")
+    git("commit", "-m", "tasks")
+    git("push", "origin", "main")
+    git("checkout", "-b", "branch-pr-001")
+    head = git("rev-parse", "HEAD").stdout.strip()
+    git("push", "origin", "HEAD")
+    runner = _make_runner(publication_contract=2)
+    runner.repo_path = str(repo)
+    runner.repo_config.url = str(remote)
+    runner._recovered = runner._scaffolded = True
+    runner.state.current_task = QueueTask(
+        pr_id="PR-001", title="Failed A", branch="branch-pr-001",
+        task_file="tasks/PR-001.md", status=TaskStatus.DOING,
+    )
+    runner.state.current_pr = PRInfo(number=1, branch="branch-pr-001", head_sha=head)
+    runner.state.active_invocation = InvocationSnapshot(
+        phase="coding", run_id="failed-A", attempt_index=1,
+        plugin_id="claude", model_override=None, reasoning_effort_override=None,
+    )
+    runner.state.publication_attempt = PublicationAttempt(
+        repo=runner.owner_repo, base="main", task_id="PR-001", branch="branch-pr-001",
+        run_id="failed-A", attempt_index=1, started_at=datetime.now(timezone.utc),
+        contract_version=2, expected_head_sha=head, cleanup_confirmed=True,
+        pending=False, pr_number=1,
+    )
+    # Exercise the real isolated status writer; it must leave the task checkout alone.
+    asyncio.run(runner._commit_and_park_in_error("A exhausted", subsource="fix_iteration_cap"))
+    assert git("status", "--porcelain").stdout == ""
+    assert git("rev-parse", "HEAD").stdout.strip() == head
+    _stub_cycle(monkeypatch, runner)
+    monkeypatch.setattr(gh_prs, "get_exact_pr_outcome", lambda *args, **kwargs: gh_prs.ExactPROutcome(
+        runner.owner_repo, "main", 1, head, gh_prs.ExactPRState.OPEN, True,
+    ))
+    monkeypatch.setattr("src.daemon.handlers.idle._resolve_merged_state", lambda *args, **kwargs: MergedState(
+        merged_branches=set(), merged_pr_ids=set(), api_available=True,
+    ))
+    return runner, git
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_terminal_dispatch_releases_only_independent_work(terminal_repo, flag):
+    from src.models import TaskStatus
+
+    runner, git = terminal_repo
+    runner.repo_config.feature_flags.use_single_error_exit = flag
+    failed_pr = runner.state.current_pr.model_copy(deep=True)
+    asyncio.run(runner._run_cycle_body())
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    retained = asyncio.run(runner._suppression_record_for_task("PR-001"))
+    assert retained.reason == SuppressionReason.FIX_ITERATION_CAP
+    assert retained.detail["terminal_failure"]["pr"]["number"] == 1
+    assert retained.detail["terminal_failure"]["error_message"] == "A exhausted"
+    git("fetch", "origin", "main")
+    assert "status: ERROR" in git("show", "origin/main:tasks/PR-001.md").stdout
+    # The selector sees the real updated base and the still-open failed PR.
+    git("checkout", "main")
+    git("pull", "--ff-only", "origin", "main")
+    selected = asyncio.run(runner._select_next_task_or_attach([failed_pr], []))
+    assert selected.pr_id == "PR-002"
+    assert runner._idle_dag_statuses["PR-001"] == TaskStatus.ERROR
+    assert runner._idle_dag_statuses["PR-003"] != TaskStatus.DONE
+    assert not any(t.pr_id == "PR-003" and t.status == TaskStatus.DOING for t in runner.state.current_queue)
+    assert asyncio.run(runner._suppression_record_for_task("PR-001")) is not None
+    # Repeat selection cannot reattach exhausted A or select blocked C.
+    assert asyncio.run(runner._select_next_task_or_attach([failed_pr], [])).pr_id == "PR-002"
+
+
+@pytest.mark.parametrize("hold", [
+    "unknown_cleanup", "unknown_child", "dirty", "remote", "storage", "read",
+    "paused", "quota", "guardrail", "pending", "identity", "status", "unpublished",
+])
+def test_terminal_dispatch_holds_unproved_attempts(terminal_repo, monkeypatch, hold):
+    runner, git = terminal_repo
+    attempt = runner.state.publication_attempt
+    if hold == "unknown_cleanup":
+        attempt.cleanup_confirmed = False
+    elif hold == "unknown_child":
+        runner._current_coder_process = object()
+    elif hold == "dirty":
+        (Path(runner.repo_path) / "unpreserved.txt").write_text("work")
+    elif hold == "remote":
+        git("push", "origin", "--delete", attempt.branch)
+    elif hold == "storage":
+        async def ignored(*args):
+            pass
+        monkeypatch.setattr(runner, "_suppress_task", ignored)
+    elif hold == "read":
+        async def unavailable(*args):
+            raise OSError("storage unavailable")
+        monkeypatch.setattr(runner, "_suppression_record_for_task", unavailable)
+    elif hold == "paused":
+        runner.state.user_paused = True
+    elif hold == "quota":
+        runner.state.rate_limited_until = datetime.now(timezone.utc) + timedelta(minutes=5)
+    elif hold == "guardrail":
+        asyncio.run(runner._commit_and_park_in_error("GUARDRAIL", subsource="guardrail"))
+        asyncio.run(runner._suppress_task("PR-001", SuppressionReason.GUARDRAIL))
+    elif hold == "pending":
+        attempt.pending = True
+    elif hold == "identity":
+        attempt.run_id = "unknown-restart-owner"
+    elif hold == "status":
+        monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task", lambda: (None, None, None))
+    elif hold == "unpublished":
+        (Path(runner.repo_path) / "work").write_text("unpublished")
+        git("add", "work")
+        git("commit", "-m", "unpublished work")
+    asyncio.run(runner._run_cycle_body())
+    assert runner.state.state in (PipelineState.ERROR, PipelineState.PAUSED)
+    assert runner.state.current_task.pr_id == "PR-001"
+    assert runner.state.current_pr.number == 1
+    if hold == "dirty":
+        assert (Path(runner.repo_path) / "unpreserved.txt").read_text() == "work"
+
+
+def test_terminal_release_without_pr_retains_published_work(terminal_repo, monkeypatch):
+    runner, _ = terminal_repo
+    runner.state.current_pr = None
+    runner.state.publication_attempt.pr_number = None
+    monkeypatch.setattr("src.github.prs.get_branch_publications", lambda *args: [])
+    asyncio.run(runner._run_cycle_body())
+    assert runner.state.state == PipelineState.IDLE
+    record = asyncio.run(runner._suppression_record_for_task("PR-001"))
+    assert record.detail["terminal_failure"]["pr"] is None
+    assert record.detail["terminal_failure"]["head_sha"]
+
+
+def test_terminal_technical_hold_reconciles_automatically(terminal_repo):
+    runner, git = terminal_repo
+    path = Path(runner.repo_path) / "saved-work"
+    path.write_text("operator preserves this work elsewhere")
+    asyncio.run(runner._run_cycle_body())
+    assert runner.state.state == PipelineState.ERROR
+    # Only the fixture owner removes its own scratch file after preservation.
+    path.unlink()
+    asyncio.run(runner._run_cycle_body())
+    assert runner.state.state == PipelineState.IDLE
+    assert git("rev-parse", "HEAD").stdout.strip()
+    assert asyncio.run(runner._suppression_record_for_task("PR-001")) is not None
+
+
+def test_terminal_unpublished_attempt_requires_base_preservation(terminal_repo, monkeypatch):
+    runner, git = terminal_repo
+    runner.state.current_pr = None
+    runner.state.publication_attempt.pr_number = None
+    git("push", "origin", "--delete", runner.state.publication_attempt.branch)
+    monkeypatch.setattr("src.github.prs.get_branch_publications", lambda *args: [])
+    asyncio.run(runner._run_cycle_body())
+    assert runner.state.state == PipelineState.IDLE
+    assert asyncio.run(runner._suppression_record_for_task("PR-001")) is not None

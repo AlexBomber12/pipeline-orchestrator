@@ -459,12 +459,12 @@ def test_error_diagnose_skip_clears_task(
 
     asyncio.run(runner.handle_error())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_task is None
-    assert runner.state.current_pr is None
-    assert runner.state.error_message is None
-    assert runner._error_diagnose_count == 0
-    assert any("diagnose_error: SKIP -> IDLE" in e["event"] for e in runner.state.history)
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task is not None
+    assert runner.state.current_pr is not None
+    assert runner.state.error_message is not None
+    assert runner._error_diagnose_count > 0
+    assert any("diagnose_error: SKIP -> terminal failure reconciliation" in e["event"] for e in runner.state.history)
 
 
 @pytest.mark.parametrize(

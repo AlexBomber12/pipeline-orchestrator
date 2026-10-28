@@ -288,8 +288,8 @@ async def test_bounded_uncertainty_preserves_work_and_actionable_evidence(lifecy
     await fresh._run_cycle_body()
     assert fresh.state.publication_attempt.exhausted
     assert not fresh.state.publication_attempt.pending
-    assert fresh.state.current_task is None
-    assert fresh.state.state == PipelineState.IDLE
+    assert fresh.state.current_task is not None
+    assert fresh.state.state == PipelineState.ERROR
     assert status.call_args.args[1] == 'ERROR'
     assert 'expected=' + expected in status.call_args.args[2]
     assert 'branch=' in status.call_args.args[2] and 'PR=' in status.call_args.args[2]
@@ -559,7 +559,7 @@ async def test_exhaustion_retries_only_failed_terminal_writes(lifecycle, monkeyp
     assert provider['calls'] == 1  # only capture, no extra provider poll
     monkeypatch.setattr(fresh, '_commit_task_status_change', AsyncMock(return_value=True))
     await fresh._run_cycle_body()
-    assert fresh.state.current_task is None
+    assert fresh.state.current_task is not None
     assert not fresh.state.publication_attempt.pending
     assert provider['requests'] == []
 
@@ -892,8 +892,10 @@ async def test_retry_retains_exhausted_expected_head_after_independent_work(life
     Clock.value = runner.state.publication_attempt.reconcile_deadline
     monkeypatch.setattr(runner, '_commit_task_status_change', AsyncMock(return_value=True))
     await runner._hold_unresolved_publication()
-    assert runner.state.current_task is None
+    assert runner.state.current_task is not None  # uncertainty now retains execution
     assert runner.state.publication_attempt.exhausted
+    # Model a later operator-resolved hold; the retry floor must still survive.
+    runner.state.current_task = None
     # Another completed task may replace the active attempt. The durable cause
     # must still prevent operator Retry from admitting the older green PR head.
     runner.state.publication_attempt = None

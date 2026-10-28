@@ -369,10 +369,10 @@ def test_diagnose_skip_clears_task_pr_error_and_returns_idle(
 
     asyncio.run(runner.handle_error())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_task is None
-    assert runner.state.current_pr is None
-    assert runner.state.error_message is None
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task is not None
+    assert runner.state.current_pr is not None
+    assert runner.state.error_message is not None
 
 
 # ---------------------------------------------------------------------------
@@ -813,9 +813,9 @@ def test_handle_error_skip_clears_state(monkeypatch: pytest.MonkeyPatch) -> None
     runner.state.current_task = QueueTask(pr_id="PR-001", title="t", status=TaskStatus.DOING)
     asyncio.run(runner.handle_error())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.error_message is None
-    assert runner.state.current_task is None
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.error_message is not None
+    assert runner.state.current_task is not None
 
 
 def test_handle_error_falls_back_to_codex_for_diagnosis(
@@ -1259,9 +1259,9 @@ def test_handle_error_non_fix_dirty_tree_skips_cleanup_when_head_lookup_fails(
 
     asyncio.run(runner.handle_error())
 
-    assert runner.state.state == PipelineState.IDLE
-    assert runner.state.current_task is None
-    assert runner.state.current_pr is None
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task is not None
+    assert runner.state.current_pr is not None
     assert [cmd[0] for cmd in calls] == ["status", "status", "rev-parse"]
     assert not any(cmd[:1] == ("reset",) for cmd in calls)
     assert not any(cmd[:1] == ("clean",) for cmd in calls)
@@ -2293,6 +2293,8 @@ def test_run_cycle_in_error_with_park_flag_releases_when_cause_deleted(
 
     monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
 
+    monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
+                        lambda: ("todo", None, "operator-retry"))
     asyncio.run(runner.run_cycle())
 
     assert calls == []
@@ -2300,7 +2302,7 @@ def test_run_cycle_in_error_with_park_flag_releases_when_cause_deleted(
     assert runner.state.skip_ai_error_diagnose is False
     assert runner.state.error_message is None
     assert any(
-        "review_timeout park cleared by operator" in entry.get("event", "")
+        "operator-cleared ERROR task frontmatter" in entry.get("event", "")
         for entry in runner.state.history
     )
 
@@ -2351,6 +2353,8 @@ def test_run_cycle_review_timeout_park_release_resets_repost_flag(
     monkeypatch.setattr(runner, "publish_state", fake_publish_state)
     monkeypatch.setattr(runner, "handle_idle", fake_handle_idle)
 
+    monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
+                        lambda: ("todo", None, "operator-retry"))
     asyncio.run(runner.run_cycle())
 
     assert runner.state.state == PipelineState.IDLE
