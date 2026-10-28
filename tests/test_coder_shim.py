@@ -453,6 +453,37 @@ async def test_settings_shim_catalogue_uses_production_discovery(tmp_path):
     ]
 
 
+async def test_settings_shim_refresh_recovers_cached_discovery_failure(tmp_path, monkeypatch):
+    from src.coder_registry import ModelCatalogUnavailable
+    from src.coders.claude import ClaudePlugin
+    from src.config import AppConfig
+    from src.web.services.model_catalog import ModelCatalogCache
+
+    (tmp_path / "claude").symlink_to(SHIM.resolve())
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    calls = []
+
+    async def daemon_loader(plugin, **kwargs):
+        calls.append(plugin.name)
+        if len(calls) == 1:
+            raise ModelCatalogUnavailable("test daemon restarting")
+        return await plugin.get_model_catalog(**kwargs)
+
+    cache = ModelCatalogCache(loader=daemon_loader)
+    plugin = ClaudePlugin()
+    kwargs = {"config": AppConfig(), "config_path": str(tmp_path / "config.yml")}
+    try:
+        assert (await cache.get(plugin, **kwargs)).status == "unavailable"
+        assert (await cache.get(plugin, **kwargs)).models == ()
+        assert calls == ["claude"]
+        refreshed = await cache.get(plugin, refresh=True, **kwargs)
+        assert refreshed.status == "available"
+        assert [model.invocation_id for model in refreshed.models] == ["opus", "sonnet"]
+        assert calls == ["claude", "claude"]
+    finally:
+        await cache.close()
+
+
 def test_settings_shim_records_bound_launch_without_prompt(tmp_path):
     import json
 

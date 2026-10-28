@@ -122,6 +122,24 @@ def test_settings_model_effort_reach_next_launch(
         _stop_daemon_and_wait_paused(TESTBED_SLUG)
         page.goto(f"{dashboard_url}/settings", wait_until="domcontentloaded")
         page.wait_for_function("Boolean(window.htmx && window.settingsSaveFeedbackInstalled)")
+        # Earlier scenarios restart daemon-test. A failed discovery can remain
+        # cached after it returns; waiting on select_option cannot refresh it.
+        card = page.locator('[data-coder-card="claude"]')
+        evidence["initial_catalog_status"] = card.locator("[data-model-catalog-status]").get_attribute(
+            "data-model-catalog-status"
+        )
+        previous_card = card.element_handle()
+        with page.expect_response(
+            lambda response: response.url.endswith("/partials/settings/coders/claude/models/refresh")
+            and response.request.method == "POST"
+        ) as refreshed:
+            card.get_by_role("button", name="Refresh models", exact=True).click()
+        assert refreshed.value.status == 200
+        page.wait_for_function("element => !element.isConnected", arg=previous_card)
+        expect(card.locator("[data-model-catalog-status]")).to_have_attribute(
+            "data-model-catalog-status", "available"
+        )
+        expect(page.locator('#claude-model option[value="sonnet"]')).to_have_count(1)
         save("#claude-model", "sonnet", {"coder_settings": {"claude": {"model": "sonnet"}}})
         save("#claude-reasoning-effort", "low", {"coder_settings": {"claude": {"reasoning_effort": "low"}}})
         with coder_shim("hang"):

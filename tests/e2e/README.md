@@ -135,6 +135,10 @@ The same module checks overlay precedence with the production config writer,
 loader and plugin launch-kwargs resolver in a temporary directory, with an
 explicit `config.production.yml`; it never writes an overlay into the stack.
 The shim advertises synthetic models through the real SDK discovery protocol.
+Before selecting a model, the journey uses the existing Refresh models button
+and waits for its HTMX replacement and an available catalogue containing
+`sonnet`. This bypasses an unavailable catalogue cached during earlier fixture
+restarts; the initial catalogue status is retained in the journey evidence.
 This proves orchestration and argument propagation, not provider model support,
 real account access or deployment. Existing testbed App/stack setup remains a
 prerequisite; real provider/deployment smoke is an operator release action.
