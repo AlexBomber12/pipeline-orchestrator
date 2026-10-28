@@ -967,3 +967,103 @@ async def test_operator_retry_uses_shared_pending_publication_continuation(lifec
         assert runner.state.current_pr.push_count == 2
         assert runner.state.current_pr.fix_iteration_count == 4
         assert len(provider['requests']) == 1
+
+
+@pytest.mark.parametrize('pending', [False, True])
+async def test_failed_unpublished_dirty_attempt_survives_preflight_and_restart(lifecycle, pending):
+    from src.daemon.preflight import PreflightMixin
+    from src.subsource_registry import SuppressionReason
+    from src.web.services.repo_state import compute_repo_dependents_count, load_current_queue
+
+    runner, provider, repo, _, expected, configure = lifecycle
+    remote = git(repo, 'remote', 'get-url', 'origin')
+    git(remote, 'update-ref', '-d', 'refs/heads/pr-001')
+    runner.state.current_pr = None
+    runner._capture_invocation_snapshot('claude', {}, phase='coding')
+    runner._begin_publication_attempt(started_at=Clock.value, baseline_numbers=set())
+    attempt = runner.state.publication_attempt
+    attempt.initial_branch_head_sha = ''
+    attempt.expected_head_sha = expected
+    attempt.head_sha = expected
+    attempt.exit_classification = 'failure'
+    attempt.cleanup_confirmed = True
+    attempt.pending = pending
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = 'deterministic continuity failure'
+    queue = [
+        runner.state.current_task.model_copy(update={'status': TaskStatus.ERROR}),
+        QueueTask(pr_id='PR-002', title='independent', status=TaskStatus.TODO, branch='pr-002'),
+        QueueTask(pr_id='PR-003', title='dependent', status=TaskStatus.TODO,
+                  branch='pr-003', depends_on=['PR-001']),
+    ]
+    # Real dispatch publishes DOING before the failed coder exits. A pending
+    # dirty hold never reaches header reconstruction to replace that snapshot.
+    runner.state.current_queue = [
+        task.model_copy(update={'status': TaskStatus.DOING})
+        if pending and task.pr_id == 'PR-001' else task
+        for task in queue
+    ]
+    dirty = repo / 'continuity-dirty.txt'
+    dirty.write_text('unpreserved failed attempt work\n')
+    await runner._suppress_task('PR-001', SuppressionReason.CRASH, {})
+
+    def restore(fresh):
+        configure(fresh)
+        # Exercise real preflight and ERROR dispatch, controlling only the
+        # remote status observation (the status writer uses another checkout).
+        fresh.preflight = PreflightMixin.preflight.__get__(fresh)
+        fresh._remote_frontmatter_error_status_for_current_task = lambda: (
+            'error', SuppressionReason.CRASH, expected,
+        )
+        return fresh
+
+    restore(runner)
+    await runner.publish_state()
+    # More than the three-cycle auto-reset threshold, with a fresh runner
+    # halfway through the unresolved publication case observed in GHA.
+    for cycle in range(8):
+        if pending and cycle == 4:
+            runner = await restart(runner, restore)
+        else:
+            runner._recovered = True
+            await runner._run_cycle_body()
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.current_task.pr_id == 'PR-001'
+        retained = runner.state.publication_attempt
+        for field in ('task_id', 'branch', 'run_id', 'attempt_index', 'expected_head_sha',
+                      'exit_classification', 'cleanup_confirmed', 'pending'):
+            assert getattr(retained, field) == getattr(attempt, field)
+        assert runner.state.error_message == 'deterministic continuity failure'
+        assert dirty.read_text() == 'unpreserved failed attempt work\n'
+        assert git(repo, 'branch', '--show-current') == 'pr-001'
+        assert git(repo, 'rev-parse', 'HEAD') == expected
+        assert runner._consecutive_dirty_cycles == 0
+        # Pending-publication recovery returns before header reconstruction.
+        # Its published queue must still expose the retained failure's edge.
+        assert await load_current_queue(runner.name, runner.redis) == queue
+        assert await compute_repo_dependents_count(
+            str(repo.parent), runner.name, {'PR-001'}, runner.redis,
+        ) == {'PR-001': 1}
+    assert provider['requests'] == []
+
+
+@pytest.mark.parametrize('case', ['failed', 'other-branch', 'done', 'success', 'unbound', 'paused', 'absent'])
+async def test_held_failure_queue_projection_is_bound(lifecycle, case):
+    from src.web.services.repo_state import load_current_queue
+
+    runner, _, _, _, _, _ = lifecycle
+    attempt = runner.state.publication_attempt
+    attempt.exit_classification = 'success' if case == 'success' else 'failure'
+    runner.state.state = PipelineState.PAUSED if case == 'paused' else PipelineState.ERROR
+    task = runner.state.current_task.model_copy(update={
+        'branch': 'another-generation' if case == 'other-branch' else attempt.branch,
+        'status': TaskStatus.DONE if case == 'done' else TaskStatus.DOING,
+    })
+    if case == 'unbound':
+        attempt.task_id = 'PR-999'
+    runner.state.current_queue = None if case == 'absent' else [task]
+    await runner.publish_state()
+    expected = None if case == 'absent' else [task.model_copy(update={
+        'status': TaskStatus.ERROR if case == 'failed' else task.status,
+    })]
+    assert await load_current_queue(runner.name, runner.redis) == expected

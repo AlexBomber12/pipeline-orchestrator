@@ -367,6 +367,22 @@ main() {
     fi
 
     case "${scenario}" in
+        failure_continuity)
+            # This scenario owns a task invocation journal outside the checkout.
+            # Diagnosis probes returned above; only real task attempts count.
+            printf '%s\t%s\n' "${pr}" "${branch}" >> "${PO_SHIM_SCENARIO_FILE}.calls"
+            case "${branch}" in
+                *-clean-root|*-dirty-root)
+                    git_setup_branch "${branch}"
+                    if [[ "${branch}" == *-dirty-root ]]; then
+                        printf 'unpreserved work for %s\n' "${pr}" > continuity-dirty.txt
+                    fi
+                    printf 'shim: deterministic continuity failure\n' >&2
+                    exit 1
+                    ;;
+                *) run_success "${pr}" "${branch}" ;;
+            esac
+            ;;
         exit_nonzero)
             # Fail with bound, clean work already preserved on the remote base.
             # A failure before branch creation deliberately lacks release proof.

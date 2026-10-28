@@ -22,6 +22,7 @@ testbed repository. It runs after the unit job. Current paths include:
 | --- | --- |
 | Stack/API and access | `test_smoke.py` checks `/api/states`; `test_shim.py` checks the installed coder shim; `test_ci_evidence_access.py` probes testbed GitHub App access to check runs and statuses in CI. |
 | Task lifecycle | `test_upload_and_merge.py` exercises upload through CODING/WATCH to IDLE with the success shim, but does not verify that the matching GitHub PR merged; `test_stop_and_resume.py` checks stop/resume and next-task selection; `test_watch_changes_requested.py`, `test_fix_coder_escalate.py`, and `test_fix_external_merge.py` exercise review, FIX, ERROR, and external-merge paths. |
+| Failure continuity | `test_failure_continuity.py` uploads fresh A/C/B tasks while paused, fails A with the shim, requires A ERROR/cause and blocked C, then verifies independent B through GitHub `merged=true`, exact head/merge commit and main marker, and DONE. Its invocation journal rejects repeated A or executed C. Clean completion survives a fixture-owned daemon restart; a dirty failure remains held across restart with B TODO and its work retained. |
 | Recovery and cancellation | `test_sigkill_recovery.py`, `test_sigkill_recovery_multitask.py`, `test_cancellation_cause_crash.py`, and `test_redis_down_and_recover.py` cover process/Redis failure and recovery signals. |
 | Chromium UI | `test_settings_navigation_ui.py` checks settings navigation, layout, and theme persistence; `test_settings_save_feedback_ui.py` checks real and mocked save responses, stale responses, retry behavior, and webhook feedback through browser interactions. |
 
@@ -29,8 +30,8 @@ These are the test paths currently present. Historical PR references in tests
 and task plans are context, not evidence that a proposed test exists. Any
 additional lifecycle, API, or browser case remains **planned** until its test
 is merged and collected by the existing workflow.
-Matching GitHub PR merge verification for the success-shim happy path is
-**planned**; its current IDLE assertion does not establish that outcome.
+The failure-continuity journey verifies a matching GitHub merge; the older
+`test_upload_and_merge.py` still uses IDLE alone.
 An isolated real-Redis component test for Redis atomicity is likewise **planned**
 where that guarantee is needed; a fake Redis test does not prove it.
 
@@ -78,3 +79,35 @@ The mock coder shim verifies orchestration around its scripted responses, not
 real coder/provider login, account access, or deployed behavior. Record those
 remaining boundaries in the PR. Real credential, provider, and deployment smoke
 checks are operator-run upgrade/release actions; a source merge is not deployment.
+
+## Failure continuity evidence and limits
+
+The existing serialized integration job collects both continuity cases. Focused
+host command: `python -m pytest tests/e2e/test_failure_continuity.py -v`.
+Each case writes `e2e-evidence/continuity-<unique-id>.json` with the exact tested
+checkout SHA (which may be GitHub's PR merge SHA), fresh task identities, outcome,
+and successful-case PR head/merge SHA. The workflow's `run.json` and failure
+records identify the tested SHA if setup fails before that evidence is written.
+An absent outcome is not a passing journey. Local collection and shim unit tests
+do not establish integration success; inspect the existing GHA job and evidence.
+
+`failure_continuity` routes only fixture branches ending in `-clean-root` or
+`-dirty-root` to deterministic failure; other tasks use the existing success
+shim and a marker unique to the task ID. It journals task attempts outside the
+checkout, excluding auth and diagnosis probes. Manual pause is observed across
+several test poll cycles before any task is dispatched. Clean restart follows
+production-confirmed failure release and B completion. Dirty restart is a held
+negative control: the exited shim has confirmed process cleanup before restart,
+but work preservation is unproved. A dirty checkout can keep the failed
+publication pending: the test requires the bound task/branch, failed exit,
+confirmed process cleanup and the dirty-work cleanup refusal (or terminal wait),
+rather than waiting for terminal reconciliation to finish. It records that
+attempt and checks the dirty file before and after restart.
+Recovery must retain A's identity and dirty
+file, without dispatching B or C. This does not prove restart ownership takeover
+for a live or unconfirmed coder; such takeover remains unsupported/held by the
+production contract. Only the fixture-owned `daemon-test` service is restarted.
+
+No provider login, real coder output, deployment or production restart is tested.
+The existing testbed App/stack prerequisites in `docs/ci-setup.md` still apply;
+real provider and deployment smoke remain operator release actions.

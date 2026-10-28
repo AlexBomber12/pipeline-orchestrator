@@ -70,12 +70,18 @@ class PreflightMixin:
     async def preflight(self) -> bool:
         """Return ``True`` iff the working tree is clean."""
         task, pr = self.state.current_task, self.state.current_pr
+        attempt = self.state.publication_attempt
         if self.state.state in {PipelineState.ERROR, PipelineState.PAUSED} and (
             is_retained_merge_error(self.state.error_message)
+            or (attempt is not None and attempt.contract_version == 2
+                and attempt.exit_classification == "failure"
+                and self._publication_attempt_matches_dispatch())
             or (task is not None and pr is not None
                 and self._bound_pr_has_unpublished_work(task, pr))
         ):
-            # This checkout may contain the resolver's unpublished work.
+            # This checkout may contain the failed coder's unpublished work,
+            # including an attempt with no PR. Cleanup proves process exit,
+            # not preservation of dirty files; terminal release checks that.
             # ERROR dispatch can repair the task status without mutating it.
             self._build_dirty_tree_policy().reset(self)
             return True

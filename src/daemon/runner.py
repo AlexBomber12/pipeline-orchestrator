@@ -3412,6 +3412,19 @@ class PipelineRunner(
             # parent snapshot shape) before recovery has read it.
             return
         self.state.active = self.repo_config.active
+        attempt = self.state.publication_attempt
+        if (self.state.state == PipelineState.ERROR and attempt is not None
+            and attempt.exit_classification == "failure"
+            and self._publication_attempt_matches_dispatch()
+            and self.state.current_queue is not None):
+            # A held failure may bypass header recovery for many cycles. Keep
+            # its queue display consistent without authorizing terminal release.
+            self.state.current_queue = [
+                queued.model_copy(update={"status": TaskStatus.ERROR})
+                if (queued.pr_id, queued.branch) == (attempt.task_id, attempt.branch)
+                and queued.status != TaskStatus.DONE else queued
+                for queued in self.state.current_queue
+            ]
         task = self.state.current_task
         self.state.error_task_status_confirmed = (
             self.state.state == PipelineState.ERROR
