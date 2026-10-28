@@ -738,6 +738,7 @@ def test_shared_config_fixture_resets_testbed_after_dispatch() -> None:
                 "clear_testbed_redis_state",
                 side_effect=lambda slug: calls.append(f"clear:{slug}"),
             ),
+            patch.object(e2e_conftest.subprocess, "run"),
             patch.object(e2e_conftest, "_resume_daemon", side_effect=lambda slug: calls.append(f"resume:{slug}")),
         ):
             fixture = e2e_conftest.shared_test_config.__wrapped__(None, lambda: None)
@@ -774,12 +775,15 @@ def test_shared_config_fixture_waits_for_runner_to_apply_restored_config(tmp_pat
             patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=lambda _: calls.append("clear")),
             patch.object(e2e_conftest, "_runner_apply_count", side_effect=lambda: 7),
             patch.object(e2e_conftest, "_daemon_reload_count", return_value=3),
-            patch.object(e2e_conftest, "_wait_for_daemon_reload", side_effect=lambda _: calls.append("reconciled")),
             patch.object(e2e_conftest, "_resume_daemon", side_effect=lambda _: calls.append("resume")),
             patch.object(
+                e2e_conftest.subprocess, "run",
+                side_effect=lambda command, **kwargs: calls.append(command[-2] + ":" + command[-1]),
+            ),
+            patch.object(
                 e2e_conftest,
-                "_wait_for_runner_apply",
-                side_effect=lambda count: calls.append(f"applied-after:{count}"),
+                "_wait_for_fresh_idle",
+                side_effect=lambda *args, **kwargs: calls.append("fresh-idle"),
             ),
         ):
             fixture = e2e_conftest.shared_test_config.__wrapped__(None, lambda: None)
@@ -796,7 +800,7 @@ def test_shared_config_fixture_waits_for_runner_to_apply_restored_config(tmp_pat
         sys.modules.pop(module_name, None)
 
     assert config_path.read_bytes() == baseline
-    assert calls == ["stop", "reset", "clear", "reconciled", "resume", "applied-after:7"]
+    assert calls == ["stop", "stop:daemon-test", "reset", "clear", "start:daemon-test", "resume", "fresh-idle"]
 
 
 @pytest.mark.parametrize("write_completed", [False, True])
@@ -822,7 +826,8 @@ def test_shared_config_fixture_restores_after_settings_request_failure(tmp_path,
             patch.object(e2e_conftest, "_daemon_reload_count", return_value=3),
             patch.object(e2e_conftest, "_wait_for_daemon_reload"),
             patch.object(e2e_conftest, "_resume_daemon"),
-            patch.object(e2e_conftest, "_wait_for_runner_apply") as wait_for_apply,
+            patch.object(e2e_conftest.subprocess, "run") as restart,
+            patch.object(e2e_conftest, "_wait_for_fresh_idle") as wait_for_idle,
         ):
             fixture = e2e_conftest.shared_test_config.__wrapped__(None, lambda: None)
             _, expect_settings_coder_write, _, _ = next(fixture)
@@ -834,7 +839,10 @@ def test_shared_config_fixture_restores_after_settings_request_failure(tmp_path,
             with pytest.raises(StopIteration):
                 next(fixture)
             assert config_path.read_bytes() == baseline
-            assert wait_for_apply.called == write_completed
+            assert wait_for_idle.called == write_completed
+            assert [call.args[0][-2:] for call in restart.call_args_list] == [
+                ["stop", "daemon-test"], ["start", "daemon-test"],
+            ]
     finally:
         sys.modules.pop(module_name, None)
 
