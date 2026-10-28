@@ -2616,9 +2616,13 @@ class PipelineRunner(
 
         # The coder checkout can retain TODO after the status writer commits
         # ERROR to the base branch. Only the confirmed base can clear a park.
-        frontmatter_status, _blocked, _revision = await asyncio.to_thread(
+        frontmatter_status, _blocked, revision = await asyncio.to_thread(
             self._remote_frontmatter_error_status_for_current_task
         )
+        # An observed task may omit the optional status field (implicit TODO).
+        # A missing revision instead means the remote observation failed.
+        if frontmatter_status is None and revision is not None:
+            frontmatter_status = "todo"
         if task_id is not None and frontmatter_status == "error":
             self._confirmed_error_task_pr_ids.add(task_id)
         if frontmatter_status == "error" and (reason is None or from_frontmatter):

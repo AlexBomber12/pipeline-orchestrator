@@ -381,8 +381,9 @@ def test_flag_off_uses_common_terminal_policy(
 
 
 @pytest.mark.parametrize("flag", [False, True])
+@pytest.mark.parametrize("omit_status", [False, True])
 def test_unchanged_todo_diagnoses_until_bounded_exhaustion(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: bool,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, flag: bool, omit_status: bool,
 ) -> None:
     from tests.runner import _helpers as h
 
@@ -391,6 +392,9 @@ def test_unchanged_todo_diagnoses_until_bounded_exhaustion(
     runner.app_config.daemon.error_handler_use_ai = True
     _stub_cycle(monkeypatch, runner)
     _clear_task_frontmatter(runner)
+    if omit_status:
+        task_path = tmp_path / runner.state.current_task.task_file
+        task_path.write_text(task_path.read_text().replace("status: TODO\n", ""))
     # A prior incident's ERROR evidence cannot authorize this new failure.
     asyncio.run(runner._transition_to_error(
         "Coder exited with nonzero status", save_run_record_as=None,
@@ -417,7 +421,7 @@ def test_unchanged_todo_diagnoses_until_bounded_exhaustion(
         assert runner._error_diagnose_count == count
         assert runner.state.error_message == "Coder exited with nonzero status"
         if count < 4:
-            assert runner._frontmatter_error_status_for_current_task()[0] == "todo"
+            assert runner._frontmatter_error_status_for_current_task()[0] == (None if omit_status else "todo")
 
     assert len(calls) == 3
     assert runner._frontmatter_error_status_for_current_task() == (
@@ -932,3 +936,29 @@ def test_terminal_observations_leave_event_loop_responsive(terminal_repo, monkey
     retained = asyncio.run(runner._suppression_record_for_task("PR-001"))
     assert retained.reason == SuppressionReason.FIX_ITERATION_CAP
     assert retained.detail["terminal_failure"]["head_sha"]
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_unavailable_remote_status_does_not_start_diagnosis(tmp_path, monkeypatch, flag):
+    from unittest.mock import AsyncMock
+
+    runner = _runner(tmp_path)
+    runner.repo_config.feature_flags.use_single_error_exit = flag
+    runner.app_config.daemon.error_handler_use_ai = True
+    _stub_cycle(monkeypatch, runner)
+    _clear_task_frontmatter(runner)
+    asyncio.run(runner._transition_to_error(
+        "Coder exited with nonzero status", save_run_record_as=None,
+    ))
+    monkeypatch.setattr(runner, "_remote_frontmatter_error_status_for_current_task",
+                        lambda: (None, None, None))
+    diagnose = AsyncMock()
+    monkeypatch.setattr(runner, "handle_error", diagnose)
+
+    asyncio.run(runner._run_cycle_body())
+
+    diagnose.assert_not_awaited()
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task.pr_id == "PR-380"
+    assert runner.state.error_message == "Coder exited with nonzero status"
+    assert any("Remote ERROR task status unavailable" in event for event in _events(runner))
