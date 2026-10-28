@@ -628,10 +628,16 @@ def terminal_repo(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("flag", [False, True])
-def test_terminal_dispatch_releases_only_independent_work(terminal_repo, flag):
+@pytest.mark.parametrize("pr_state", ["OPEN", "CLOSED"])
+def test_terminal_dispatch_releases_only_independent_work(terminal_repo, monkeypatch, flag, pr_state):
+    from src.github import prs
     from src.models import TaskStatus
 
     runner, git = terminal_repo
+    attempt = runner.state.publication_attempt
+    monkeypatch.setattr(prs, "get_exact_pr_outcome", lambda *args, **kwargs: prs.ExactPROutcome(
+        runner.owner_repo, "main", 1, attempt.expected_head_sha, prs.ExactPRState(pr_state), True,
+    ))
     runner.repo_config.feature_flags.use_single_error_exit = flag
     failed_pr = runner.state.current_pr.model_copy(deep=True)
     asyncio.run(runner._run_cycle_body())
@@ -643,21 +649,40 @@ def test_terminal_dispatch_releases_only_independent_work(terminal_repo, flag):
     assert retained.detail["terminal_failure"]["error_message"] == "A exhausted"
     git("fetch", "origin", "main")
     assert "status: ERROR" in git("show", "origin/main:tasks/PR-001.md").stdout
-    # The selector sees the real updated base and the still-open failed PR.
+    # The selector sees the real updated base and only open PRs.
+    open_prs = [failed_pr] if pr_state == "OPEN" else []
     git("checkout", "main")
     git("pull", "--ff-only", "origin", "main")
-    selected = asyncio.run(runner._select_next_task_or_attach([failed_pr], []))
+    selected = asyncio.run(runner._select_next_task_or_attach(open_prs, []))
     assert selected.pr_id == "PR-002"
     assert runner._idle_dag_statuses["PR-001"] == TaskStatus.ERROR
     from src.dag import get_eligible_tasks
     eligible = {item.pr_id for item in get_eligible_tasks(runner._idle_dag_headers, runner._idle_dag_statuses)}
     assert "PR-001" not in eligible
-    assert "PR-003" not in eligible  # C depends on failed A, even while A's PR is open.
+    assert "PR-003" not in eligible  # C depends on failed A, regardless of A's PR state.
     assert runner._idle_dag_statuses["PR-003"] != TaskStatus.DONE
     assert not any(t.pr_id == "PR-003" and t.status == TaskStatus.DOING for t in runner.state.current_queue)
     assert asyncio.run(runner._suppression_record_for_task("PR-001")) is not None
     # Repeat selection cannot reattach exhausted A or select blocked C.
-    assert asyncio.run(runner._select_next_task_or_attach([failed_pr], [])).pr_id == "PR-002"
+    assert asyncio.run(runner._select_next_task_or_attach(open_prs, [])).pr_id == "PR-002"
+
+
+@pytest.mark.parametrize(("pr_state", "complete"), [("CLOSED", False), ("UNKNOWN", True)])
+def test_terminal_dispatch_holds_unverified_pr_outcome(terminal_repo, monkeypatch, pr_state, complete):
+    from src.github import prs
+
+    runner, _ = terminal_repo
+    attempt = runner.state.publication_attempt
+    monkeypatch.setattr(prs, "get_exact_pr_outcome", lambda *args, **kwargs: prs.ExactPROutcome(
+        runner.owner_repo, "main", 1, attempt.expected_head_sha, prs.ExactPRState(pr_state), complete,
+    ))
+    for _ in range(2):
+        asyncio.run(runner._run_cycle_body())
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.current_task.pr_id == "PR-001"
+        assert asyncio.run(runner._suppression_record_for_task("PR-001")).reason == (
+            SuppressionReason.FIX_ITERATION_CAP
+        )
 
 
 @pytest.mark.parametrize("hold", [

@@ -226,7 +226,9 @@ class ErrorMixin:
                     gh_prs.get_exact_pr_outcome, attempt.repo, attempt.base, pr.number, head,
                     expected_branch=attempt.branch,
                 )
-                resolved = (outcome.discovery_complete and outcome.state == gh_prs.ExactPRState.OPEN)
+                resolved = (outcome.discovery_complete and outcome.state in {
+                    gh_prs.ExactPRState.OPEN, gh_prs.ExactPRState.CLOSED,
+                })
             else:
                 resolved = attempt.pr_number is None and not publications
                 cleaned_branch = False
