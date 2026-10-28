@@ -345,6 +345,29 @@ def test_different_context_resets_counter_to_one(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("single_error_exit", [False, True])
+def test_diagnose_skip_without_task_returns_idle_for_queue_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    single_error_exit: bool,
+) -> None:
+    """Queue validation failures must allow IDLE to sync corrected specs."""
+    runner = h._make_runner()
+    runner.repo_config.feature_flags.use_single_error_exit = single_error_exit
+    _patch_plugin_diagnose(monkeypatch, runner, "claude", (0, "SKIP", ""))
+    _patch_plugin_diagnose(monkeypatch, runner, "codex", (0, "SKIP", ""))
+    runner.state.state = PipelineState.ERROR
+    runner.state.error_message = "Task selection failed: invalid task specification"
+    runner._error_diagnose_count = 1
+
+    asyncio.run(runner.handle_error())
+
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.error_message is None
+    assert runner.state.current_task is None
+    assert runner.state.publication_attempt is None
+    assert runner._error_diagnose_count == 0
+
+
 def test_diagnose_skip_retains_failed_task_until_safe_finalization(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

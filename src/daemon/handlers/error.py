@@ -711,8 +711,19 @@ class ErrorMixin:
                 )
                 git_ops._git(self.repo_path, "clean", "-fd", check=False)
         if verdict == "SKIP":
-            await self._mark_diagnose_exhausted(retry_task_id or "")
-            self.log_event("[ERROR] diagnose_error: SKIP -> terminal failure reconciliation.")
+            if retry_task_id is None:
+                # Repository-level failures (such as queue validation) have
+                # no task to finalize. Retry IDLE so it can sync corrections.
+                await self._clear_error_message_on_recovery(
+                    log_prefix="[ERROR]",
+                    reason="diagnose_error SKIP without a task",
+                )
+                self.state.state = PipelineState.IDLE
+                self._error_diagnose_policy.reset(self)
+                self.log_event("[ERROR] diagnose_error: SKIP -> IDLE (no bound task).")
+            else:
+                await self._mark_diagnose_exhausted(retry_task_id)
+                self.log_event("[ERROR] diagnose_error: SKIP -> terminal failure reconciliation.")
         elif verdict == "FIX":
             await _clear_cause_for_retry()
             await self._clear_error_message_on_recovery(
