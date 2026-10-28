@@ -32,6 +32,9 @@ from src.subsource_registry import SuppressionReason
 
 logger = logging.getLogger(__name__)
 _CLAUDE_CLI_COAUTHOR = "Co-authored-by: Claude CLI <noreply@anthropic.com>"
+_UNCERTAIN_FIX_OWNERSHIP_PREFIX = (
+    "Persisted FIX invocation ownership is uncertain; operator Retry required"
+)
 
 _RETAINED_MERGE_ERROR_PREFIXES = (
     "Merge accounting conflict:",
@@ -170,6 +173,7 @@ class ErrorMixin:
                 or self._current_coder_process is not None
                 or self._current_coder_supervised_process is not None
                 or self._coder_cleanup_failure_detail is not None
+                or (self.state.error_message or "").startswith(_UNCERTAIN_FIX_OWNERSHIP_PREFIX)
                 or is_retained_merge_error(self.state.error_message)):
                 self.log_event(
                     f"[RECOVERY] Terminal failure {getattr(task, 'pr_id', None)} held: "
@@ -329,7 +333,7 @@ class ErrorMixin:
             await self._hold_unresolved_publication()
             await self._process_upload_while_publication_held()
             return
-        if context.startswith("Persisted FIX invocation ownership is uncertain; operator Retry required"):
+        if context.startswith(_UNCERTAIN_FIX_OWNERSHIP_PREFIX):
             self.log_event("[RECOVERY] Uncertain FIX invocation remains parked for operator Retry.")
             return
 

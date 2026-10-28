@@ -798,3 +798,26 @@ def test_review_timeout_can_release_independent_work_without_retry(terminal_repo
     assert runner.state.state == PipelineState.IDLE
     assert runner.state.current_task is None
     assert asyncio.run(runner._suppression_record_for_task(task.pr_id)).reason == SuppressionReason.REVIEW_TIMEOUT
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_uncertain_restart_owner_holds_direct_and_common_error_callers(terminal_repo, monkeypatch, flag):
+    from unittest.mock import AsyncMock
+
+    runner, _ = terminal_repo
+    runner.repo_config.feature_flags.use_single_error_exit = flag
+    runner.state.error_message = "Persisted FIX invocation ownership is uncertain; operator Retry required"
+    diagnosis = AsyncMock()
+    monkeypatch.setattr(runner, "_refresh_auth_status_cache", diagnosis)
+    # An archived cleanup observation cannot override unresolved restart ownership.
+    assert runner.state.publication_attempt.cleanup_confirmed
+    asyncio.run(runner.handle_error())
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task.pr_id == "PR-001"
+    assert any("Uncertain FIX invocation remains parked" in entry["event"] for entry in runner.state.history)
+    asyncio.run(runner._run_cycle_body())
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task.pr_id == "PR-001"
+    assert runner.state.current_pr.number == 1
+    diagnosis.assert_not_awaited()
+    assert asyncio.run(runner._suppression_record_for_task("PR-001")) is not None
