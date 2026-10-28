@@ -1,5 +1,6 @@
 """Settings writes must steer a later dispatch by the real test daemon."""
 
+import json
 import time
 
 import requests
@@ -14,6 +15,36 @@ from tests.e2e.conftest import (
     _wait_for_runner_config_ack,
 )
 from tests.e2e.lib.coder_shim import coder_shim
+
+
+def _wait_for_settings_launch(get_state, launch_path, task_id, branch, previous_run_id):
+    """Join CLI evidence to a fresh invocation, never the prior task's snapshot."""
+    deadline = time.monotonic() + 20
+    last_state = None
+    while time.monotonic() < deadline:
+        if launch_path.exists():
+            record = json.loads(launch_path.read_text())
+            if record["pr_id"] == task_id:
+                assert record["branch"] == branch
+                # Dispatch can publish the new task before capturing its snapshot.
+                # Read again after CLI evidence, rather than retaining that state.
+                last_state = get_state() or {}
+                task = last_state.get("current_task") or {}
+                snapshot = last_state.get("active_invocation") or {}
+                if (
+                    last_state.get("state") == "CODING"
+                    and task.get("pr_id") == task_id
+                    and task.get("branch") == branch
+                    and snapshot.get("phase") == "coding"
+                    and snapshot.get("run_id")
+                    and snapshot["run_id"] != previous_run_id
+                    and snapshot.get("plugin_id") == record["plugin_id"] == "claude"
+                ):
+                    assert record["model"] == snapshot["model_override"] == "sonnet"
+                    assert record["effort"] == snapshot["reasoning_effort_override"]
+                    return last_state, record
+        time.sleep(0.2)
+    raise AssertionError(f"no bound CLI launch evidence for {task_id}; last state={last_state!r}")
 
 
 def test_settings_repo_coder_changes_daemon_dispatch(
@@ -63,7 +94,6 @@ def test_settings_model_effort_reach_next_launch(
     get_state, shared_test_config,
 ):
     """One Chromium journey, two real daemon launches, no provider inference."""
-    import json
     from concurrent.futures import ThreadPoolExecutor
     from datetime import datetime, timezone
 
@@ -103,20 +133,13 @@ def test_settings_model_effort_reach_next_launch(
     def launch(task_id, slug):
         assert upload_zip(make_task_zip(task_id, slug, coder="any", priority=1)) in (200, 201)
         _resume_daemon(TESTBED_SLUG)
-        state = wait_dispatch(f"PR-{task_id}", "claude")
-        deadline = time.monotonic() + 20
-        while time.monotonic() < deadline:
-            if launch_path.exists():
-                record = json.loads(launch_path.read_text())
-                if record["pr_id"] == f"PR-{task_id}":
-                    assert record["branch"] == f"pr-{task_id}-{slug}"
-                    snapshot = state["active_invocation"]
-                    assert record["plugin_id"] == snapshot["plugin_id"] == "claude"
-                    assert record["model"] == snapshot["model_override"] == "sonnet"
-                    evidence["launches"].append({"cli": record, "snapshot": snapshot})
-                    return state, record
-            time.sleep(0.2)
-        raise AssertionError(f"no CLI launch evidence for PR-{task_id}")
+        wait_dispatch(f"PR-{task_id}", "claude")
+        previous_run_id = evidence["launches"][-1]["snapshot"]["run_id"] if evidence["launches"] else None
+        state, record = _wait_for_settings_launch(
+            get_state, launch_path, f"PR-{task_id}", f"pr-{task_id}-{slug}", previous_run_id,
+        )
+        evidence["launches"].append({"cli": record, "snapshot": state["active_invocation"]})
+        return state, record
 
     try:
         _stop_daemon_and_wait_paused(TESTBED_SLUG)

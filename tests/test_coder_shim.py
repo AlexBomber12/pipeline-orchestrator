@@ -512,3 +512,65 @@ def test_settings_overlay_oracle_runs_with_production_config(tmp_path):
     from tests.e2e.test_shared_config import test_settings_overlay_precedence_is_disposable
 
     test_settings_overlay_precedence_is_disposable(tmp_path)
+
+
+@pytest.mark.parametrize("outcome", [
+    "fresh", "stale_only", "wrong_task", "wrong_branch", "wrong_plugin",
+    "wrong_phase", "missing_run", "wrong_effort",
+])
+def test_settings_launch_oracle_requires_fresh_bound_snapshot(tmp_path, monkeypatch, outcome):
+    import json
+    from types import SimpleNamespace
+
+    from tests.e2e import test_shared_config as scenario
+
+    now, reads = [0.0], [0]
+    monkeypatch.setattr(scenario, "time", SimpleNamespace(
+        monotonic=lambda: now[0],
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    ))
+    launch_path = tmp_path / "launch.json"
+    cli = {"pr_id": "PR-43", "branch": "pr-43-next", "plugin_id": "claude",
+           "model": "sonnet", "effort": "high"}
+    launch_path.write_text(json.dumps(cli))
+
+    def get_state():
+        reads[0] += 1
+        # Reproduce CI: new task identity is published with the previous run's
+        # low snapshot. CLI evidence already exists when this state is read.
+        stale = reads[0] == 1 or outcome == "stale_only"
+        state = {
+            "state": "CODING",
+            "current_task": {"pr_id": "PR-43", "branch": "pr-43-next"},
+            "active_invocation": {
+                "plugin_id": "claude", "model_override": "sonnet",
+                "reasoning_effort_override": "low" if stale else "high",
+                "run_id": "old-run" if stale else "new-run", "phase": "coding",
+            },
+        }
+        if not stale:
+            if outcome in {"wrong_task", "wrong_branch"}:
+                state["current_task"]["pr_id" if outcome == "wrong_task" else "branch"] = "other"
+            elif outcome in {"wrong_plugin", "wrong_phase", "missing_run", "wrong_effort"}:
+                key, value = {
+                    "wrong_plugin": ("plugin_id", "codex"),
+                    "wrong_phase": ("phase", "fix"),
+                    "missing_run": ("run_id", None),
+                    "wrong_effort": ("reasoning_effort_override", "low"),
+                }[outcome]
+                state["active_invocation"][key] = value
+        return state
+
+    def run():
+        return scenario._wait_for_settings_launch(
+            get_state, launch_path, "PR-43", "pr-43-next", "old-run",
+        )
+
+    if outcome == "fresh":
+        state, record = run()
+        assert reads[0] == 2
+        assert state["active_invocation"]["run_id"] == "new-run"
+        assert record == cli
+    else:
+        with pytest.raises(AssertionError):
+            run()

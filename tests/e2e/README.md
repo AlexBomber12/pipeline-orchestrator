@@ -124,7 +124,10 @@ While that process is active, a concurrent timeout save and effort change must
 both survive; invalid model/effort writes must leave the bytes unchanged.
 After daemon reload the original snapshot stays fixed. Stop/resume launches a
 second unique task with the new effort. Success requires both matching CLI
-handshakes; IDLE alone cannot pass. The fixture pauses and resets its owned
+handshakes, paired with a newly read CODING snapshot for the matching task and
+branch. The second launch must have a different nonempty invocation run ID, so
+a transitional publication retaining the first snapshot cannot pass. IDLE alone
+cannot pass. The fixture pauses and resets its owned
 stack and removes its launch handshake.
 
 `settings-<unique-id>.json` in `e2e-evidence` records the exact tested checkout
