@@ -17,10 +17,13 @@ import subprocess
 from pathlib import Path
 
 from src.cancellation import (
+    get_task_spec_hash,
     record_task_spec_hash,
     reset_retry_count,
     safe_delete_cancellation_cause,
+    task_spec_content_hash,
 )
+from src.completion_evidence import get_recorded_completions
 from src.daemon import git_ops, scaffolder
 from src.daemon.git_ops import (
     _FETCH_MISSING_REF_NEEDLE,
@@ -29,7 +32,9 @@ from src.daemon.git_ops import (
 )
 from src.keyspace import upload_pending, upload_pending_count
 from src.models import TaskStatus
+from src.queue_parser import parse_existing_task_header
 from src.retry import retry_transient
+from src.web.services.upload_validation import read_frontmatter_status
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +291,6 @@ return 0
 
         staging_dir = Path(manifest["staging_dir"]) if "staging_dir" in manifest else Path("/data/uploads") / self.name
         filenames: list[str] = manifest.get("files", [])
-        task_hashes = manifest.get("task_hashes", {})
         commit_subject = manifest.get("commit_subject")
         include_commit_body = isinstance(commit_subject, str) and bool(
             commit_subject.strip()
@@ -295,8 +299,6 @@ return 0
             commit_subject = "chore: upload sprint tasks via dashboard"
         else:
             commit_subject = commit_subject.strip()
-        if not isinstance(task_hashes, dict):
-            task_hashes = {}
         if not filenames or not staging_dir.is_dir():
             logger.warning("%s: upload manifest has no files or staging dir missing", self.name)
             await self.redis.delete(key)
@@ -324,12 +326,61 @@ return 0
             return False
 
         branch = self.repo_config.branch
+        task_hashes: dict[str, str] = {}
+        # Plan the whole batch before writing anything. Replays retain the
+        # exact accepted bytes, including daemon-owned failure/completion state.
+        try:
+            replay_filenames: set[str] = set()
+            for fname in stageable_filenames:
+                src = staging_dir / fname
+                if not (fname.startswith("PR-") and fname.endswith(".md") and src.is_file()):
+                    continue
+                task_id = Path(fname).stem
+                incoming_hash = task_spec_content_hash(src.read_text(encoding="utf-8"))
+                dest = Path(self.repo_path) / _uploaded_repo_path(fname)
+                existing_text = dest.read_text(encoding="utf-8") if dest.is_file() else None
+                if existing_text is not None:
+                    if task_spec_content_hash(existing_text) == incoming_hash:
+                        replay_filenames.add(fname)
+                        continue
+                    if read_frontmatter_status(existing_text) in {"DONE", "DOING"}:
+                        raise RuntimeError(f"{task_id}: completed/active task replacement blocked")
+                accepted_hash = await get_task_spec_hash(self.redis, self.name, task_id)
+                if accepted_hash == incoming_hash:
+                    raise RuntimeError(f"{task_id}: accepted spec bytes unavailable or conflicting")
+                current_task = getattr(self.state, "current_task", None)
+                current_pr = getattr(self.state, "current_pr", None)
+                attempt = getattr(self.state, "publication_attempt", None)
+                pending_attempt = attempt if attempt is not None and attempt.pending else None
+                if pending_attempt is not None and pending_attempt.task_id == task_id:
+                    raise RuntimeError(f"{task_id}: unresolved publication replacement blocked")
+                if current_task is not None or current_pr is not None or pending_attempt is not None:
+                    header = parse_existing_task_header(src)
+                    if (
+                        current_task is not None and (
+                            current_task.pr_id == task_id or current_task.branch == header.branch
+                        )
+                    ) or (current_pr is not None and current_pr.branch == header.branch) or (
+                        pending_attempt is not None and pending_attempt.branch == header.branch
+                    ):
+                        raise RuntimeError(f"{task_id}: active task/branch replacement blocked")
+                task_hashes[task_id] = incoming_hash
+            completed = get_recorded_completions(
+                self.repo_path, branch, Path(self.repo_path).name.replace("__", "/", 1),
+                set(task_hashes),
+            )
+            if completed:
+                raise RuntimeError(f"Recorded completion replacement blocked: {sorted(completed)}")
+        except Exception as exc:
+            self.log_event(f"[INFRA] Upload admission blocked: {exc}.")
+            return None
+
         try:
             tasks_dir = Path(self.repo_path) / "tasks"
             tasks_dir.mkdir(exist_ok=True)
             for fname in stageable_filenames:
                 src = staging_dir / fname
-                if src.is_file():
+                if src.is_file() and fname not in replay_filenames:
                     dest = Path(self.repo_path) / _uploaded_repo_path(fname)
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     if dest.exists():
@@ -369,6 +420,8 @@ return 0
                 lambda: git_ops._git(self.repo_path, "push", "origin", branch, timeout=60),
                 operation_name=f"git push origin {branch}",
             )
+            if commit_result.returncode != 0:
+                task_hashes.clear()
             try:
                 for task_id, task_hash in task_hashes.items():
                     await record_task_spec_hash(
@@ -394,15 +447,10 @@ return 0
                 f"[INFRA] Uploaded {task_count} task files to tasks/ "
                 f"and pushed to {branch}."
             )
-            # Re-uploading a task file is the user's signal to retry a
-            # previously parked task. Flag-on repos clear the suppression via
-            # the cancellation record below; flag-off repos still clear the
-            # legacy in-memory crash marker here.
-            uploaded_pr_ids = {
-                Path(name).stem
-                for name in stageable_filenames
-                if name.startswith("PR-") and name.endswith(".md")
-            }
+            # Only a committed instruction change authorizes replacing retry
+            # history. A no-commit replay (including uncertain prior pushes)
+            # cannot revive failed or unresolved work.
+            uploaded_pr_ids = set(task_hashes)
             crashed_pr_ids = getattr(self, "_crashed_task_pr_ids", None)
             use_single_error_exit = getattr(
                 getattr(self.repo_config, "feature_flags", None),
