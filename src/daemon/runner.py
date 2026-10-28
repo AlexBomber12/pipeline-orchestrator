@@ -3193,6 +3193,33 @@ class PipelineRunner(
             return False
         return True
 
+    async def _park_startup_stop(self) -> None:
+        """Acknowledge Stop without serializing an unrecovered runner's defaults."""
+        state_key = pipeline_state(self.name)
+        stop_key = control_stop(self.name)
+
+        async def park(pipe: Any) -> None:
+            # Watch both keys so a concurrent Resume wins over an old Stop
+            # observation. Preserve the raw snapshot, including legacy shape
+            # and publication provenance needed by subsequent recovery. Keep
+            # the saved phase: hydration uses it to restore interrupted CODING
+            # and other recovery identities. user_paused blocks dispatch while
+            # recovery performs the required crash bookkeeping.
+            if not await pipe.get(stop_key):
+                return
+            raw = await pipe.get(state_key)
+            data = json.loads(raw) if raw else self.state.model_dump(mode="json")
+            data.update(
+                user_paused=True,
+                last_updated=datetime.now(timezone.utc).isoformat(),
+            )
+            pipe.multi()
+            pipe.set(state_key, json.dumps(data))
+            pipe.delete(stop_key)
+
+        await self.redis.transaction(park, state_key, stop_key)
+        await self._refresh_user_paused_from_redis()
+
     async def _terminate_current_coder(self) -> bool:
         """Clean the owned coder group and clear it only after quiescence."""
         managed = self._current_coder_supervised_process
@@ -4042,7 +4069,6 @@ class PipelineRunner(
         await self._refresh_user_paused_from_redis()
         if not self.state.user_paused:
             self._user_pause_logged = False
-
         # Durable Retry commands are consumed before the ordinary ERROR,
         # pause, and GitHub-budget exits.  This lets a parked runner
         # acknowledge the command and report the exact inhibitor instead of
@@ -4070,6 +4096,15 @@ class PipelineRunner(
                     await self.publish_state()
                     return
 
+        # Startup publication is suppressed until recovery has read the saved
+        # snapshot. Park Stop separately, retaining that snapshot for Resume.
+        if await self._pop_stop_request():
+            if not self._recovered:
+                await self._park_startup_stop()
+            else:
+                await self.publish_state()
+            return
+
         if not await self._check_github_api_budget():
             await self.publish_state()
             return
@@ -4083,7 +4118,7 @@ class PipelineRunner(
                     has_pending = bool(raw)
                 except Exception:
                     pass
-                if has_pending:
+                if has_pending and not self.state.user_paused:
                     branch = self.repo_config.branch
                     on_base = False
                     try:

@@ -3747,15 +3747,21 @@ def test_run_cycle_handles_ensure_repo_cloned_runtime_error(
         ("feature/work", True),
     ],
 )
+@pytest.mark.parametrize("inhibitor", [None, "pause", "stop"])
 def test_run_cycle_processes_pending_uploads_from_recovery_when_on_or_off_base(
     monkeypatch: pytest.MonkeyPatch,
     head_ref: str,
     expect_checkout: bool,
+    inhibitor: str | None,
 ) -> None:
     publishes: list[str] = []
     upload_calls: list[bool] = []
     git_calls: list[tuple[str, ...]] = []
     runner = h._make_runner()
+    if inhibitor == "pause":
+        runner.state.user_paused = True
+    elif inhibitor == "stop":
+        runner.redis.store[f"control:{runner.name}:stop"] = "1"
 
     async def fake_ensure_repo_cloned() -> None:
         return None
@@ -3786,9 +3792,11 @@ def test_run_cycle_processes_pending_uploads_from_recovery_when_on_or_off_base(
 
     asyncio.run(runner.run_cycle())
 
-    assert publishes == ["published"]
-    assert upload_calls == [True]
-    if expect_checkout:
+    assert publishes == ([] if inhibitor == "stop" else ["published"])
+    assert upload_calls == ([] if inhibitor else [True])
+    if inhibitor:
+        assert not git_calls
+    elif expect_checkout:
         assert ("checkout", runner.repo_config.branch) in git_calls
     else:
         assert ("checkout", runner.repo_config.branch) not in git_calls

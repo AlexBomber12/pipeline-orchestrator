@@ -104,3 +104,94 @@ def test_stop_during_coding_then_resume_picks_next_task(
     state = get_state()
     assert state is not None, "no state entry returned for testbed at end"
     assert state["state"] == "IDLE", f"final state was {state['state']!r}"
+
+
+def test_pending_upload_survives_missed_wake_restart_and_pause(
+    dashboard_url, testbed_slug, get_state, upload_zip, make_task_zip, reset_testbed,
+):
+    """Real stack transport and Redis; coder/provider behavior uses the shim."""
+    from datetime import datetime, timezone
+
+    from tests.e2e.conftest import _stop_daemon_and_wait_paused
+
+    def compose(*args):
+        return subprocess.run(
+            ["docker", "compose", "-f", "docker-compose.test.yml", *args],
+            capture_output=True, text=True, check=True, timeout=60,
+        ).stdout.strip()
+
+    def redis(*args):
+        return compose("exec", "-T", "redis-test", "redis-cli", "--raw", *args)
+
+    def paused_publication(after):
+        deadline = time.monotonic() + 150
+        while time.monotonic() < deadline:
+            entry = get_state() or {}
+            updated = datetime.fromisoformat(entry.get("last_updated") or "1970-01-01T00:00:00+00:00")
+            if updated > after:
+                assert entry.get("user_paused") is True, entry
+                assert entry.get("current_task") is None, entry
+                assert entry.get("state") in {"IDLE", "PAUSED"}, entry
+                return updated
+            time.sleep(0.5)
+        raise AssertionError("restarted daemon did not publish the persisted pause")
+
+    pr_id = int(time.time())
+    branch = f"pr-{pr_id}-e2e-missed-upload-wake"
+    pending_key = f"upload:{testbed_slug}:pending"
+    _stop_daemon_and_wait_paused(testbed_slug)
+    stopped = False
+    try:
+        compose("stop", "daemon-test")
+        stopped = True
+        # No subscriber exists at acceptance: PubSub cannot retain this wake.
+        assert redis("PUBSUB", "NUMSUB", f"orchestrator:wake:{testbed_slug}").splitlines()[-1] == "0"
+        zip_path = make_task_zip(pr_id, "e2e-missed-upload-wake")
+        assert upload_zip(zip_path) in (200, 201)
+        raw = redis("GET", pending_key)
+        manifest = json.loads(raw)
+        manifest["files"].append(f"PR-{pr_id + 1}.md")  # proven absent sibling
+        raw = json.dumps(manifest)
+        redis("SET", pending_key, raw)
+        restarted = datetime.now(timezone.utc)
+        compose("start", "daemon-test")
+        stopped = False
+        updated = paused_publication(restarted)
+        # A late upload wake must not act as Resume.
+        redis("PUBLISH", f"orchestrator:wake:{testbed_slug}", '{"event_type":"upload"}')
+        paused_publication(updated)
+        assert redis("GET", pending_key) == raw
+
+        # Drop Resume's wake too: startup must discover the accepted manifest.
+        compose("stop", "daemon-test")
+        stopped = True
+        response = requests.post(f"{dashboard_url}/repos/{testbed_slug}/resume", timeout=10)
+        assert response.status_code in (200, 204)
+        with coder_shim("success"):
+            compose("start", "daemon-test")
+            stopped = False
+            deadline = time.monotonic() + 300
+            matched_pr = None
+            while time.monotonic() < deadline:
+                result = subprocess.run(
+                    ["gh", "pr", "list", "--repo", testbed_slug.replace("__", "/", 1),
+                     "--head", branch, "--state", "all", "--json", "number,state,mergedAt,headRefName"],
+                    capture_output=True, text=True, check=True, timeout=30,
+                )
+                prs = json.loads(result.stdout)
+                assert len(prs) <= 1, prs
+                if prs and prs[0]["state"] == "MERGED" and prs[0]["mergedAt"]:
+                    matched_pr = prs[0]
+                    break
+                time.sleep(2)
+            assert matched_pr and matched_pr["headRefName"] == branch
+            assert redis("GET", pending_key) == ""
+            # Only one upload commit exists despite missed wakes and restart.
+            subjects = compose(
+                "exec", "-T", "daemon-test", "git", "-C", f"/data/repos/{testbed_slug}",
+                "log", "origin/main", "--format=%s", "--", f"tasks/PR-{pr_id}.md",
+            ).splitlines()
+            assert subjects.count("tasks: upload batch (1 files)") == 1, subjects
+    finally:
+        if stopped:
+            compose("start", "daemon-test")
