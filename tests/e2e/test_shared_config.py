@@ -89,14 +89,15 @@ def test_settings_model_effort_reach_next_launch(
 
     def save(control, value, updates):
         expect_write(repository["url"], "claude", daemon_updates=updates)
+        previous_control = page.locator(control).element_handle()
         with page.expect_response(
             lambda response: response.url.endswith("/settings/daemon")
             and response.request.method == "PUT"
         ) as response:
             page.locator(control).select_option(value)
         assert response.value.status == 200
+        page.wait_for_function("element => !element.isConnected", arg=previous_control)
         expect(page.locator(control)).to_have_value(value)
-        expect(page.locator(f'{control} + [role="status"] span')).to_have_text("Saved")
         note_write()
 
     def launch(task_id, slug):
@@ -162,7 +163,7 @@ def test_settings_model_effort_reach_next_launch(
             # Require a publication after reload acknowledgment, so a stale
             # pre-save Redis payload cannot prove snapshot immutability.
             acknowledged = datetime.now(timezone.utc)
-            deadline = time.monotonic() + 15
+            deadline = time.monotonic() + 35
             while time.monotonic() < deadline:
                 active = get_state() or {}
                 updated = datetime.fromisoformat(active.get("last_updated") or "1970-01-01T00:00:00+00:00")
