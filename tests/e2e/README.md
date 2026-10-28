@@ -42,6 +42,11 @@ deadline and useful last-observed state. IDLE alone can also follow ERROR or an
 unrelated task: e2e success must inspect the matching external PR, task status,
 or other outcome the scenario promises. Use deterministic fault injection and
 fixture-owned cleanup (`tests/e2e/conftest.py` and `tests/e2e/lib/testbed_reset.py`).
+At session startup, reset first requires a successful stop of the fixture-owned
+`daemon-test` compose service before changing testbed or Redis state. It does
+not wait for a dashboard pause acknowledgement, which startup recovery of an
+unfinished merge from a previous run may never publish. A failed service stop
+aborts setup without resetting state. The service restarts after reset.
 Before each lifecycle test, reset confirms the operator pause (a terminal
 ERROR may retain its state with `user_paused=true`), stops only the
 isolated `daemon-test` service, clears testbed state, and starts a fresh daemon.
