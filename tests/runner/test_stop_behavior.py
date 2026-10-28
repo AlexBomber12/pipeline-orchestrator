@@ -234,7 +234,7 @@ async def test_startup_stop_parks_snapshot_until_resume(stopped_runner, monkeypa
     for _ in range(3):
         await runner.run_cycle()
     saved = json.loads(await runner.redis.get(state_key))
-    assert saved["state"] == "PAUSED"
+    assert saved["state"] == ("IDLE" if snapshot_kind == "absent" else "CODING")
     assert saved["user_paused"]
     assert saved["last_updated"] != data["last_updated"]
     if snapshot_kind != "absent":
@@ -302,3 +302,90 @@ async def test_recovered_stop_uses_normal_publication(stopped_runner, monkeypatc
     assert saved.user_paused
     assert await runner.redis.get(control_stop(runner.name)) is None
     runner.handle_idle.assert_not_awaited()
+
+
+@pytest.mark.parametrize("scope", ["global", "repo"])
+async def test_startup_stop_recovers_interrupted_coding_before_resume(
+    stopped_runner, monkeypatch, tmp_path, scope,
+):
+    from unittest.mock import AsyncMock, Mock
+
+    from src.task_status import MergedState
+
+    runner = stopped_runner
+    runner.repo_path = str(tmp_path)
+    task_path = tmp_path / "tasks" / "PR-419.md"
+    task_path.parent.mkdir()
+    task_path.write_text(
+        "---\nstatus: TODO\n---\n\n# PR-419: Interrupted coding\n\n"
+        "Branch: pr-419-recover-pending-uploads\n"
+        "- Type: bugfix\n- Complexity: medium\n- Depends on: none\n",
+    )
+    task = QueueTask(
+        pr_id="PR-419", title="Interrupted coding", status=TaskStatus.DOING,
+        branch="pr-419-recover-pending-uploads", task_file="tasks/PR-419.md",
+    )
+    runner.state.state = PipelineState.CODING
+    runner.state.current_task = task
+    runner._start_current_run_record("codex", "")
+    invocation = runner._capture_invocation_snapshot("codex", {"model": ""}, phase="coding")
+    await runner._checkpoint_current_run_record()
+    await runner.publish_state()
+    assert runner.state.publication_attempt is None
+    await submit(runner, monkeypatch, scope)
+
+    # Restart with only Redis's saved dispatch and run checkpoint available.
+    runner.state = RepoState(name=runner.name, url=runner.state.url)
+    runner._current_run_record = None
+    runner._recovered = False
+    monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+    monkeypatch.setattr("src.github.prs.get_open_prs", lambda *args, **kwargs: [])
+    monkeypatch.setattr(
+        "src.daemon.recovery._resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
+    )
+    monkeypatch.setattr(
+        "src.github.prs.get_merged_prs_discovery",
+        lambda *args, **kwargs: SimpleNamespace(complete=True, prs=[]),
+    )
+    monkeypatch.setattr(runner, "_is_doing_already_merged", lambda task: False)
+    preserve = Mock(return_value=True)
+    monkeypatch.setattr(runner, "_preserve_crashed_run_commits", preserve)
+    monkeypatch.setattr(runner, "handle_coding", AsyncMock())
+    monkeypatch.setattr(runner, "handle_idle", AsyncMock())
+    monkeypatch.setattr(runner, "process_pending_uploads", AsyncMock())
+
+    await runner.run_cycle()  # Park and acknowledge Stop, preserving CODING.
+    assert not runner._recovered
+    assert await runner.redis.get(control_stop(runner.name)) is None
+    saved = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert saved.state == PipelineState.CODING
+    assert saved.user_paused
+    # Another restart while parked must still restore both dispatch identities.
+    runner.state = RepoState(name=runner.name, url=runner.state.url)
+    assert await runner._hydrate_current_task_from_persisted_state()
+    assert runner.state.current_task == task
+    assert runner.state.active_invocation == invocation
+
+    await runner.run_cycle()  # Actual header derivation and recovery bookkeeping.
+    assert runner._recovered, "\n".join(e["event"] for e in runner.state.history)
+    preserve.assert_called_once_with(task.branch)
+    record = await runner._metrics_store.get(invocation.run_id)
+    assert record.ended_at is not None
+    assert record.cause == "CRASH"
+    assert record.run_phase == "recovery"
+    assert record.invocations == [invocation]
+    assert runner.state.current_task.pr_id == task.pr_id
+    assert runner.state.current_task.status == TaskStatus.DOING
+    assert runner.state.user_paused
+    await runner.run_cycle()
+    runner.handle_coding.assert_not_awaited()
+    runner.handle_idle.assert_not_awaited()
+    runner.process_pending_uploads.assert_not_awaited()
+    await submit(runner, monkeypatch, scope, resume=True)
+    monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+    monkeypatch.setattr(runner, "reload_repo_config_if_dirty", AsyncMock())
+    monkeypatch.setattr(runner, "_maybe_auto_pause_for_error_rate", AsyncMock(return_value=False))
+    await runner.run_cycle()
+    assert not runner.state.user_paused
+    runner.handle_idle.assert_awaited_once()

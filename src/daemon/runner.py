@@ -3201,13 +3201,15 @@ class PipelineRunner(
         async def park(pipe: Any) -> None:
             # Watch both keys so a concurrent Resume wins over an old Stop
             # observation. Preserve the raw snapshot, including legacy shape
-            # and publication provenance needed by subsequent recovery.
+            # and publication provenance needed by subsequent recovery. Keep
+            # the saved phase: hydration uses it to restore interrupted CODING
+            # and other recovery identities. user_paused blocks dispatch while
+            # recovery performs the required crash bookkeeping.
             if not await pipe.get(stop_key):
                 return
             raw = await pipe.get(state_key)
             data = json.loads(raw) if raw else self.state.model_dump(mode="json")
             data.update(
-                state=PipelineState.PAUSED.value,
                 user_paused=True,
                 last_updated=datetime.now(timezone.utc).isoformat(),
             )
