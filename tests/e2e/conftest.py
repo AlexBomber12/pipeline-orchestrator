@@ -251,7 +251,9 @@ def shared_test_config(reset_testbed, get_state):
         expected_digest = observed
 
     def wait_for_coder_dispatch(pr_id: str, plugin_id: str) -> dict:
-        deadline = time.monotonic() + 70
+        # Allow the real GitHub upload commit/push and task preflight, as in
+        # the other lifecycle tests; retain exact task and invocation matching.
+        deadline = time.monotonic() + 180
         last_entry = None
         while time.monotonic() < deadline:
             last_entry = get_state()
@@ -272,9 +274,16 @@ def shared_test_config(reset_testbed, get_state):
         yield _shared_config_bytes, expect_settings_coder_write, note_settings_write, wait_for_coder_dispatch
     finally:
         restored = False
-        applies_before = 0
+        service_stopped = False
         try:
             _stop_daemon_and_wait_paused(TESTBED_SLUG)
+            # This fixture owns daemon-test. Stop its heartbeat before clearing
+            # Redis so it cannot resurrect the task snapshot during restoration.
+            subprocess.run(
+                ["docker", "compose", "-f", "docker-compose.test.yml", "stop", "daemon-test"],
+                cwd=REPO_DIR, check=True, timeout=60,
+            )
+            service_stopped = True
             reset_testbed_full(TESTBED_SLUG)
             clear_testbed_redis_state(TESTBED_SLUG)
             observed = _config_digest()
@@ -282,8 +291,6 @@ def shared_test_config(reset_testbed, get_state):
                 "shared config changed outside this fixture; refusing to overwrite concurrent changes"
             )
             if baseline != _shared_config_bytes():
-                applies_before = _runner_apply_count()
-                reloads_before = _daemon_reload_count()
                 fd, temporary = tempfile.mkstemp(prefix="config.test.yml.", dir=TEST_DATA_DIR)
                 try:
                     with os.fdopen(fd, "wb") as output:
@@ -293,13 +300,19 @@ def shared_test_config(reset_testbed, get_state):
                 finally:
                     if os.path.exists(temporary):
                         os.unlink(temporary)
-                _wait_for_daemon_reload(reloads_before)
                 assert _shared_config_bytes() == baseline
                 restored = True
         finally:
+            if service_stopped:
+                subprocess.run(
+                    ["docker", "compose", "-f", "docker-compose.test.yml", "start", "daemon-test"],
+                    cwd=REPO_DIR, check=True, timeout=60,
+                )
             _resume_daemon(TESTBED_SLUG)
         if restored:
-            _wait_for_runner_apply(applies_before)
+            # Direct config swaps need not emit a staged-apply log. A fresh
+            # process loads the restored file; require its publication, too.
+            _wait_for_fresh_idle(TESTBED_SLUG, after=datetime.now(timezone.utc))
 
 
 def _wait_for_runner_apply(applies_before: int) -> None:

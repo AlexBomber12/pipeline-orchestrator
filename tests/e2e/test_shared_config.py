@@ -46,12 +46,13 @@ def test_settings_repo_coder_changes_daemon_dispatch(
     assert updated["daemon"]["trusted_reviewer_identities"] == reviewer_identities
     # End any in-flight IDLE cycle, then require a runner-level config acknowledgment.
     _stop_daemon_and_wait_paused(TESTBED_SLUG)
-    _resume_daemon(TESTBED_SLUG)
-    _wait_for_runner_config_ack(applies_before, reloads_before)
 
     pr_id = int(time.time())
     with coder_shim("hang"):
         zip_path = make_task_zip(pr_id, "e2e-shared-config", coder="any")
         assert upload_zip(zip_path) in (200, 201)
+        # Queue the upload before resume so the first IDLE cycle can consume it.
+        _resume_daemon(TESTBED_SLUG)
+        _wait_for_runner_config_ack(applies_before, reloads_before)
         observed = wait_for_coder_dispatch(f"PR-{pr_id}", "codex")
         assert observed["current_task"]["branch"] == f"pr-{pr_id}-e2e-shared-config"

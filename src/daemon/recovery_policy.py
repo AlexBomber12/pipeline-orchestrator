@@ -9,7 +9,10 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Any, Awaitable, Callable, Generic, TypeVar, Union
+
+from src.subsource_registry import SuppressionReason, lookup
 
 T = TypeVar("T")
 
@@ -57,3 +60,73 @@ class BoundedRecoveryPolicy(Generic[T]):
         if inspect.isawaitable(result):
             await result
         return True
+
+
+class TerminalReleaseDecision(StrEnum):
+    """Permission for independent work only; never permission to retry the task.
+
+    Every result retains failed-task suppression and dependency blocking.
+    WAIT uses existing bounded recovery/wake conditions; OPERATOR_DECISION
+    requires a substantive decision rather than another technical retry.
+    """
+
+    RELEASE = "release"
+    WAIT = "wait"
+    OPERATOR_DECISION = "operator_decision"
+
+
+@dataclass(frozen=True)
+class TerminalReleaseFacts:
+    """Observed safety facts; absent evidence is never a positive observation.
+
+    ``cleanup_confirmed`` means positively confirmed process cleanup, not a
+    missing process handle. Remote facts cover ownership and the outcome of
+    any creation/merge attempt (including confirmed absence of an attempt).
+    Preservation must be verified before it can substitute for no-loss proof.
+    """
+
+    failure_persisted: bool | None = None
+    remote_ownership_known: bool | None = None
+    remote_outcome_resolved: bool | None = None
+    cleanup_confirmed: bool | None = None
+    worktree_stable: bool | None = None
+    no_loss_confirmed: bool | None = None
+    preservation_verified: bool | None = None
+    user_paused: bool | None = None
+    cost_hold: bool | None = None
+    security_hold: bool | None = None
+
+
+def terminal_release_decision(
+    subsource: SuppressionReason | str | None,
+    facts: TerminalReleaseFacts,
+) -> TerminalReleaseDecision:
+    """Decide whether a terminal failure may release an independent writer.
+
+    This read-only policy neither clears suppression/status nor selects work.
+    Dependents remain blocked and the failed task remains suppressed even on
+    RELEASE. It grants no recovery attempts beyond existing bounded policies
+    and does not change quota wake conditions or user pause semantics.
+    """
+    if subsource is None or lookup(subsource) is None:
+        return TerminalReleaseDecision.OPERATOR_DECISION
+    if (
+        subsource in (SuppressionReason.GUARDRAIL, SuppressionReason.OPERATOR_STOPPED)
+        or facts.user_paused is True
+        or facts.security_hold is True
+    ):
+        return TerminalReleaseDecision.OPERATOR_DECISION
+    if (
+        facts.user_paused is not False
+        or facts.security_hold is not False
+        or facts.cost_hold is not False
+        or facts.failure_persisted is not True
+        or facts.remote_ownership_known is not True
+        or facts.remote_outcome_resolved is not True
+        or facts.cleanup_confirmed is not True
+        or facts.worktree_stable is not True
+    ):
+        return TerminalReleaseDecision.WAIT
+    if facts.no_loss_confirmed is not True and facts.preservation_verified is not True:
+        return TerminalReleaseDecision.OPERATOR_DECISION
+    return TerminalReleaseDecision.RELEASE
