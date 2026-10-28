@@ -491,7 +491,7 @@ def test_reset_testbed_session_resets_repo_and_redis_once() -> None:
         with (
             patch.object(
                 e2e_conftest, "_stop_daemon_and_wait_paused",
-                side_effect=lambda slug: calls.append(f"stop:{slug}"),
+                side_effect=AssertionError("session reset must not wait for recovered merge pause"),
             ),
             patch.object(e2e_conftest, "reset_testbed_full", side_effect=reset_full),
             patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=clear_redis),
@@ -505,12 +505,46 @@ def test_reset_testbed_session_resets_repo_and_redis_once() -> None:
         sys.modules.pop(module_name, None)
 
     assert calls == [
-        f"stop:{e2e_conftest.TESTBED_SLUG}",
         "stop",
         f"reset:{e2e_conftest.TESTBED_SLUG}",
         f"clear:{e2e_conftest.TESTBED_SLUG}",
         "start",
     ]
+
+
+@pytest.mark.parametrize("failure", ["stop", "reset", "clear", "start"])
+def test_session_reset_requires_service_stop_and_complete_reset(failure) -> None:
+    from tests.e2e import conftest as module
+
+    calls = []
+
+    def stage(name):
+        calls.append(name)
+        if name == failure:
+            raise RuntimeError(f"{name} unavailable")
+        return {}
+
+    def service_command(cmd, **kwargs):
+        assert cmd == ["docker", "compose", "-f", "docker-compose.test.yml", cmd[-2], "daemon-test"]
+        assert kwargs["check"] is True
+        assert kwargs["timeout"] == 60
+        stage(cmd[-2])
+
+    with (
+        patch.object(module.subprocess, "run", side_effect=service_command),
+        patch.object(module, "_stop_daemon_and_wait_paused", side_effect=AssertionError("unexpected pause wait")),
+        patch.object(module, "reset_testbed_full", side_effect=lambda _: stage("reset")),
+        patch.object(module, "clear_testbed_redis_state", side_effect=lambda _: stage("clear")),
+    ):
+        fixture = module._reset_testbed_session.__wrapped__()
+        with pytest.raises(RuntimeError, match=f"{failure} unavailable"):
+            next(fixture)
+    assert calls == {
+        "stop": ["stop"],
+        "reset": ["stop", "reset", "start"],
+        "clear": ["stop", "reset", "clear", "start"],
+        "start": ["stop", "reset", "clear", "start"],
+    }[failure]
 
 
 def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:

@@ -111,3 +111,52 @@ def test_publication_migration_command_is_atomic_in_isolated_redis() -> None:
     # Give the isolated Redis client its own loop and thread for this test.
     with ThreadPoolExecutor(max_workers=1) as pool:
         pool.submit(lambda: asyncio.run(exercise())).result(timeout=30)
+
+
+def test_publication_diagnostics_retains_disclosure_across_summary_refreshes(
+    page: Page, dashboard_url: str,
+) -> None:
+    """Real HTMX swaps refresh evidence without closing an operator's disclosure."""
+    observation = PublicationMigration(
+        repo="example/alpha", pr_number=620, head_repo="example/alpha",
+        ref="refs/heads/work", head_sha="a" * 40, reason="Inspect publication evidence",
+    )
+    state = RepoState(url="https://github.com/example/alpha", name="example__alpha",
+                      publication_migration=observation)
+    context = dict(repo=state, coders=[], effective_coder=None,
+                   page_rendered_at=datetime.now(timezone.utc).isoformat(),
+                   publication_migration_binding=migration_binding(observation),
+                   publication_migration_confirmable=True)
+    html = web_app.templates.get_template("repo.html").render(**context)
+    refreshes = []
+
+    def refresh(route) -> None:
+        refreshes.append(len(refreshes) + 1)
+        # Changing the evidence proves the panel refreshes rather than being preserved wholesale.
+        state.publication_migration.reason = f"Observation {len(refreshes)}"
+        fragment = web_app.templates.get_template("components/repo_summary.html").render(**context)
+        route.fulfill(status=200, body=fragment, content_type="text/html")
+
+    page.route("**/api/repos/example__alpha/events", lambda route: route.abort())
+    page.route("**/partials/repo/example__alpha", refresh)
+    page.route(dashboard_url + "/repo/example__alpha", lambda route: route.fulfill(
+        status=200, body=html, content_type="text/html",
+    ))
+    page.goto(dashboard_url + "/repo/example__alpha", wait_until="domcontentloaded")
+    diagnostics = page.locator("[data-work-diagnostics]")
+    button = diagnostics.get_by_role("button", name="Confirm initial publication floor")
+    expect(diagnostics).to_contain_text("Observation 1")
+    expect(button).to_be_hidden()
+    for number, event in enumerate(("repo:state_change", "repo:history_updated"), start=2):
+        if number == 2:
+            diagnostics.locator("summary").click()
+        page.evaluate("event => htmx.trigger(document.body, event)", event)
+        expect(diagnostics).to_contain_text(f"Observation {number}")
+        expect(button).to_be_visible()
+    diagnostics.locator("summary").click()
+    # Issue the same request as the periodic poll and verify intentional closure survives too.
+    page.evaluate("""() => htmx.ajax('GET', '/partials/repo/example__alpha', {
+        target: '#repo-summary-refresh', swap: 'innerHTML'
+    })""")
+    expect(diagnostics).to_contain_text("Observation 4")
+    expect(button).to_be_hidden()

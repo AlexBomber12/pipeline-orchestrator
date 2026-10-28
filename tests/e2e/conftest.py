@@ -416,10 +416,10 @@ def _reset_testbed_session():
     running e2e tests against a polluted testbed produces nondeterministic
     failures that are far worse than a loud setup abort.
     """
-    # The daemon may have recovered an unfinished merge from the previous CI
-    # run before pytest starts. Pause it before deleting that task on main,
-    # then restart so its in-memory state cannot resurrect the old merge.
-    _stop_daemon_and_wait_paused(TESTBED_SLUG)
+    # Startup can retain an unfinished merge from a previous CI run without
+    # reaching the dashboard pause acknowledgement. This session owns the
+    # isolated compose service: require its successful stop before any reset,
+    # then restart so in-memory recovery cannot resurrect deleted state.
     subprocess.run(
         ["docker", "compose", "-f", "docker-compose.test.yml", "stop", "daemon-test"],
         cwd=REPO_DIR, check=True, timeout=60,

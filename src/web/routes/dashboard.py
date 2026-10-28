@@ -48,6 +48,7 @@ from src.github import prs as gh_prs
 from src.keyspace import (
     cli_log_latest,
     daemon_panic_state,
+    pipeline_state,
     recovery_backup_branch,
     upload_pending_count,
 )
@@ -466,6 +467,118 @@ async def _build_guardrail_pending_view(
     return views
 
 
+async def _work_summary(
+    state: RepoState, redis_client: Any, *, stale_after: int, guardrail_decision: bool = False,
+) -> dict[str, Any]:
+    """Read durable results separately from snapshot freshness and activity.
+
+    A published stage or invocation is not evidence of a live coder process.
+    Passive viewing never changes review trust or recovery state.
+    """
+    now = datetime.now(timezone.utc)
+    source_time = None
+    freshness = "unavailable"
+    try:
+        raw = await redis_client.get(pipeline_state(state.name))
+        if raw:
+            decoded = json.loads(raw)
+            snapshot = RepoState.model_validate(decoded)
+            source_time = _parse_iso8601(decoded.get("last_updated"))
+            if source_time is None or snapshot.name != state.name or snapshot.url != state.url:
+                raise ValueError("Missing source time or mismatched repository")
+            state = snapshot
+            freshness = (
+                "unknown (clock skew)" if (now - source_time).total_seconds() < -5
+                else "stale" if (now - source_time).total_seconds() > stale_after
+                else "current"
+            )
+    except Exception:
+        source_time = None
+    result = None
+    results_available = False
+    if redis_client is not None:
+        try:
+            records = await MetricsStore(redis_client).recent(
+                repo_name=state.name, limit=200,
+            )
+            results_available = True
+            completed = [r for r in records if r.ended_at and r.outcome in {"merged", "failed"}]
+            if completed:
+                latest = max(completed, key=lambda r: _parse_iso8601(r.ended_at)
+                             or datetime.min.replace(tzinfo=timezone.utc))
+                result = {
+                    "task": latest.task_id, "outcome": latest.outcome,
+                    "cause": latest.cause, "ended_at": latest.ended_at,
+                }
+        except Exception:
+            pass
+    stage = state.state.value
+    reason = state.error_message or ""
+    next_step = {
+        "CODING": "The daemon will observe publication, then check CI and review.",
+        "FIX": "The daemon will observe the fix, then check CI and review again.",
+        "WATCH": "The daemon will recheck CI and current-change review before merging.",
+        "MERGE": "The daemon will verify the merge and finish cleanup.",
+        "IDLE": "The daemon will select the next eligible task automatically.",
+        "PREFLIGHT": "The daemon will recheck prerequisites before dispatch.",
+        "PAUSED": "The daemon will recheck resource availability before continuing.",
+        "ERROR": "Inspect the failure, then choose Retry or reject the task.",
+    }[stage]
+    if stage == "ERROR" and not state.skip_ai_error_diagnose:
+        next_step = "The daemon will reconcile the failure; inspect the result before choosing Retry."
+    if stage == "WATCH" and not reason:
+        reason = "Waiting for CI and current-change review."
+    applicable = [i for i in state.active_inhibitors if i.is_blocking_now(now)
+                  and (stage == "IDLE" or i.coder_affected is None or i.coder_affected == state.coder)]
+    # Coder limits gate WATCH review retriggers, not CI/review polling or merging.
+    # Slowdown reduces cadence but does not prevent dispatch or WATCH polling.
+    informational_types = {"github_budget_slowdown"}
+    if stage == "WATCH":
+        informational_types.update({"rate_limit", "spend_ceiling"})
+    # IDLE has no selected dispatch coder yet. The daemon may use an eligible
+    # fallback, so a per-coder inhibitor alone cannot prove a repository wait.
+    informational = [i for i in applicable if i.inhibitor_type.value in informational_types
+                     or (stage == "IDLE" and i.coder_affected is not None)]
+    blockers = [i for i in applicable if i not in informational]
+    if state.rate_limited_until and state.rate_limited_until > now and not reason:
+        reason = (
+            "Coder rate limit reported; task selection will check eligible coders."
+            if stage == "IDLE" else "Waiting for the resource rate limit to reset."
+        )
+    if blockers:
+        reason = "; ".join(i.reason_text or INHIBITOR_LABELS[i.inhibitor_type.value]
+                           for i in blockers)
+        if any(i.expires_at is None for i in blockers):
+            next_step = "The daemon will recheck resources; reset time is unknown."
+        else:
+            next_step = "The daemon will recheck resources after the reported reset."
+        if any(i.inhibitor_type.value in {"user_stop", "cascade_panic", "error_rate_auto_pause"}
+               for i in blockers):
+            next_step = "Inspect the stop or safety condition before choosing to resume work."
+    if state.user_paused or any(i.inhibitor_type.value == "user_pause" for i in blockers):
+        reason = "Operator paused this repository."
+        next_step = "Choose Resume when you want work to continue."
+    if not state.active:
+        reason = "This repository is disabled."
+        next_step = "Enable this repository in Settings before work can continue."
+    if guardrail_decision:
+        next_step = "Inspect the flagged action, then choose Approve or Reject below."
+    if state.publication_migration is not None:
+        reason = state.publication_migration.reason
+        next_step = "Publication evidence needs operator inspection in diagnostics; the safety fence remains active."
+    for inhibitor in informational:
+        context = inhibitor.reason_text or INHIBITOR_LABELS[inhibitor.inhibitor_type.value]
+        reason = "; ".join(filter(None, (reason, context)))
+    if freshness != "current":
+        next_step = "Waiting for a fresh daemon snapshot; the automatic next step is unconfirmed."
+    return {
+        "stage": stage if source_time else "Unknown", "reason": reason, "next_step": next_step,
+        "freshness": freshness, "source_time": source_time,
+        "activity": "Unknown — coder process liveness is not reported by this snapshot.",
+        "result": result, "results_available": results_available,
+    }
+
+
 async def _repo_template_context(
     name: str,
     redis_client: aioredis.Redis | None,
@@ -510,6 +623,13 @@ async def _repo_template_context(
         registry = build_coder_registry()
     return {
         "repo": state,
+        "work_summary": await _work_summary(
+            state, redis_client,
+            guardrail_decision=any(entry["is_active"] for entry in guardrail_pending),
+            stale_after=max(300, (repo_config.poll_interval_sec if repo_config else 60) * 3,
+                            config.daemon.idle_extended_poll_interval_sec * 2,
+                            config.daemon.watch_slow_poll_interval_sec * 2),
+        ),
         "guardrail_pending": guardrail_pending,
         "publication_migration_binding": migration_token,
         "publication_migration_confirmable": (
