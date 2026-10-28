@@ -238,6 +238,46 @@ async def test_work_summary_disabled_repository_requires_enabling():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["IDLE", "WATCH"])
+@pytest.mark.parametrize("reason_text", ["GitHub API budget low", ""])
+async def test_work_summary_github_slowdown_is_informational(stage, reason_text):
+    from datetime import timedelta
+    from src.inhibitor import WorkInhibitor
+
+    state = _summary_state(state=stage)
+    normal = await _summary(state)
+    slowdown = WorkInhibitor(
+        inhibitor_type="github_budget_slowdown", source_key="budget",
+        reason_text=reason_text,
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    state.active_inhibitors = [slowdown]
+    view = await _summary(state)
+    assert view["next_step"] == normal["next_step"]
+    assert view["reason"] == "; ".join(filter(None, (
+        normal["reason"], reason_text or "GitHub slowdown",
+    )))
+
+    # An unknown slowdown reset must not change a real blocker's reset guidance.
+    state.active_inhibitors = [
+        slowdown.model_copy(update={"expires_at": None}),
+        WorkInhibitor(
+            inhibitor_type="github_budget_pause", source_key="pause",
+            reason_text="GitHub budget exhausted", expires_at=slowdown.expires_at,
+        ),
+    ]
+    blocked = await _summary(state)
+    assert blocked["next_step"] == "The daemon will recheck resources after the reported reset."
+    assert "GitHub budget exhausted" in blocked["reason"]
+    assert (reason_text or "GitHub slowdown") in blocked["reason"]
+
+    state.active_inhibitors = [slowdown.model_copy(update={
+        "expires_at": datetime.now(timezone.utc) - timedelta(seconds=1),
+    })]
+    assert (await _summary(state))["reason"] == normal["reason"]
+
+
+@pytest.mark.asyncio
 async def test_work_summary_resource_and_operator_waits():
     from datetime import timedelta
     from src.inhibitor import WorkInhibitor
