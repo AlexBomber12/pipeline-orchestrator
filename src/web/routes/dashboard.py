@@ -545,6 +545,9 @@ async def _work_summary(
     if state.user_paused or any(i.inhibitor_type.value == "user_pause" for i in blockers):
         reason = "Operator paused this repository."
         next_step = "Choose Resume when you want work to continue."
+    if not state.active:
+        reason = "This repository is disabled."
+        next_step = "Enable this repository in Settings before work can continue."
     if guardrail_decision:
         next_step = "Inspect the flagged action, then choose Approve or Reject below."
     if state.publication_migration is not None:

@@ -23,7 +23,7 @@
    with wall-clock time even when no state/history event fires, so a
    long PAUSED stretch would otherwise leave the countdown stale until
    the next transition. #}
-<div hx-get="/partials/repo/{{ repo.name }}"
+<div hx-get="/partials/repo/{{ repo.name }}" id="repo-summary-refresh"
      hx-trigger="load, repo:state_change from:body, repo:history_updated from:body, every 30s"
      hx-swap="innerHTML">
     {% include "components/repo_summary.html" %}
@@ -72,6 +72,21 @@
 </details>
 
 <script>
+    (function () {
+        const container = document.getElementById('repo-summary-refresh');
+        let diagnosticsOpen = false;
+        document.addEventListener('htmx:beforeSwap', function (event) {
+            if (event.detail.target !== container) return;
+            const diagnostics = container.querySelector('[data-work-diagnostics]');
+            diagnosticsOpen = Boolean(diagnostics && diagnostics.open);
+        });
+        document.addEventListener('htmx:afterSwap', function (event) {
+            if (event.detail.target !== container) return;
+            const diagnostics = container.querySelector('[data-work-diagnostics]');
+            if (diagnostics) diagnostics.open = diagnosticsOpen;
+        });
+    })();
+
     (function () {
         if (window.repoDetailSSEConnection) {
             return;

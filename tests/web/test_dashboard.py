@@ -223,6 +223,21 @@ async def test_work_summary_stages(stage, expected):
 
 
 @pytest.mark.asyncio
+async def test_work_summary_disabled_repository_requires_enabling():
+    # Use the published flag, even if the caller's local state is still active.
+    state = _summary_state(state="IDLE")
+    disabled = state.model_copy(update={"active": False})
+    redis = _SummaryRedis({f"pipeline:{state.name}": disabled.model_dump_json()})
+    view = await _summary(state, redis)
+    assert view["freshness"] == "current"
+    assert view["reason"] == "This repository is disabled."
+    assert view["next_step"] == "Enable this repository in Settings before work can continue."
+    assert "automatically" not in view["next_step"]
+    # Enabling restores the normal automatic next step.
+    assert "next eligible task automatically" in (await _summary(state))["next_step"]
+
+
+@pytest.mark.asyncio
 async def test_work_summary_resource_and_operator_waits():
     from datetime import timedelta
     from src.inhibitor import WorkInhibitor
