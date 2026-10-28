@@ -3633,3 +3633,190 @@ async def test_unavailable_pr_head_stays_retryable(approval, monkeypatch):
     monkeypatch.setattr(daemon_approval.gh_prs, "get_open_prs", lambda *a: [command.pr])
     await runner._run_cycle_body()
     assert (await load_approval(runner.redis, runner.name, command.binding)).status == "applied"
+
+
+@pytest.mark.parametrize("change", ["run", "attempt", "fix_iteration"])
+@pytest.mark.parametrize("stage", ["submit", "consume", "restart", "commit"])
+async def test_approval_binds_invocation_at_same_head(approval, monkeypatch, change, stage):
+    runner, _, repo, _ = approval
+    runner._start_current_run_record("claude", "opus")
+    runner._capture_invocation_snapshot("claude", {}, phase="fix", fix_iteration=1)
+    raw = await runner.redis.get(cause_key(runner.name, "PR-42"))
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    command = build_approval(runner.name, runner.state, raw, repo)
+    if stage != "submit":
+        await enqueue_approval(runner.redis, command)
+    fields = {
+        "run": {"run_id": "another-run"},
+        "attempt": {"attempt_index": 99},
+        "fix_iteration": {"fix_iteration": 2},
+    }[change]
+    changed = runner.state.model_copy(deep=True)
+    changed.active_invocation = replace(changed.active_invocation, **fields)
+    replacement = build_approval(runner.name, changed, raw, repo)
+    assert replacement.binding != command.binding
+    assert replacement.pr.head_sha == command.pr.head_sha
+
+    async def publish_changed():
+        await runner.redis.set(pipeline_state(runner.name), changed.model_dump_json())
+
+    if stage == "commit":
+        original = runner.redis.transaction
+
+        async def transaction(fn, *keys, **kwargs):
+            if len(keys) == 5:
+                await publish_changed()
+            return await original(fn, *keys, **kwargs)
+
+        monkeypatch.setattr(runner.redis, "transaction", transaction)
+    else:
+        await publish_changed()
+    if stage == "submit":
+        with pytest.raises(ApprovalChanged, match="changed"):
+            await enqueue_approval(runner.redis, command)
+        assert await load_approval(runner.redis, runner.name, command.binding) is None
+    else:
+        if stage == "restart":
+            runner._recovered = False
+            runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+        await runner._run_cycle_body()
+        saved = await load_approval(runner.redis, runner.name, command.binding)
+        assert saved.status == "failed"
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) == raw
+
+
+@pytest.mark.parametrize("change", ["run", "task", "branch", "unknown", "spec"])
+async def test_applied_receipt_grants_no_permission_to_changed_context(approval, change):
+    runner, command, repo, _ = approval
+    await enqueue_approval(runner.redis, command)
+    await runner._run_cycle_body()
+    violation = GuardrailViolation(1, "large_diff_threshold", "+1800 LOC", "rule")
+    assert runner._approval_allows_violation(command.pr, violation)
+    if change == "run":
+        runner._start_current_run_record("claude", "opus")
+        runner._capture_invocation_snapshot("claude", {}, phase="fix", fix_iteration=1)
+    elif change == "task":
+        runner.state.current_task.pr_id = "PR-other"
+    elif change == "branch":
+        runner.state.current_pr.branch = "another-branch"
+    elif change == "unknown":
+        runner._approval_receipt.attempt = None
+    else:
+        with (repo / "tasks/PR-42.md").open("a") as f:
+            f.write("Changed specification.\n")
+    # Removing every label does not authorize even the previously approved finding.
+    unlabeled = command.pr.model_copy(update={"quarantine_labels": set()})
+    assert not runner._approval_allows_violation(unlabeled, violation)
+    runner._approval_history = [runner._approval_receipt]
+    fresh = build_approval(runner.name, runner.state, command.failure, repo) if change == "run" else None
+    if fresh:
+        assert runner._matching_approvals(fresh) == [fresh]
+        await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+        runner._recovered = False
+        runner._approval_receipt = None
+        runner.state = RepoState(name=runner.name, url=runner.repo_config.url)
+        await runner._run_cycle_body()
+        await runner._run_cycle_body()
+        assert not runner._approval_allows_violation(unlabeled, violation)
+
+
+async def test_historical_receipt_without_attempt_is_audit_only(approval):
+    runner, command, _, _ = approval
+    await enqueue_approval(runner.redis, command)
+    historical = command.model_dump(mode="json", exclude={"attempt"})
+    import json
+
+    await runner.redis.set(approval_key(runner.name, command.binding), json.dumps(historical, default=str))
+    assert (await enqueue_approval(runner.redis, command)).attempt is None
+    await runner._run_cycle_body()
+    saved = await load_approval(runner.redis, runner.name, command.binding)
+    assert saved.status == "failed" and "unknown" in saved.reason
+    assert await runner.redis.get(cause_key(runner.name, "PR-42"))
+
+
+@pytest.mark.parametrize("change", ["attempt", "spec", "violation"])
+async def test_http_changed_decision_requires_new_binding_and_exact_replay_is_receipt_only(
+    approval, monkeypatch, change,
+):
+    from src.web import app as web_app
+    from src.web.routes import repo_control
+
+    runner, original, repo, _ = approval
+    target = repo.parent / runner.name
+    repo.rename(target)
+    monkeypatch.setattr(web_app, "REPOS_DIR", str(target.parent))
+    monkeypatch.setattr(
+        repo_control, "_resolve_repo_task_path",
+        AsyncMock(return_value=(target / "tasks/PR-42.md", "tasks/PR-42.md")),
+    )
+    monkeypatch.setattr(web_app, "publish_wake", AsyncMock())
+    if change == "attempt":
+        runner._start_current_run_record("claude", "opus")
+        runner._capture_invocation_snapshot("claude", {}, phase="coding")
+    elif change == "spec":
+        with (target / "tasks/PR-42.md").open("a") as f:
+            f.write("Revised requirements.\n")
+    else:
+        changed = CancellationCause.from_redis(original.failure)
+        changed.payload["excerpt"] = "a different violation"
+        await runner.redis.set(cause_key(runner.name, "PR-42"), changed.to_redis())
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    response = await repo_control._approve_guardrail_decision(
+        runner.name, "PR-42", runner.repo_config, runner.redis, original.binding,
+    )
+    assert response.status_code == 409
+    assert await list_approvals(runner.redis, runner.name) == []
+    raw = await runner.redis.get(cause_key(runner.name, "PR-42"))
+    current = build_approval(runner.name, runner.state, raw, target)
+    assert current.binding != original.binding
+    response = await repo_control._approve_guardrail_decision(
+        runner.name, "PR-42", runner.repo_config, runner.redis, current.binding,
+    )
+    assert response.status_code == 202
+    saved = await load_approval(runner.redis, runner.name, current.binding)
+    # Replaying an accepted token after a later attempt returns only its original
+    # receipt; it cannot enqueue a decision for the new invocation.
+    runner._start_current_run_record("claude", "opus")
+    runner._capture_invocation_snapshot("claude", {}, phase="fix", fix_iteration=9)
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    response = await repo_control._approve_guardrail_decision(
+        runner.name, "PR-42", runner.repo_config, runner.redis, current.binding,
+    )
+    assert response.status_code == 202 and response.body.decode() == saved.reason
+    assert await load_approval(runner.redis, runner.name, current.binding) == saved
+    assert len(await list_approvals(runner.redis, runner.name)) == 1
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) == raw
+    await runner._run_cycle_body()
+    assert (await load_approval(runner.redis, runner.name, current.binding)).status == "failed"
+    assert await runner.redis.get(cause_key(runner.name, "PR-42")) == raw
+
+
+@pytest.mark.parametrize("field", ["run_id", "attempt_index"])
+async def test_unknown_invocation_context_cannot_be_approved(approval, field):
+    runner, command, repo, _ = approval
+    runner._start_current_run_record("claude", "opus")
+    runner._capture_invocation_snapshot("claude", {}, phase="coding")
+    runner.state.active_invocation = replace(runner.state.active_invocation, **{field: None})
+    with pytest.raises(ApprovalChanged, match="unknown"):
+        build_approval(runner.name, runner.state, command.failure, repo)
+    runner._approval_receipt = command.model_copy(update={"status": "applied"})
+    assert runner._current_approval(command.pr) is None
+
+
+async def test_cold_fix_accounting_still_parks_persisted_invocation(approval, monkeypatch):
+    runner, _, admitted, invocation, dispatched = await checkpointed_prelaunch_approval(
+        approval, monkeypatch,
+    )
+    runner.state.active_invocation = invocation
+    runner.state.state = PipelineState.FIX
+    runner.state.current_pr.ci_status = CIStatus.PENDING
+    await runner.publish_state()
+    # Accounting must be restored before ownership can be decided. A refresh
+    # without an actionable CI failure must never dispatch an uncertain coder.
+    runner._current_run_record = None
+    runner.state.state = PipelineState.WATCH
+    await runner.handle_fix()
+    assert runner.state.state == PipelineState.ERROR
+    assert runner._current_run_record.run_id == admitted.run_id
+    assert "operator Retry required" in runner.state.error_message
+    dispatched.assert_not_awaited()

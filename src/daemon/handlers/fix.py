@@ -281,7 +281,10 @@ class FixMixin(BreachMixin):
         """Recheck approval and checkout ownership at destructive/launch boundaries."""
         task = self.state.current_task
         if (
-            task is None or self._current_approval(current_pr) is None
+            # This launch was admitted against the old invocation above. Its new
+            # snapshot must not inherit violation authority, but still needs the
+            # existing checkout preservation checks before starting the coder.
+            task is None or self._current_approval(current_pr, check_attempt=False) is None
             or not matches_state(command, self.state)
             or self.state.user_paused or not self.repo_config.active
             or self._current_coder_process is not None
@@ -320,6 +323,28 @@ class FixMixin(BreachMixin):
             return True
         except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
             return False
+
+    async def _park_persisted_fix_invocation(self, record) -> bool:
+        """Keep uncertain execution ownership binding even after approval expires."""
+        if (
+            record is not None and record.ended_at is None and record.invocations
+            and record.run_id != getattr(self, "_completed_fix_run_id", None)
+        ):
+            raw_state = await self.redis.get(pipeline_state(self.name))
+            if raw_state:
+                persisted = RepoState.model_validate_json(raw_state)
+                if (
+                    persisted.state == PipelineState.FIX
+                    and persisted.active_invocation is not None
+                    and persisted.active_invocation.run_id == record.run_id
+                ):
+                    await self._transition_to_error(
+                        "Persisted FIX invocation ownership is uncertain; operator Retry required",
+                        save_run_record_as=None, log_prefix="[FIX]",
+                        commit_task_status=True,
+                    )
+                    return True
+        return False
 
     async def _recover_fix_prelaunch(self, admitted, previous, approval) -> bool:
         """Reuse a saved invocation only when WATCH still owns the old run."""
@@ -595,6 +620,8 @@ class FixMixin(BreachMixin):
             if review_origin != expected_origin:
                 review_feedback = None
                 review_limitation = "status-poll review identity changed before dispatch"
+        if await self._park_persisted_fix_invocation(self._current_run_record):
+            return
         ci_failure = None
         observed_attempts = (
             attempt_scope(self.state, self.owner_repo, self.repo_path, current_pr)
@@ -661,24 +688,8 @@ class FixMixin(BreachMixin):
                     (item for item in recent if item.task_id == task.pr_id), None
                 )
             record = self._current_run_record
-            if (
-                record is not None and record.ended_at is None and record.invocations
-                and record.run_id != getattr(self, "_completed_fix_run_id", None)
-            ):
-                raw_state = await self.redis.get(pipeline_state(self.name))
-                if raw_state:
-                    persisted = RepoState.model_validate_json(raw_state)
-                    if (
-                        persisted.state == PipelineState.FIX
-                        and persisted.active_invocation is not None
-                        and persisted.active_invocation.run_id == record.run_id
-                    ):
-                        await self._transition_to_error(
-                            "Persisted FIX invocation ownership is uncertain; operator Retry required",
-                            save_run_record_as=None, log_prefix="[FIX]",
-                            commit_task_status=True,
-                        )
-                        return
+            if await self._park_persisted_fix_invocation(record):
+                return
             if record is None:
                 if approval_candidate is not None:
                     self.log_event("[FIX] Approved guardrail run accounting unavailable; deferring dispatch.")

@@ -28,6 +28,7 @@ from src.approval_commands import (
     enqueue_approval,
     failure_identity,
     list_approvals,
+    matches_attempt,
     matches_state,
 )
 from src.cancellation.storage import CancellationCause, cause_key, index_key, task_spec_content_hash
@@ -572,6 +573,13 @@ class ApprovalCommandMixin:
                 raise ApprovalChanged("Approval repository binding changed.")
             if self._recovered and not matches_state(command, self.state):
                 raise ApprovalChanged("Active task or PR binding changed.")
+            raw = await self.redis.get(pipeline_state(self.name))
+            persisted = RepoState.model_validate_json(raw) if raw else None
+            if (
+                persisted is None or not matches_attempt(command, persisted)
+                or (self._recovered and not matches_attempt(command, self.state))
+            ):
+                raise ApprovalChanged("Attempt context changed or is unknown; approve the current decision again.")
             # A later decision invalidates this request even while uploads or
             # other inhibitors block application. The transaction checks again
             # before clearing anything; a stale request must not hold forever.
@@ -673,7 +681,7 @@ class ApprovalCommandMixin:
             current = ApprovalCommand.model_validate_json(await pipe.get(key))
             raw = await pipe.get(state_key)
             persisted = RepoState.model_validate_json(raw) if raw else self.state
-            if not matches_state(command, persisted):
+            if not matches_state(command, persisted) or not matches_attempt(command, persisted):
                 raise ApprovalChanged("Published task or PR changed while applying approval.")
             if current.status != "applied" and await pipe.get(upload_key):
                 raise RuntimeError("Task upload arrived during approval application.")
@@ -790,7 +798,7 @@ class ApprovalCommandMixin:
     def _approval_scope(command: ApprovalCommand) -> tuple[Any, ...]:
         return (
             command.repo_slug, command.repo_url, command.task.pr_id, command.task.task_file,
-            command.pr.number, command.pr.branch, command.pr.head_sha, command.task_fingerprint,
+            command.pr.number, command.pr.branch, command.pr.head_sha, command.task_fingerprint, command.attempt,
         )
 
     def _matching_approvals(self, command: ApprovalCommand) -> list[ApprovalCommand]:
@@ -798,7 +806,8 @@ class ApprovalCommandMixin:
         # This grants no lifetime across pushes or revised requirements.
         return [command] + [
             previous for previous in self._approval_history
-            if previous.binding != command.binding and self._approval_scope(previous) == self._approval_scope(command)
+            if previous.binding != command.binding and previous.active and previous.status == "applied"
+            and previous.attempt is not None and self._approval_scope(previous) == self._approval_scope(command)
         ]
 
     def _unapproved_labels(self, command: ApprovalCommand, labels: set[str]) -> set[str]:
@@ -807,9 +816,16 @@ class ApprovalCommandMixin:
             quarantine_label_for_category(category) for category in approved if category
         }
 
-    def _current_approval(self, pr: Any) -> ApprovalCommand | None:
+    def _current_approval(self, pr: Any, *, check_attempt: bool = True) -> ApprovalCommand | None:
         command = self._approval_receipt
-        if command is None or pr.number != command.pr.number or pr.head_sha != command.pr.head_sha:
+        if (
+            command is None or not command.active or command.status != "applied"
+            or command.repo_slug != self.name
+            or not matches_state(command, self.state) or command.attempt is None
+            or (check_attempt and not matches_attempt(command, self.state))
+            or pr.number != command.pr.number or pr.branch != command.pr.branch
+            or pr.head_sha != command.pr.head_sha
+        ):
             return None
         try:
             path = approval_task_path(Path(self.repo_path), command.task.task_file)
