@@ -6,6 +6,10 @@ Onboarding flows read the canonical content from here, optionally apply
 per-repo overrides for placeholders like ``{repo_slug}``, and use
 ``apply_managed_regions`` to inject the sections into a target repo's
 existing AGENTS.md without disturbing user-authored content.
+``AGENTS.md`` is the content source;
+``templates/AGENTS.md`` carries the corresponding starter instructions. Review
+wording describes the delivered readers and coder/daemon handoff, not a separate
+runtime policy implementation.
 """
 
 from __future__ import annotations

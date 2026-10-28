@@ -51,7 +51,7 @@ Quick rules
   and every remaining failure. Never describe that gate as green; an unexplained
   failure does not qualify. Do not repeat an unchanged full-gate run.
 - Always generate `artifacts/ci.log`, `artifacts/pr.patch`, and `artifacts/structure.txt`, and confirm the review patch is nonempty before publication. These are for review only and must not appear in commits (.gitignore handles this).
-- Codex Review is "green" with a valid trusted approval reaction or an explicit successful review bound to the current HEAD (see Codex Review gate). Do not use screenshots.
+- Merge requires a valid current-change trusted `+1`; the delivered reader also recognizes explicit successful reviews bound to the current HEAD (see Codex Review gate). Do not use screenshots.
 - Do not drift from the approved outcome and do not add "nice-to-have" work.
 
 ### Work Modes
@@ -90,16 +90,19 @@ When triggered by the pipeline orchestrator daemon (non-interactive):
 
 ### Codex Review gate (GitHub PR)
 
-This repo treats Codex Review as a single pass/fail signal.
+This repo requires a valid current-change trusted `+1` before merge. The delivered
+review reader also recognizes commit-bound successful reviews as described below;
+that reader verdict does not waive this repository's required `+1`.
 
 Pass signal
-- thumbs up (`+1`) reaction from the Codex bot on either:
+- A trusted thumbs up (`+1`) reaction, admitted against proven publication of the current full PR HEAD, on either:
   - the PR body (description), OR
   - the review anchor comment
-- A trusted review comment with the stable verdict `Codex Review: Didn't find any major issues.` also passes when explicitly bound to the current PR HEAD through GitHub commit metadata or the supported `**Reviewed commit:**` field. Conversational suffixes and the standard provider footer may vary. Abbreviated SHAs must resolve unambiguously to HEAD; missing, conflicting, malformed, or stale bindings do not pass.
+- A trusted review comment with the stable verdict `Codex Review: Didn't find any major issues.` can yield reader approval when explicitly bound to the current PR HEAD through GitHub commit metadata or the supported `**Reviewed commit:**` field. Conversational suffixes and the standard provider footer may vary. Abbreviated SHAs must resolve unambiguously to HEAD; missing, conflicting, malformed, or stale bindings do not pass.
 - A newer successful current-HEAD review supersedes older findings and historical unresolved-summary flags. A summary update alone does not prove a new finding. Later actionable findings or negative reviews still block approval; repeated review requests do not erase a valid verdict. A changed HEAD requires fresh approval.
 - The receipt marker, a completed summary, progress text, and arbitrary LGTM text are not approval signals.
-- The daemon compares the reaction timestamp against the latest push timestamp. A +1 that predates the most recent push is stale and does not count as a pass.
+- Reaction freshness requires proven current-HEAD publication, not the commit author/committer date, a review-request timestamp, or PR `updated_at`. A `+1` predating that publication is stale, including after a later publication of the same SHA. Body reactions also account for newer reviews of another commit by the same actor.
+- Missing or uncertain publication, actor identity, commit binding, or evidence ordering remains pending; timestamps alone cannot establish approval. A fresh request or mutable summary update cannot repair missing provenance. No automatic trust-migration or request/invocation-binding protocol is implied.
 
 In-progress signal
 - eyes (`eyes`) reaction from the Codex bot.
@@ -109,17 +112,15 @@ Feedback
 - Codex may post a comment with findings (often labeled `P1` or `P2`). Fix all `P1` and `P2` by default to obtain current-HEAD approval.
 
 Definitions
-- Codex bot: a GitHub user whose stable numeric ID is included in the configured trusted reviewer identities. A matching login alone does not establish trust.
-- Review anchor comment: the most recent PR conversation comment authored by the PR author that matches at least one:
-  - contains `@codex review`
-  If none exist, use the first PR author comment in the conversation.
+- Codex bot: a GitHub user whose stable numeric ID is included in `daemon.trusted_reviewer_identities`. A matching login alone does not establish trust. Logins are diagnostic labels; neither a `codex` substring nor a bot-looking name grants trust. Use the same configured actor policy for reactions, findings, provider errors and FIX feedback.
+- Review anchor comment: the most recent PR-author conversation comment containing `@codex review` (case-insensitive reader matching). There is no fallback to an arbitrary author comment. Reader matching does not relax the exact trigger body required below.
 
-In `PLANNED PR` and `MICRO PR` flows, the coder posts `@codex review` as a PR comment immediately after PR creation AND after every push in the Fix loop. The comment body MUST be exactly the string `@codex review` with no prefix, no escape characters, no artifact list, no summary, and no trailing text. Artifact filenames belong in the PR description only, never in the trigger comment. The daemon deduplicates: if a valid `@codex review` trigger from the PR author already exists for the current HEAD SHA, the daemon skips its own post; if not, the daemon posts one as a safety net.
+In `PLANNED PR` and `MICRO PR` flows, the coder posts `@codex review` as a PR comment immediately after PR creation AND after every push in the Fix loop. The comment body MUST be exactly the string `@codex review` with no prefix, no escape characters, no artifact list, no summary, and no trailing text. Artifact filenames belong in the PR description only, never in the trigger comment. The daemon checks recent PR-author requests against the proven current-HEAD publication boundary before posting. An earlier-publication request cannot suppress a new request. AUTO PR and daemon FIX coders do not post or wait for review: they publish once, report evidence, and exit; the daemon owns subsequent review/FIX/merge orchestration.
 
 Manual fix loop (used only when `FIX FEEDBACK` does not contain the daemon handoff marker)
 1. Fetch PR comments, reviews, and reactions via GitHub CLI (`gh`). No screenshots.
 2. Check trusted approval reactions on the PR body and review anchor, and explicitly successful current-HEAD review comments.
-3. If valid current-HEAD approval exists without later blocking review evidence, stop. The review gate is green.
+3. If valid current-HEAD approval and the required trusted `+1` exist without later blocking review evidence, stop. The review gate is green.
 4. Otherwise, collect the latest Codex feedback after the most recent push:
    - review comments
    - top-level PR comments
@@ -133,7 +134,7 @@ Manual fix loop (used only when `FIX FEEDBACK` does not contain the daemon hando
 8. Push to the same PR branch.
 9. Post `@codex review` as a new PR comment; the comment body must be exactly `@codex review` with no other text, prefix, or artifact list.
 10. Poll the PR for up to 15 minutes:
-   - if valid current-HEAD approval appears, stop
+   - if valid current-HEAD approval and the required trusted `+1` appear, stop
    - if a new Codex feedback comment appears after the push, repeat the loop
 
 ### Required review artifacts
@@ -261,7 +262,7 @@ If any condition fails, MICRO is not allowed. Use PLANNED PR.
   permits publication only under the documented confirmed-baseline exception.
 - Push to the same PR branch.
 - For a daemon invocation (identified by its handoff marker), perform exactly one iteration. Make one bounded branch/PR observation, report expected and observed SHAs separately, and exit promptly without triggering or waiting for review, handling newly arriving findings, or merging.
-- For a manual invocation, post `@codex review` after the push and use the manual Codex Review gate above until valid current-HEAD approval is present.
+- For a manual invocation, post `@codex review` after the push and use the manual Codex Review gate above until valid current-HEAD approval and the required trusted `+1` are present.
 - If the daemon iteration genuinely cannot implement the change under
   the execution policy, report the real blocker and follow the strict `ESCALATE:`
   last-line protocol. Estimate deviation, an unexpected necessary path, or a
