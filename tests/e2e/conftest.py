@@ -12,8 +12,7 @@ from pathlib import Path
 
 import pytest
 import requests
-import yaml
-from src.config import AppConfig, RepoConfig, normalize_repo_url
+from src.config import update_daemon_config, update_repository
 
 from tests.e2e.lib.review_api import ReviewApi
 from tests.e2e.lib.testbed_reset import clear_testbed_redis_state, reset_testbed_full
@@ -229,20 +228,19 @@ def shared_test_config(reset_testbed, get_state):
     expected_digest = baseline_digest
     pending_digest = None
 
-    def expect_settings_coder_write(url: str, coder: str) -> None:
+    def expect_settings_coder_write(url: str, coder: str, *, daemon_updates=None) -> None:
         nonlocal pending_digest
-        config = AppConfig.model_validate(yaml.safe_load(baseline))
-        matches = [
-            index for index, repo in enumerate(config.repositories)
-            if normalize_repo_url(repo.url) == normalize_repo_url(url)
-        ]
-        assert len(matches) == 1, "expected exactly one repository for the Settings write"
-        index = matches[0]
-        existing = config.repositories[index]
-        config.repositories[index] = RepoConfig.model_validate({**existing.model_dump(), "coder": coder})
-        payload = config.model_dump(mode="json", exclude_none=True)
-        intended = yaml.dump(payload, default_flow_style=False, sort_keys=False).encode("utf-8")
-        pending_digest = hashlib.sha256(intended).hexdigest()
+        # Reuse the writers on disposable bytes; support successive Settings
+        # saves without accepting an arbitrary observed write as fixture-owned.
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.yml"
+            current = _shared_config_bytes()
+            assert hashlib.sha256(current).hexdigest() == expected_digest, "shared config changed outside this fixture"
+            path.write_bytes(current)
+            update_repository(url, path=str(path), coder=coder)
+            if daemon_updates:
+                update_daemon_config(path=str(path), **daemon_updates)
+            pending_digest = hashlib.sha256(path.read_bytes()).hexdigest()
 
     def note_settings_write() -> None:
         nonlocal expected_digest
@@ -287,7 +285,7 @@ def shared_test_config(reset_testbed, get_state):
             reset_testbed_full(TESTBED_SLUG)
             clear_testbed_redis_state(TESTBED_SLUG)
             observed = _config_digest()
-            assert observed == expected_digest or (expected_digest == baseline_digest and observed == pending_digest), (
+            assert observed in {expected_digest, pending_digest}, (
                 "shared config changed outside this fixture; refusing to overwrite concurrent changes"
             )
             if baseline != _shared_config_bytes():

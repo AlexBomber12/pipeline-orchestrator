@@ -440,3 +440,137 @@ def test_clean_failure_e2e_oracle_requires_retained_terminal_outcome(monkeypatch
     else:
         with pytest.raises(AssertionError):
             run()
+
+
+async def test_settings_shim_catalogue_uses_production_discovery(tmp_path):
+    from src.coders.claude_models import discover_claude_models
+
+    (tmp_path / "claude").symlink_to(SHIM.resolve())
+    models = await discover_claude_models(env={**os.environ, "PATH": f"{tmp_path}:{os.environ['PATH']}"})
+    assert [model.invocation_id for model in models] == ["opus", "sonnet"]
+    assert [[effort.name for effort in model.reasoning_efforts] for model in models] == [
+        ["low", "high"], ["low", "high"],
+    ]
+
+
+async def test_settings_shim_refresh_recovers_cached_discovery_failure(tmp_path, monkeypatch):
+    from src.coder_registry import ModelCatalogUnavailable
+    from src.coders.claude import ClaudePlugin
+    from src.config import AppConfig
+    from src.web.services.model_catalog import ModelCatalogCache
+
+    (tmp_path / "claude").symlink_to(SHIM.resolve())
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    calls = []
+
+    async def daemon_loader(plugin, **kwargs):
+        calls.append(plugin.name)
+        if len(calls) == 1:
+            raise ModelCatalogUnavailable("test daemon restarting")
+        return await plugin.get_model_catalog(**kwargs)
+
+    cache = ModelCatalogCache(loader=daemon_loader)
+    plugin = ClaudePlugin()
+    kwargs = {"config": AppConfig(), "config_path": str(tmp_path / "config.yml")}
+    try:
+        assert (await cache.get(plugin, **kwargs)).status == "unavailable"
+        assert (await cache.get(plugin, **kwargs)).models == ()
+        assert calls == ["claude"]
+        refreshed = await cache.get(plugin, refresh=True, **kwargs)
+        assert refreshed.status == "available"
+        assert [model.invocation_id for model in refreshed.models] == ["opus", "sonnet"]
+        assert calls == ["claude", "claude"]
+    finally:
+        await cache.close()
+
+
+def test_settings_shim_records_bound_launch_without_prompt(tmp_path):
+    import json
+
+    scenario = tmp_path / "scenario"
+    scenario.write_text("hang\n")
+    _write_task(tmp_path, "PR-42", branch="pr-42-e2e-settings-first", status="DOING")
+    result = subprocess.run(
+        ["bash", "-c", '''
+source "$1"
+REPO_DIR="$2"
+sleep() { [[ "$1" == 120 ]]; }
+main --print "private prompt excluded from evidence" --model sonnet --effort high
+''', "claude", str(SHIM.resolve()), str(tmp_path)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=5,
+        env={**os.environ, "PO_SHIM_SCENARIO_FILE": str(scenario)},
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(Path(str(scenario) + ".settings-started").read_text()) == {
+        "pr_id": "PR-42", "branch": "pr-42-e2e-settings-first",
+        "plugin_id": "claude", "model": "sonnet", "effort": "high",
+    }
+    assert not Path(str(scenario) + ".settings-started.tmp").exists()
+
+
+def test_settings_overlay_oracle_runs_with_production_config(tmp_path):
+    from tests.e2e.test_shared_config import test_settings_overlay_precedence_is_disposable
+
+    test_settings_overlay_precedence_is_disposable(tmp_path)
+
+
+@pytest.mark.parametrize("outcome", [
+    "fresh", "stale_only", "wrong_task", "wrong_branch", "wrong_plugin",
+    "wrong_phase", "missing_run", "wrong_effort",
+])
+def test_settings_launch_oracle_requires_fresh_bound_snapshot(tmp_path, monkeypatch, outcome):
+    import json
+    from types import SimpleNamespace
+
+    from tests.e2e import test_shared_config as scenario
+
+    now, reads = [0.0], [0]
+    monkeypatch.setattr(scenario, "time", SimpleNamespace(
+        monotonic=lambda: now[0],
+        sleep=lambda seconds: now.__setitem__(0, now[0] + seconds),
+    ))
+    launch_path = tmp_path / "launch.json"
+    cli = {"pr_id": "PR-43", "branch": "pr-43-next", "plugin_id": "claude",
+           "model": "sonnet", "effort": "high"}
+    launch_path.write_text(json.dumps(cli))
+
+    def get_state():
+        reads[0] += 1
+        # Reproduce CI: new task identity is published with the previous run's
+        # low snapshot. CLI evidence already exists when this state is read.
+        stale = reads[0] == 1 or outcome == "stale_only"
+        state = {
+            "state": "CODING",
+            "current_task": {"pr_id": "PR-43", "branch": "pr-43-next"},
+            "active_invocation": {
+                "plugin_id": "claude", "model_override": "sonnet",
+                "reasoning_effort_override": "low" if stale else "high",
+                "run_id": "old-run" if stale else "new-run", "phase": "coding",
+            },
+        }
+        if not stale:
+            if outcome in {"wrong_task", "wrong_branch"}:
+                state["current_task"]["pr_id" if outcome == "wrong_task" else "branch"] = "other"
+            elif outcome in {"wrong_plugin", "wrong_phase", "missing_run", "wrong_effort"}:
+                key, value = {
+                    "wrong_plugin": ("plugin_id", "codex"),
+                    "wrong_phase": ("phase", "fix"),
+                    "missing_run": ("run_id", None),
+                    "wrong_effort": ("reasoning_effort_override", "low"),
+                }[outcome]
+                state["active_invocation"][key] = value
+        return state
+
+    def run():
+        return scenario._wait_for_settings_launch(
+            get_state, launch_path, "PR-43", "pr-43-next", "old-run",
+        )
+
+    if outcome == "fresh":
+        state, record = run()
+        assert reads[0] == 2
+        assert state["active_invocation"]["run_id"] == "new-run"
+        assert record == cli
+    else:
+        with pytest.raises(AssertionError):
+            run()

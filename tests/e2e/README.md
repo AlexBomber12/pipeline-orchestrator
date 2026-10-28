@@ -111,3 +111,37 @@ production contract. Only the fixture-owned `daemon-test` service is restarted.
 No provider login, real coder output, deployment or production restart is tested.
 The existing testbed App/stack prerequisites in `docs/ci-setup.md` still apply;
 real provider and deployment smoke remain operator release actions.
+
+## Applied Settings evidence
+
+`python -m pytest tests/e2e/test_shared_config.py -v` runs in the existing
+serialized integration job. The shared disposable config is restored using
+exact expected write digests, including successive and concurrent saves.
+The Chromium journey selects generic Claude model/effort controls, launches a
+unique task with the real test daemon, and compares saved YAML, immutable
+`active_invocation`, and allowlisted CLI arguments recorded by the hang shim.
+While that process is active, a concurrent timeout save and effort change must
+both survive; invalid model/effort writes must leave the bytes unchanged.
+After daemon reload the original snapshot stays fixed. Stop/resume launches a
+second unique task with the new effort. Success requires both matching CLI
+handshakes, paired with a newly read CODING snapshot for the matching task and
+branch. The second launch must have a different nonempty invocation run ID, so
+a transitional publication retaining the first snapshot cannot pass. IDLE alone
+cannot pass. The fixture pauses and resets its owned
+stack and removes its launch handshake.
+
+`settings-<unique-id>.json` in `e2e-evidence` records the exact tested checkout
+SHA, task/branch identities, saved values, snapshots and launch arguments. A
+missing outcome is not success. This SHA may be GitHub's PR merge SHA; local
+collection and shim component checks do not prove the GHA integration passed.
+The same module checks overlay precedence with the production config writer,
+loader and plugin launch-kwargs resolver in a temporary directory, with an
+explicit `config.production.yml`; it never writes an overlay into the stack.
+The shim advertises synthetic models through the real SDK discovery protocol.
+Before selecting a model, the journey uses the existing Refresh models button
+and waits for its HTMX replacement and an available catalogue containing
+`sonnet`. This bypasses an unavailable catalogue cached during earlier fixture
+restarts; the initial catalogue status is retained in the journey evidence.
+This proves orchestration and argument propagation, not provider model support,
+real account access or deployment. Existing testbed App/stack setup remains a
+prerequisite; real provider/deployment smoke is an operator release action.
