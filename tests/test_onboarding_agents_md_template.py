@@ -127,7 +127,7 @@ def test_quick_rules_mentions_auto_pr_for_daemon() -> None:
 def test_onboarded_review_contract_allows_bound_success_and_preserves_later_blockers():
     generated = apply_managed_regions("# Project instructions\n", daemon_managed_content())
     regions = extract_managed_regions(generated)
-    assert "explicit successful review bound to the current HEAD" in regions["quick_rules"]
+    assert "explicit successful reviews bound to the current HEAD" in regions["quick_rules"]
     assert "Codex review approval valid" in regions["ci_gates"]
     gate = regions["codex_review_gate"]
     assert "Didn't find any major issues." in gate
@@ -138,3 +138,86 @@ def test_onboarded_review_contract_allows_bound_success_and_preserves_later_bloc
     assert "valid current-HEAD approval" in regions["review_fix_runbook"]
     assert 'green" only when' not in generated
     assert "until a non-stale thumbs up" not in generated
+
+
+STARTER_PATH = AGENTS_MD_PATH.parent / "templates" / "AGENTS.md"
+
+
+def _starter_review_gate() -> str:
+    text = STARTER_PATH.read_text()
+    return text.split("### Codex Review gate (GitHub PR)", 1)[1].split(
+        "### Required review artifacts", 1
+    )[0].strip()
+
+
+def test_starter_review_gate_matches_canonical_source() -> None:
+    gate = daemon_managed_content()["codex_review_gate"]
+    assert _starter_review_gate() == gate.split(
+        "## Codex Review gate (GitHub PR)", 1
+    )[1].strip()
+
+
+@pytest.mark.parametrize("representation", ["canonical", "starter", "generated"])
+def test_review_instructions_preserve_actor_head_and_handoff_contract(
+    representation: str,
+) -> None:
+    content = {
+        "canonical": AGENTS_MD_PATH.read_text(),
+        "starter": STARTER_PATH.read_text(),
+        "generated": apply_managed_regions("# User instructions\n", daemon_managed_content()),
+    }[representation]
+    for required in (
+        "requires a valid current-change trusted `+1` before merge",
+        "daemon.trusted_reviewer_identities",
+        "stable numeric ID",
+        "Logins are diagnostic labels",
+        "same configured actor policy",
+        "proven current-HEAD publication",
+        "same SHA",
+        "remains pending",
+        "No automatic trust-migration",
+        "Abbreviated SHAs must resolve unambiguously to HEAD",
+        "There is no fallback to an arbitrary author comment",
+        "comment body MUST be exactly the string `@codex review`",
+        "Manual fix loop (used only when `FIX FEEDBACK` does not contain the daemon handoff marker)",
+        "AUTO PR and daemon FIX coders do not post or wait for review",
+        "they publish once, report evidence, and exit",
+        "Do not post `@codex review`, poll GitHub CI or review",
+        "required trusted `+1` exist without later blocking review evidence",
+        "Do not wait for\n  another review or act on findings that arrive during the invocation",
+        "estimates and expected paths are planning signals, not automatic",
+        "runtime guardrails",
+    ):
+        assert required in content
+    for obsolete in (
+        "If none exist, use the first PR author comment",
+        "compares the reaction timestamp against the latest push timestamp",
+        "already exists for the current HEAD SHA",
+        '"codex" in login',
+    ):
+        assert obsolete not in content
+
+
+def test_review_regeneration_preserves_user_bytes_and_unrelated_modes() -> None:
+    regions = daemon_managed_content()
+    old_regions = dict(regions, codex_review_gate="\nobsolete review policy\n")
+    preamble = "User preamble: café\n\n".encode("utf-8")
+    suffix = b"\n## User rules\nKeep exactly:  two spaces.\n"
+    original = preamble.decode("utf-8") + apply_managed_regions("", old_regions)
+    original += suffix.decode("utf-8")
+    review_update = {"codex_review_gate": regions["codex_review_gate"]}
+    updated = apply_managed_regions(original, review_update)
+    assert updated == original.replace(
+        old_regions["codex_review_gate"], regions["codex_review_gate"]
+    )
+    updated_bytes = updated.encode("utf-8")
+    assert updated_bytes.startswith(preamble)
+    assert updated_bytes.endswith(suffix)
+    assert updated.count(
+        "<!-- pipeline-orchestrator: managed BEGIN codex_review_gate -->"
+    ) == 1
+    assert updated.count(
+        "<!-- pipeline-orchestrator: managed END codex_review_gate -->"
+    ) == 1
+    assert extract_managed_regions(updated) == regions
+    assert apply_managed_regions(updated, regions) == updated

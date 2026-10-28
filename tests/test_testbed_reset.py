@@ -695,6 +695,48 @@ def test_fresh_idle_wait_rejects_control_snapshot_and_unready_runner() -> None:
         sys.modules.pop(module_name, None)
 
 
+@pytest.mark.parametrize("publication_delay", [65, 135])
+def test_fresh_idle_wait_allows_slow_scan_but_requires_new_publication(publication_delay) -> None:
+    module_name = "tests.e2e.conftest"
+    after = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    elapsed = 0
+    observations = []
+
+    def advance(seconds):
+        nonlocal elapsed
+        elapsed += seconds
+
+    def response(*args, **kwargs):
+        observations.append(elapsed)
+        # A valid-looking IDLE stub must remain insufficient throughout
+        # the slow scan; only the runner's new publication permits return.
+        updated = after + timedelta(seconds=1) if elapsed >= publication_delay else after
+        payload = {"states": [{
+            "name": "slug", "state": "IDLE", "user_paused": False,
+            "current_task": None, "current_pr": None,
+            "last_updated": updated.isoformat(),
+        }]}
+        import json
+        result = MagicMock()
+        result.__enter__.return_value.read.return_value = json.dumps(payload).encode()
+        return result
+
+    sys.modules.pop(module_name, None)
+    try:
+        with patch.dict(sys.modules, {"requests": types.SimpleNamespace()}):
+            module = importlib.import_module(module_name)
+        with (
+            patch.object(module.urllib.request, "urlopen", side_effect=response),
+            patch.object(module.time, "monotonic", side_effect=lambda: elapsed),
+            patch.object(module.time, "sleep", side_effect=advance),
+        ):
+            module._wait_for_fresh_idle("slug", after=after)
+        assert observations[0] == 0
+        assert observations[-1] == publication_delay
+    finally:
+        sys.modules.pop(module_name, None)
+
+
 def test_fresh_idle_wait_times_out_on_unavailable_daemon() -> None:
     module_name = "tests.e2e.conftest"
     sys.modules.pop(module_name, None)

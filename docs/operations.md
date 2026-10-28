@@ -327,6 +327,20 @@ complete status-history response for the same commit before admission.
 
 ## Automatic review replacement investigation (PR-406)
 
+The managed Codex Review gate in `AGENTS.md` (read by
+`src/onboarding/agents_md_template.py`) and the starter `templates/AGENTS.md`
+describe the delivered stable-actor/current-change rules. Trust uses configured
+`daemon.trusted_reviewer_identities` numeric GitHub IDs; logins and substrings
+are not trust evidence. Reaction freshness needs proven publication of the
+current full HEAD, including same-SHA republication. Unknown provenance remains
+pending. The reader also supports explicitly commit-bound successful verdicts;
+this repository still requires a current-change trusted `+1` before merge.
+A receipt, mutable summary or fresh request cannot supply missing publication or
+invocation linkage. AUTO PR and daemon FIX coders publish once and exit; the
+daemon owns later review requests and waiting. Manual coders retain their review
+loop and post the exact body `@codex review`. These instructions do not change
+runtime policy or authorize an automatic migration protocol.
+
 Result: **insufficient linkage; no automatic replacement is authorized**. Reusing
 an existing request and posting a fresh exact `@codex review` both leave missing
 publication provenance unknown. No runtime policy, review gate, Redis state,

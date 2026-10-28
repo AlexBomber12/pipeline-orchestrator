@@ -27,6 +27,10 @@ import urllib.request
 
 from tests.e2e.lib.coder_shim import coder_shim
 
+# Upload consumption can follow an in-flight empty IDLE scan. Allow that
+# scan plus the next GitHub-backed dispatch cycle, as other lifecycle tests do.
+CANCELLATION_DEADLINE_SEC = 240
+
 
 def _fetch_cancellations(dashboard_url: str, slug: str) -> list[dict]:
     url = f"{dashboard_url}/api/cancellations/{slug}"
@@ -92,10 +96,10 @@ def test_coder_crash_records_cancellation_cause_and_propagates(
         # ``pr_a_id`` (``_entry_for(payload, pr_a_id)``), so identifying
         # PR-A as the crashed task is guaranteed by that assertion;
         # there is no need for a separate ``current_task`` snapshot.
-        # The 90s budget folds together what was previously a 60s wait
-        # for CODING plus a 30s wait for the cause, so the total time
-        # the test will tolerate end-to-end is unchanged.
-        deadline = time.monotonic() + 90
+        # CI run 40690687583 still showed an empty queue 61s after
+        # upload; the old 90s limit expired before the next dispatch.
+        # Keep polling the durable, task-specific cause through discovery.
+        deadline = time.monotonic() + CANCELLATION_DEADLINE_SEC
         last_payload: list[dict] = []
         cause_for_a: dict | None = None
         while time.monotonic() < deadline:
@@ -106,7 +110,7 @@ def test_coder_crash_records_cancellation_cause_and_propagates(
             time.sleep(1)
         assert cause_for_a is not None, (
             f"no cancellation cause surfaced for {pr_a_id!r} via "
-            f"/api/cancellations/{testbed_slug} within 90s; "
+            f"/api/cancellations/{testbed_slug} within {CANCELLATION_DEADLINE_SEC}s; "
             f"last payload={last_payload!r}; "
             f"runner state={get_state()!r}"
         )
