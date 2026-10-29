@@ -71,3 +71,23 @@ def test_producer_hydration_does_not_guess_identity(monkeypatch, fault):
     evidence = checks.evaluate_ci_evidence(repo="owner/repo", pr_number=1, sha=sha, statuses=payload["statuses"])
     assert evidence.policy_result == CIStatus.PENDING
     assert evidence.pending_reason == "missing_identity:gate"
+
+
+@pytest.mark.parametrize("malformed", [{}, 7, None, "bad"])
+def test_retrieve_ci_status_evidence_preserves_failure_with_malformed_entries(monkeypatch, malformed):
+    sha = "a" * 40
+    payload = {"sha": sha, "state": "failure", "total_count": 1, "statuses": [malformed]}
+    checks.clear_ci_status_cache()
+    monkeypatch.setattr(cache, "_gh_api_paginated_evidence", lambda path: cache.PaginatedEvidence(
+        [{"total_count": 0, "check_runs": []}], True, True))
+    monkeypatch.setattr(cache, "_etag_get_object_pages_evidence", lambda *args: cache.PaginatedEvidence(
+        [deepcopy(payload)], True, False))
+    try:
+        result = checks._retrieve_ci_status_evidence("owner/repo", sha, fresh=True)
+        assert result.status_source.complete is False
+        assert result.status_source.error == "malformed"
+        assert result.evidence.policy_result == CIStatus.FAILURE
+        assert result.evidence.pending_reason is None
+        assert result.status_payload == payload
+    finally:
+        checks.clear_ci_status_cache()

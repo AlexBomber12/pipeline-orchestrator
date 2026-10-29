@@ -366,7 +366,7 @@ def _parse_status_pages(
 def _hydrate_status_producers(repo: str, sha: str, payload: dict) -> None:
     """Combined statuses omit creator; recover it from the exact history record."""
     missing = [status for status in payload.get("statuses", [])
-               if _status_producer(status) is None
+               if isinstance(status, dict) and _status_producer(status) is None
                and type(status.get("id")) is int and status["id"] > 0]
     if not missing:
         return
