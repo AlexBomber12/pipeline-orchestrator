@@ -1034,7 +1034,8 @@ def test_stop_daemon_waits_for_runner_pause_ack(terminal_state) -> None:
             e2e_conftest = importlib.import_module(module_name)
 
         slug = e2e_conftest.TESTBED_SLUG
-        pause_event = "held in ERROR" if terminal_state == "ERROR" else "[INFRA] Paused. Press Play to resume."
+        # A retained WATCH Stop need not emit the generic pause log either.
+        pause_event = "held in ERROR" if terminal_state == "ERROR" else "[RECOVERY] Restored bound FIX PR"
         responses = iter(
             [
                 f'[{{"name": "{slug}", "state": "CODING", "user_paused": true}}]'.encode(),

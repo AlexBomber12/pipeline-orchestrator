@@ -33,6 +33,18 @@ def _calls():
     return CALLS.read_text().splitlines() if CALLS.exists() else []
 
 
+def _recovered_watch(state, task, branch, number, head, restarted_after):
+    pr = state.get("current_pr") or {}
+    return (
+        state.get("state") == "WATCH"
+        and (state.get("current_task") or {}).get("pr_id") == task
+        and pr.get("branch") == branch and pr.get("number") == number
+        and pr.get("head_sha") == head and bool(pr.get("publication_at"))
+        and pr.get("publication_head_sha") == head
+        and datetime.fromisoformat(state["last_updated"]) > restarted_after
+    )
+
+
 def _status(repo, head, state):
     subprocess.run(
         ["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{head}",
@@ -60,6 +72,14 @@ def test_restart_preserves_fix_work(
     def state_matching(predicate):
         def observe():
             state = get_state() or {}
+            evidence["last_observed"] = {
+                key: state.get(key) for key in (
+                    "state", "last_updated", "current_task", "current_pr",
+                    "active_invocation", "publication_attempt", "publication_watermark",
+                    "publication_migration", "review_request_head", "review_request_pr",
+                    "review_request_task", "error_message",
+                )
+            }
             return state if predicate(state) else None
         return _until(observe, seconds=300)
 
@@ -151,7 +171,7 @@ def test_restart_preserves_fix_work(
             if interrupted:
                 recovered = state_matching(lambda s: fresh(s) and s.get("state") == "ERROR")
                 assert recovered["current_pr"]["number"] == number
-                assert recovered["error_message"] == "publication cleanup proof is missing; operator recovery required"
+                assert recovered["error_message"] == "Publication ownership unresolved; retaining coder attempt"
                 retained = recovered["publication_attempt"]
                 for key in ("task_id", "branch", "run_id", "attempt_index", "pr_number"):
                     assert retained[key] == attempt[key], (key, retained, attempt)
@@ -177,7 +197,11 @@ def test_restart_preserves_fix_work(
                 assert pull["state"] == "open" and not pull["merged"], pull
                 evidence["outcome"] = "unknown owner held; no duplicate execution or false success"
             else:
-                recovered = state_matching(lambda s: fresh(s) and ready(s) and s["current_pr"]["head_sha"] == head)
+                # Recovery rebinds the published work; review-request scheduling
+                # fields are rebuilt separately from that ownership contract.
+                recovered = state_matching(
+                    lambda s: _recovered_watch(s, task, branch, number, head, restarted_after)
+                )
                 assert recovered["current_pr"]["number"] == number
                 assert recovered["active_invocation"] == inv
                 assert review_status(head) != ReviewStatus.APPROVED
