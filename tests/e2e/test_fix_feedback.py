@@ -11,9 +11,10 @@ from datetime import datetime
 from pathlib import Path
 
 from src.config import load_config
+from src.github.checks import _classify_ci_retrieval, _retrieve_ci_status_evidence
 from src.github.reviewer_policy import reviewer_policy_from_config
 from src.github.reviews import clear_review_status_cache, get_pr_review_status, read_review_feedback
-from src.models import ReviewStatus
+from src.models import CIStatus, ReviewStatus
 
 from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
 from tests.e2e.lib.review_api import MergeOutcomeApi, ReviewApi, task_released_and_done
@@ -120,6 +121,13 @@ def test_review_feedback_reaches_new_reviewed_head_and_merge(
             ["gh", "api", "-X", "POST", f"repos/{repo}/statuses/{head}",
              "-f", "state=success", "-f", "context=e2e/watch-merge-gate"],
             check=True, capture_output=True, text=True, timeout=30,
+        )
+        # Exercise the production evidence reader against GitHub's real payload,
+        # including producer hydration from the SHA-pinned status history.
+        _wait(
+            lambda: {"ci": _retrieve_ci_status_evidence(repo, head, fresh=True)},
+            lambda evidence: _classify_ci_retrieval(evidence["ci"]) == CIStatus.SUCCESS,
+            timeout=45,
         )
         final = _wait(get_state, lambda state: task_released_and_done(state, task, branch), timeout=240)
         evidence = outcome.assert_merged(number, branch, head, task, marker)
