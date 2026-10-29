@@ -189,6 +189,8 @@ run_success_pending_ci() {
     # carries Commit statuses: Write per docs/ci-setup.md.
     local pr="$1" branch="$2"
     git_setup_branch "${branch}"
+    safe_push_branch "${branch}"
+    sleep 2
     write_marker_and_commit "${pr}"
     safe_push_branch "${branch}"
     local sha
@@ -206,13 +208,19 @@ run_success_pending_ci() {
 }
 
 run_fix_existing_pr() {
-    # FIX must keep the published branch and PR open. run_success resets the
-    # branch to main first, which closes an existing PR before FIX completes.
-    local pr="$1" branch="$2"
+    # Preserve the original PR and replace this task's marker in place.
+    local pr="$1" branch="$2" pending="${3:-false}"
     git fetch origin
     git checkout -B "${branch}" "origin/${branch}"
+    sed -i "\|^shim marker for ${pr} at |d" tests/e2e-shim-marker.txt
+    # Make the FIX marker distinct even on a fast second-resolution clock.
+    sleep 2
     write_marker_and_commit "${pr}"
     safe_push_branch "${branch}"
+    if [[ "${pending}" == true ]]; then
+        gh api -X POST "repos/AlexBomber12/pipeline-orchestrator-testbed/statuses/$(git rev-parse HEAD)" \
+            -f state=pending -f context=e2e/watch-merge-gate >/dev/null
+    fi
     local pr_url
     pr_url="$(ensure_pr_url "${branch}" "${pr}")"
     gh pr comment "${pr_url}" --body "@codex review"
@@ -429,6 +437,9 @@ PYTHON
             ;;
         fix_existing_pr)
             run_fix_existing_pr "${pr}" "${branch}"
+            ;;
+        fix_existing_pr_pending_ci)
+            run_fix_existing_pr "${pr}" "${branch}" true
             ;;
         no_pr)
             run_no_pr "${pr}" "${branch}"

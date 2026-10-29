@@ -171,3 +171,66 @@ def test_convergence_requires_positive_task_and_released_identities():
         changed = {**copy.deepcopy(state), **changes}
         assert not task_released_and_done(changed, "PR-42", "pr-42-upload"), changed
     assert not task_released_and_done(None, "PR-42", "pr-42-upload")
+
+
+@pytest.mark.parametrize("actual_head", ["a" * 40, "b" * 40])
+def test_approval_binds_current_head_and_fresh_anchor(actual_head):
+    head = "a" * 40
+    payloads = [
+        {"head": {"sha": actual_head}, "user": {"login": "author"}},
+        {"commit_id": head, "state": "APPROVED"},
+        [{"id": 19, "user": {"login": "author"}, "body": "@codex review",
+          "created_at": "2020-01-01T00:00:02Z"}],
+        {"content": "+1"},
+    ]
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _result(stdout=json.dumps(payloads.pop(0)))
+
+    api = ReviewApi("reviewer-token", runner=run)
+    if actual_head != head:
+        with pytest.raises(AssertionError):
+            api.approve_head(17, head, "2020-01-01T00:00:01Z")
+        assert len(calls) == 1
+        return
+    api.approve_head(17, head, "2020-01-01T00:00:01Z")
+    assert json.loads(calls[1][1]["input"])["commit_id"] == head
+    assert calls[-1][0][4].endswith("issues/comments/19/reactions")
+    assert all(call[1]["env"]["GH_TOKEN"] == "reviewer-token" for call in calls)
+
+
+@pytest.mark.parametrize("fault", [None, "no_push", "unchanged_marker", "unmatched_pr", "remote_mismatch"])
+def test_fix_outcome_requires_changed_marker_on_matching_new_remote_head(merge_evidence, fault):
+    api, responses, _, marker = merge_evidence
+    head, old_head = "a" * 40, "d" * 40
+    old_marker = "shim marker for PR-42 at old"
+    responses["git/ref/heads/pr-42-upload"] = {"object": {"sha": head}}
+    if fault == "no_push":
+        old_head = head
+    elif fault == "unchanged_marker":
+        old_marker = marker
+    elif fault == "unmatched_pr":
+        responses["pulls/17"]["number"] = 18
+    elif fault == "remote_mismatch":
+        responses["git/ref/heads/pr-42-upload"]["object"]["sha"] = old_head
+    if fault:
+        with pytest.raises(AssertionError):
+            api.fixed_marker(17, "pr-42-upload", head, "PR-42", old_head, old_marker)
+    else:
+        assert api.fixed_marker(17, "pr-42-upload", head, "PR-42", old_head, old_marker) == marker
+
+
+def test_review_transport_failure_is_unknown_and_never_an_actionable_finding(monkeypatch):
+    from src.github import reviews
+    from src.github.reviewer_policy import ReviewerPolicy
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("controlled transport unavailable")
+
+    monkeypatch.setattr(reviews.cache, "_gh_api_paginated", unavailable)
+    feedback = reviews.read_review_feedback("example/testbed", 17, "author", ReviewerPolicy([]))
+    assert feedback.findings == () and feedback.source_ids == ()
+    assert "review feedback unavailable" in feedback.unknown_reason
+    assert not feedback.provider_error_only

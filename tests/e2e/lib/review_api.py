@@ -142,6 +142,35 @@ class ReviewApi:
             )
         return parsed
 
+    def approve_head(self, pr_number: int, head: str, publication_at: str) -> dict:
+        """Post real, independent success evidence after proven publication."""
+        pull = self._call("get_pull", pr_number, f"repos/{self.repo}/pulls/{pr_number}")
+        assert pull["head"]["sha"] == head and re.fullmatch(r"[0-9a-f]{40}", head), pull
+        floor = datetime.fromisoformat(publication_at.replace("Z", "+00:00"))
+        deadline = time.monotonic() + 10
+        while datetime.now(timezone.utc) <= floor + timedelta(seconds=1):
+            assert time.monotonic() < deadline, "publication timestamp is in the future"
+            time.sleep(0.1)
+        review = self._call(
+            "create_success_review", pr_number, f"repos/{self.repo}/pulls/{pr_number}/reviews",
+            method="POST", payload={
+                "event": "APPROVE", "commit_id": head,
+                "body": "Codex Review: Didn't find any major issues.",
+            },
+        )
+        assert review["commit_id"] == head and review["state"] == "APPROVED", review
+        comments = self._call("get_anchor", pr_number, f"repos/{self.repo}/issues/{pr_number}/comments")
+        anchors = [item for item in comments if item.get("body") == "@codex review"
+                   and item["user"]["login"] == pull["user"]["login"]]
+        anchor = anchors[-1]
+        assert datetime.fromisoformat(anchor["created_at"].replace("Z", "+00:00")) >= floor
+        reaction = self._call(
+            "approve_anchor", pr_number, f"repos/{self.repo}/issues/comments/{anchor['id']}/reactions",
+            method="POST", payload={"content": "+1"},
+        )
+        assert reaction["content"] == "+1", reaction
+        return review
+
     def post_changes_requested(self, pr_number: int) -> dict:
         pull = self._call("get_pull", pr_number, f"repos/{self.repo}/pulls/{pr_number}")
         if not isinstance(pull, dict):
@@ -274,6 +303,16 @@ class MergeOutcomeApi:
         ]
         assert len(markers) == 1, markers
         return markers[0]
+
+    def fixed_marker(
+        self, number: int, branch: str, head: str, task_id: str, old_head: str, old_marker: str,
+    ) -> str:
+        assert head != old_head, "FIX did not publish a new HEAD"
+        marker = self.published_marker(number, branch, head, task_id)
+        assert marker != old_marker, "FIX did not change the task marker"
+        remote = self._get(f"git/ref/heads/{quote(branch, safe='')}")
+        assert remote["object"]["sha"] == head, remote
+        return marker
 
     def assert_merged(
         self, number: int, branch: str, head: str, task_id: str, marker: str,
