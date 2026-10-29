@@ -9,6 +9,7 @@ import subprocess
 import time
 from datetime import datetime
 from pathlib import Path
+from uuid import NAMESPACE_URL, uuid5
 
 from src.config import load_config
 from src.github.checks import _classify_ci_retrieval, _retrieve_ci_status_evidence
@@ -139,13 +140,57 @@ def test_review_feedback_reaches_new_reviewed_head_and_merge(
         pulls = outcome._get(f"pulls?state=all&head={repo.split('/')[0]}:{branch}")
         assert [p["number"] for p in pulls] == [number], pulls
         runs = _runs(testbed_slug, task)
-        assert len(runs) == 1 and runs[0]["run_id"] == original_run["run_id"], runs
-        retained = runs[0]
-        assert retained["attempt_index"] == original_run["attempt_index"]
-        assert retained["fix_iterations"] == 1, retained
-        assert retained["invocations"][0] == original_run["invocations"][0]
-        assert [i["phase"] for i in retained["invocations"]] == ["coding", "fix"]
-        assert retained["invocations"][1]["fix_iteration"] == 1
-        assert retained["invocations"][1]["fix_trigger"] == {"ci": None, "review": True}
-        assert retained["exit_reason"] == "success_merged", retained
-        print(f"review-driven FIX merged outcome: {evidence}; run={retained['run_id']}")
+        # Preserve actual records alongside the synthetic CI checkout identity,
+        # even if an accounting assertion fails after the positive merge path.
+        destination = Path(__file__).parent / "evidence" / f"fix-feedback-{task}.json"
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(json.dumps({
+            "tested_sha": subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parents[2], text=True,
+            ).strip(),
+            "repo": repo, "task": task, "branch": branch, "old_head": old_head,
+            "merged": evidence, "original_run": original_run, "runs": runs,
+        }, indent=2, sort_keys=True) + "\n")
+
+        # CODING completion is immutable history, not an active record that FIX
+        # can reopen. The successor is admitted once from that predecessor.
+        by_id = {record["run_id"]: record for record in runs}
+        assert len(by_id) == len(runs), runs
+        assert by_id[original_run["run_id"]] == original_run, runs
+        assert original_run["exit_reason"] == "coding_complete"
+        assert original_run["outcome"] == "superseded"
+        assert original_run["run_phase"] == "coding"
+        assert original_run["head_sha"] == old_head
+        assert original_run["fix_iterations"] == 0
+        assert sorted(record["attempt_index"] for record in runs) == [
+            original_run["attempt_index"], original_run["attempt_index"] + 1,
+        ], runs
+        successor_id = str(uuid5(
+            NAMESPACE_URL, f"{testbed_slug}:coding_complete:{original_run['run_id']}:fix",
+        ))
+        retained = by_id[successor_id]
+        assert retained["coder_session_id"] != original_run["coder_session_id"]
+        assert retained["task_spec_hash"] == original_run["task_spec_hash"] != ""
+        assert retained["base_sha"] == original_run["base_sha"]
+        assert datetime.fromisoformat(retained["started_at"]) >= datetime.fromisoformat(original_run["ended_at"])
+        for record in runs:
+            assert record["task_id"] == task and record["repo_name"] == testbed_slug, record
+            assert record["base_branch"] == configured.branch
+            assert record["ended_at"] and record["duration_ms"] is not None, record
+            assert record["cause"] is None and not record["operator_intervention"], record
+            assert record["fix_recovery_baseline"] == 0, record
+            for invocation in record["invocations"]:
+                assert invocation["run_id"] == record["run_id"], invocation
+                assert invocation["attempt_index"] == record["attempt_index"], invocation
+        # Count all stored invocations, so duplicate execution cannot hide behind
+        # repeated WATCH/FIX events or a record containing extra invocations.
+        assert sorted(i["phase"] for record in runs for i in record["invocations"]) == ["coding", "fix"]
+        assert [i["phase"] for i in retained["invocations"]] == ["fix"]
+        invocation = retained["invocations"][0]
+        assert invocation["fix_iteration"] == retained["fix_iterations"] == 1
+        assert invocation["fix_trigger"] == {"ci": None, "review": True}
+        assert retained["exit_reason"] == "success_merged" and retained["outcome"] == "merged", retained
+        assert retained["run_phase"] == "merge" and retained["head_sha"] == evidence["head_sha"] == head
+        assert [parent["sha"] for parent in outcome._get(f"commits/{head}")["parents"]] == [old_head]
+        print(f"review-driven FIX merged outcome: {evidence}; predecessor={original_run['run_id']}; "
+              f"successor={retained['run_id']}")
