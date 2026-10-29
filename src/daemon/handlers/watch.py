@@ -55,20 +55,8 @@ CODEX_BOT_ERROR_PATTERNS = gh_reviews.CODEX_BOT_ERROR_PATTERNS
 # head_sha is in flight, so the TTL never races a still-relevant retry
 # decision but does reclaim space for closed PRs.
 _CI_INFRA_RETRIED_TTL_SECONDS = 7 * 24 * 60 * 60
-# PR-251 follow-up: grace window applied between writing the infra-retry
-# marker (immediately after ``gh run rerun --failed``) and treating a
-# subsequent INFRA_FAILURE classification as "persistent" enough to
-# escalate to FIX. The CI status fetch is cached for
-# ``_CI_STATUS_CACHE_TTL_SECONDS`` (15s); on fast WATCH cadences (the
-# e2e config polls every 2s) the next cycle can still read the
-# pre-rerun cached payload, see the marker, and route to ``handle_fix``
-# before GitHub has reported any new check-run state. The grace window
-# must be larger than the cache TTL plus enough slack for GitHub to
-# acknowledge the rerun and emit fresh check-runs; 60s gives roughly
-# four cache-miss refetches at the 15s TTL, after which any persisting
-# INFRA_FAILURE genuinely reflects a post-rerun observation. The grace
-# is bounded by the marker TTL above, so closed/abandoned PRs cannot
-# accumulate state.
+# Wait beyond the CI cache TTL before reconciling a workflow rerun.
+# Persistent infrastructure evidence terminates as infrastructure, never FIX.
 _INFRA_RETRY_GRACE_SECONDS = 60.0
 # PR-251 follow-up: regex for extracting the GitHub Actions workflow run
 # ID from a check-run ``details_url``. The canonical format is
@@ -452,19 +440,28 @@ class WatchMixin:
                     self._fix_feedback_reviewer_policy = reviewer_policy
             await self.handle_fix()
             return
+        elif ci in (CIStatus.INFRA_FAILURE, CIStatus.PENDING) and await self._ci_infra_recovery_expired(found):
+            if review == ReviewStatus.CHANGES_REQUESTED:
+                result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
+                if result == FeedbackCheckResult.NEW:
+                    self._fix_feedback_reviewer_policy = reviewer_policy
+                    await self.handle_fix()
+                    return
+            await self._transition_to_error(
+                "Infrastructure CI recovery evidence remained unavailable past the recovery window; "
+                "operator Retry required",
+                save_run_record_as=None, log_prefix="[WATCH]",
+                cancellation_cause=CancellationCause(
+                    category="ERROR", payload={"subsource": "infra_failure"},
+                ),
+                commit_task_status=True,
+            )
+            return
         elif ci == CIStatus.INFRA_FAILURE:
             if attempt_scope(self.state, self.owner_repo, self.repo_path, found) is None:
                 self.log_event(f"[WATCH] PR #{found.number} task generation unavailable; deferring CI retry.")
                 return
-            # A single infra-class failure earns one workflow rerun per
-            # ``head_sha``. Route a persistent failure to FIX only after
-            # the current failed check has a new attempt identity.
-            #
-            # PR-251 follow-up: the marker is gated by
-            # ``_INFRA_RETRY_GRACE_SECONDS`` so the cached pre-rerun CI
-            # payload (TTL 15s) cannot trigger FIX escalation before
-            # GitHub has reported any post-rerun state. While the grace
-            # window is in flight WATCH stays put and re-polls.
+            # One rerun per HEAD, with bounded requery for ambiguous evidence.
             marker_exists, grace_elapsed = await self._infra_retry_attempted(
                 found.number, found.head_sha
             )
@@ -545,27 +542,20 @@ class WatchMixin:
                         f"[WATCH] PR #{found.number} awaiting post-retry terminal CI evidence."
                     )
                     return
-                self.log_event(
-                    f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
-                    f"persisted after retry; routing to FIX as "
-                    f"effective FAILURE."
-                )
-                # Downgrade in-memory ci_status to FAILURE so the FIX
-                # prompt builder injects CI logs (it gates that section
-                # on ``ci_status == CIStatus.FAILURE``); leaving it as
-                # INFRA_FAILURE would drop the very logs the coder
-                # needs for the effective-failure handoff.
-                found.ci_status = CIStatus.FAILURE
                 if review == ReviewStatus.CHANGES_REQUESTED:
                     result = self._has_new_codex_feedback_since_last_push(reviewer_policy)
-                    if result == FeedbackCheckResult.UNKNOWN:
-                        self.log_event(
-                            f"[WATCH] PR #{found.number} CI FIX continues: "
-                            "review feedback unavailable."
-                        )
                     if result == FeedbackCheckResult.NEW:
                         self._fix_feedback_reviewer_policy = reviewer_policy
-                await self.handle_fix()
+                        await self.handle_fix()
+                        return
+                await self._transition_to_error(
+                    "Infrastructure CI failure persisted after retry; operator Retry required",
+                    save_run_record_as=None, log_prefix="[WATCH]",
+                    cancellation_cause=CancellationCause(
+                        category="ERROR", payload={"subsource": "infra_failure"},
+                    ),
+                    commit_task_status=True,
+                )
                 return
             if marker_exists:
                 self.log_event(
@@ -576,8 +566,7 @@ class WatchMixin:
                 return
             self.log_event(
                 f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
-                f"detected; retrying workflow once before routing to "
-                f"FIX."
+                f"detected; retrying workflow once before operator recovery."
             )
             self._infra_retry_baseline = None
             self._infra_retry_rerunnable_checks = []
@@ -1163,6 +1152,30 @@ class WatchMixin:
             return True
         return coder in self.state.rate_limited_coders
 
+    async def _ci_infra_recovery_expired(self, pr: PRInfo) -> bool:
+        """Bound reconciliation using the original durable recovery clock.
+
+        Requeries, issuance progress and restarts cannot renew the allowance.
+        Unknown CI without a confirmed infrastructure incident grants no rerun.
+        """
+        if self.redis is None or not pr.head_sha:
+            return False
+        raw = await self.redis.get(ci_infra_retried(self.owner_repo, pr.number, pr.head_sha))
+        try:
+            marker = json.loads(raw)
+            if not isinstance(marker, dict):
+                return False
+            if attempt_scope(self.state, self.owner_repo, self.repo_path, pr) is None:
+                return False
+            if marker.get("scope") not in (None, self.state.ci_attempt_scope):
+                return False
+            started_at = float(marker.get("started_at", marker["at"]))
+        except (TypeError, ValueError, KeyError, AttributeError):
+            return False
+        return time.time() - started_at >= max(
+            _INFRA_RETRY_GRACE_SECONDS, self.app_config.daemon.ci_pending_max_min * 60,
+        )
+
     async def _infra_retry_attempted(
         self, pr_number: int, head_sha: str
     ) -> tuple[bool, bool]:
@@ -1172,7 +1185,7 @@ class WatchMixin:
         check identities for ``head_sha``; ``grace_elapsed`` is ``True`` only after
         ``_INFRA_RETRY_GRACE_SECONDS`` have passed since that
         timestamp, ensuring that an immediate re-poll on a fast WATCH
-        cadence cannot escalate to FIX while the CI fetch is still
+        cadence cannot exhaust recovery while the CI fetch is still
         serving the pre-rerun cached payload.
 
         Without ``redis`` or ``head_sha`` we report ``(True, True)`` to
@@ -1445,9 +1458,16 @@ class WatchMixin:
         if self.redis is None or not head_sha:
             return
         key = ci_infra_retried(self.owner_repo, pr_number, head_sha)
+        started_at = time.time()
+        try:
+            previous = json.loads(await self.redis.get(key))
+            if previous.get("scope") in (None, self.state.ci_attempt_scope):
+                started_at = float(previous.get("started_at", previous["at"]))
+        except (TypeError, ValueError, KeyError, AttributeError):
+            pass
         await self.redis.set(
             key, json.dumps({
-                "at": time.time(), "issued": issued or (
+                "at": time.time(), "started_at": started_at, "issued": issued or (
                     bool(getattr(self, "_infra_retry_target_run_ids", []))
                     and set(self._infra_retry_target_run_ids).issubset(
                         getattr(self, "_infra_retry_issued_run_ids", [])
