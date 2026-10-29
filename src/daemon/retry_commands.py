@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import subprocess
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -648,6 +648,20 @@ class RetryCommandMixin:
             return await self._defer_retry_command(
                 command, "Prior invocation process cleanup is unconfirmed; publication cannot authorize Retry.",
             )
+        if (attempt is not None and attempt.pending and attempt.provider_error is not None
+            and attempt.exit_classification == "failure"):
+            pr = self.state.current_pr
+            if (pr is None or (command.task_id, command.task_branch, command.bound_pr_number,
+                              command.bound_pr_branch, command.bound_pr_head_sha) != (
+                    attempt.task_id, attempt.branch, attempt.pr_number, attempt.branch, pr.head_sha)):
+                return await self._fail_retry_command(command, "Provider Retry task/PR binding changed.")
+            try:
+                problem = await publication.provider_retry_problem(self, allow_provider_park=True)
+                if problem is not None:
+                    return await self._defer_retry_command(command, problem)
+            except Exception as exc:
+                return await self._defer_retry_command(command, f"Provider Retry ownership unavailable: {exc}.")
+            return "provider_fix", pr
         try:
             floor = await publication.retry_floor(self, command)
         except Exception as exc:
@@ -919,6 +933,63 @@ class RetryCommandMixin:
         )
         return updated
 
+    async def _resume_provider_retry(self, command: RetryCommand) -> RetryDispatch:
+        """Checkpoint one provider-allowance grant, preserving publication and run history."""
+        attempt = self.state.publication_attempt
+        if (attempt is None
+            or (not attempt.pending and command.effect_stage != RetryEffectStage.APPLIED)
+            or (attempt.task_id, attempt.branch, attempt.pr_number) != (
+                command.task_id, command.task_branch, command.bound_pr_number)):
+            return await self._fail_retry_command(command, "Retained provider Retry ownership changed.")
+        if command.effect_stage == RetryEffectStage.APPLIED and attempt.provider_retry_command_id != command.command_id:
+            return await self._fail_retry_command(command, "Applied provider Retry receipt is missing.")
+        if attempt.provider_retry_command_id != command.command_id:
+            previous = self.state.model_copy(deep=True)
+            attempt.provider_retries = 0
+            attempt.provider_retry_at = datetime.now(timezone.utc)
+            attempt.provider_retry_ready = False
+            attempt.provider_retry_command_id = command.command_id
+            attempt.reconcile_deadline = datetime.now(timezone.utc) + timedelta(
+                minutes=self.repo_config.review_timeout_min or self.app_config.daemon.review_timeout_min,
+            )
+            try:
+                # Retain ERROR until the command acknowledgement is durable.
+                # Restart before acknowledgement cannot launch the staged grant.
+                await self.publish_state()
+            except Exception as exc:
+                self.state = previous
+                return await self._defer_retry_command(command, f"Provider Retry checkpoint unavailable: {exc}.")
+        try:
+            if command.effect_stage != RetryEffectStage.APPLIED:
+                command = await self._mark_retry_applied(command, "provider_fix", ["provider_retries"])
+            if (attempt.provider_error is not None and attempt.provider_retries == 0
+                and publication.provider_retry_owns_failure(attempt, attempt.failure)
+                and publication.provider_retry_owns_failure(attempt, self.state.error_message)):
+                await self._clear_retry_failure_evidence(command)
+                self._set_retry_task_snapshot(self.state.current_task)
+                attempt.failure = None
+                attempt.provider_observation_failure = None
+                self.state.error_message = None
+                self.state.state = PipelineState.PAUSED
+                await self.publish_state()
+            # The command's grant/handoff is complete; the retained publication
+            # lifecycle owns subsequent FIX execution. Replays cannot grant again.
+            def complete(current: RetryCommand) -> None:
+                current.status = RetryCommandStatus.APPLIED
+                current.processing_owner = None
+                current.processing_started_at = None
+                current.execution_state = RetryExecutionState.COMPLETED
+
+            updated = await update_retry_command(
+                self.redis, self.name, command.command_id, complete, keep_pending=False,
+                transition_reason="Provider allowance reset; retained FIX scheduled without discarding local work.",
+            )
+            if updated is None:
+                raise RuntimeError("provider Retry command disappeared")
+        except Exception as exc:
+            return await self._defer_retry_command(command, f"Provider Retry handoff acknowledgement deferred: {exc}.")
+        return RetryDispatch.HANDLED
+
     async def _resume_merge_accounting_retry(
         self, command: RetryCommand, task: QueueTask, pr: PRInfo,
     ) -> RetryDispatch:
@@ -947,6 +1018,10 @@ class RetryCommandMixin:
         blocker = await self._retry_blocker(command, "watch")
         if blocker is not None:
             return blocker
+
+        if (command.effect_stage == RetryEffectStage.APPLIED
+            and command.selected_continuation == "provider_fix"):
+            return await self._resume_provider_retry(command)
 
         continuation = await self._select_retry_continuation(command)
         if isinstance(continuation, RetryDispatch):
@@ -1033,6 +1108,9 @@ class RetryCommandMixin:
                     command,
                     f"Status was persisted but acknowledgement failed: {exc}.",
                 )
+
+        if continuation_name == "provider_fix":
+            return await self._resume_provider_retry(command)
 
         if continuation_name == "watch":
             if (
@@ -1122,6 +1200,10 @@ class RetryCommandMixin:
         blocker = await self._retry_blocker(command, "watch")
         if blocker is not None:
             return blocker
+        if (command.effect_stage == RetryEffectStage.APPLIED
+            and command.selected_continuation == "provider_fix"):
+            return await self._resume_provider_retry(command)
+
         continuation = await self._select_retry_continuation(command)
         if isinstance(continuation, RetryDispatch):
             return continuation

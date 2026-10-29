@@ -237,6 +237,18 @@ class PublicationAttempt(BaseModel):
     exit_classification: Literal["success", "failure"] | None = None
     # Supervised terminal cancellation permits exact terminal bookkeeping only.
     terminal_cancelled: bool = False
+    # Provider interruptions retain the same FIX work and a bounded retry budget.
+    provider_error: Literal["capacity", "rate_limit"] | None = None
+    provider_retries: int = Field(default=0, ge=0)
+    provider_retry_at: datetime | None = None
+    provider_retry_ready: bool = False
+    provider_retry_command_id: str | None = None
+    # Exact admitted review/CI prompt, bound to this dispatch and its original head.
+    fix_feedback_context: str | None = None
+    # Latest exact publication owned by this recovery chain; not the review baseline.
+    provider_published_head_sha: str | None = None
+    # Exact error owned by an exhausted observation budget, eligible for bound Retry.
+    provider_observation_failure: str | None = None
 
 class SizeFixCompletion(BaseModel):
     """Confirmed FIX exit awaiting a status write or marker cleanup."""

@@ -224,6 +224,7 @@ def error_category_to_reason(category: "ErrorCategory") -> SuppressionReason:
     from src.daemon.handlers.error import ErrorCategory
 
     mapping = {
+        ErrorCategory.CAPACITY: SuppressionReason.INFRA_FAILURE,
         ErrorCategory.RATE_LIMIT: SuppressionReason.RATE_LIMIT,
         # ``TIMEOUT`` is produced by a broad text match in the ERROR handler.
         # Until R1.5 separates CLI timeouts from review-timeout parking, keep

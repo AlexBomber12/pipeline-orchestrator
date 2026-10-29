@@ -81,6 +81,55 @@ exact PR and open-PR discovery agreement before admission; an older green PR
 view cannot bypass the floor. Missing identity or cleanup evidence requires
 operator inspection rather than a new coder invocation.
 
+## Interrupted provider attempts
+
+A positively classified FIX provider capacity/service-unavailable error is not
+quota exhaustion. Its failed exit checkpoints the frozen head, provider kind,
+and next retry on the existing publication attempt. The run ends as paused;
+each retry has a new run identity while retaining dispatch and attempt history.
+Three consecutive provider interruptions exhaust automatic recovery. The existing
+FIX polling interval supplies exponential backoff; the model and reasoning effort
+remain bound to the interrupted invocation. Actual rate limits retain their
+provider pause deadline. Provider interruptions do not spend the code-fix allowance.
+The attempt also checkpoints the exact admitted review feedback and CI context,
+including retrieved failure logs, before launching the coder. Recovery restores
+that prompt after restart without fetching replacement evidence. Both original
+branch and PR heads survive subsequent attempts, so a commit pushed before an
+interruption still receives the normal current-head review request even when
+the resumed coder only completes validation.
+
+Before resuming, the runner requires bound cleanup/run evidence, the retained
+local branch and head, and exact open-PR evidence. The remote may still contain
+the initial head, the last exact published head owned by the recovery chain,
+or the captured local commit; an independently changed head
+parks recovery without rewriting either side. The resumed FIX keeps commits and
+dirty changes, reruns unfinished validation, and uses normal publication and
+review/CI gates after successful exit. A clean tree or an already-published commit
+cannot convert a failed invocation into successful completion. Operator pause
+continues to block automatic work. Expired quota markers are cleared before
+interrupted-publication recovery so they cannot cause ERROR/PAUSED oscillation.
+An exhausted ownership-observation budget records its exact provider-owned error.
+Bound operator Retry rechecks all ownership evidence before clearing that error
+and granting a new provider allowance. Independent failures remain blocking,
+including when they occur after the observation park.
+Changing the selected provider parks recovery without changing the retained
+invocation. After the operator restores that provider, bound Retry revalidates
+the selected provider and retained ownership before clearing the provider-change
+error and granting a new allowance. Retry cannot authorize a different provider.
+After provider exhaustion, operator Retry can reserve the existing bounded Retry
+allowance and resume the retained FIX without a manual push. Admission uses the
+same local/remote/PR and run-ownership proofs as automatic continuation. The
+existing TODO status checkpoint precedes the handoff; only the provider allowance
+is reset, leaving dispatched attempts, FIX counters, review/CI evidence, and the
+unpublished checkout intact. A durable command receipt makes the allowance grant
+idempotent across lost acknowledgements and restarts. The receipt follows the
+retained FIX's subsequent attempts so replay can acknowledge an already-started
+handoff without resetting its budget or executing CODING. Operator pause and quota
+deadlines still gate execution.
+
+Legacy snapshots lacking bound provider, cleanup, or accounting evidence remain
+stably parked with the missing evidence and the existing Retry action identified.
+
 ## Compatibility and verification boundaries
 
 Version 1 snapshots remain readable and keep their conservative recovery rules.

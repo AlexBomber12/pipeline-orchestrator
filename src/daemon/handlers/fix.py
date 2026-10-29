@@ -537,7 +537,11 @@ class FixMixin(BreachMixin):
 
     async def handle_fix(self) -> None:
         """Run ``FIX FEEDBACK`` via the active coder CLI and return to WATCH."""
-        if self.state.publication_attempt is not None and self.state.publication_attempt.pending:
+        retained = self.state.publication_attempt
+        provider_resume = retained is not None and retained.provider_retry_ready
+        provider_snapshot = self.state.active_invocation if provider_resume else None
+        if (self.state.publication_attempt is not None
+            and self.state.publication_attempt.pending and not provider_resume):
             if self.state.publication_attempt.contract_version == 2:
                 await self._hold_unresolved_publication()
                 return
@@ -580,6 +584,9 @@ class FixMixin(BreachMixin):
                 publish=False,
                 log_prefix="[FIX]",
             )
+            return
+        if provider_snapshot is not None and provider_snapshot.plugin_id != coder_name:
+            await publication._park(self, publication.PROVIDER_RECOVERY_CHANGED)
             return
         if not await self.usage_gate(proactive_coder=coder_name):
             return
@@ -631,7 +638,7 @@ class FixMixin(BreachMixin):
             self._current_approval(current_pr) if current_pr is not None else None
         )
         if (
-            current_pr is not None and current_pr.ci_status == CIStatus.FAILURE
+            not provider_resume and current_pr is not None and current_pr.ci_status == CIStatus.FAILURE
             and approval_candidate is None
         ):
             if self.state.current_task is None or observed_attempts is not None:
@@ -651,7 +658,7 @@ class FixMixin(BreachMixin):
                     return
                 current_pr.ci_status = CIStatus.PENDING
         if (
-            current_pr is not None
+            not provider_resume and current_pr is not None
             and current_pr.ci_status != CIStatus.FAILURE
             and current_pr.review_status == ReviewStatus.CHANGES_REQUESTED
             and (not review_feedback or not review_head or review_head != current_pr.head_sha)
@@ -712,14 +719,14 @@ class FixMixin(BreachMixin):
                 return
             elif record.ended_at is not None:
                 approval = None
-                if record.exit_reason != "coding_complete":
+                if record.exit_reason != "coding_complete" and not provider_resume:
                     approval = await self._approved_guardrail_fix_attempt(record, current_pr)
                     if approval is None:
                         self.log_event("[FIX] Completed or unrelated run record; deferring dispatch.")
                         self.state.state = PipelineState.WATCH
                         return
                     approved_continuation = approval
-                if record.fix_iterations - record.fix_recovery_baseline >= fix_iteration_cap:
+                if record.fix_iterations - record.fix_recovery_baseline - int(provider_resume) >= fix_iteration_cap:
                     await self._escalate_fix_iteration_cap(current_pr)
                     return
                 previous_snapshot = self.state.active_invocation
@@ -739,6 +746,8 @@ class FixMixin(BreachMixin):
                             model=plugin.resolve_model(self.app_config.daemon),
                             task_spec_hash=expected_task_hash,
                         )
+                        if provider_resume:
+                            admitted.fix_recovery_baseline += 1
                         admitted.run_id = admitted_run_id
                         self._current_run_record = admitted
                         await self._checkpoint_current_run_record()
@@ -746,7 +755,7 @@ class FixMixin(BreachMixin):
                         admitted.task_id != task.pr_id or admitted.repo_name != self.name
                         or admitted.ended_at is not None
                         or admitted.attempt_index != record.attempt_index + 1
-                        or admitted.fix_recovery_baseline != record.fix_recovery_baseline
+                        or admitted.fix_recovery_baseline != record.fix_recovery_baseline + int(provider_resume)
                         or admitted.task_spec_hash != expected_task_hash
                     ):
                         raise RuntimeError("admitted FIX accounting changed")
@@ -774,7 +783,7 @@ class FixMixin(BreachMixin):
         record = self._current_run_record
         if (
             record is not None and current_pr is not None
-            and record.fix_iterations - record.fix_recovery_baseline >= fix_iteration_cap
+            and record.fix_iterations - record.fix_recovery_baseline - int(provider_resume) >= fix_iteration_cap
         ):
             await self._escalate_fix_iteration_cap(current_pr)
             return
@@ -825,6 +834,7 @@ class FixMixin(BreachMixin):
         if (
             self.state.current_pr is not None
             and not self.state.current_pr.is_cross_repository
+            and not provider_resume
         ):
             branch = self.state.current_pr.branch
             try:
@@ -915,14 +925,17 @@ class FixMixin(BreachMixin):
                 if metadata.get("head_sha") != review_head:
                     admitted_feedback = None
                     review_limitation = "PR HEAD changed before review dispatch"
-            extra_context = await self._build_fix_feedback_context(
-                self.state.current_pr,
-                reviewer_policy=fix_feedback_reviewer_policy,
-                review_feedback=admitted_feedback,
-                review_limitation=review_limitation,
-                ci_failure=ci_failure,
-                observed_attempts=observed_attempts,
-            )
+            if provider_resume:
+                extra_context = retained.fix_feedback_context
+            else:
+                extra_context = await self._build_fix_feedback_context(
+                    self.state.current_pr,
+                    reviewer_policy=fix_feedback_reviewer_policy,
+                    review_feedback=admitted_feedback,
+                    review_limitation=review_limitation,
+                    ci_failure=ci_failure,
+                    observed_attempts=observed_attempts,
+                )
             if ci_failure is not None and observed_attempts is not None:
                 await persist_attempts()
             if extra_context is not None:
@@ -981,6 +994,16 @@ class FixMixin(BreachMixin):
                         self.log_event("[FIX] CI failure changed before coder launch; returning to WATCH.")
                         self.state.state = PipelineState.WATCH
                         return
+        feedback_context = retained.fix_feedback_context if provider_resume else fix_kwargs.get("extra_context")
+        if provider_snapshot is not None:
+            fix_kwargs["model"] = provider_snapshot.model_override
+            fix_kwargs["reasoning_effort"] = provider_snapshot.reasoning_effort_override
+            fix_kwargs["extra_context"] = (
+                "Resume the interrupted FIX on this retained checkout. Preserve local commits and dirty changes. "
+                "The previous provider invocation failed; its gate is unfinished. Rerun required validation "
+                "before reporting success. Reuse the existing PR; do not republish unchanged work.\n"
+                + (feedback_context or "")
+            )
         if reused_prelaunch:
             snapshot = pending_fix_record.invocations[-1]
             if (
@@ -1020,7 +1043,7 @@ class FixMixin(BreachMixin):
         try:
             if run_record is not None:
                 run_record.profile_id = (
-                    f"{coder_name}:{plugin_run_kwargs['model']}:container"
+                    f"{coder_name}:{fix_kwargs['model']}:container"
                 )
             self.log_event(
                 f"[{coder_name}] entering FIX.",
@@ -1051,7 +1074,16 @@ class FixMixin(BreachMixin):
             if not self._publication_attempt_matches_dispatch():
                 self._begin_publication_attempt(started_at=datetime.now(timezone.utc))
                 if self.state.publication_attempt is not None:
+                    self.state.publication_attempt.fix_feedback_context = feedback_context
                     self.state.publication_attempt.initial_branch_head_sha = head_before or None
+                    if provider_resume:
+                        self.state.publication_attempt.provider_retries = retained.provider_retries
+                        self.state.publication_attempt.provider_retry_command_id = retained.provider_retry_command_id
+                        self.state.publication_attempt.initial_branch_head_sha = retained.initial_branch_head_sha
+                        self.state.publication_attempt.initial_pr_head_sha = retained.initial_pr_head_sha
+                        self.state.publication_attempt.provider_published_head_sha = (
+                            retained.provider_published_head_sha
+                        )
             await self.publish_state()
             if approved_continuation is not None and not await self._approved_fix_checkout_safe(
                 approved_continuation, current_pr, require_fetched_head=True,
@@ -1556,8 +1588,11 @@ class FixMixin(BreachMixin):
             # cap even though the no-push cycles were not consecutive.
             if self.state.current_pr is not None:
                 no_push_policy.reset(self.state.current_pr)
+            if await publication.pause_provider_failure(self, stderr, coder_name):
+                return
             self._detect_rate_limit(stderr, coder_name=coder_name)
-            if self.state.rate_limited_until is not None:
+            if (self.state.rate_limited_until is not None
+                and self.state.rate_limited_until > datetime.now(timezone.utc)):
                 self.state.state = PipelineState.PAUSED
                 await self._clear_error_message_on_recovery(
                     log_prefix="[FIX]",
@@ -1588,7 +1623,7 @@ class FixMixin(BreachMixin):
 
         attempt = self.state.publication_attempt
         if (attempt is not None and attempt.contract_version == 2
-            and (attempt.expected_head_sha != attempt.initial_pr_head_sha or not attempt.verified)):
+            and (provider_resume or attempt.expected_head_sha != attempt.initial_pr_head_sha or not attempt.verified)):
             await capture_stop_requested_after_exit()
             if await pause_for_stop_after_bookkeeping():
                 return
