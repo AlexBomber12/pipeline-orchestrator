@@ -91,6 +91,12 @@ Three consecutive provider interruptions exhaust automatic recovery. The existin
 FIX polling interval supplies exponential backoff; the model and reasoning effort
 remain bound to the interrupted invocation. Actual rate limits retain their
 provider pause deadline. Provider interruptions do not spend the code-fix allowance.
+The attempt also checkpoints the exact admitted review feedback and CI context,
+including retrieved failure logs, before launching the coder. Recovery restores
+that prompt after restart without fetching replacement evidence. Both original
+branch and PR heads survive subsequent attempts, so a commit pushed before an
+interruption still receives the normal current-head review request even when
+the resumed coder only completes validation.
 
 Before resuming, the runner requires bound cleanup/run evidence, the retained
 local branch and head, and exact open-PR evidence. The remote may still contain

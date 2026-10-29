@@ -925,14 +925,17 @@ class FixMixin(BreachMixin):
                 if metadata.get("head_sha") != review_head:
                     admitted_feedback = None
                     review_limitation = "PR HEAD changed before review dispatch"
-            extra_context = await self._build_fix_feedback_context(
-                self.state.current_pr,
-                reviewer_policy=fix_feedback_reviewer_policy,
-                review_feedback=admitted_feedback,
-                review_limitation=review_limitation,
-                ci_failure=ci_failure,
-                observed_attempts=observed_attempts,
-            )
+            if provider_resume:
+                extra_context = retained.fix_feedback_context
+            else:
+                extra_context = await self._build_fix_feedback_context(
+                    self.state.current_pr,
+                    reviewer_policy=fix_feedback_reviewer_policy,
+                    review_feedback=admitted_feedback,
+                    review_limitation=review_limitation,
+                    ci_failure=ci_failure,
+                    observed_attempts=observed_attempts,
+                )
             if ci_failure is not None and observed_attempts is not None:
                 await persist_attempts()
             if extra_context is not None:
@@ -991,6 +994,7 @@ class FixMixin(BreachMixin):
                         self.log_event("[FIX] CI failure changed before coder launch; returning to WATCH.")
                         self.state.state = PipelineState.WATCH
                         return
+        feedback_context = retained.fix_feedback_context if provider_resume else fix_kwargs.get("extra_context")
         if provider_snapshot is not None:
             fix_kwargs["model"] = provider_snapshot.model_override
             fix_kwargs["reasoning_effort"] = provider_snapshot.reasoning_effort_override
@@ -998,7 +1002,7 @@ class FixMixin(BreachMixin):
                 "Resume the interrupted FIX on this retained checkout. Preserve local commits and dirty changes. "
                 "The previous provider invocation failed; its gate is unfinished. Rerun required validation "
                 "before reporting success. Reuse the existing PR; do not republish unchanged work.\n"
-                + str(fix_kwargs.get("extra_context", ""))
+                + (feedback_context or "")
             )
         if reused_prelaunch:
             snapshot = pending_fix_record.invocations[-1]
@@ -1070,11 +1074,13 @@ class FixMixin(BreachMixin):
             if not self._publication_attempt_matches_dispatch():
                 self._begin_publication_attempt(started_at=datetime.now(timezone.utc))
                 if self.state.publication_attempt is not None:
+                    self.state.publication_attempt.fix_feedback_context = feedback_context
                     self.state.publication_attempt.initial_branch_head_sha = head_before or None
                     if provider_resume:
                         self.state.publication_attempt.provider_retries = retained.provider_retries
                         self.state.publication_attempt.provider_retry_command_id = retained.provider_retry_command_id
-                        self.state.publication_attempt.initial_branch_head_sha = retained.initial_pr_head_sha
+                        self.state.publication_attempt.initial_branch_head_sha = retained.initial_branch_head_sha
+                        self.state.publication_attempt.initial_pr_head_sha = retained.initial_pr_head_sha
             await self.publish_state()
             if approved_continuation is not None and not await self._approved_fix_checkout_safe(
                 approved_continuation, current_pr, require_fetched_head=True,

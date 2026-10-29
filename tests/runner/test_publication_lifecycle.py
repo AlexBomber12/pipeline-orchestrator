@@ -46,7 +46,9 @@ async def lifecycle(tmp_path, monkeypatch):
     git(repo, 'config', 'user.email', 'fixture@example.test')
     git(repo, 'config', 'user.name', 'Fixture')
     (repo / 'tasks').mkdir()
-    (repo / 'tasks/PR-001.md').write_text('# PR-001: Repair\n\nBranch: pr-001\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n')
+    (repo / 'tasks/PR-001.md').write_text(
+        '# PR-001: Repair\n\nBranch: pr-001\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n'
+    )
     git(repo, 'add', '.')
     git(repo, 'commit', '-m', 'base')
     git(repo, 'remote', 'add', 'origin', str(remote))
@@ -1072,8 +1074,10 @@ async def test_held_failure_queue_projection_is_bound(lifecycle, case):
 @pytest.mark.parametrize('published', [False, True])
 @pytest.mark.parametrize('dirty', [False, True])
 @pytest.mark.parametrize('diagnostic', ['capacity', 'rate_limit'])
+@pytest.mark.parametrize('feedback_source', ['review', 'ci', 'both'])
+@pytest.mark.parametrize('interrupted_before_work', [False, True])
 async def test_provider_interrupted_fix_preserves_work_and_eventually_progresses(
-    lifecycle, monkeypatch, published, dirty, diagnostic,
+    lifecycle, monkeypatch, published, dirty, diagnostic, feedback_source, interrupted_before_work,
 ):
     runner, provider, repo, old, expected, configure = lifecycle
     remote = git(repo, 'remote', 'get-url', 'origin')
@@ -1083,6 +1087,21 @@ async def test_provider_interrupted_fix_preserves_work_and_eventually_progresses
     await runner._save_current_run_record('coding_complete')
     runner.state.active_invocation = None
     runner.state.current_pr.review_status = ReviewStatus.PENDING
+    finding = 'Repair the missing ownership check before accepting a publication.'
+    ci_log = 'FAILED test_original_repair: ownership evidence was discarded'
+    if feedback_source in {'review', 'both'}:
+        runner.state.current_pr.review_status = ReviewStatus.CHANGES_REQUESTED
+        runner._fix_review_feedback = finding
+        runner._fix_review_head = old
+        monkeypatch.setattr(prs, 'get_pr_metadata', lambda *a: {'head_sha': old})
+    if feedback_source in {'ci', 'both'}:
+        runner.state.current_pr.ci_status = CIStatus.FAILURE
+        monkeypatch.setattr('src.daemon.handlers.fix._current_ci_failure', lambda *a: {
+            'repo': 'octo/demo', 'pr_number': 646, 'head_sha': old,
+            'contexts': [{'name': 'unit', 'source': 'check', 'check_id': 1, 'attempt': 1,
+                          'state': 'failure', 'workflow_run_id': None, 'job_id': None}],
+        })
+        monkeypatch.setattr('src.daemon.handlers.fix._fetch_failed_ci_logs', lambda *a: ci_log)
     calls = []
     with (repo / ".git/info/exclude").open("a") as exclusions:
         exclusions.write("artifacts/\n")
@@ -1101,11 +1120,14 @@ async def test_provider_interrupted_fix_preserves_work_and_eventually_progresses
 
     async def coder(path, *args, **kwargs):
         calls.append(kwargs)
+        assert (finding in kwargs['extra_context']) is (feedback_source in {'review', 'both'})
+        assert (ci_log in kwargs['extra_context']) is (feedback_source in {'ci', 'both'})
         if len(calls) == 1:
-            git(repo, 'reset', '--hard', expected)
+            if not interrupted_before_work:
+                git(repo, 'reset', '--hard', expected)
             if published:
                 git(repo, 'push', 'origin', 'pr-001')
-                provider['head'] = expected
+                provider['head'] = old if interrupted_before_work else expected
             if dirty:
                 (repo / 'unfinished').write_text('retain me')
             (repo / 'artifacts').mkdir(exist_ok=True)
@@ -1118,12 +1140,16 @@ async def test_provider_interrupted_fix_preserves_work_and_eventually_progresses
             return 1, '', 'Task: PR-429\n' + message
         assert kwargs['model'] == calls[0]['model'] == 'gpt-5.4'
         assert kwargs['reasoning_effort'] == calls[0]['reasoning_effort'] == 'high'
-        assert git(repo, 'rev-parse', 'HEAD') == expected
+        assert git(repo, 'rev-parse', 'HEAD') == (old if interrupted_before_work else expected)
         assert not dirty or (repo / 'unfinished').read_text() == 'retain me'
         assert (repo / 'artifacts/ci.log').read_text() == 'pytest 2% -- no result'
         assert 'gate is unfinished' in kwargs['extra_context']
+        assert kwargs['extra_context'].endswith(calls[0]['extra_context'])
+        if interrupted_before_work:
+            # Fresh invocation still knows which repair to implement.
+            git(repo, 'reset', '--hard', expected)
         (repo / 'artifacts/ci.log').write_text('required gate passed')
-        if not published:
+        if not published or interrupted_before_work:
             git(repo, 'push', 'origin', 'pr-001')
         provider['head'] = expected
         return 0, 'Gate completed successfully; existing PR retained.', ''
@@ -1140,7 +1166,13 @@ async def test_provider_interrupted_fix_preserves_work_and_eventually_progresses
     fresh = await restart(runner, setup)
     fresh._recovered = True
     fresh.app_config.daemon.coder_settings = {"codex": {"model": "gpt-5.4-mini", "reasoning_effort": "low"}}
-    assert fresh.state.publication_attempt.expected_head_sha == expected
+    assert fresh.state.publication_attempt.expected_head_sha == (old if interrupted_before_work else expected)
+    assert fresh.state.publication_attempt.fix_feedback_context == calls[0]['extra_context']
+    # Recovery must use durable admitted evidence, even if remote logs disappear.
+    monkeypatch.setattr('src.daemon.handlers.fix._current_ci_failure',
+                        lambda *a: pytest.fail('recovery fetched new CI evidence'))
+    monkeypatch.setattr('src.daemon.handlers.fix._fetch_failed_ci_logs',
+                        lambda *a: pytest.fail('recovery fetched new CI logs'))
     await fresh._run_cycle_body()
     assert len(calls) == 1
     fresh.state.user_paused = True
@@ -1153,6 +1185,10 @@ async def test_provider_interrupted_fix_preserves_work_and_eventually_progresses
     await fresh._run_cycle_body()
     assert len(calls) == 2, "\n".join(e["event"] for e in fresh.state.history[-15:])
     assert fresh.state.state == PipelineState.WATCH
+    assert len(provider['requests']) == 1
+    assert fresh.state.review_requested_at is not None
+    assert fresh.state.publication_attempt.initial_pr_head_sha == old
+    assert fresh.state.publication_attempt.initial_branch_head_sha == old
     assert git(repo, 'rev-parse', 'HEAD') == expected
     assert (repo / 'artifacts/ci.log').read_text() == 'required gate passed'
     assert fresh.state.current_task.pr_id == 'PR-001'
@@ -1230,7 +1266,9 @@ async def test_persistent_capacity_is_bounded_without_spending_fix_allowance(lif
     assert all(len(r.invocations) == 1 and r.invocations[0].phase == "fix" for r in paused)
 
 
-@pytest.mark.parametrize('problem', ['checkout', 'remote', 'cleanup', 'identity', 'accounting', 'unavailable', 'closed', 'exit', 'pr', 'invocation'])
+@pytest.mark.parametrize('problem', [
+    'checkout', 'remote', 'cleanup', 'identity', 'accounting', 'unavailable', 'closed', 'exit', 'pr', 'invocation',
+])
 async def test_provider_recovery_retains_conflicting_or_missing_evidence(lifecycle, monkeypatch, problem):
     runner, provider, repo, old, expected, _ = lifecycle
     await publication.record_exit(runner, 1, '', 'ERROR: Selected model is at capacity')
@@ -1417,8 +1455,12 @@ async def test_operator_retry_resumes_exhausted_unpublished_fix(lifecycle, monke
     from src.cancellation import get_cancellation_cause, task_spec_content_hash
     from src.daemon.retry_commands import RetryCommandMixin, RetryDispatch
     from src.retry_commands import (
-        RetryCommandStatus, RetryExecutionState, enqueue_retry_command, load_retry_command,
-        new_retry_command, retry_failure_identity,
+        RetryCommandStatus,
+        RetryExecutionState,
+        enqueue_retry_command,
+        load_retry_command,
+        new_retry_command,
+        retry_failure_identity,
     )
 
     monkeypatch.setattr("src.retry_commands.utc_now", lambda: Clock.value)

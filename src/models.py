@@ -243,6 +243,8 @@ class PublicationAttempt(BaseModel):
     provider_retry_at: datetime | None = None
     provider_retry_ready: bool = False
     provider_retry_command_id: str | None = None
+    # Exact admitted review/CI prompt, bound to this dispatch and its original head.
+    fix_feedback_context: str | None = None
 
 class SizeFixCompletion(BaseModel):
     """Confirmed FIX exit awaiting a status write or marker cleanup."""
