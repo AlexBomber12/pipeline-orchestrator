@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from urllib.parse import quote
 
@@ -231,14 +232,23 @@ def wipe_tasks_dir_on_main() -> bool:
                 f"wipe_tasks_dir_on_main: git commit failed "
                 f"(rc={commit.returncode}): {commit.stderr.strip()}"
             )
-        push = subprocess.run(
-            ["git", "-C", str(repo), "push", "origin", "main"],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-            env=_git_env(),
-        )
+        # Retry the same commit only for GitHub's transient server error. A
+        # lost successful response is safe: repeating this push is up to date.
+        # Auth, policy and non-fast-forward failures must still fail immediately.
+        for attempt in range(3):
+            push = subprocess.run(
+                ["git", "-C", str(repo), "push", "origin", "main"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=30,
+                env=_git_env(),
+            )
+            if push.returncode == 0 or "Internal Server Error" not in push.stderr:
+                break
+            if attempt < 2:
+                print(f"wipe_tasks_dir_on_main: transient push failure; retry {attempt + 1}/2")
+                time.sleep(attempt + 1)
         if push.returncode != 0:
             raise RuntimeError(
                 f"wipe_tasks_dir_on_main: git push failed "
