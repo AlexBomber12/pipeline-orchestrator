@@ -998,6 +998,10 @@ class IdleMixin:
 
     async def handle_paused(self) -> None:
         """Wait for rate limit window to expire, then resume previous flow."""
+        from src.daemon import publication
+
+        if await publication.resume_provider_failure(self):
+            return
         attempt = self.state.publication_attempt
         invocation = self.state.active_invocation
         if (attempt is not None and attempt.pending and attempt.contract_version == 2

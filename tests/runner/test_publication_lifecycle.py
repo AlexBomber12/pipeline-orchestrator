@@ -1067,3 +1067,346 @@ async def test_held_failure_queue_projection_is_bound(lifecycle, case):
         'status': TaskStatus.ERROR if case == 'failed' else task.status,
     })]
     assert await load_current_queue(runner.name, runner.redis) == expected
+
+
+@pytest.mark.parametrize('published', [False, True])
+@pytest.mark.parametrize('dirty', [False, True])
+@pytest.mark.parametrize('diagnostic', ['capacity', 'rate_limit'])
+async def test_provider_interrupted_fix_preserves_work_and_eventually_progresses(
+    lifecycle, monkeypatch, published, dirty, diagnostic,
+):
+    runner, provider, repo, old, expected, configure = lifecycle
+    remote = git(repo, 'remote', 'get-url', 'origin')
+    git(remote, 'update-ref', 'refs/heads/pr-001', old)
+    git(repo, 'reset', '--hard', old)
+    runner.state.publication_attempt = None
+    await runner._save_current_run_record('coding_complete')
+    runner.state.active_invocation = None
+    runner.state.current_pr.review_status = ReviewStatus.PENDING
+    calls = []
+    with (repo / ".git/info/exclude").open("a") as exclusions:
+        exclusions.write("artifacts/\n")
+
+    def setup(r):
+        configure(r)
+        r.repo_config.coder = "codex"
+        r.app_config.daemon.coder_settings = {"codex": {"model": "gpt-5.4", "reasoning_effort": "high"}}
+        r._refresh_auth_status_cache = AsyncMock()
+        r.usage_gate = AsyncMock(return_value=True)
+        r._run_coder_with_polling = lambda *args: None
+        return r
+
+    setup(runner)
+    _, plugin = runner._get_coder()
+
+    async def coder(path, *args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            git(repo, 'reset', '--hard', expected)
+            if published:
+                git(repo, 'push', 'origin', 'pr-001')
+                provider['head'] = expected
+            if dirty:
+                (repo / 'unfinished').write_text('retain me')
+            (repo / 'artifacts').mkdir(exist_ok=True)
+            (repo / 'artifacts/ci.log').write_text('pytest 2% -- no result')
+            assert bool(git(repo, 'status', '--porcelain')) is dirty
+            message = ('ERROR: Selected model is at capacity. Please try a different model.\n'
+                       'ERROR: Selected model is at capacity. Please try a different model.\n'
+                       'ERROR: rollout recording failed: missing thread'
+                       if diagnostic == 'capacity' else 'ERROR: HTTP 429 Too Many Requests. Try again in 2 hours.')
+            return 1, '', 'Task: PR-429\n' + message
+        assert kwargs['model'] == calls[0]['model'] == 'gpt-5.4'
+        assert kwargs['reasoning_effort'] == calls[0]['reasoning_effort'] == 'high'
+        assert git(repo, 'rev-parse', 'HEAD') == expected
+        assert not dirty or (repo / 'unfinished').read_text() == 'retain me'
+        assert (repo / 'artifacts/ci.log').read_text() == 'pytest 2% -- no result'
+        assert 'gate is unfinished' in kwargs['extra_context']
+        (repo / 'artifacts/ci.log').write_text('required gate passed')
+        if not published:
+            git(repo, 'push', 'origin', 'pr-001')
+        provider['head'] = expected
+        return 0, 'Gate completed successfully; existing PR retained.', ''
+
+    monkeypatch.setattr(type(plugin), 'fix_review', lambda self, *a, **kw: coder(*a, **kw))
+    await runner.handle_fix()
+    attempt = runner.state.publication_attempt
+    assert attempt.provider_error == diagnostic
+    assert attempt.exit_classification == 'failure'
+    assert (runner.state.rate_limited_until is None) is (diagnostic == 'capacity')
+    interrupted_id = runner.state.active_invocation.run_id
+    interrupted = await runner._metrics_store.get(interrupted_id)
+    assert interrupted.ended_at and interrupted.outcome == 'paused'
+    fresh = await restart(runner, setup)
+    fresh._recovered = True
+    fresh.app_config.daemon.coder_settings = {"codex": {"model": "gpt-5.4-mini", "reasoning_effort": "low"}}
+    assert fresh.state.publication_attempt.expected_head_sha == expected
+    await fresh._run_cycle_body()
+    assert len(calls) == 1
+    fresh.state.user_paused = True
+    Clock.value = attempt.provider_retry_at + timedelta(seconds=1)
+    await fresh._run_cycle_body()
+    assert len(calls) == 1
+    fresh.state.user_paused = False
+    await fresh.redis.set(pipeline_state(fresh.name), fresh.state.model_dump_json())
+    await fresh.publish_state()
+    await fresh._run_cycle_body()
+    assert len(calls) == 2, "\n".join(e["event"] for e in fresh.state.history[-15:])
+    assert fresh.state.state == PipelineState.WATCH
+    assert git(repo, 'rev-parse', 'HEAD') == expected
+    assert (repo / 'artifacts/ci.log').read_text() == 'required gate passed'
+    assert fresh.state.current_task.pr_id == 'PR-001'
+    records = await fresh._metrics_store.list_task_runs(fresh.name, 'PR-001')
+    assert any(record.run_id == interrupted_id and record.ended_at for record in records)
+    assert all(record.ended_at for record in records)
+    assert len({record.run_id for record in records}) == len(records)
+
+
+@pytest.mark.parametrize('flag', [False, True])
+async def test_legacy_interrupted_fix_expiry_is_stably_parked(lifecycle, monkeypatch, flag):
+    runner, _, _, _, _, _ = lifecycle
+    await publication.record_exit(runner, 1, '', 'unclassified failure')
+    await publication.record_cleanup(runner)
+    runner.repo_config.feature_flags.use_single_error_exit = flag
+    runner.state.state = PipelineState.PAUSED
+    runner.state.rate_limited_until = Clock.value + timedelta(minutes=30)
+    await runner.handle_paused()
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner._current_run_record.ended_at
+    assert runner._current_run_record.outcome == "failed"
+    Clock.value += timedelta(minutes=31)
+    for _ in range(3):
+        assert await publication.resume_provider_failure(runner)
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.rate_limited_until is None
+    events = [e for e in runner.state.history if 'lacks bound provider' in e['event']]
+    assert len(events) == 1
+
+
+async def test_persistent_capacity_is_bounded_without_spending_fix_allowance(lifecycle, monkeypatch):
+    runner, provider, repo, old, expected, configure = lifecycle
+    runner._current_run_record.fix_iterations = 3
+    runner.app_config.daemon.fix_iteration_cap = 4
+    remote = git(repo, 'remote', 'get-url', 'origin')
+    git(remote, 'update-ref', 'refs/heads/pr-001', old)
+    runner.state.publication_attempt = None
+    await runner._save_current_run_record('coding_complete')
+    runner.state.active_invocation = None
+    runner.state.current_pr.review_status = ReviewStatus.PENDING
+    runner._refresh_auth_status_cache = AsyncMock()
+    runner.usage_gate = AsyncMock(return_value=True)
+    runner._run_coder_with_polling = lambda *args: None
+    calls = []
+    _, plugin = runner._get_coder()
+
+    async def unavailable(*args, **kwargs):
+        calls.append(kwargs)
+        git(repo, 'reset', '--hard', expected)
+        return 1, '', 'ERROR: Selected model is at capacity. Please try a different model.'
+
+    monkeypatch.setattr(plugin, 'fix_review', unavailable)
+    await runner.handle_fix()
+    for count in (1, 2):
+        Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+        await publication.resume_provider_failure(runner)
+        assert len(calls) == count + 1
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    for _ in range(5):
+        assert await publication.resume_provider_failure(runner)
+        assert runner.state.state == PipelineState.ERROR
+    assert len(calls) == 3
+    assert 'exhausted' in runner.state.error_message
+    assert git(repo, 'rev-parse', 'HEAD') == expected
+    assert git(remote, 'rev-parse', 'refs/heads/pr-001') == old
+    assert provider['requests'] == []
+    records = await runner._metrics_store.list_task_runs(runner.name, 'PR-001')
+    paused = [r for r in records if r.outcome == 'paused']
+    assert len(paused) == 3
+    assert all(r.ended_at for r in paused)
+    assert len({r.run_id for r in paused}) == 3
+    assert sorted(r.fix_iterations for r in paused) == [4, 5, 6]
+    assert sorted(r.fix_recovery_baseline for r in paused) == [0, 1, 2]
+    assert sorted(r.attempt_index for r in paused) == [2, 3, 4]
+    assert all(len(r.invocations) == 1 and r.invocations[0].phase == "fix" for r in paused)
+
+
+@pytest.mark.parametrize('problem', ['checkout', 'remote', 'cleanup', 'identity', 'accounting', 'unavailable', 'closed', 'exit', 'pr', 'invocation'])
+async def test_provider_recovery_retains_conflicting_or_missing_evidence(lifecycle, monkeypatch, problem):
+    runner, provider, repo, old, expected, _ = lifecycle
+    await publication.record_exit(runner, 1, '', 'ERROR: Selected model is at capacity')
+    await publication.record_cleanup(runner)
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    attempt = runner.state.publication_attempt
+    if problem == 'checkout':
+        git(repo, 'reset', '--hard', old)
+    elif problem == 'remote':
+        (repo / 'other').write_text('independent')
+        git(repo, 'add', 'other')
+        git(repo, 'commit', '-m', 'independent')
+        git(repo, 'push', 'origin', 'pr-001')
+        git(repo, 'reset', '--hard', expected)
+    elif problem == 'cleanup':
+        attempt.cleanup_confirmed = False
+    elif problem == 'identity':
+        attempt.run_id = 'other-run'
+    elif problem == 'exit':
+        attempt.exit_classification = None
+    elif problem == 'invocation':
+        runner.state.active_invocation = None
+    elif problem == 'pr':
+        runner.state.current_pr.number = 647
+    elif problem == 'accounting':
+        runner._current_run_record = None
+        runner._metrics_store.get = AsyncMock(return_value=None)
+    elif problem == 'unavailable':
+        provider['error'] = 'provider observation down'
+        Clock.value = attempt.reconcile_deadline + timedelta(seconds=1)
+    else:
+        provider['head'] = expected
+        provider['state'] = prs.ExactPRState.CLOSED
+    dispatch = AsyncMock()
+    monkeypatch.setattr(runner, 'handle_fix', dispatch)
+    for _ in range(3):
+        assert await publication.resume_provider_failure(runner)
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_task.pr_id == 'PR-001'
+    assert runner.state.publication_attempt.pending
+    assert dispatch.await_count == 0
+    assert provider['requests'] == []
+
+
+async def test_provider_pause_blocks_direct_handler_and_repairs_interrupted_accounting(lifecycle, monkeypatch):
+    runner, provider, repo, old, expected, _ = lifecycle
+    await publication.record_exit(runner, 1, '', 'ERROR: Selected model is at capacity')
+    await publication.record_cleanup(runner)
+    runner.state.user_paused = True
+    invocation = runner.state.active_invocation
+    runner.state.active_invocation = None
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.state == PipelineState.PAUSED
+    runner.state.active_invocation = invocation
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.state == PipelineState.PAUSED
+    runner.state.user_paused = False
+    runner._current_run_record.ended_at = None  # legacy exited record awaiting terminal checkpoint
+    await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    provider['head'] = expected
+    resumed = AsyncMock()
+    monkeypatch.setattr(runner, 'handle_fix', resumed)
+    assert await publication.resume_provider_failure(runner)
+    assert resumed.await_count == 1
+    assert runner._current_run_record.ended_at
+
+
+async def test_provider_retry_without_new_work_returns_to_watch_without_publication(lifecycle, monkeypatch):
+    runner, provider, repo, old, _, _ = lifecycle
+    remote = git(repo, 'remote', 'get-url', 'origin')
+    git(remote, 'update-ref', 'refs/heads/pr-001', old)
+    git(repo, 'reset', '--hard', old)
+    provider['head'] = old
+    runner.state.publication_attempt = None
+    await runner._save_current_run_record('coding_complete')
+    runner.state.active_invocation = None
+    runner.state.current_pr.review_status = ReviewStatus.PENDING
+    runner._refresh_auth_status_cache = AsyncMock()
+    runner.usage_gate = AsyncMock(return_value=True)
+    runner._run_coder_with_polling = lambda *args: None
+    calls = []
+    _, plugin = runner._get_coder()
+
+    async def coder(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return 1, '', 'ERROR: HTTP 503 Service Unavailable'
+        return 0, 'Required validation complete; no new changes.', ''
+
+    monkeypatch.setattr(plugin, 'fix_review', coder)
+    await runner.handle_fix()
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    await publication.resume_provider_failure(runner)
+    assert len(calls) == 2
+    assert runner.state.state == PipelineState.WATCH
+    assert not runner.state.publication_attempt.pending
+    assert git(repo, 'rev-parse', 'HEAD') == old
+    assert git(remote, 'rev-parse', 'refs/heads/pr-001') == old
+    assert provider['requests'] == []
+    assert runner._current_run_record.ended_at
+
+
+@pytest.mark.parametrize('observation', ['unavailable', 'lagging'])
+async def test_provider_retry_waits_for_exact_publication_observation(lifecycle, monkeypatch, observation):
+    runner, provider, _, _, expected, _ = lifecycle
+    await publication.record_exit(runner, 1, '', 'ERROR: Selected model is at capacity')
+    await publication.record_cleanup(runner)
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    if observation == 'unavailable':
+        provider['error'] = 'temporary API failure'
+    resumed = AsyncMock()
+    monkeypatch.setattr(runner, 'handle_fix', resumed)
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.state == PipelineState.PAUSED
+    assert resumed.await_count == 0
+    assert runner.state.publication_attempt.provider_retries == 1
+    provider['error'] = None
+    provider['head'] = expected
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    assert resumed.await_count == 1
+    assert runner.state.publication_attempt.provider_retries == 1
+
+
+async def test_provider_retry_never_switches_provider(lifecycle, monkeypatch):
+    runner, provider, _, _, expected, _ = lifecycle
+    await publication.record_exit(runner, 1, '', 'ERROR: Selected model is at capacity')
+    await publication.record_cleanup(runner)
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    provider['head'] = expected
+    runner.repo_config.coder = 'codex'
+    runner._refresh_auth_status_cache = AsyncMock()
+    await publication.resume_provider_failure(runner)
+    assert runner.state.state == PipelineState.ERROR
+    assert 'provider changed' in runner.state.error_message
+    assert runner.state.active_invocation.plugin_id == 'claude'
+    assert runner._current_run_record.ended_at
+
+
+async def test_operator_pause_at_provider_retry_checkpoint_prevents_launch(lifecycle, monkeypatch):
+    runner, provider, _, _, expected, _ = lifecycle
+    await publication.record_exit(runner, 1, '', 'ERROR: Selected model is at capacity')
+    await publication.record_cleanup(runner)
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    provider['head'] = expected
+    publish = runner.publish_state
+
+    async def pause_at_checkpoint():
+        if runner.state.publication_attempt.provider_retry_ready:
+            runner.state.user_paused = True
+            await runner.redis.set(pipeline_state(runner.name), runner.state.model_dump_json())
+        await publish()
+
+    monkeypatch.setattr(runner, 'publish_state', pause_at_checkpoint)
+    resumed = AsyncMock()
+    monkeypatch.setattr(runner, 'handle_fix', resumed)
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.user_paused
+    assert resumed.await_count == 0
+
+
+async def test_expired_observed_quota_is_not_rescheduled_from_its_marker(lifecycle, monkeypatch):
+    runner, provider, _, _, expected, _ = lifecycle
+    await publication.record_exit(runner, 1, '', 'Error: HTTP 429 Too Many Requests. Try again in 2 hours.')
+    await publication.record_cleanup(runner)
+    attempt = runner.state.publication_attempt
+    until = runner.state.rate_limited_until
+    Clock.value = until + timedelta(seconds=1)
+    assert not await publication.pause_provider_failure(runner, 'unrelated error', 'claude')
+    assert attempt.provider_retries == 1
+    assert runner.state.rate_limited_until == until
+    provider['head'] = expected
+    dispatch = AsyncMock()
+    monkeypatch.setattr(runner, 'handle_fix', dispatch)
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.rate_limited_until is None
+    assert dispatch.await_count == 1

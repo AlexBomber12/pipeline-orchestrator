@@ -237,6 +237,11 @@ class PublicationAttempt(BaseModel):
     exit_classification: Literal["success", "failure"] | None = None
     # Supervised terminal cancellation permits exact terminal bookkeeping only.
     terminal_cancelled: bool = False
+    # Provider interruptions retain the same FIX work and a bounded retry budget.
+    provider_error: Literal["capacity", "rate_limit"] | None = None
+    provider_retries: int = Field(default=0, ge=0)
+    provider_retry_at: datetime | None = None
+    provider_retry_ready: bool = False
 
 class SizeFixCompletion(BaseModel):
     """Confirmed FIX exit awaiting a status write or marker cleanup."""

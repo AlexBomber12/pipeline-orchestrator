@@ -814,3 +814,27 @@ async def test_run_codex_async_cancellation_records_cleanup_failure(
         "cleanup could not prove quiescence" in note
         for note in getattr(caught.value, "__notes__", [])
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('diagnostic', ['', 'Error: HTTP 429 Too Many Requests',
+                                        'ERROR: Selected model is at capacity. Please try a different model.'])
+async def test_echoed_task_examples_are_not_provider_diagnostics(monkeypatch, diagnostic):
+    from src.provider_errors import diagnostic_text, is_capacity_error
+    from tests.runner import _helpers as h
+
+    prompt = _build_fix_feedback_prompt(
+        'Examples only:\nError: HTTP 429 Too Many Requests\nERROR: Selected model is at capacity.',
+        pr_id='PR-429', task_file='tasks/PR-429.md',
+    )
+    transcript = f'user\n{prompt}\nthinking\n{diagnostic}\n'
+    proc = _make_fake_proc(stderr=transcript.encode(), returncode=1)
+    monkeypatch.setattr(asyncio, 'create_subprocess_exec', AsyncMock(return_value=proc))
+    code, _, stderr = await run_codex_async(prompt, '/tmp')
+    assert code == 1
+    assert '[echoed prompt omitted]' in stderr
+    assert diagnostic_text(stderr) == diagnostic
+    runner = h._make_runner()
+    runner._detect_rate_limit(stderr, coder_name='codex')
+    assert (runner.state.rate_limited_until is not None) is ('429' in diagnostic)
+    assert is_capacity_error(stderr) is ('capacity' in diagnostic)

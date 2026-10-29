@@ -753,6 +753,10 @@ class RecoveryMixin:
                 self.state.current_pr = None
             self.state.user_paused = persisted.user_paused
             self.state.rate_limited_until = persisted.rate_limited_until
+            self.state.rate_limit_reactive_coder = persisted.rate_limit_reactive_coder
+            self.state.rate_limit_reactive = persisted.rate_limit_reactive
+            self.state.rate_limited_coder_until = dict(persisted.rate_limited_coder_until)
+            self.state.rate_limited_coders = set(persisted.rate_limited_coders)
             if persisted.publication_attempt.contract_version == 2:
                 for field in (
                     "review_request_pr", "review_request_head", "review_request_task",

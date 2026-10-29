@@ -539,6 +539,8 @@ class CodingMixin:
             return False
         if attempt.contract_version == 2 and attempt.exit_classification == "success":
             return await publication_lifecycle.hold(self)
+        if attempt.provider_error is not None:
+            return await publication_lifecycle.resume_provider_failure(self)
         resolved = await self._resolve_published_attempt()
         if resolved and self.state.current_task is None:
             return True

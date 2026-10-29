@@ -81,6 +81,29 @@ exact PR and open-PR discovery agreement before admission; an older green PR
 view cannot bypass the floor. Missing identity or cleanup evidence requires
 operator inspection rather than a new coder invocation.
 
+## Interrupted provider attempts
+
+A positively classified FIX provider capacity/service-unavailable error is not
+quota exhaustion. Its failed exit checkpoints the frozen head, provider kind,
+and next retry on the existing publication attempt. The run ends as paused;
+each retry has a new run identity while retaining dispatch and attempt history.
+Three consecutive provider interruptions exhaust automatic recovery. The existing
+FIX polling interval supplies exponential backoff; the model and reasoning effort
+remain bound to the interrupted invocation. Actual rate limits retain their
+provider pause deadline. Provider interruptions do not spend the code-fix allowance.
+
+Before resuming, the runner requires bound cleanup/run evidence, the retained
+local branch and head, and exact open-PR evidence. The remote may still contain
+the initial head or the captured local commit; an independently changed head
+parks recovery without rewriting either side. The resumed FIX keeps commits and
+dirty changes, reruns unfinished validation, and uses normal publication and
+review/CI gates after successful exit. A clean tree or an already-published commit
+cannot convert a failed invocation into successful completion. Operator pause
+continues to block automatic work. Expired quota markers are cleared before
+interrupted-publication recovery so they cannot cause ERROR/PAUSED oscillation.
+Legacy snapshots lacking bound provider, cleanup, or accounting evidence remain
+stably parked with the missing evidence and the existing Retry action identified.
+
 ## Compatibility and verification boundaries
 
 Version 1 snapshots remain readable and keep their conservative recovery rules.
