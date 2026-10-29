@@ -21,6 +21,7 @@ VALID_SCENARIOS = {
     "success_pending_ci",
     "fix_existing_pr",
     "fix_existing_pr_pending_ci",
+    "fix_published_wait",
     "no_pr",
     "exit_nonzero",
     "failure_continuity",

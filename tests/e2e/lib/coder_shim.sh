@@ -384,6 +384,11 @@ print(json.dumps({"type": "control_response", "response": {
         exit 0
     fi
 
+    # Only the restart fixture owns this journal; never record prompts.
+    if [[ "${branch}" == *-e2e-fix-restart ]]; then
+        printf '%s\t%s\n' "${pr}" "${branch}" >> "${PO_SHIM_SCENARIO_FILE}.restart-calls"
+    fi
+
     if [[ "${scenario}" == "hang" ]]; then
         # Record only allowlisted launch arguments, never prompts or credentials.
         # Atomic replacement lets the host correlate a unique task with a real
@@ -437,6 +442,14 @@ PYTHON
             ;;
         fix_existing_pr)
             run_fix_existing_pr "${pr}" "${branch}"
+            ;;
+        fix_published_wait)
+            run_fix_existing_pr "${pr}" "${branch}" true
+            # A real Git push and pending CI precede the crash handshake.
+            printf '%s\t%s\t%s\n' "${pr}" "${branch}" "$(git rev-parse HEAD)" \
+                > "${PO_SHIM_SCENARIO_FILE}.fix-published"
+            sleep 300
+            exit 1
             ;;
         fix_existing_pr_pending_ci)
             run_fix_existing_pr "${pr}" "${branch}" true
