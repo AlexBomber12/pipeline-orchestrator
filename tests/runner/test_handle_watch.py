@@ -3152,8 +3152,9 @@ def test_completed_newer_failed_attempt_reconciles_even_with_matching_job(
     fix = AsyncMock()
     monkeypatch.setattr(runner, "handle_fix", fix)
     asyncio.run(runner.handle_watch())
-    assert fix.await_count == 1, [entry["event"] for entry in runner.state.history[-6:]]
-    assert runner.state.current_pr.ci_status == CIStatus.FAILURE
+    fix.assert_not_awaited()
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr.ci_status == CIStatus.INFRA_FAILURE
 
 
 def test_exhausted_submission_allowance_still_reconciles_pending_intent(
@@ -3433,7 +3434,7 @@ def test_successful_pending_rerun_reconciles_independently_of_failed_checks(
     assert marker["intent_runs"] == []
     assert sorted(marker["issued_runs"]) == [11, 22] and marker["issued"] is True
     assert sorted(reruns) == [11, 22]
-    # Fresh B failure reaches FIX, including after a stale/missing-check pass.
+    # Fresh B infrastructure failure exhausts recovery after a stale/missing-check pass.
     visible, complete = fresh, True
     retrieval = gh_checks._make_ci_retrieval(
         runner.owner_repo, sha, 0.0, fresh, {"sha": sha, "statuses": []},
@@ -3445,8 +3446,9 @@ def test_successful_pending_rerun_reconciles_independently_of_failed_checks(
     fix = AsyncMock()
     monkeypatch.setattr(runner, "handle_fix", fix)
     asyncio.run(runner.handle_watch())
-    fix.assert_awaited_once()
-    assert runner.state.current_pr.ci_status == CIStatus.FAILURE
+    fix.assert_not_awaited()
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr.ci_status == CIStatus.INFRA_FAILURE
     assert sorted(reruns) == [11, 22]
 
 
@@ -3708,14 +3710,12 @@ def test_infra_rerun_marker_without_issuance_proof_needs_operator_recovery() -> 
         (ReviewStatus.CHANGES_REQUESTED, FeedbackCheckResult.UNKNOWN),
     ],
 )
-def test_second_infra_failure_routes_to_fix(
+def test_second_infra_failure_preserves_infrastructure_outcome(
     monkeypatch: pytest.MonkeyPatch,
     review_status: ReviewStatus,
     feedback_result: FeedbackCheckResult,
 ) -> None:
-    """PR-251: a second INFRA_FAILURE classification on the same head_sha
-    (the prior retry didn't help) routes WATCH straight through
-    ``handle_fix`` without issuing another ``gh run rerun``."""
+    """Only independent actionable review feedback can spend a code attempt."""
     pr = _patch_infra_failure_pr(monkeypatch, pr_number=78, head_sha="d00df00d")
     pr.review_status = review_status
 
@@ -3758,23 +3758,16 @@ def test_second_infra_failure_routes_to_fix(
     runner.state.current_pr = PRInfo(number=pr.number, branch=pr.branch)
     asyncio.run(runner.handle_watch())
 
-    assert fix_calls == [None]
+    actionable_review = review_status == ReviewStatus.CHANGES_REQUESTED and feedback_result == FeedbackCheckResult.NEW
+    assert fix_calls == ([None] if actionable_review else [])
     assert len(feedback_policies) == (1 if review_status == ReviewStatus.CHANGES_REQUESTED else 0)
-    if feedback_policies and feedback_result == FeedbackCheckResult.NEW:
+    if actionable_review:
         assert runner._fix_feedback_reviewer_policy is feedback_policies[0]
-    # No workflow rerun calls were made — straight to FIX.
+    else:
+        assert runner.state.state == PipelineState.ERROR
+        assert "Infrastructure CI failure persisted after retry" in runner.state.error_message
     assert all(args[:2] != ["run", "rerun"] for args in gh_calls)
-    history = " ".join(entry.get("event", "") for entry in runner.state.history)
-    assert "INFRA_FAILURE persisted after retry" in history
-    if feedback_result == FeedbackCheckResult.UNKNOWN and feedback_policies:
-        assert "CI FIX continues" in history
-    # PR-251 follow-up: ``handle_fix`` reads ``ci_status`` to decide
-    # whether to inject CI logs into the FIX prompt; the persisted-INFRA
-    # path must downgrade to FAILURE before invoking it so the coder
-    # actually receives the failure logs the daemon promised in the
-    # "effective FAILURE" log line.
-    assert runner.state.current_pr is not None
-    assert runner.state.current_pr.ci_status == CIStatus.FAILURE
+    assert pr.ci_status == CIStatus.INFRA_FAILURE
 
 
 @pytest.mark.parametrize(
@@ -6267,7 +6260,7 @@ def test_already_running_new_attempt_stays_watch(monkeypatch, tmp_path, with_che
     assert runner.state.state == PipelineState.WATCH, runner.state.error_message
 
 
-def test_accepted_rerun_terminal_failure_reaches_fix(monkeypatch, tmp_path):
+def test_accepted_rerun_terminal_infrastructure_failure_requires_operator(monkeypatch, tmp_path):
     runner, pr = _lifecycle_watch(monkeypatch, tmp_path, False)
     checks = [{
         'id': 12345, 'name': 'unit', 'head_sha': pr.head_sha,
@@ -6304,7 +6297,10 @@ def test_accepted_rerun_terminal_failure_reaches_fix(monkeypatch, tmp_path):
         if runner.state.state == PipelineState.ERROR or fix.await_count:
             break
     assert len(reruns) == 1
-    assert fix.await_count == 1, (runner.state.error_message, runner.state.ci_attempts)
+    fix.assert_not_awaited()
+    assert runner.state.state == PipelineState.ERROR
+    assert pr.ci_status == CIStatus.INFRA_FAILURE
+    assert "Infrastructure CI failure persisted" in runner.state.error_message
 
 
 def test_interrupted_final_issuance_marker_is_reconciled(monkeypatch, tmp_path):
@@ -6423,13 +6419,14 @@ def test_partial_rerun_reconciles_workflow_after_its_check_succeeds(
                 runner = restarted
         asyncio.run(runner.handle_watch())
         marker = _expire_infra_grace(runner, pr)
-        if fix.await_count:
+        if runner.state.state == PipelineState.ERROR:
             break
     assert reruns == [11, 22]
-    assert fix.await_count == 1, {
+    assert runner.state.state == PipelineState.ERROR, {
         'intent_runs': marker['intent_runs'], 'issued_runs': marker['issued_runs'],
         'workflow_reads': reads, 'state': runner.state.state,
     }
+    fix.assert_not_awaited()
 
 
 @pytest.mark.parametrize("failures", [1, 2])
@@ -6681,3 +6678,122 @@ def test_pending_request_requires_attempt_advancement_even_when_jobs_disappear(
     marker = _expire_infra_grace(runner, pr)
     assert marker["intent_runs"] == [] and marker["issued"]
     assert len(requests) == 1
+
+
+@pytest.mark.parametrize("outcome", ["success", "failure", "cancelled", "unknown"])
+def test_ci_outage_recovery_uses_current_production_evidence(monkeypatch, tmp_path, outcome):
+    runner, pr = _lifecycle_watch(monkeypatch, tmp_path, False)
+    checks, statuses, _ = watch_module.gh_checks._fetch_ci_status_rest("octo/demo", pr.head_sha)
+    requests = []
+    phase = 1
+
+    def transport(args, **kwargs):
+        if args[:2] == ["run", "rerun"]:
+            requests.append(args)
+            return ""
+        assert args[:2] == ["run", "view"]
+        return {"databaseId": 9876, "headSha": pr.head_sha, "attempt": phase,
+                "status": "completed", "conclusion": checks[0]["conclusion"],
+                "jobs": [{"databaseId": checks[0]["id"], "name": "unit",
+                          "conclusion": checks[0]["conclusion"]}]}
+
+    def poll(repo, **kwargs):
+        retrieval = watch_module.gh_checks._retrieve_ci_status_evidence(repo, pr.head_sha)
+        pr.ci_status = watch_module.gh_checks._classify_ci_retrieval(retrieval)
+        return [pr]
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", transport)
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", poll)
+    fix = AsyncMock()
+    monkeypatch.setattr(runner, "handle_fix", fix)
+    asyncio.run(runner.handle_watch())
+    marker = _expire_infra_grace(runner, pr)
+    assert marker["issued"] and len(requests) == 1
+    started_at = marker["started_at"]
+    phase = 2
+    checks[0].update(id=23456, conclusion=outcome,
+                     details_url="https://github.com/octo/demo/actions/runs/9876/job/23456")
+    if outcome == "unknown":
+        monkeypatch.setattr(watch_module.gh_checks, "_fetch_ci_status_rest",
+                            lambda *args: ([], {"sha": pr.head_sha, "statuses": []}, False))
+    asyncio.run(runner.handle_watch())
+    assert len(requests) == 1
+    assert _expire_infra_grace(runner, pr)["started_at"] == started_at
+    if outcome == "failure":
+        fix.assert_awaited_once()
+        assert pr.ci_status == CIStatus.FAILURE
+    else:
+        fix.assert_not_awaited()
+        assert pr.fix_iteration_count == 0
+        if outcome == "cancelled":
+            assert runner.state.state == PipelineState.ERROR
+            assert pr.ci_status == CIStatus.INFRA_FAILURE
+        else:
+            assert runner.state.state == PipelineState.WATCH
+            assert pr.ci_status == (CIStatus.SUCCESS if outcome == "success" else CIStatus.PENDING)
+
+
+@pytest.mark.parametrize("pending", [False, True])
+@pytest.mark.parametrize("restart", [False, True])
+@pytest.mark.parametrize("feedback", [FeedbackCheckResult.NEW, FeedbackCheckResult.UNKNOWN, None])
+def test_ci_outage_requery_deadline_survives_progress_and_restart(monkeypatch, tmp_path, pending, restart, feedback):
+    runner, pr = _lifecycle_watch(monkeypatch, tmp_path, False)
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", MagicMock(side_effect=RuntimeError("API unavailable")))
+    fix = AsyncMock()
+    monkeypatch.setattr(runner, "handle_fix", fix)
+    asyncio.run(runner.handle_watch())
+    marker = _expire_infra_grace(runner, pr)
+    assert marker["tries"] == 0  # metadata unavailable; no submission allowance spent
+    key = ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha)
+    marker["started_at"] = time.time() - runner.app_config.daemon.ci_pending_max_min * 60 - 1
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    # Progress writes may renew the grace clock, never the recovery deadline.
+    asyncio.run(runner._mark_infra_retry_attempted(pr.number, pr.head_sha, issued=False, tries=0))
+    assert json.loads(asyncio.run(runner.redis.get(key)))["started_at"] == marker["started_at"]
+    if restart:
+        previous = runner
+        runner = h._make_runner()
+        runner.repo_path = previous.repo_path
+        runner.redis = previous.redis
+        runner.state = RepoState.model_validate_json(previous.state.model_dump_json())
+        monkeypatch.setattr(runner, "_scan_pr_diff_once", AsyncMock())
+        monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
+        monkeypatch.setattr(runner, "handle_fix", fix)
+    if pending:
+        pr.ci_status = CIStatus.PENDING
+        monkeypatch.setattr(watch_module.gh_checks, "_fetch_ci_status_rest",
+                            lambda *args: ([], {"sha": pr.head_sha, "statuses": []}, False))
+    if feedback is not None:
+        pr.review_status = ReviewStatus.CHANGES_REQUESTED
+        monkeypatch.setattr(runner, "_has_new_codex_feedback_since_last_push", lambda policy: feedback)
+    asyncio.run(runner.handle_watch())
+    if feedback == FeedbackCheckResult.NEW:
+        fix.assert_awaited_once()
+        assert runner.state.state == PipelineState.WATCH
+    else:
+        assert runner.state.state == PipelineState.ERROR
+        assert "Infrastructure CI recovery evidence remained unavailable" in runner.state.error_message
+        fix.assert_not_awaited()
+    assert pr.fix_iteration_count == 0
+    assert runner.state.ci_attempts == {}
+    assert json.loads(asyncio.run(runner.redis.get(key)))["tries"] == 0
+
+
+@pytest.mark.parametrize("marker", [None, "broken", "1", '{}',
+                                  '{"at": 1, "scope": "another generation"}'])
+def test_ci_outage_deadline_requires_bound_recovery_marker(marker):
+    runner = h._make_runner()
+    pr = PRInfo(number=19, branch="pr-019", head_sha="a" * 40)
+    if marker is not None:
+        asyncio.run(runner.redis.set(ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha), marker))
+    assert not asyncio.run(runner._ci_infra_recovery_expired(pr))
+    runner.redis = None
+    assert not asyncio.run(runner._ci_infra_recovery_expired(pr))
+
+
+def test_ci_outage_deadline_cannot_use_unreadable_task_generation(monkeypatch, tmp_path):
+    runner, pr = _lifecycle_watch(monkeypatch, tmp_path, False)
+    asyncio.run(runner.redis.set(ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha),
+                               json.dumps({"at": 1})))
+    (tmp_path / runner.state.current_task.task_file).unlink()
+    assert not asyncio.run(runner._ci_infra_recovery_expired(pr))
