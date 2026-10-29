@@ -76,7 +76,8 @@ class RunRecord:
     had_merge_conflict: bool = False
     base_branch: str = ""
     invocations: list[InvocationSnapshot] = field(default_factory=list)
-    # Operator Retry starts a new FIX allowance without erasing dispatch history.
+    # Operator Retry resets the allowance; interrupted provider attempts receive
+    # an allowance credit without erasing dispatched-attempt history.
     fix_recovery_baseline: int = 0
 
     def __post_init__(self) -> None:

@@ -2604,12 +2604,17 @@ class PipelineRunner(
         obsolete_ci = await self._maybe_resume_obsolete_ci_error()
         if obsolete_ci is not None:
             return obsolete_ci
-        if self.state.rate_limited_until is not None:
+        pause = self._global_pause_verdict(datetime.now(timezone.utc))
+        if pause is not None and pause.active:
             self.state.state = PipelineState.PAUSED
             self.log_event(
                 "[RATE-LIMIT] Legacy ERROR + rate_limited_until -> PAUSED."
             )
             return
+
+        if pause is not None and pause.expired:
+            self._clear_rate_limit(pause.pause_coder)
+            self._clear_global_pause_fields()
 
         reason, from_frontmatter = await self._error_suppression_reason()
         task = self.state.current_task
@@ -4166,6 +4171,12 @@ class PipelineRunner(
             and self.state.merge_phase in {"merging", "post_merge_cleanup"}
         ):
             await self.handle_merge()
+            await self.publish_state()
+            return
+
+        from src.daemon import publication
+
+        if await publication.resume_provider_failure(self):
             await self.publish_state()
             return
 

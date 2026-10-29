@@ -49,6 +49,10 @@ async def record_exit(
         attempt.reconcile_deadline = datetime.now(timezone.utc) + timedelta(
             minutes=runner.repo_config.review_timeout_min or runner.app_config.daemon.review_timeout_min,
         )
+    if (code > 0 and runner.state.active_invocation is not None
+        and not terminal_cancelled and not scan_stdout(f"{stdout}\n{stderr}")
+        and fix_escalation.parse_escalate_marker(stdout) is None):
+        await pause_provider_failure(runner, stderr, runner.state.active_invocation.plugin_id)
     await runner.publish_state()
 
 
@@ -114,6 +118,7 @@ async def resolve(runner: PipelineRunner, *, resolve_terminal: bool) -> bool:
         attempt.head_sha = expected
         attempt.unverified_head_sha = None
         attempt.verified = True
+        attempt.provider_published_head_sha = expected
         current.head_sha = expected
         current.review_status = ReviewStatus.PENDING
         current.ci_status = CIStatus.PENDING
@@ -377,3 +382,184 @@ async def retry_floor(runner: PipelineRunner, command: RetryCommand) -> Publicat
     if not outcome.discovery_complete or outcome.state != gh_prs.ExactPRState.OPEN:
         raise ValueError("Retained expected PR head is unresolved or terminal; implementation will not be rerun")
     return floor
+
+
+PROVIDER_RECOVERY_EXHAUSTED = (
+    "Provider recovery exhausted after 3 interrupted FIX attempts; retained work requires Retry"
+)
+PROVIDER_RECOVERY_CHANGED = "Interrupted FIX provider changed; restore selected provider before Retry"
+
+
+async def pause_provider_failure(runner: PipelineRunner, stderr: str, coder_name: str) -> bool:
+    """Retain interrupted FIX work, independently of quota and publication success."""
+    from src.provider_errors import is_capacity_error
+
+    attempt = runner.state.publication_attempt
+    invocation = runner.state.active_invocation
+    if attempt is None or invocation is None or invocation.phase != "fix":
+        return False
+    capacity = is_capacity_error(stderr)
+    if (not capacity and attempt.provider_error is None
+        and not runner._detect_rate_limit(stderr, coder_name=coder_name)):
+        return False
+    until = runner.state.rate_limited_until
+    if not capacity and (until is None or until <= datetime.now(timezone.utc)):
+        return False
+    first_observation = attempt.provider_error is None
+    attempt.provider_error = "capacity" if capacity else "rate_limit"
+    attempt.provider_retries += int(first_observation)
+    attempt.provider_retry_ready = False
+    attempt.provider_retry_at = attempt.provider_retry_at or (
+        datetime.now(timezone.utc) + timedelta(
+            seconds=runner.app_config.daemon.fix_poll_interval_sec * 2 ** min(attempt.provider_retries - 1, 2),
+        ) if capacity else until
+    )
+    attempt.exit_classification = "failure"
+    if runner._current_run_record is not None and runner._current_run_record.ended_at is None:
+        await runner._save_current_run_record("paused" if capacity else "rate_limit", run_phase="fix")
+    runner.state.error_message = None
+    runner.state.state = PipelineState.PAUSED
+    runner.log_event(f"[INFRA] {attempt.provider_error}: retained FIX; retry {attempt.provider_retries}/3 scheduled.")
+    await runner.publish_state()
+    return True
+
+
+async def resume_provider_failure(runner: PipelineRunner) -> bool:
+    """Resume only the bound FIX checkout; never adopt the older remote head."""
+    attempt = runner.state.publication_attempt
+    invocation = runner.state.active_invocation
+    if (attempt is not None and attempt.pending and attempt.provider_error is not None
+        and (invocation is None or invocation.phase != "fix")):
+        if await _operator_paused(runner):
+            return True
+        return await _park(runner, "Interrupted FIX invocation binding is missing; inspect retained work and use Retry")
+    if (attempt is None or not attempt.pending or invocation is None
+        or invocation.phase != "fix" or attempt.exit_classification == "success"
+        or (attempt.provider_error is None
+            and not (runner.state.state == PipelineState.PAUSED and runner.state.rate_limited_until is not None)
+            and not (runner.state.error_message or "").startswith("Interrupted FIX"))):
+        return False
+    if await _operator_paused(runner):
+        return True
+    # Legacy pauses may retain an open record despite a checkpointed exit.
+    # Exit and cleanup proof can close accounting independently of publication.
+    if (attempt.exit_classification == "failure" and attempt.cleanup_confirmed
+        and runner._publication_attempt_matches_dispatch()):
+        if not _run_matches(runner):
+            await runner._restore_current_run_record()
+        if _run_matches(runner) and runner._current_run_record.ended_at is None:
+            await runner._save_current_run_record(
+                "paused" if attempt.provider_error else "error", run_phase="fix",
+            )
+    now = datetime.now(timezone.utc)
+    until = runner.state.rate_limited_until
+    if until is not None:
+        until = until if until.tzinfo else until.replace(tzinfo=timezone.utc)
+        if now < until:
+            runner.state.state = PipelineState.PAUSED
+            return True
+        runner._clear_rate_limit(runner.state.rate_limit_reactive_coder or invocation.plugin_id)
+        runner._clear_global_pause_fields()
+    if attempt.provider_error is not None and runner.state.error_message:
+        # An exhausted or independently blocked attempt remains parked until Retry.
+        runner.state.state = PipelineState.ERROR
+        return True
+    if attempt.provider_retry_at is not None and now < attempt.provider_retry_at:
+        runner.state.state = PipelineState.PAUSED
+        return True
+    if not attempt.provider_error:
+        return await _park(
+            runner, "Interrupted FIX lacks bound provider failure evidence; inspect retained work and use Retry",
+        )
+    if attempt.provider_retries >= 3:
+        return await _park(
+            runner, PROVIDER_RECOVERY_EXHAUSTED,
+        )
+    try:
+        problem = await provider_retry_problem(runner)
+        if problem is not None:
+            return await _park(runner, problem)
+    except Exception as exc:
+        return await _defer_provider_observation(runner, f"ownership observation unavailable: {type(exc).__name__}")
+    attempt.provider_retry_ready = True
+    runner.state.error_message = None
+    runner.state.state = PipelineState.FIX
+    await runner.publish_state()
+    if await _operator_paused(runner):
+        return True
+    await runner.handle_fix()
+    return True
+
+
+async def _defer_provider_observation(runner: PipelineRunner, boundary: str) -> bool:
+    attempt = runner.state.publication_attempt
+    now = datetime.now(timezone.utc)
+    if attempt.reconcile_deadline is None or now >= attempt.reconcile_deadline:
+        message = f"Interrupted FIX {boundary}; observation budget exhausted; inspect and use Retry"
+        attempt.provider_observation_failure = message
+        return await _park(runner, message)
+    attempt.incident = boundary
+    attempt.provider_retry_at = now + timedelta(seconds=runner.app_config.daemon.fix_poll_interval_sec)
+    runner.state.state = PipelineState.PAUSED
+    await runner.publish_state()
+    return True
+
+
+def provider_retry_owns_failure(attempt: PublicationAttempt, message: str | None) -> bool:
+    """Only clear provider-owned parks, never independent implementation failures."""
+    return message in {None, PROVIDER_RECOVERY_EXHAUSTED, PROVIDER_RECOVERY_CHANGED} or (
+        attempt.provider_observation_failure is not None and message == attempt.provider_observation_failure
+    )
+
+
+async def provider_retry_problem(
+    runner: PipelineRunner, *, allow_provider_park: bool = False,
+) -> str | None:
+    """Observe retained FIX ownership without resetting allowance or dispatching."""
+    attempt = runner.state.publication_attempt
+    pr = runner.state.current_pr
+    if (attempt.contract_version != 2 or attempt.exit_classification != "failure"
+        or (attempt.provider_retries == 0 and attempt.provider_retry_command_id is None)
+        or not runner._publication_attempt_matches_dispatch() or not attempt.cleanup_confirmed
+        or not attempt.expected_head_sha or not attempt.initial_pr_head_sha
+        or (attempt.failure is not None and not (
+            allow_provider_park and provider_retry_owns_failure(attempt, attempt.failure)
+        ))
+        or (runner.state.error_message is not None and not (
+            allow_provider_park and provider_retry_owns_failure(attempt, runner.state.error_message)
+        ))
+        or pr is None or pr.number != attempt.pr_number or pr.branch != attempt.branch
+        or pr.is_cross_repository or pr.pr_id not in {None, attempt.task_id}
+        or pr.head_sha not in {
+            attempt.initial_pr_head_sha, attempt.expected_head_sha, attempt.provider_published_head_sha,
+        }):
+        return "Interrupted FIX lacks matching identity, exit, or cleanup proof; use Retry"
+    if allow_provider_park:
+        coder_name, _ = runner._get_coder(allow_exploration=False)
+        if coder_name != runner.state.active_invocation.plugin_id:
+            return PROVIDER_RECOVERY_CHANGED
+    if not _run_matches(runner):
+        await runner._restore_current_run_record()
+    if not _run_matches(runner):
+        return "Interrupted FIX run accounting is missing; restore bound run before Retry"
+    branch = (await asyncio.to_thread(git_ops._git, runner.repo_path, "branch", "--show-current")).stdout.strip()
+    head = (await asyncio.to_thread(git_ops._git, runner.repo_path, "rev-parse", "HEAD")).stdout.strip()
+    remote = (await asyncio.to_thread(
+        git_ops._git, runner.repo_path, "ls-remote", "--heads", "origin", f"refs/heads/{attempt.branch}",
+    )).stdout.split()
+    if branch != attempt.branch or head != attempt.expected_head_sha:
+        return "Interrupted FIX checkout changed; retain both versions and use Retry"
+    if len(remote) != 2 or remote[1] != f"refs/heads/{branch}" or remote[0] not in {
+        attempt.initial_pr_head_sha, attempt.expected_head_sha, attempt.provider_published_head_sha,
+    }:
+        return "Interrupted FIX remote head changed independently; preserve both sides and use Retry"
+    outcome = await asyncio.to_thread(
+        gh_prs.get_exact_pr_outcome, attempt.repo, attempt.base, attempt.pr_number, remote[0],
+        expected_branch=attempt.branch,
+    )
+    if not outcome.discovery_complete:
+        raise RuntimeError("exact open PR evidence unavailable")
+    if outcome.state != gh_prs.ExactPRState.OPEN:
+        return "Interrupted FIX exact PR is terminal; use Retry after inspection"
+    attempt.provider_published_head_sha = remote[0]
+    return None

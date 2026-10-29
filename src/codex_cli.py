@@ -231,6 +231,9 @@ async def run_codex_async(
         return (-1, "", f"Timeout after {timeout}s")
     stdout = result.stdout.decode("utf-8", errors="replace")
     stderr = result.stderr.decode("utf-8", errors="replace")
+    # Codex echoes the supplied user prompt to stderr, including quoted provider
+    # errors in task text. That known echo is not diagnostic evidence.
+    stderr = stderr.replace(f"user\n{prompt}\n", "user\n[echoed prompt omitted]\n")
     code = result.returncode
     logger.info("[codex] codex exec exited with code %s", code)
     return (code, stdout, stderr)

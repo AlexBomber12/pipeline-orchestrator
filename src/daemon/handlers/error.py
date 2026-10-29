@@ -105,6 +105,7 @@ def _is_infra_error(context: str) -> bool:
 
 
 class ErrorCategory(Enum):
+    CAPACITY = "capacity"
     RATE_LIMIT = "rate_limit"
     TIMEOUT = "timeout"
     OOM = "oom"
@@ -120,7 +121,12 @@ class ErrorCategory(Enum):
 def _classify_error(context: str) -> ErrorCategory:
     lowered = context.lower()
     has_ci_token = re.search(r"\bci\b", lowered) is not None
-    if "rate limit" in lowered or re.search(r"\b429\b", lowered):
+    from src.provider_errors import RATE_LIMIT_STATUS, diagnostic_text, is_capacity_error
+
+    if is_capacity_error(context):
+        return ErrorCategory.CAPACITY
+    diagnostic = diagnostic_text(context).lower()
+    if "rate limit" in diagnostic or "usage limit" in diagnostic or RATE_LIMIT_STATUS.search(diagnostic):
         return ErrorCategory.RATE_LIMIT
     if "timeout" in lowered:
         return ErrorCategory.TIMEOUT

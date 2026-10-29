@@ -22,6 +22,7 @@ from src.daemon.notifications import send_spend_ceiling_warning
 from src.daemon.selector import resolve_pause_coder
 from src.keyspace import coder_usage
 from src.models import PipelineState
+from src.provider_errors import RATE_LIMIT_STATUS, diagnostic_text, is_capacity_error
 from src.usage import UsageObservation, UsageSnapshot
 
 
@@ -669,7 +670,7 @@ class RateLimitMixin:
             proactive_coder=proactive_coder, preserve_error_message=preserve_error_message
         )
 
-    def _detect_rate_limit(self, stderr: str, coder_name: str | None = None) -> None:
+    def _detect_rate_limit(self, stderr: str, coder_name: str | None = None) -> bool:
         """Set rate-limit pause if stderr contains rate-limit signals.
 
         ``coder_name`` identifies the CLI that produced *stderr*.  When
@@ -680,6 +681,8 @@ class RateLimitMixin:
         """
         if coder_name is None:
             coder_name = self._get_coder()[0]
+        if is_capacity_error(stderr):
+            return False
         session_threshold = self.app_config.daemon.rate_limit_session_pause_percent
         weekly_threshold = self.app_config.daemon.rate_limit_weekly_pause_percent
         lower = stderr.lower()
@@ -694,6 +697,8 @@ class RateLimitMixin:
             and default_reference is not None
             and self._registry.reference_for(coder_name) == default_reference
         )
+        stderr = diagnostic_text(stderr, custom=not uses_detailed_builtin_parser)
+        lower = stderr.lower()
         if plugin is not None and not uses_detailed_builtin_parser:
             try:
                 triggered = any(
@@ -703,7 +708,7 @@ class RateLimitMixin:
             except Exception:
                 triggered = False
 
-        if re.search(r"\b429\b", stderr):
+        if RATE_LIMIT_STATUS.search(stderr):
             triggered = True
             limit_type = "session"
 
@@ -733,7 +738,7 @@ class RateLimitMixin:
             lower,
         )
         codex_retry_parsed = False
-        if not triggered and m_codex_retry and coder_name == "codex":
+        if m_codex_retry and (coder_name == "codex" or triggered):
             days = int(m_codex_retry.group(1) or 0)
             hours = int(m_codex_retry.group(2) or 0)
             minutes = int(m_codex_retry.group(3) or 0)
@@ -792,3 +797,4 @@ class RateLimitMixin:
                 f"[RATE-LIMIT] [{coder_name}] Rate limit detected "
                 f"({limit_type}), pausing for {pause_min} min."
             )
+        return triggered

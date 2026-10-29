@@ -3904,3 +3904,80 @@ def test_run_cycle_swallows_burn_recording_failure(
 
     # Must not raise even though the recorder itself is broken.
     asyncio.run(runner.run_cycle())
+
+
+@pytest.mark.parametrize('text', [
+    'Task: PR-429\nNetwork connection closed unexpectedly',
+    'File: tasks/PR-429.md\nProcess exited with code 1',
+    '429 items processed',
+    'Error: HTTP 500 while processing Task PR-429',
+    'Error: HTTP 500; quoted example: HTTP 429 Too Many Requests',
+    'echo "Error: HTTP 429 Too Many Requests"',
+    '`Error: HTTP 429 Too Many Requests`',
+    '```python\nError: HTTP 429 Too Many Requests\n```',
+    'exec\n/bin/bash -lc echo ERROR\nError: HTTP 429 Too Many Requests\ncodex\nDone',
+    '{"type":"item.completed","item":{"text":"HTTP 429 Too Many Requests"}}',
+])
+def test_transcript_numbers_and_examples_are_not_provider_limits(text):
+    runner = h._make_runner()
+    assert not runner._detect_rate_limit(text, coder_name='codex')
+    assert runner.state.rate_limited_until is None
+    assert _classify_error(text) != ErrorCategory.RATE_LIMIT
+
+
+@pytest.mark.parametrize('text', [
+    'Error: HTTP 429 Too Many Requests. Try again in 2 hours.',
+    '{"type":"turn.failed","error":{"message":"HTTP 429 Too Many Requests. Try again in 2 hours."}}',
+])
+def test_provider_retry_duration_precedes_generic_429(text):
+    runner = h._make_runner()
+    now = datetime.now(timezone.utc)
+    runner._detect_rate_limit(text, coder_name='codex')
+    assert 7199 <= (runner.state.rate_limited_until - now).total_seconds() <= 7201
+
+
+def test_capacity_is_separate_from_quota_and_task_number():
+    runner = h._make_runner()
+    message = 'Task: PR-429\nERROR: Selected model is at capacity. Please try a different model.'
+    runner._detect_rate_limit(message, coder_name='codex')
+    assert runner.state.rate_limited_until is None
+    assert _classify_error(message) == ErrorCategory.CAPACITY
+    assert _classify_error('Rate limit exceeded') == ErrorCategory.RATE_LIMIT
+
+
+@pytest.mark.parametrize('text', [
+    '{not json',
+    '{"type":"error","error":"HTTP 429 Too Many Requests"}',
+    'Error: example says "HTTP 429 Too Many Requests"',
+])
+def test_malformed_or_quoted_provider_evidence_does_not_pause(text):
+    runner = h._make_runner()
+    runner._detect_rate_limit(text, coder_name='codex')
+    assert runner.state.rate_limited_until is None
+
+
+@pytest.mark.parametrize('text', ['ERROR: HTTP 503 Service Unavailable', 'ERROR: 503 Service Unavailable'])
+def test_service_unavailable_is_not_quota(text):
+    runner = h._make_runner()
+    runner._detect_rate_limit(text, coder_name='codex')
+    assert runner.state.rate_limited_until is None
+    assert _classify_error(text) == ErrorCategory.CAPACITY
+
+
+@pytest.mark.parametrize('flag', [False, True])
+def test_error_policy_clears_expired_pause_instead_of_reentering_paused(monkeypatch, flag):
+    from unittest.mock import AsyncMock
+
+    runner = h._make_runner()
+    runner.repo_config.feature_flags.use_single_error_exit = flag
+    runner.state.state = PipelineState.ERROR
+    runner.state.rate_limited_until = datetime.now(timezone.utc) - timedelta(minutes=1)
+    monkeypatch.setattr(runner, '_maybe_resume_obsolete_ci_error', AsyncMock(return_value=None))
+    monkeypatch.setattr(runner, '_error_suppression_reason', AsyncMock(return_value=(None, False)))
+    monkeypatch.setattr(runner, '_remote_frontmatter_error_status_for_current_task', lambda: (None, None, None))
+    diagnose = AsyncMock()
+    monkeypatch.setattr(runner, 'handle_error', diagnose)
+    asyncio.run(runner._handle_single_error_exit())
+    assert runner.state.rate_limited_until is None
+    assert runner.state.state != PipelineState.PAUSED
+    assert diagnose.await_count == 1
