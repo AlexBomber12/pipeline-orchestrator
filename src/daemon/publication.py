@@ -118,6 +118,7 @@ async def resolve(runner: PipelineRunner, *, resolve_terminal: bool) -> bool:
         attempt.head_sha = expected
         attempt.unverified_head_sha = None
         attempt.verified = True
+        attempt.provider_published_head_sha = expected
         current.head_sha = expected
         current.review_status = ReviewStatus.PENDING
         current.ci_status = CIStatus.PENDING
@@ -493,7 +494,9 @@ async def _defer_provider_observation(runner: PipelineRunner, boundary: str) -> 
     attempt = runner.state.publication_attempt
     now = datetime.now(timezone.utc)
     if attempt.reconcile_deadline is None or now >= attempt.reconcile_deadline:
-        return await _park(runner, f"Interrupted FIX {boundary}; observation budget exhausted; inspect and use Retry")
+        message = f"Interrupted FIX {boundary}; observation budget exhausted; inspect and use Retry"
+        attempt.provider_observation_failure = message
+        return await _park(runner, message)
     attempt.incident = boundary
     attempt.provider_retry_at = now + timedelta(seconds=runner.app_config.daemon.fix_poll_interval_sec)
     runner.state.state = PipelineState.PAUSED
@@ -501,8 +504,15 @@ async def _defer_provider_observation(runner: PipelineRunner, boundary: str) -> 
     return True
 
 
+def provider_retry_owns_failure(attempt: PublicationAttempt, message: str | None) -> bool:
+    """Only clear provider-owned parks, never independent implementation failures."""
+    return message is None or message == PROVIDER_RECOVERY_EXHAUSTED or (
+        attempt.provider_observation_failure is not None and message == attempt.provider_observation_failure
+    )
+
+
 async def provider_retry_problem(
-    runner: PipelineRunner, *, allow_provider_exhaustion: bool = False,
+    runner: PipelineRunner, *, allow_provider_park: bool = False,
 ) -> str | None:
     """Observe retained FIX ownership without resetting allowance or dispatching."""
     attempt = runner.state.publication_attempt
@@ -512,11 +522,16 @@ async def provider_retry_problem(
         or not runner._publication_attempt_matches_dispatch() or not attempt.cleanup_confirmed
         or not attempt.expected_head_sha or not attempt.initial_pr_head_sha
         or (attempt.failure is not None and not (
-            allow_provider_exhaustion and attempt.failure == PROVIDER_RECOVERY_EXHAUSTED
+            allow_provider_park and provider_retry_owns_failure(attempt, attempt.failure)
+        ))
+        or (runner.state.error_message is not None and not (
+            allow_provider_park and provider_retry_owns_failure(attempt, runner.state.error_message)
         ))
         or pr is None or pr.number != attempt.pr_number or pr.branch != attempt.branch
         or pr.is_cross_repository or pr.pr_id not in {None, attempt.task_id}
-        or pr.head_sha not in {attempt.initial_pr_head_sha, attempt.expected_head_sha}):
+        or pr.head_sha not in {
+            attempt.initial_pr_head_sha, attempt.expected_head_sha, attempt.provider_published_head_sha,
+        }):
         return "Interrupted FIX lacks matching identity, exit, or cleanup proof; use Retry"
     if not _run_matches(runner):
         await runner._restore_current_run_record()
@@ -530,7 +545,7 @@ async def provider_retry_problem(
     if branch != attempt.branch or head != attempt.expected_head_sha:
         return "Interrupted FIX checkout changed; retain both versions and use Retry"
     if len(remote) != 2 or remote[1] != f"refs/heads/{branch}" or remote[0] not in {
-        attempt.initial_pr_head_sha, attempt.expected_head_sha,
+        attempt.initial_pr_head_sha, attempt.expected_head_sha, attempt.provider_published_head_sha,
     }:
         return "Interrupted FIX remote head changed independently; preserve both sides and use Retry"
     outcome = await asyncio.to_thread(
@@ -541,4 +556,5 @@ async def provider_retry_problem(
         raise RuntimeError("exact open PR evidence unavailable")
     if outcome.state != gh_prs.ExactPRState.OPEN:
         return "Interrupted FIX exact PR is terminal; use Retry after inspection"
+    attempt.provider_published_head_sha = remote[0]
     return None

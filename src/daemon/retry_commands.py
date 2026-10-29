@@ -656,7 +656,7 @@ class RetryCommandMixin:
                     attempt.task_id, attempt.branch, attempt.pr_number, attempt.branch, pr.head_sha)):
                 return await self._fail_retry_command(command, "Provider Retry task/PR binding changed.")
             try:
-                problem = await publication.provider_retry_problem(self, allow_provider_exhaustion=True)
+                problem = await publication.provider_retry_problem(self, allow_provider_park=True)
                 if problem is not None:
                     return await self._defer_retry_command(command, problem)
             except Exception as exc:
@@ -963,12 +963,12 @@ class RetryCommandMixin:
             if command.effect_stage != RetryEffectStage.APPLIED:
                 command = await self._mark_retry_applied(command, "provider_fix", ["provider_retries"])
             if (attempt.provider_error is not None and attempt.provider_retries == 0
-                and attempt.failure in {None, publication.PROVIDER_RECOVERY_EXHAUSTED}
-                and self.state.error_message in {None, publication.PROVIDER_RECOVERY_EXHAUSTED}):
+                and publication.provider_retry_owns_failure(attempt, attempt.failure)
+                and publication.provider_retry_owns_failure(attempt, self.state.error_message)):
                 await self._clear_retry_failure_evidence(command)
                 self._set_retry_task_snapshot(self.state.current_task)
-                if attempt.failure == publication.PROVIDER_RECOVERY_EXHAUSTED:
-                    attempt.failure = None
+                attempt.failure = None
+                attempt.provider_observation_failure = None
                 self.state.error_message = None
                 self.state.state = PipelineState.PAUSED
                 await self.publish_state()

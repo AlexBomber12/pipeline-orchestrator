@@ -1589,19 +1589,11 @@ async def test_operator_retry_resumes_exhausted_unpublished_fix(lifecycle, monke
     assert replayed.status == RetryCommandStatus.APPLIED
 
 
-async def queued_exhausted_provider_retry(lifecycle):
+async def enqueue_bound_provider_retry(runner, repo):
     from src.cancellation import get_cancellation_cause, task_spec_content_hash
     from src.daemon.retry_commands import RetryCommandMixin
     from src.retry_commands import enqueue_retry_command, new_retry_command, retry_failure_identity
 
-    runner, provider, repo, old, expected, _ = lifecycle
-    remote = git(repo, 'remote', 'get-url', 'origin')
-    git(remote, 'update-ref', 'refs/heads/pr-001', old)
-    await publication.record_exit(runner, 1, '', 'ERROR: Selected model is at capacity')
-    await publication.record_cleanup(runner)
-    runner.state.publication_attempt.provider_retries = 3
-    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
-    await publication.resume_provider_failure(runner)
     task = runner.state.current_task.model_copy(update={'status': TaskStatus.ERROR})
     runner.state.current_queue = [task]
     await runner.publish_state()
@@ -1616,7 +1608,156 @@ async def queued_exhausted_provider_retry(lifecycle):
     await enqueue_retry_command(runner.redis, command)
     runner._consume_retry_command = RetryCommandMixin._consume_retry_command.__get__(runner)
     runner._commit_task_status_change = AsyncMock(return_value=True)
+    return command
+
+
+async def queued_exhausted_provider_retry(lifecycle, *, observation=False):
+    runner, provider, repo, old, expected, _ = lifecycle
+    remote = git(repo, 'remote', 'get-url', 'origin')
+    git(remote, 'update-ref', 'refs/heads/pr-001', old)
+    await publication.record_exit(runner, 1, '', 'ERROR: Selected model is at capacity')
+    await publication.record_cleanup(runner)
+    if observation:
+        provider['error'] = 'GitHub unavailable'
+        Clock.value = runner.state.publication_attempt.reconcile_deadline + timedelta(seconds=1)
+    else:
+        runner.state.publication_attempt.provider_retries = 3
+        Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    await publication.resume_provider_failure(runner)
+    command = await enqueue_bound_provider_retry(runner, repo)
     return runner, command, provider, repo, remote, old, expected
+
+
+@pytest.mark.parametrize('operator_retry', [False, True])
+async def test_provider_chain_retains_intermediate_published_head(lifecycle, monkeypatch, operator_retry):
+    from src.daemon.retry_commands import RetryDispatch
+
+    runner, provider, repo, old, first, configure = lifecycle
+    remote = git(repo, 'remote', 'get-url', 'origin')
+    git(remote, 'update-ref', 'refs/heads/pr-001', old)
+    git(repo, 'reset', '--hard', old)
+    runner.state.publication_attempt = None
+    await runner._save_current_run_record('coding_complete')
+    runner.state.active_invocation = None
+    runner.state.current_pr.review_status = ReviewStatus.PENDING
+    calls = []
+    second = None
+
+    def setup(r):
+        configure(r)
+        r._refresh_auth_status_cache = AsyncMock()
+        r.usage_gate = AsyncMock(return_value=True)
+        r._run_coder_with_polling = lambda *args: None
+        def post(number):
+            assert r.state.current_pr.head_sha == second
+            provider['requests'].append(Clock.value)
+            r.state.review_requested_at = Clock.value
+            return True
+        r._post_codex_review = post
+        return r
+
+    setup(runner)
+    _, plugin = runner._get_coder()
+
+    async def coder(*args, **kwargs):
+        nonlocal second
+        calls.append(kwargs)
+        if len(calls) == 1:
+            git(repo, 'reset', '--hard', first)
+            git(repo, 'push', 'origin', 'pr-001')
+            provider['head'] = first
+        elif len(calls) == 2:
+            (repo / 'second-repair').write_text('retained unpublished repair')
+            git(repo, 'add', 'second-repair')
+            git(repo, 'commit', '-m', 'second repair')
+            second = git(repo, 'rev-parse', 'HEAD')
+        else:
+            assert len(calls) == 3
+            assert git(repo, 'rev-parse', 'HEAD') == second
+            assert git(remote, 'rev-parse', 'refs/heads/pr-001') == first
+            git(repo, 'push', 'origin', 'pr-001')
+            provider['head'] = second
+            return 0, 'Required validation passed; retained second repair published.', ''
+        return 1, '', 'ERROR: Selected model is at capacity'
+
+    monkeypatch.setattr(type(plugin), 'fix_review', lambda self, *a, **kw: coder(*a, **kw))
+    await runner.handle_fix()
+    for _ in range(2):
+        runner = await restart(runner, setup)
+        attempt = runner.state.publication_attempt
+        assert attempt.initial_pr_head_sha == old
+        assert attempt.provider_published_head_sha == first
+        assert runner.state.current_pr.head_sha == first
+        assert git(remote, 'rev-parse', 'refs/heads/pr-001') == first
+        if operator_retry and len(calls) == 2:
+            attempt.provider_retries = 3
+        Clock.value = attempt.provider_retry_at + timedelta(seconds=1)
+        await publication.resume_provider_failure(runner)
+    if operator_retry:
+        assert runner.state.state == PipelineState.ERROR
+        assert len(calls) == 2
+        await enqueue_bound_provider_retry(runner, repo)
+        assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+        await publication.resume_provider_failure(runner)
+    assert len(calls) == 3
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.head_sha == second
+    assert git(remote, 'rev-parse', 'refs/heads/pr-001') == second
+    assert runner.state.publication_attempt.initial_pr_head_sha == old
+    assert len(provider['requests']) == 1
+
+
+@pytest.mark.parametrize('problem', ['resolved', 'unavailable', 'independent', 'remote'])
+async def test_retry_revalidates_exhausted_provider_observation(lifecycle, monkeypatch, problem):
+    from src.daemon.retry_commands import RetryCommandMixin, RetryDispatch
+    from src.retry_commands import RetryCommandStatus, load_retry_command
+
+    monkeypatch.setattr('src.daemon.retry_commands.datetime', Clock)
+    runner, command, provider, repo, remote, old, expected = await queued_exhausted_provider_retry(
+        lifecycle, observation=True,
+    )
+    message = runner.state.error_message
+    assert runner.state.publication_attempt.provider_observation_failure == message
+    assert runner.state.publication_attempt.failure == message
+    runner = await restart(runner, lifecycle[-1])
+    runner._consume_retry_command = RetryCommandMixin._consume_retry_command.__get__(runner)
+    runner._commit_task_status_change = AsyncMock(return_value=True)
+    if problem != 'unavailable':
+        provider['error'] = None
+    if problem == 'independent':
+        await runner._transition_to_error('independent implementation failure', save_run_record_as=None)
+    if problem == 'remote':
+        git(remote, 'update-ref', 'refs/heads/pr-001', expected)
+        # An unrelated remote commit, rather than either retained owned head.
+        git(repo, 'commit', '--allow-empty', '-m', 'external change')
+        git(repo, 'push', 'origin', 'pr-001')
+        git(repo, 'reset', '--hard', expected)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    attempt = runner.state.publication_attempt
+    assert git(repo, 'rev-parse', 'HEAD') == expected
+    if problem != 'resolved':
+        assert runner.state.state == PipelineState.ERROR
+        assert attempt.provider_retries == 1
+        assert attempt.failure == message
+        assert runner.state.error_message == (
+            'independent implementation failure' if problem == 'independent' else message
+        )
+        assert stored.status != RetryCommandStatus.APPLIED
+        runner._commit_task_status_change.assert_not_awaited()
+        return
+    assert stored.status == RetryCommandStatus.APPLIED
+    assert stored.retry_count == 1
+    assert attempt.failure is None and attempt.provider_observation_failure is None
+    assert runner.state.error_message is None
+    assert attempt.provider_retries == 0
+    assert attempt.reconcile_deadline > Clock.value
+    assert git(remote, 'rev-parse', 'refs/heads/pr-001') == old
+    dispatch = AsyncMock()
+    monkeypatch.setattr(runner, 'handle_fix', dispatch)
+    assert await publication.resume_provider_failure(runner)
+    dispatch.assert_awaited_once()
+    assert runner.state.state == PipelineState.FIX
 
 
 @pytest.mark.parametrize('problem', ['pause', 'remote', 'cleanup', 'run', 'observation', 'cap', 'failure', 'binding'])

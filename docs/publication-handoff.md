@@ -100,13 +100,18 @@ the resumed coder only completes validation.
 
 Before resuming, the runner requires bound cleanup/run evidence, the retained
 local branch and head, and exact open-PR evidence. The remote may still contain
-the initial head or the captured local commit; an independently changed head
+the initial head, the last exact published head owned by the recovery chain,
+or the captured local commit; an independently changed head
 parks recovery without rewriting either side. The resumed FIX keeps commits and
 dirty changes, reruns unfinished validation, and uses normal publication and
 review/CI gates after successful exit. A clean tree or an already-published commit
 cannot convert a failed invocation into successful completion. Operator pause
 continues to block automatic work. Expired quota markers are cleared before
 interrupted-publication recovery so they cannot cause ERROR/PAUSED oscillation.
+An exhausted ownership-observation budget records its exact provider-owned error.
+Bound operator Retry rechecks all ownership evidence before clearing that error
+and granting a new provider allowance. Independent failures remain blocking,
+including when they occur after the observation park.
 After provider exhaustion, operator Retry can reserve the existing bounded Retry
 allowance and resume the retained FIX without a manual push. Admission uses the
 same local/remote/PR and run-ownership proofs as automatic continuation. The

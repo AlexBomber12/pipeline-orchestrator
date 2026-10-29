@@ -245,6 +245,10 @@ class PublicationAttempt(BaseModel):
     provider_retry_command_id: str | None = None
     # Exact admitted review/CI prompt, bound to this dispatch and its original head.
     fix_feedback_context: str | None = None
+    # Latest exact publication owned by this recovery chain; not the review baseline.
+    provider_published_head_sha: str | None = None
+    # Exact error owned by an exhausted observation budget, eligible for bound Retry.
+    provider_observation_failure: str | None = None
 
 class SizeFixCompletion(BaseModel):
     """Confirmed FIX exit awaiting a status write or marker cleanup."""
