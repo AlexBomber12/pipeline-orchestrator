@@ -55,7 +55,15 @@ No new configuration, public state, scheduler, or operator control is required.
 Before releasing the publication hold, the daemon checkpoints push accounting
 and its receipt together. FIX accounting uses the captured initial iteration;
 replaying a checkpoint cannot increment it again. Run records retain their run
-identity and terminal history. Unavailable bound run accounting defers handoff;
+identity and terminal history. A completed CODING run remains finalized as
+`superseded` / `coding_complete`. A review-triggered FIX admits a separate run
+whose deterministic identity binds that predecessor and whose `attempt_index`
+increments by one. Each record retains its own invocation snapshots; cumulative
+FIX counters do not imply duplicate invocations in the predecessor. Successful
+merge finalizes the successor as `merged` / `success_merged` for the exact PR
+head proved merged, preserving the original CODING history. Provider recovery
+keeps this same record/attempt contract rather than reopening an exited run.
+Unavailable bound run accounting defers handoff;
 terminal metrics use the frozen commit even if the local checkout later moves.
 Review handoff checkpoints its start before POST;
 a restart consults current-head request history before another POST. Unavailable

@@ -207,7 +207,8 @@ def test_shim_ignores_status_doing_outside_task_metadata(tmp_path: Path) -> None
     assert result.stdout == "PR-002\tpr-002\n"
 
 
-def test_success_shim_separates_branch_creation_from_head_publication(tmp_path: Path) -> None:
+@pytest.mark.parametrize("scenario", ["run_success", "run_success_pending_ci"])
+def test_success_shim_separates_branch_creation_from_head_publication(tmp_path: Path, scenario: str) -> None:
     remote = tmp_path / "remote.git"
     repo = tmp_path / "repo"
 
@@ -230,8 +231,8 @@ def test_success_shim_separates_branch_creation_from_head_publication(tmp_path: 
 source "$1"
 ensure_pr_url() { printf 'https://example.invalid/pull/42'; }
 gh() { return 0; }
-run_success PR-42 pr-42-success
-''', "bash", str(SHIM.resolve())],
+$2 PR-42 pr-42-success
+''', "bash", str(SHIM.resolve()), scenario],
         cwd=repo, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
@@ -574,3 +575,41 @@ def test_settings_launch_oracle_requires_fresh_bound_snapshot(tmp_path, monkeypa
     else:
         with pytest.raises(AssertionError):
             run()
+
+
+def test_fix_shim_preserves_remote_history_and_replaces_only_owned_marker(tmp_path):
+    def git(*args, cwd=tmp_path):
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout.strip()
+
+    remote, repo = tmp_path / "remote.git", tmp_path / "repo"
+    git("init", "--bare", "--initial-branch=main", str(remote))
+    git("clone", str(remote), str(repo))
+    git("config", "user.name", "Fixture", cwd=repo)
+    git("config", "user.email", "fixture@test.invalid", cwd=repo)
+    (repo / "tests").mkdir()
+    marker = repo / "tests/e2e-shim-marker.txt"
+    other = "shim marker for PR-420 at unchanged"
+    marker.write_text(f"{other}\nshim marker for PR-42 at old\n")
+    git("add", "tests", cwd=repo)
+    git("commit", "-m", "original", cwd=repo)
+    git("push", "origin", "HEAD:pr-42-fix", cwd=repo)
+    old = git("rev-parse", "HEAD", cwd=repo)
+    result = subprocess.run(
+        ["bash", "-c", '''
+source "$1"
+ensure_pr_url() { printf 'https://example.invalid/pull/42'; }
+gh() { printf '%s\n' "$*" >> gh-calls; }
+run_fix_existing_pr PR-42 pr-42-fix true
+''', "bash", str(SHIM.resolve())],
+        cwd=repo, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    head = git("rev-parse", "refs/heads/pr-42-fix", cwd=remote)
+    assert head != old
+    assert git("rev-parse", f"{head}^", cwd=remote) == old
+    lines = git("show", f"{head}:tests/e2e-shim-marker.txt", cwd=remote).splitlines()
+    assert lines[0] == other and len(lines) == 2
+    assert lines[1].startswith("shim marker for PR-42 at ") and not lines[1].endswith("old")
+    calls = (repo / "gh-calls").read_text()
+    assert f"statuses/{head} -f state=pending" in calls
+    assert calls.index("state=pending") < calls.index("@codex review")

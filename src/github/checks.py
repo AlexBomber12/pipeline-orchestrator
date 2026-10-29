@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Any, NamedTuple
 
 from src.github import cache, gh_runner
-from src.github.ci_evidence import CIEvidence, _latest, evaluate_ci_evidence
+from src.github.ci_evidence import CIEvidence, _latest, _status_producer, evaluate_ci_evidence
 from src.models import CIStatus
 from src.retry import retry_transient
 
@@ -363,6 +363,29 @@ def _parse_status_pages(
     )
 
 
+def _hydrate_status_producers(repo: str, sha: str, payload: dict) -> None:
+    """Combined statuses omit creator; recover it from the exact history record."""
+    missing = [status for status in payload.get("statuses", [])
+               if isinstance(status, dict) and _status_producer(status) is None
+               and type(status.get("id")) is int and status["id"] > 0]
+    if not missing:
+        return
+    try:
+        history = cache._gh_api_paginated(f"repos/{repo}/commits/{sha}/statuses?per_page=100")
+    except RuntimeError:
+        return  # Missing provenance remains pending; never infer a producer.
+    if history is None:
+        return
+    for status in missing:
+        matches = [record for record in history
+                   if record.get("id") == status["id"]
+                   and all(record.get(key) == status.get(key)
+                           for key in ("context", "state", "created_at"))
+                   and record.get("sha", sha) == sha]
+        if len(matches) == 1 and _status_producer(matches[0]) is not None:
+            status.update({key: matches[0][key] for key in ("creator", "app_id") if key in matches[0]})
+
+
 def _make_ci_retrieval(
     repo: str,
     sha: str,
@@ -480,6 +503,8 @@ def _retrieve_ci_status_evidence(repo: str, sha: str, *, fresh: bool = False) ->
     status_path = f"repos/{repo}/commits/{sha}/status?per_page=100"
     status_pages = cache._etag_get_object_pages_evidence(status_path, "statuses")
     status_payload, status_source = _parse_status_pages(status_pages, sha)
+    if status_source.sha_matches:
+        _hydrate_status_producers(repo, sha, status_payload)
 
     retrieval = _make_ci_retrieval(
         repo,
