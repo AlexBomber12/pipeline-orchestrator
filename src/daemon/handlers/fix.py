@@ -586,7 +586,7 @@ class FixMixin(BreachMixin):
             )
             return
         if provider_snapshot is not None and provider_snapshot.plugin_id != coder_name:
-            await publication._park(self, "Interrupted FIX provider changed; restore selected provider before Retry")
+            await publication._park(self, publication.PROVIDER_RECOVERY_CHANGED)
             return
         if not await self.usage_gate(proactive_coder=coder_name):
             return

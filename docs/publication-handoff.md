@@ -112,6 +112,10 @@ An exhausted ownership-observation budget records its exact provider-owned error
 Bound operator Retry rechecks all ownership evidence before clearing that error
 and granting a new provider allowance. Independent failures remain blocking,
 including when they occur after the observation park.
+Changing the selected provider parks recovery without changing the retained
+invocation. After the operator restores that provider, bound Retry revalidates
+the selected provider and retained ownership before clearing the provider-change
+error and granting a new allowance. Retry cannot authorize a different provider.
 After provider exhaustion, operator Retry can reserve the existing bounded Retry
 allowance and resume the retained FIX without a manual push. Admission uses the
 same local/remote/PR and run-ownership proofs as automatic continuation. The

@@ -387,6 +387,7 @@ async def retry_floor(runner: PipelineRunner, command: RetryCommand) -> Publicat
 PROVIDER_RECOVERY_EXHAUSTED = (
     "Provider recovery exhausted after 3 interrupted FIX attempts; retained work requires Retry"
 )
+PROVIDER_RECOVERY_CHANGED = "Interrupted FIX provider changed; restore selected provider before Retry"
 
 
 async def pause_provider_failure(runner: PipelineRunner, stderr: str, coder_name: str) -> bool:
@@ -506,7 +507,7 @@ async def _defer_provider_observation(runner: PipelineRunner, boundary: str) -> 
 
 def provider_retry_owns_failure(attempt: PublicationAttempt, message: str | None) -> bool:
     """Only clear provider-owned parks, never independent implementation failures."""
-    return message is None or message == PROVIDER_RECOVERY_EXHAUSTED or (
+    return message in {None, PROVIDER_RECOVERY_EXHAUSTED, PROVIDER_RECOVERY_CHANGED} or (
         attempt.provider_observation_failure is not None and message == attempt.provider_observation_failure
     )
 
@@ -533,6 +534,10 @@ async def provider_retry_problem(
             attempt.initial_pr_head_sha, attempt.expected_head_sha, attempt.provider_published_head_sha,
         }):
         return "Interrupted FIX lacks matching identity, exit, or cleanup proof; use Retry"
+    if allow_provider_park:
+        coder_name, _ = runner._get_coder(allow_exploration=False)
+        if coder_name != runner.state.active_invocation.plugin_id:
+            return PROVIDER_RECOVERY_CHANGED
     if not _run_matches(runner):
         await runner._restore_current_run_record()
     if not _run_matches(runner):
