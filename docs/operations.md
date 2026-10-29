@@ -696,3 +696,129 @@ tests/runner/test_misc.py -q`. This investigation has no deployment prerequisite
 It does not prove real provider, bwrap/container, credential, or production
 shutdown behavior. Operator release verification is separate; no deployment,
 restart drill, runtime migration, or process-control code is delivered here.
+
+## Final Reject protocol investigation (PR-427)
+
+Source base: `073df13e92888d6bb2f83df834608bbeb40b5969` (current main,
+2026-10-29); historical audit reference:
+`7167c2e916a2bbb843ecb6a6ce7fc15795e61802`. This is a characterization,
+not a new runtime rejection schema or authorization to reject production work.
+The retired task identifiers listed in PR-427 are traceability only.
+
+### Existing boundaries and evidence
+
+| Boundary | Retain/reuse | Actual gap for final Reject |
+| --- | --- | --- |
+| `repo_control.reject_guardrail_park` | The task-card route only returns edit-spec advice | No decision, close, or finality effect. |
+| `repo_control._reject_guardrail_decision` | Configured repository, active task's PR number; fallback `_read_task_branch` and unique same-owner open-PR lookup | Web owns the close; no exact attempt/spec binding or fresh PR identity verification. CAS rechecks only that the cause is still a guardrail, not equality with the initially read failure. |
+| Reject CAS / cancellation history | WATCH prevents replacing a non-guardrail cause; original rule/excerpt retained | Writes `operator_reject` before external close; cause TTL is 30 days, refreshed by readers to 90 days. It is diagnostic history, not a permanent rejection fence. |
+| `_gh_best_effort` | Bounded subprocess and error logging | Swallows failed close/timeout; no exact-PR terminal readback, resumable operation, or terminal receipt. HTTP 204 cannot prove closure. |
+| `retry_commands` / daemon `RetryCommandMixin` | Durable request binding, deduplication, claim, attempt reservation and effect checkpoints; current task/PR/spec/failure validation | Redis survival is required. Normal Retry selects the existing bound open PR; do not route it through new-attempt readmission. |
+| `approval_commands` / daemon `ApprovalCommandMixin` | Non-expiring decision-bound receipts; repository, path, spec, PR number/full head, failure and invocation identity; preservation holds | An approval is permission for its exact work, not a Reject command or permission for revised work. Historical missing attempt context grants no authority. |
+| Retry reservation / scheduler inhibitors / process supervisor | Serialize checkout work, preserve operator pause, require live owned cleanup proof | Web Reject takes no daemon reservation and has no writer-quiescence prerequisite. Redis reservation or expected-branch hook alone cannot fence an already running writer. Restart ownership is separately unresolved (PR-431 investigation above). |
+| `RepoOpsMixin.process_pending_uploads` | Identical fingerprint replay preserves accepted task bytes; changed DONE/DOING, active task/branch and pending publication replacements blocked | No durable rejected-generation admission rule. Web staging alone does not prove daemon readmission. |
+| `completion_evidence`, `task_status`, merge accounting/recovery | Exact task-byte/ancestry completion evidence and historical run/merge accounting | Completion means implemented/merged; never encode rejected work as DONE or weaken historical completion to allow a new attempt. Existing Git history is reusable storage, not an existing rejection receipt. |
+| `github.prs.merge_pr`, CODING branch preparation | Merge uses exact expected head and branch deletion; CODING can replace a local branch from base | Reject close deliberately omits branch deletion. Neither local branch replacement nor deleting a remote branch proves all writers stopped; a late push can recreate/advance it. |
+
+`tests/test_reject_contract.py` calls the production Reject caller with controlled
+GitHub transport and existing Redis double. Three cases distinguish a successful
+close reply, applied close with lost reply, and timeout before application. All
+currently return 204, store the same unbound cause shape, and return 404 on replay
+without another close attempt. Even the successful transport case has no
+production readback: CLOSED is known to the controlled service only. The tests
+assert the exact repository and PR number and forbid branch deletion. They do
+not assert that the current caller implements final Reject correctly.
+
+A real temporary bare remote, checkout and fixture-owned Linux process show
+that a writer started before Reject can push a local commit afterwards. The
+old head stays unchanged until an explicit stdin release; then the remote head
+must equal that late commit. The test retains and reads its work and reaps only
+its own child. The transport's old head observation is stale. It does not model
+GitHub automatically reopening a PR or prove provider-side close semantics.
+
+The revised-spec test exercises production staging and approval binding: status
+and blocked-reason edits alone preserve the spec fingerprint; a substantive
+requirement edit changes it, and a new invocation attempt changes the approval
+binding independently. ID/Branch remain the same. DONE collision protection
+remains intact. This proves reusable identity primitives, not a complete new-PR
+readmission path. Existing `tests/runner/test_retry_commands.py` proves bound
+open-PR continuation and drift rejection; `tests/test_approval_commands.py`
+contains preservation, replay and restart regressions.
+
+`tests/e2e/test_reject_contract.py` repeats the three transport cases with real
+Redis transactions in the existing serialized GHA stack, checks positive cause
+TTL, deletes only its random namespace to model loss, and confirms replay can
+no longer recover the close. It records the checkout SHA as `tested_sha` in
+pytest properties. Deletion models evidence loss, not a Redis crash/AOF test.
+Local verification does not run Docker or this integration test; its real-Redis
+result and exact executed SHA remain pending GHA. No Redis-loss durability
+claim follows from the unit double or from a future test merely being collected.
+
+### Minimum proposed contract and retained state
+
+The following is an implementation proposal, not delivered behavior:
+
+1. **Accepted** means a non-expiring intent was durably retained for the exact
+   repository/base, task ID/path/Branch, substantive spec fingerprint, run/attempt
+   (including phase/FIX generation), failure identity, and old PR number/full head.
+   Missing or conflicting identity stays parked. Replays return the same receipt;
+   no acknowledgement before retention. Reuse command-store conventions and
+   indexes; a wake is a hint. Preserve the operator pause.
+2. **Pending external outcome** retains that intent, exclusive daemon ownership,
+   recoverable work and latest observations. The daemon must first confirm owned
+   coder cleanup and reconcile unpublished/late work. Dirty/local-ahead work is
+   preserved, not reset. Close only the exact old PR after fresh repository,
+   branch and head validation. A timeout is ambiguous: read that same PR again,
+   never branch-search for a replacement or infer success from an absent open
+   list. A merged PR follows existing completion accounting, not rejection.
+3. **Final durable rejection** requires positive exact-PR CLOSED/unmerged evidence
+   after writer quiescence, and a retained generation fence that recovery and
+   admission can reconstruct without Redis. Persist an idempotent, reviewed
+   Git-backed receipt before releasing the hold. Record the old PR, spec/attempt,
+   confirmed terminal observation and preserved-work references. Unknown GitHub
+   outcome, failed Git persistence, or unproven process ownership remains pending.
+   Do not delete recoverable branches/work as a shortcut to finality.
+4. **Changed unfinished spec readmission** compares substantive fingerprints,
+   completion evidence and the retained fence. Identical bytes/status-only edits
+   remain rejected. Genuinely changed unfinished work may reuse ID/Branch only
+   after old-PR finality and owned checkout safety are proven. Start a new
+   run/attempt and new PR from freshly fetched current base; retain old history
+   and useful work references but never silently replay old implementation,
+   approvals, Retry requests or publication authority. Normal Retry retains its PR.
+
+One retained command intent with effect checkpoints plus one Git-backed final
+fence is the minimum candidate, rather than a series of new stores. Redis
+records alone cannot meet total Redis-loss recovery. Loss before a final fence
+is committed also needs recoverable pending intent: either persist pending
+intent in the same Git-backed journal before acknowledging, or explicitly keep
+Redis-loss cases parked for operator reconciliation and admit that acceptance
+is Redis-durable only. This choice is unresolved; do not declare an automatic
+Redis-loss recovery implementation ready. The Git receipt layout, publication
+conflict/replay rules and authorization must be agreed before implementation.
+
+### Bounded follow-up and replacement targets
+
+A separate proposal should scope the daemon Reject consumer, decision-bound web
+request/receipt UI, pending/final Git journal, admission/recovery checks and
+changed-spec new-attempt branch preparation together. Provisional implementation
+range: 350–550 production, 450–650 tests, 80–120 documentation lines across
+roughly 7–10 files, contingent on resolving pending-intent durability and restart
+ownership. This is not an approved implementation task. Cross-host/escaped writer
+fencing, generic transactions, provider login and production drills are excluded;
+ambiguous ownership must hold rather than signal an inferred PID.
+
+Replace web-owned best-effort close and its TTL cause-as-finality assumption;
+keep cancellation history as diagnostics. Add rejection-aware checks at existing
+upload/recovery/dispatch boundaries instead of another scheduler. Reuse durable
+Retry/Approve command patterns without changing their semantics. Replace any
+new-attempt reliance on old branch state with verified current-base preparation.
+No runtime logic is removed, migrated or replaced in this investigation.
+
+Focused verification: `python -m pytest tests/test_reject_contract.py
+ tests/runner/test_retry_commands.py -q`. GHA-owned integration command:
+`python -m pytest tests/e2e/test_reject_contract.py -v`. Full local gate and
+artifacts use `bash scripts/make-review-artifacts.sh` after the checkpoint commit.
+There are no deployment prerequisites for these tests/docs. Follow-up release
+verification must separately prove real GitHub access/terminal semantics and
+process restart containment; source merge is not deployment. Existing crash,
+Approve, fairness, completion and pause behavior is unchanged.
