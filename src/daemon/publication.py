@@ -383,6 +383,11 @@ async def retry_floor(runner: PipelineRunner, command: RetryCommand) -> Publicat
     return floor
 
 
+PROVIDER_RECOVERY_EXHAUSTED = (
+    "Provider recovery exhausted after 3 interrupted FIX attempts; retained work requires Retry"
+)
+
+
 async def pause_provider_failure(runner: PipelineRunner, stderr: str, coder_name: str) -> bool:
     """Retain interrupted FIX work, independently of quota and publication success."""
     from src.provider_errors import is_capacity_error
@@ -466,42 +471,12 @@ async def resume_provider_failure(runner: PipelineRunner) -> bool:
         )
     if attempt.provider_retries >= 3:
         return await _park(
-            runner, "Provider recovery exhausted after 3 interrupted FIX attempts; retained work requires Retry",
+            runner, PROVIDER_RECOVERY_EXHAUSTED,
         )
-    pr = runner.state.current_pr
-    if (attempt.contract_version != 2 or attempt.exit_classification != "failure"
-        or not runner._publication_attempt_matches_dispatch() or not attempt.cleanup_confirmed
-        or not attempt.expected_head_sha or not attempt.initial_pr_head_sha or attempt.failure
-        or pr is None or pr.number != attempt.pr_number or pr.branch != attempt.branch
-        or pr.is_cross_repository or pr.pr_id not in {None, attempt.task_id}
-        or pr.head_sha not in {attempt.initial_pr_head_sha, attempt.expected_head_sha}):
-        return await _park(runner, "Interrupted FIX lacks matching identity, exit, or cleanup proof; use Retry")
-    if not _run_matches(runner):
-        await runner._restore_current_run_record()
-    if not _run_matches(runner):
-        return await _park(runner, "Interrupted FIX run accounting is missing; restore bound run before Retry")
     try:
-        branch = (await asyncio.to_thread(git_ops._git, runner.repo_path, "branch", "--show-current")).stdout.strip()
-        head = (await asyncio.to_thread(git_ops._git, runner.repo_path, "rev-parse", "HEAD")).stdout.strip()
-        remote = (await asyncio.to_thread(
-            git_ops._git, runner.repo_path, "ls-remote", "--heads", "origin", f"refs/heads/{attempt.branch}",
-        )).stdout.split()
-        if branch != attempt.branch or head != attempt.expected_head_sha:
-            return await _park(runner, "Interrupted FIX checkout changed; retain both versions and use Retry")
-        if len(remote) != 2 or remote[1] != f"refs/heads/{branch}" or remote[0] not in {
-            attempt.initial_pr_head_sha, attempt.expected_head_sha,
-        }:
-            return await _park(
-                runner, "Interrupted FIX remote head changed independently; preserve both sides and use Retry",
-            )
-        outcome = await asyncio.to_thread(
-            gh_prs.get_exact_pr_outcome, attempt.repo, attempt.base, attempt.pr_number, remote[0],
-            expected_branch=attempt.branch,
-        )
-        if not outcome.discovery_complete:
-            return await _defer_provider_observation(runner, "exact open PR evidence unavailable")
-        if outcome.state != gh_prs.ExactPRState.OPEN:
-            return await _park(runner, "Interrupted FIX exact PR is terminal; use Retry after inspection")
+        problem = await provider_retry_problem(runner)
+        if problem is not None:
+            return await _park(runner, problem)
     except Exception as exc:
         return await _defer_provider_observation(runner, f"ownership observation unavailable: {type(exc).__name__}")
     attempt.provider_retry_ready = True
@@ -524,3 +499,46 @@ async def _defer_provider_observation(runner: PipelineRunner, boundary: str) -> 
     runner.state.state = PipelineState.PAUSED
     await runner.publish_state()
     return True
+
+
+async def provider_retry_problem(
+    runner: PipelineRunner, *, allow_provider_exhaustion: bool = False,
+) -> str | None:
+    """Observe retained FIX ownership without resetting allowance or dispatching."""
+    attempt = runner.state.publication_attempt
+    pr = runner.state.current_pr
+    if (attempt.contract_version != 2 or attempt.exit_classification != "failure"
+        or (attempt.provider_retries == 0 and attempt.provider_retry_command_id is None)
+        or not runner._publication_attempt_matches_dispatch() or not attempt.cleanup_confirmed
+        or not attempt.expected_head_sha or not attempt.initial_pr_head_sha
+        or (attempt.failure is not None and not (
+            allow_provider_exhaustion and attempt.failure == PROVIDER_RECOVERY_EXHAUSTED
+        ))
+        or pr is None or pr.number != attempt.pr_number or pr.branch != attempt.branch
+        or pr.is_cross_repository or pr.pr_id not in {None, attempt.task_id}
+        or pr.head_sha not in {attempt.initial_pr_head_sha, attempt.expected_head_sha}):
+        return "Interrupted FIX lacks matching identity, exit, or cleanup proof; use Retry"
+    if not _run_matches(runner):
+        await runner._restore_current_run_record()
+    if not _run_matches(runner):
+        return "Interrupted FIX run accounting is missing; restore bound run before Retry"
+    branch = (await asyncio.to_thread(git_ops._git, runner.repo_path, "branch", "--show-current")).stdout.strip()
+    head = (await asyncio.to_thread(git_ops._git, runner.repo_path, "rev-parse", "HEAD")).stdout.strip()
+    remote = (await asyncio.to_thread(
+        git_ops._git, runner.repo_path, "ls-remote", "--heads", "origin", f"refs/heads/{attempt.branch}",
+    )).stdout.split()
+    if branch != attempt.branch or head != attempt.expected_head_sha:
+        return "Interrupted FIX checkout changed; retain both versions and use Retry"
+    if len(remote) != 2 or remote[1] != f"refs/heads/{branch}" or remote[0] not in {
+        attempt.initial_pr_head_sha, attempt.expected_head_sha,
+    }:
+        return "Interrupted FIX remote head changed independently; preserve both sides and use Retry"
+    outcome = await asyncio.to_thread(
+        gh_prs.get_exact_pr_outcome, attempt.repo, attempt.base, attempt.pr_number, remote[0],
+        expected_branch=attempt.branch,
+    )
+    if not outcome.discovery_complete:
+        raise RuntimeError("exact open PR evidence unavailable")
+    if outcome.state != gh_prs.ExactPRState.OPEN:
+        return "Interrupted FIX exact PR is terminal; use Retry after inspection"
+    return None

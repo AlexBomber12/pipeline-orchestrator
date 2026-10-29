@@ -46,7 +46,7 @@ async def lifecycle(tmp_path, monkeypatch):
     git(repo, 'config', 'user.email', 'fixture@example.test')
     git(repo, 'config', 'user.name', 'Fixture')
     (repo / 'tasks').mkdir()
-    (repo / 'tasks/PR-001.md').write_text('# PR-001\n\nBranch: pr-001\n')
+    (repo / 'tasks/PR-001.md').write_text('# PR-001: Repair\n\nBranch: pr-001\n- Type: bugfix\n- Complexity: low\n- Depends on: none\n')
     git(repo, 'add', '.')
     git(repo, 'commit', '-m', 'base')
     git(repo, 'remote', 'add', 'origin', str(remote))
@@ -1410,3 +1410,287 @@ async def test_expired_observed_quota_is_not_rescheduled_from_its_marker(lifecyc
     assert await publication.resume_provider_failure(runner)
     assert runner.state.rate_limited_until is None
     assert dispatch.await_count == 1
+
+
+@pytest.mark.parametrize('restart_at', ['none', 'grant', 'applied', 'scheduled'])
+async def test_operator_retry_resumes_exhausted_unpublished_fix(lifecycle, monkeypatch, restart_at):
+    from src.cancellation import get_cancellation_cause, task_spec_content_hash
+    from src.daemon.retry_commands import RetryCommandMixin, RetryDispatch
+    from src.retry_commands import (
+        RetryCommandStatus, RetryExecutionState, enqueue_retry_command, load_retry_command,
+        new_retry_command, retry_failure_identity,
+    )
+
+    monkeypatch.setattr("src.retry_commands.utc_now", lambda: Clock.value)
+    runner, provider, repo, old, expected, configure = lifecycle
+    remote = git(repo, 'remote', 'get-url', 'origin')
+    git(remote, 'update-ref', 'refs/heads/pr-001', old)
+    git(repo, 'reset', '--hard', old)
+    runner.state.publication_attempt = None
+    await runner._save_current_run_record('coding_complete')
+    runner.state.active_invocation = None
+    runner.state.current_pr.review_status = ReviewStatus.PENDING
+    calls = []
+    status_writes = []
+
+    async def status(*args, **kwargs):
+        status_writes.append(args[1])
+        return True
+
+    def setup(r):
+        configure(r)
+        r._consume_retry_command = RetryCommandMixin._consume_retry_command.__get__(r)
+        r._refresh_auth_status_cache = AsyncMock()
+        r.usage_gate = AsyncMock(return_value=True)
+        r._run_coder_with_polling = lambda *args: None
+        r._commit_task_status_change = status
+        return r
+
+    setup(runner)
+    _, plugin = runner._get_coder()
+
+    async def coder(*args, **kwargs):
+        calls.append(kwargs)
+        if len(calls) <= 3:
+            git(repo, 'reset', '--hard', expected)
+            return 1, '', 'ERROR: Selected model is at capacity'
+        assert len(calls) == 4
+        assert git(repo, 'rev-parse', 'HEAD') == expected
+        assert git(remote, 'rev-parse', 'refs/heads/pr-001') == old
+        assert 'gate is unfinished' in kwargs['extra_context']
+        git(repo, 'push', 'origin', 'pr-001')
+        provider['head'] = expected
+        return 0, 'Required gate rerun passed; retained work published to the existing PR.', ''
+
+    monkeypatch.setattr(type(plugin), 'fix_review', lambda self, *a, **kw: coder(*a, **kw))
+    await runner.handle_fix()
+    for _ in range(3):
+        Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+        await publication.resume_provider_failure(runner)
+    assert len(calls) == 3
+    assert runner.state.state == PipelineState.ERROR
+    task = runner.state.current_task.model_copy(update={'status': TaskStatus.ERROR})
+    runner.state.current_queue = [task]
+    await runner.publish_state()
+    cause = await get_cancellation_cause(runner.redis, runner.name, task.pr_id, refresh_ttl=False)
+    pr = runner.state.current_pr
+    command = new_retry_command(
+        repo_slug=runner.name, task_id=task.pr_id, task_file=task.task_file, task_branch=task.branch,
+        task_fingerprint=task_spec_content_hash((repo / task.task_file).read_text()),
+        request_binding='b' * 64, failure_id=retry_failure_identity(task, runner.state, cause), retry_cap=3,
+        bound_pr_number=pr.number, bound_pr_branch=pr.branch, bound_pr_head_sha=pr.head_sha,
+    )
+    await enqueue_retry_command(runner.redis, command)
+    original_run = runner.state.active_invocation.run_id
+    original_fix_count = runner._current_run_record.fix_iterations
+    original_pr_count = pr.fix_iteration_count
+    checkpoint = runner.publish_state
+
+    class Interrupted(BaseException):
+        pass
+
+    async def crash_checkpoint():
+        await checkpoint()
+        a = runner.state.publication_attempt
+        if a.provider_retry_command_id == command.command_id and (
+            restart_at == 'grant' or restart_at == 'scheduled' and runner.state.state == PipelineState.PAUSED
+        ):
+            raise Interrupted()
+
+    if restart_at in {'grant', 'scheduled'}:
+        monkeypatch.setattr(runner, 'publish_state', crash_checkpoint)
+    if restart_at == 'applied':
+        mark = runner._mark_retry_applied
+        async def crash_mark(*args, **kwargs):
+            await mark(*args, **kwargs)
+            raise Interrupted()
+        monkeypatch.setattr(runner, '_mark_retry_applied', crash_mark)
+    if restart_at != 'none':
+        with pytest.raises(Interrupted):
+            await runner._consume_retry_command()
+        Clock.value += timedelta(minutes=6)  # expired claim lease after daemon death
+        fresh = setup(h._make_runner(publication_contract=2))
+        fresh.redis = runner.redis
+        fresh._metrics_store = type(runner._metrics_store)(fresh.redis)
+        # A new runner loads the actual retained snapshot before command replay.
+        await fresh._hydrate_current_task_from_persisted_state()
+        runner = fresh
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.APPLIED, stored.outcome_reason
+    assert stored.execution_state == RetryExecutionState.COMPLETED
+    assert stored.selected_continuation == 'provider_fix'
+    assert stored.retry_count == 1
+    assert stored.reset_counters == ['provider_retries']
+    assert runner.state.publication_attempt.provider_retries == 0
+    assert runner.state.publication_attempt.pending
+    assert runner.state.active_invocation.run_id == original_run
+    assert runner._current_run_record.fix_iterations == original_fix_count
+    assert runner.state.current_pr.fix_iteration_count == original_pr_count
+    assert git(repo, 'rev-parse', 'HEAD') == expected
+    assert git(remote, 'rev-parse', 'refs/heads/pr-001') == old
+    assert status_writes == ['TODO']
+    assert len(calls) == 3
+    assert await runner._consume_retry_command() == RetryDispatch.NONE
+    await publication.resume_provider_failure(runner)
+    assert len(calls) == 4
+    assert runner.state.state == PipelineState.WATCH
+    assert git(remote, 'rev-parse', 'refs/heads/pr-001') == expected
+    assert runner._current_run_record.ended_at
+    assert runner.state.publication_attempt.provider_retry_command_id == command.command_id
+    # Replay of an acknowledged grant cannot reset a later provider allowance.
+    runner.state.publication_attempt.provider_retries = 2
+    assert await runner._reconcile_applied_retry(stored) == RetryDispatch.HANDLED
+    assert runner.state.publication_attempt.provider_retries == 2
+    assert len(calls) == 4
+    replayed = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert replayed.status == RetryCommandStatus.APPLIED
+
+
+async def queued_exhausted_provider_retry(lifecycle):
+    from src.cancellation import get_cancellation_cause, task_spec_content_hash
+    from src.daemon.retry_commands import RetryCommandMixin
+    from src.retry_commands import enqueue_retry_command, new_retry_command, retry_failure_identity
+
+    runner, provider, repo, old, expected, _ = lifecycle
+    remote = git(repo, 'remote', 'get-url', 'origin')
+    git(remote, 'update-ref', 'refs/heads/pr-001', old)
+    await publication.record_exit(runner, 1, '', 'ERROR: Selected model is at capacity')
+    await publication.record_cleanup(runner)
+    runner.state.publication_attempt.provider_retries = 3
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    await publication.resume_provider_failure(runner)
+    task = runner.state.current_task.model_copy(update={'status': TaskStatus.ERROR})
+    runner.state.current_queue = [task]
+    await runner.publish_state()
+    cause = await get_cancellation_cause(runner.redis, runner.name, task.pr_id, refresh_ttl=False)
+    pr = runner.state.current_pr
+    command = new_retry_command(
+        repo_slug=runner.name, task_id=task.pr_id, task_file=task.task_file, task_branch=task.branch,
+        task_fingerprint=task_spec_content_hash((repo / task.task_file).read_text()),
+        request_binding='c' * 64, failure_id=retry_failure_identity(task, runner.state, cause), retry_cap=3,
+        bound_pr_number=pr.number, bound_pr_branch=pr.branch, bound_pr_head_sha=pr.head_sha,
+    )
+    await enqueue_retry_command(runner.redis, command)
+    runner._consume_retry_command = RetryCommandMixin._consume_retry_command.__get__(runner)
+    runner._commit_task_status_change = AsyncMock(return_value=True)
+    return runner, command, provider, repo, remote, old, expected
+
+
+@pytest.mark.parametrize('problem', ['pause', 'remote', 'cleanup', 'run', 'observation', 'cap', 'failure', 'binding'])
+async def test_operator_provider_retry_requires_ownership_and_existing_admission(lifecycle, monkeypatch, problem):
+    from src.cancellation import retry_count_key
+    from src.daemon.retry_commands import RetryDispatch
+    from src.retry_commands import RetryCommandStatus, load_retry_command
+
+    runner, command, provider, repo, remote, old, expected = await queued_exhausted_provider_retry(lifecycle)
+    if problem == 'pause':
+        runner.state.user_paused = True
+    elif problem == 'remote':
+        (repo / 'independent').write_text('other work')
+        git(repo, 'add', 'independent')
+        git(repo, 'commit', '-m', 'independent')
+        git(repo, 'push', 'origin', 'pr-001')
+        git(repo, 'reset', '--hard', expected)
+    elif problem == 'cleanup':
+        runner.state.publication_attempt.cleanup_confirmed = False
+    elif problem == 'run':
+        runner._current_run_record = None
+        monkeypatch.setattr(runner._metrics_store, 'get', AsyncMock(return_value=None))
+    elif problem == 'observation':
+        provider['error'] = 'API unavailable'
+    elif problem == 'cap':
+        await runner.redis.set(retry_count_key(runner.name, command.task_id), '3')
+    elif problem == 'failure':
+        runner.state.publication_attempt.failure = 'independent implementation failure'
+    else:
+        command.bound_pr_number = 647
+        assert await runner._select_retry_continuation(command) == RetryDispatch.HANDLED
+    if problem != 'binding':
+        assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status in {RetryCommandStatus.DEFERRED, RetryCommandStatus.FAILED}
+    assert stored.retry_count is None
+    assert runner.state.publication_attempt.provider_retries == 3
+    assert runner.state.publication_attempt.provider_retry_command_id is None
+    assert runner.state.publication_attempt.pending
+    assert git(repo, 'rev-parse', 'HEAD') == expected
+    runner._commit_task_status_change.assert_not_awaited()
+
+
+@pytest.mark.parametrize('boundary', ['checkpoint', 'applied', 'clear', 'completion'])
+async def test_operator_provider_retry_recovers_failed_acknowledgements(lifecycle, monkeypatch, boundary):
+    from src.daemon import retry_commands as retry_module
+    from src.daemon.retry_commands import RetryDispatch
+    from src.retry_commands import RetryCommandStatus, load_retry_command
+
+    runner, command, _, repo, _, _, expected = await queued_exhausted_provider_retry(lifecycle)
+    if boundary == 'checkpoint':
+        original = runner.publish_state
+        monkeypatch.setattr(runner, 'publish_state', AsyncMock(side_effect=OSError('state write failed')))
+    elif boundary == 'applied':
+        original = runner._mark_retry_applied
+        monkeypatch.setattr(runner, '_mark_retry_applied', AsyncMock(side_effect=OSError('ack failed')))
+    elif boundary == 'clear':
+        original = runner._clear_retry_failure_evidence
+        monkeypatch.setattr(runner, '_clear_retry_failure_evidence', AsyncMock(side_effect=OSError('clear failed')))
+    else:
+        original = retry_module.update_retry_command
+        async def lost_ack(*args, **kwargs):
+            if kwargs.get('keep_pending') is False:
+                return None
+            return await original(*args, **kwargs)
+        monkeypatch.setattr(retry_module, 'update_retry_command', lost_ack)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.DEFERRED
+    assert stored.retry_count == 1
+    if boundary == 'checkpoint':
+        assert runner.state.publication_attempt.provider_retries == 3
+        assert runner.state.publication_attempt.provider_retry_command_id is None
+        monkeypatch.setattr(runner, 'publish_state', original)
+    elif boundary == 'applied':
+        monkeypatch.setattr(runner, '_mark_retry_applied', original)
+    elif boundary == 'clear':
+        monkeypatch.setattr(runner, '_clear_retry_failure_evidence', original)
+    else:
+        monkeypatch.setattr(retry_module, 'update_retry_command', original)
+    deadline = runner.state.publication_attempt.reconcile_deadline
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.APPLIED
+    assert stored.retry_count == 1
+    assert runner.state.publication_attempt.provider_retries == 0
+    assert runner.state.publication_attempt.pending
+    assert git(repo, 'rev-parse', 'HEAD') == expected
+    if boundary != 'checkpoint':
+        assert runner.state.publication_attempt.reconcile_deadline == deadline
+    runner._commit_task_status_change.assert_awaited_once()
+
+
+@pytest.mark.parametrize('change', ['owner', 'receipt', 'independent'])
+async def test_applied_provider_retry_replay_never_overrides_another_failure(lifecycle, change):
+    from src.daemon.retry_commands import RetryDispatch
+    from src.retry_commands import RetryCommandStatus, load_retry_command
+
+    runner, command, _, _, _, _, _ = await queued_exhausted_provider_retry(lifecycle)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert stored.status == RetryCommandStatus.APPLIED
+    if change == 'owner':
+        runner.state.publication_attempt.task_id = 'PR-999'
+    elif change == 'receipt':
+        runner.state.publication_attempt.provider_retry_command_id = None
+    else:
+        await runner._transition_to_error('independent implementation failure', save_run_record_as=None)
+    assert await runner._resume_provider_retry(stored) == RetryDispatch.HANDLED
+    replay = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert replay.status == (RetryCommandStatus.APPLIED if change == 'independent' else RetryCommandStatus.FAILED)
+    assert runner.state.publication_attempt.provider_retries == 0
+    if change == 'independent':
+        assert runner.state.state == PipelineState.ERROR
+        assert runner.state.error_message == 'independent implementation failure'
+        assert runner.state.publication_attempt.failure == 'independent implementation failure'
+    elif change == 'receipt':
+        assert await publication.resume_provider_failure(runner)
+        assert runner.state.state == PipelineState.ERROR

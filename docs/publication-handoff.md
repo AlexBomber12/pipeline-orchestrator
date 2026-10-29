@@ -101,6 +101,17 @@ review/CI gates after successful exit. A clean tree or an already-published comm
 cannot convert a failed invocation into successful completion. Operator pause
 continues to block automatic work. Expired quota markers are cleared before
 interrupted-publication recovery so they cannot cause ERROR/PAUSED oscillation.
+After provider exhaustion, operator Retry can reserve the existing bounded Retry
+allowance and resume the retained FIX without a manual push. Admission uses the
+same local/remote/PR and run-ownership proofs as automatic continuation. The
+existing TODO status checkpoint precedes the handoff; only the provider allowance
+is reset, leaving dispatched attempts, FIX counters, review/CI evidence, and the
+unpublished checkout intact. A durable command receipt makes the allowance grant
+idempotent across lost acknowledgements and restarts. The receipt follows the
+retained FIX's subsequent attempts so replay can acknowledge an already-started
+handoff without resetting its budget or executing CODING. Operator pause and quota
+deadlines still gate execution.
+
 Legacy snapshots lacking bound provider, cleanup, or accounting evidence remain
 stably parked with the missing evidence and the existing Retry action identified.
 

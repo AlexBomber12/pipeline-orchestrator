@@ -242,6 +242,7 @@ class PublicationAttempt(BaseModel):
     provider_retries: int = Field(default=0, ge=0)
     provider_retry_at: datetime | None = None
     provider_retry_ready: bool = False
+    provider_retry_command_id: str | None = None
 
 class SizeFixCompletion(BaseModel):
     """Confirmed FIX exit awaiting a status write or marker cleanup."""

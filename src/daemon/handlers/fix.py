@@ -1073,6 +1073,7 @@ class FixMixin(BreachMixin):
                     self.state.publication_attempt.initial_branch_head_sha = head_before or None
                     if provider_resume:
                         self.state.publication_attempt.provider_retries = retained.provider_retries
+                        self.state.publication_attempt.provider_retry_command_id = retained.provider_retry_command_id
                         self.state.publication_attempt.initial_branch_head_sha = retained.initial_pr_head_sha
             await self.publish_state()
             if approved_continuation is not None and not await self._approved_fix_checkout_safe(
