@@ -12,6 +12,7 @@ All subprocess.run calls are mocked; no real GitHub API or git calls happen.
 from __future__ import annotations
 
 import importlib
+import json
 import subprocess
 import sys
 import types
@@ -1004,7 +1005,7 @@ def test_wait_for_runner_config_ack_requires_new_runner_event(acknowledgment: st
         sys.modules.pop(module_name, None)
 
 
-@pytest.mark.parametrize("terminal_state", ["WATCH", "ERROR"])
+@pytest.mark.parametrize("terminal_state", ["WATCH", "ERROR", "IDLE"])
 def test_stop_daemon_waits_for_runner_pause_ack(terminal_state) -> None:
     module_name = "tests.e2e.conftest"
     posts: list[tuple[str, int]] = []
@@ -1034,8 +1035,24 @@ def test_stop_daemon_waits_for_runner_pause_ack(terminal_state) -> None:
             e2e_conftest = importlib.import_module(module_name)
 
         slug = e2e_conftest.TESTBED_SLUG
+        stopped_at = datetime(2026, 10, 29, tzinfo=timezone.utc)
+        future = (stopped_at + timedelta(seconds=1)).isoformat()
         # A retained WATCH Stop need not emit the generic pause log either.
         pause_event = "held in ERROR" if terminal_state == "ERROR" else "[RECOVERY] Restored bound FIX PR"
+        if terminal_state == "IDLE":
+            pause_event = "[INFRA] Applied staged repo config."
+        idle = {"name": slug, "state": "IDLE", "user_paused": True,
+                "history": [{"event": "[INFRA] Applied staged repo config."}]}
+        invalid_idle = [
+            {**idle, "last_updated": value}
+            for value in (None, "invalid", stopped_at.isoformat(),
+                          (stopped_at - timedelta(seconds=1)).isoformat(),
+                          stopped_at.replace(tzinfo=None).isoformat())
+        ] + [
+            {**idle, "last_updated": future, "user_paused": False},
+            {**idle, "last_updated": future, "name": "another-repo"},
+            {**idle, "last_updated": future, "state": "FIX"},
+        ]
         responses = iter(
             [
                 f'[{{"name": "{slug}", "state": "CODING", "user_paused": true}}]'.encode(),
@@ -1045,8 +1062,10 @@ def test_stop_daemon_waits_for_runner_pause_ack(terminal_state) -> None:
                     '"history": [{"event": "Stop requested. Aborting run; working tree may be left dirty."}]'
                     "}]"
                 ).encode(),
+                *[json.dumps([entry]).encode() for entry in invalid_idle],
                 (
                     f'[{{"name": "{slug}", "state": "{terminal_state}", "user_paused": true, '
+                    f'"last_updated": "{future}", '
                     f'"history": [{{"event": "{pause_event}"}}]}}]'
                 ).encode(),
             ]
@@ -1059,11 +1078,14 @@ def test_stop_daemon_waits_for_runner_pause_ack(terminal_state) -> None:
         with (
             patch.object(e2e_conftest.urllib.request, "urlopen", side_effect=urlopen),
             patch.object(e2e_conftest.time, "sleep", side_effect=sleeps.append),
+            patch.object(e2e_conftest, "datetime") as clock,
         ):
+            clock.now.return_value = stopped_at
+            clock.fromisoformat.side_effect = datetime.fromisoformat
             e2e_conftest._stop_daemon_and_wait_paused(slug, timeout_sec=1)
     finally:
         sys.modules.pop(module_name, None)
 
     assert posts == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/repos/{slug}/stop", 10)]
-    assert opens == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/api/states", 5)] * 4
-    assert sleeps == [0.5, 0.5, 0.5]
+    assert opens == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/api/states", 5)] * (4 + len(invalid_idle))
+    assert sleeps == [0.5] * (3 + len(invalid_idle))
