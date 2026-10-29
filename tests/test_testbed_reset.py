@@ -359,6 +359,48 @@ def test_wipe_tasks_dir_cleans_workdir_even_on_exception(tmp_path) -> None:
     assert rmtree_mock.call_args.kwargs.get("ignore_errors") is True
 
 
+@pytest.mark.parametrize(
+    ("failures", "final_error"),
+    [(1, ""), (2, ""), (3, "Internal Server Error"), (1, "permission denied")],
+)
+def test_wipe_tasks_dir_bounds_server_error_push_retries(
+    tmp_path, monkeypatch, failures, final_error
+) -> None:
+    monkeypatch.setattr(testbed_reset.tempfile, "mkdtemp", lambda **kwargs: str(tmp_path))
+    pushes = []
+    commands = []
+
+    def fake_run(cmd, **kwargs):
+        commands.append(cmd)
+        if cmd[:2] == ["git", "clone"]:
+            (Path(cmd[-1]) / "tasks").mkdir(parents=True)
+        if "push" in cmd:
+            pushes.append((cmd, kwargs))
+            if len(pushes) <= failures:
+                return _completed(1, stderr="remote: Internal Server Error")
+            if final_error:
+                return _completed(1, stderr=final_error)
+            # Also covers a lost response where the first push actually applied.
+            return _completed(stderr="Everything up-to-date")
+        return _completed()
+
+    monkeypatch.setattr(testbed_reset.subprocess, "run", fake_run)
+    with patch.object(testbed_reset.time, "sleep") as sleep:
+        if final_error:
+            with pytest.raises(RuntimeError, match=final_error):
+                wipe_tasks_dir_on_main()
+        else:
+            assert wipe_tasks_dir_on_main() is True
+        assert [call.args[0] for call in sleep.call_args_list] == list(
+            range(1, min(failures, 2) + 1)
+        )
+
+    assert len(pushes) == min(failures + 1, 3)
+    assert all(push == pushes[0] for push in pushes)
+    assert sum("commit" in cmd for cmd in commands) == 1
+    assert not tmp_path.exists()  # Fixture-owned clone is cleaned on every outcome.
+
+
 def test_clone_url_returns_plain_url_without_token(monkeypatch) -> None:
     monkeypatch.delenv("GH_TOKEN", raising=False)
     assert _clone_url() == TESTBED_URL
