@@ -32,6 +32,8 @@ class ApprovalCommand(BaseModel):
     pr: PRInfo
     task_fingerprint: str
     failure: str
+    # Missing on historical receipts: retain for audit, never infer authority.
+    attempt: str | None = None
     status: Literal["pending", "deferred", "applied", "failed"] = "pending"
     reason: str = "Approval requested; waiting for the daemon to apply it."
     requested_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -71,6 +73,26 @@ def approval_task_path(root: Path, task_file: str) -> Path:
     return cursor
 
 
+def attempt_identity(state: RepoState) -> str | None:
+    """Bind the durable invocation, including successive FIXes in one run.
+
+    A label-detected failure can precede any invocation; explicit null is
+    distinct from a historical receipt with no recorded attempt context.
+    """
+    invocation = state.active_invocation
+    if invocation is not None and (not invocation.run_id or invocation.attempt_index is None):
+        return None
+    return json.dumps(
+        [invocation.run_id, invocation.attempt_index, invocation.phase, invocation.fix_iteration]
+        if invocation is not None else None,
+        separators=(",", ":"),
+    )
+
+
+def matches_attempt(command: ApprovalCommand, state: RepoState) -> bool:
+    return command.attempt is not None and command.attempt == attempt_identity(state)
+
+
 def build_approval(
     repo: str,
     state: RepoState,
@@ -89,6 +111,9 @@ def build_approval(
         raise ApprovalChanged("Task and existing PR bindings disagree.")
     if not pr.head_sha:
         raise ApprovalChanged("The existing PR HEAD is unavailable; wait for daemon refresh.")
+    attempt = attempt_identity(state)
+    if attempt is None:
+        raise ApprovalChanged("Attempt context is unknown; wait for daemon refresh.")
     fingerprint = task_spec_content_hash(path.read_text(encoding="utf-8"))
     failure = failure_identity(raw_cause)
     binding = hashlib.sha256(
@@ -103,6 +128,7 @@ def build_approval(
                 pr.number,
                 pr.head_sha,
                 failure,
+                attempt,
             ]
         ).encode()
     ).hexdigest()
@@ -114,6 +140,7 @@ def build_approval(
         pr=pr.model_copy(deep=True),
         task_fingerprint=fingerprint,
         failure=failure,
+        attempt=attempt,
     )
 
 
@@ -152,7 +179,7 @@ async def enqueue_approval(redis: Any, command: ApprovalCommand) -> ApprovalComm
         if failure_identity(await pipe.get(cancellation)) != command.failure:
             raise ApprovalChanged("The pending failure changed; refresh before approving.")
         state = RepoState.model_validate_json(await pipe.get(state_key))
-        if not matches_state(command, state):
+        if not matches_state(command, state) or not matches_attempt(command, state):
             raise ApprovalChanged("The active task or PR changed; refresh before approving.")
         pipe.multi()
         pipe.set(key, command.model_dump_json())
