@@ -2097,6 +2097,7 @@ async def test_persistent_coding_capacity_is_bounded_and_stable(coding_provider,
     await runner.handle_coding()
     for _ in range(2):
         runner = await restart(runner, setup)
+        runner.repo_config.feature_flags.use_single_error_exit = single_error_exit
         runner._recovered = True
         Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
         await runner._run_cycle_body()
@@ -2422,4 +2423,52 @@ async def test_coding_pause_during_auth_prevents_new_invocation(coding_provider)
     Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
     assert await publication.resume_provider_failure(runner)
     assert runner.state.user_paused and len(provider['calls_to_coder']) == 1
+    assert len(await runner._metrics_store.list_task_runs(runner.name, 'PR-001')) == 1
+
+
+@pytest.mark.parametrize('expired', [False, True])
+async def test_coding_observation_loss_after_auth_preserves_closed_history(coding_provider, expired):
+    runner, provider, repo, _, _ = coding_provider
+    await runner.handle_coding()
+    original = await runner._metrics_store.get(runner.state.active_invocation.run_id)
+    runner._refresh_auth_status_cache = AsyncMock(
+        side_effect=lambda: git(repo, 'remote', 'set-url', 'origin', str(repo / 'unavailable')),
+    )
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    if expired:
+        runner.state.publication_attempt.reconcile_deadline = Clock.value - timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    assert len(provider['calls_to_coder']) == 1
+    assert runner.state.state == (PipelineState.ERROR if expired else PipelineState.PAUSED)
+    assert await runner._metrics_store.get(original.run_id) == original
+
+
+async def test_coding_unavailable_selector_does_not_rewrite_predecessor(coding_provider):
+    runner, provider, _, _, _ = coding_provider
+    await runner.handle_coding()
+    original = await runner._metrics_store.get(runner.state.active_invocation.run_id)
+    runner.repo_config.disabled_coders = runner._registry.coder_names()
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.state == PipelineState.PAUSED
+    assert len(provider['calls_to_coder']) == 1
+    assert await runner._metrics_store.get(original.run_id) == original
+    Clock.value = runner.state.publication_attempt.reconcile_deadline + timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.state == PipelineState.ERROR
+    assert await runner._metrics_store.get(original.run_id) == original
+
+
+async def test_coding_renewed_usage_pause_creates_no_phantom_attempt(coding_provider):
+    runner, provider, _, _, _ = coding_provider
+    await runner.handle_coding()
+    original = await runner._metrics_store.get(runner.state.active_invocation.run_id)
+    # Resource-policy tests own deriving the pause. This port failure tests that
+    # provider admission does not create another run before that policy allows it.
+    runner.usage_gate = AsyncMock(return_value=False)
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    runner.usage_gate.assert_awaited_once_with(proactive_coder='codex')
+    assert len(provider['calls_to_coder']) == 1
+    assert await runner._metrics_store.get(original.run_id) == original
     assert len(await runner._metrics_store.list_task_runs(runner.name, 'PR-001')) == 1

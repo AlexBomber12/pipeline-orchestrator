@@ -625,6 +625,11 @@ class CodingMixin:
                 self._get_coder(allow_exploration=False) if provider_resume else self._get_coder()
             )
         except CoderSelectionUnavailable as exc:
+            if provider_resume:
+                await publication_lifecycle._defer_provider_observation(
+                    self, f"selected provider unavailable: {exc}",
+                )
+                return
             await self._transition_to_error(
                 str(exc),
                 publish=False,
@@ -647,11 +652,19 @@ class CodingMixin:
             return
         if provider_snapshot is not None:
             # Auth/selection awaits may outlive an operator's checkout change.
-            problem = await publication_lifecycle.provider_retry_problem(self)
+            try:
+                problem = await publication_lifecycle.provider_retry_problem(self)
+            except Exception as exc:
+                await publication_lifecycle._defer_provider_observation(
+                    self, f"ownership observation unavailable: {type(exc).__name__}",
+                )
+                return
             if problem is not None:
                 await publication_lifecycle._park(self, problem)
                 return
             if await publication_lifecycle._operator_paused(self):
+                return
+            if not await self.usage_gate(proactive_coder=coder_name):
                 return
         self._start_current_run_record(
             coder_name, provider_snapshot.model_override if provider_snapshot is not None
@@ -663,7 +676,7 @@ class CodingMixin:
         # after the guard, a malformed task would short-circuit through
         # ``_transition_to_error`` and bypass the cooldown that
         # ``usage_gate`` is responsible for enforcing.
-        if not await self.usage_gate(proactive_coder=coder_name):
+        if provider_snapshot is None and not await self.usage_gate(proactive_coder=coder_name):
             await self._save_current_run_record("rate_limit")
             return
 
@@ -961,7 +974,7 @@ class CodingMixin:
                 attempt.coding_task_body = retained.coding_task_body
                 task_body = retained.coding_task_body + "\n\n" + (
                     "PROVIDER RECOVERY -- CONTINUE THE SAME CODING TASK\n"
-                    "The previous invocation failed; its gate is unfinished. Complete required validation. "
+                    "The provider failed. If a gate is unfinished, complete required validation for this HEAD. "
                     "Preserve local commits and dirty changes. Do not reset, stash or clean the checkout. "
                     + ("Continue on the existing task branch; do not create or recreate it. "
                        if retained.expected_head_sha is not None else "Create the original task branch as usual. ")
