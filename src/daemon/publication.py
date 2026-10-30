@@ -611,7 +611,7 @@ async def _coding_provider_retry_problem(
         return "Interrupted CODING PR binding changed; preserve work and inspect before Retry"
     task = runner.state.current_task
     task_file = task.task_file or f"tasks/{task.pr_id}.md"
-    body = _resolve_task_file_under_repo(runner.repo_path, task_file).read_text(encoding="utf-8")
+    body = _resolve_task_file_under_repo(runner.repo_path, task_file).read_bytes().decode("utf-8")
     if attempt.coding_task_body is None and record.task_spec_hash == task_spec_content_hash(body):
         # Older checkpoints can recover text from the unchanged bound generation.
         attempt.coding_task_body = body

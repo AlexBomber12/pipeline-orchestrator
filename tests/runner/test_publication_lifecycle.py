@@ -2516,3 +2516,37 @@ async def test_coding_prelaunch_deferral_keeps_retained_dispatch(coding_provider
     records = await runner._metrics_store.list_task_runs(runner.name, 'PR-001')
     assert sorted(r.attempt_index for r in records) == [1, 2]
     assert all(r.ended_at for r in records)
+
+
+@pytest.mark.parametrize('restore_context', [False, True])
+@pytest.mark.parametrize('single_error_exit', [False, True])
+async def test_coding_crlf_task_recovery_preserves_original_fingerprint(
+    coding_provider, restore_context, single_error_exit,
+):
+    runner, provider, repo, _, setup = coding_provider
+    path = repo / 'tasks/PR-001.md'
+    original = path.read_bytes().replace(b'\n', b'\r\n')
+    git(repo, 'config', 'core.autocrlf', 'false')
+    path.write_bytes(original)
+    git(repo, 'add', 'tasks/PR-001.md')
+    git(repo, 'commit', '-m', 'Windows-authored task')
+    git(repo, 'push', 'origin', 'main')
+    await runner.handle_coding()
+    first = await runner._metrics_store.get(runner.state.active_invocation.run_id)
+    assert runner.state.publication_attempt.coding_task_body == original.decode('utf-8')
+    if restore_context:
+        runner.state.publication_attempt.coding_task_body = None
+        await runner.publish_state()
+    fresh = await restart(runner, setup)
+    fresh._recovered = True
+    fresh.repo_config.feature_flags.use_single_error_exit = single_error_exit
+    Clock.value = fresh.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    provider['fail'] = False
+    await fresh._run_cycle_body()
+    assert fresh.state.state == PipelineState.WATCH, fresh.state.error_message
+    assert path.read_bytes() == original
+    assert len(provider['calls_to_coder']) == 2
+    assert provider['calls_to_coder'][1]['task_body'].startswith(original.decode('utf-8'))
+    records = await fresh._metrics_store.list_task_runs(fresh.name, 'PR-001')
+    assert len(records) == 2 and {r.task_spec_hash for r in records} == {first.task_spec_hash}
+    assert await fresh._metrics_store.get(first.run_id) == first
