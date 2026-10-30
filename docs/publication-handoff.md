@@ -91,11 +91,11 @@ operator inspection rather than a new coder invocation.
 
 ## Interrupted provider attempts
 
-A positively classified FIX provider capacity/service-unavailable error is not
+A positively classified CODING or FIX provider capacity/service-unavailable error is not
 quota exhaustion. Its failed exit checkpoints the frozen head, provider kind,
 and next retry on the existing publication attempt. The run ends as paused;
 each retry has a new run identity while retaining dispatch and attempt history.
-Three consecutive provider interruptions exhaust automatic recovery. The existing
+Three consecutive provider interruptions exhaust automatic recovery for either phase. The existing
 FIX polling interval supplies exponential backoff; the model and reasoning effort
 remain bound to the interrupted invocation. Actual rate limits retain their
 provider pause deadline. Provider interruptions do not spend the code-fix allowance.
@@ -134,6 +134,22 @@ idempotent across lost acknowledgements and restarts. The receipt follows the
 retained FIX's subsequent attempts so replay can acknowledge an already-started
 handoff without resetting its budget or executing CODING. Operator pause and quota
 deadlines still gate execution.
+
+CODING retains the canonical task text on the existing publication attempt. Its
+continuation preserves the original branch/PR discovery floor and uses a fresh
+run/attempt/invocation with the bound model and effort. It explicitly continues
+the existing branch instead of repeating AUTO PR branch creation, retains dirty
+files and local commits, reruns unfinished validation, and reuses any exact owned
+PR. A provider failure cannot become success merely because a ready PR exists.
+The ordinary current-head review and CI handoff follows only a successful exit.
+Before-branch failures can repeat normal branch creation only when the saved
+branch was absent and the original base remains unchanged and clean. Conflicting
+refs, task generations, missing context or cleanup/accounting proof stay parked;
+GitHub observation outages use the existing bounded observation deadline.
+Operator pause/Stop and real quota deadlines continue to block launch. Exhausted
+CODING also uses the existing bound Retry receipt to renew only its provider
+allowance, preserving dirty work and all prior attempts. The historical internal
+receipt name `provider_fix` remains readable for both provider continuations.
 
 Legacy snapshots lacking bound provider, cleanup, or accounting evidence remain
 stably parked with the missing evidence and the existing Retry action identified.

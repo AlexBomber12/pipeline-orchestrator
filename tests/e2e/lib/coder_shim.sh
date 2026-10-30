@@ -448,6 +448,37 @@ PYTHON
                 *) run_success "${pr}" "${branch}" ;;
             esac
             ;;
+        coding_capacity_once)
+            # Fixture-owned journal outside the checkout survives the failed CLI.
+            printf '%s\t%s\n' "${pr}" "${branch}" >> "${PO_SHIM_SCENARIO_FILE}.capacity-calls"
+            if [[ "$(wc -l < "${PO_SHIM_SCENARIO_FILE}.capacity-calls")" -eq 1 ]]; then
+                git_setup_branch "${branch}"
+                mkdir -p tests
+                printf 'retained commit for %s\n' "${pr}" > tests/e2e-capacity-commit.txt
+                git add tests/e2e-capacity-commit.txt
+                git commit -m "${pr}: retain pre-capacity work"
+                printf 'retained dirty work for %s\n' "${pr}" > tests/e2e-capacity-retained.txt
+                printf 'unfinished\n' > "${PO_SHIM_SCENARIO_FILE}.capacity-gate"
+                printf 'ERROR: Selected model is at capacity. Please try a different model.\n' >&2
+                exit 1
+            fi
+            # Never call git_setup_branch here: recovery must supply the same
+            # committed and untracked work, rather than recreate the task.
+            [[ "$(git branch --show-current)" == "${branch}" ]]
+            [[ "$(git show HEAD:tests/e2e-capacity-commit.txt)" == "retained commit for ${pr}" ]]
+            [[ "$(cat tests/e2e-capacity-retained.txt)" == "retained dirty work for ${pr}" ]]
+            [[ "$(cat "${PO_SHIM_SCENARIO_FILE}.capacity-gate")" == unfinished ]]
+            git push -u origin "${branch}"
+            wait_for_base_activity "${branch}"
+            git add tests/e2e-capacity-retained.txt
+            write_marker_and_commit "${pr}"
+            printf 'completed-after-capacity\n' > "${PO_SHIM_SCENARIO_FILE}.capacity-gate"
+            git push -u origin "${branch}"
+            pr_url="$(ensure_pr_url "${branch}" "${pr}")"
+            gh api -X POST "repos/AlexBomber12/pipeline-orchestrator-testbed/statuses/$(git rev-parse HEAD)" \
+                -f state=pending -f context=e2e/watch-merge-gate >/dev/null
+            gh pr comment "${pr_url}" --body "@codex review"
+            ;;
         exit_nonzero)
             # Fail with bound, clean work already preserved on the remote base.
             # A failure before branch creation deliberately lacks release proof.

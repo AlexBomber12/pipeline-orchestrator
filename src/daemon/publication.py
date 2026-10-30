@@ -391,12 +391,12 @@ PROVIDER_RECOVERY_CHANGED = "Interrupted FIX provider changed; restore selected 
 
 
 async def pause_provider_failure(runner: PipelineRunner, stderr: str, coder_name: str) -> bool:
-    """Retain interrupted FIX work, independently of quota and publication success."""
+    """Retain interrupted coder work, independently of quota and publication success."""
     from src.provider_errors import is_capacity_error
 
     attempt = runner.state.publication_attempt
     invocation = runner.state.active_invocation
-    if attempt is None or invocation is None or invocation.phase != "fix":
+    if attempt is None or invocation is None or invocation.phase not in {"coding", "fix"}:
         return False
     capacity = is_capacity_error(stderr)
     if (not capacity and attempt.provider_error is None
@@ -416,28 +416,31 @@ async def pause_provider_failure(runner: PipelineRunner, stderr: str, coder_name
     )
     attempt.exit_classification = "failure"
     if runner._current_run_record is not None and runner._current_run_record.ended_at is None:
-        await runner._save_current_run_record("paused" if capacity else "rate_limit", run_phase="fix")
+        await runner._save_current_run_record("paused" if capacity else "rate_limit", run_phase=invocation.phase)
     runner.state.error_message = None
     runner.state.state = PipelineState.PAUSED
-    runner.log_event(f"[INFRA] {attempt.provider_error}: retained FIX; retry {attempt.provider_retries}/3 scheduled.")
+    runner.log_event(f"[INFRA] {attempt.provider_error}: retained {invocation.phase.upper()}; "
+                     f"retry {attempt.provider_retries}/3 scheduled.")
     await runner.publish_state()
     return True
 
 
 async def resume_provider_failure(runner: PipelineRunner) -> bool:
-    """Resume only the bound FIX checkout; never adopt the older remote head."""
+    """Resume the bound coder checkout; never accept publication as successful validation."""
     attempt = runner.state.publication_attempt
     invocation = runner.state.active_invocation
     if (attempt is not None and attempt.pending and attempt.provider_error is not None
-        and (invocation is None or invocation.phase != "fix")):
+        and (invocation is None or invocation.phase not in {"coding", "fix"})):
         if await _operator_paused(runner):
             return True
-        return await _park(runner, "Interrupted FIX invocation binding is missing; inspect retained work and use Retry")
+        return await _park(
+            runner, "Interrupted coder invocation binding is missing; inspect retained work and use Retry",
+        )
     if (attempt is None or not attempt.pending or invocation is None
-        or invocation.phase != "fix" or attempt.exit_classification == "success"
+        or invocation.phase not in {"coding", "fix"} or attempt.exit_classification == "success"
         or (attempt.provider_error is None
             and not (runner.state.state == PipelineState.PAUSED and runner.state.rate_limited_until is not None)
-            and not (runner.state.error_message or "").startswith("Interrupted FIX"))):
+            and not (runner.state.error_message or "").startswith(("Interrupted FIX", "Interrupted CODING")))):
         return False
     if await _operator_paused(runner):
         return True
@@ -449,7 +452,7 @@ async def resume_provider_failure(runner: PipelineRunner) -> bool:
             await runner._restore_current_run_record()
         if _run_matches(runner) and runner._current_run_record.ended_at is None:
             await runner._save_current_run_record(
-                "paused" if attempt.provider_error else "error", run_phase="fix",
+                "paused" if attempt.provider_error else "error", run_phase=invocation.phase,
             )
     now = datetime.now(timezone.utc)
     until = runner.state.rate_limited_until
@@ -469,11 +472,12 @@ async def resume_provider_failure(runner: PipelineRunner) -> bool:
         return True
     if not attempt.provider_error:
         return await _park(
-            runner, "Interrupted FIX lacks bound provider failure evidence; inspect retained work and use Retry",
+            runner, f"Interrupted {invocation.phase.upper()} lacks bound provider failure evidence; "
+            "inspect retained work and use Retry",
         )
     if attempt.provider_retries >= 3:
         return await _park(
-            runner, PROVIDER_RECOVERY_EXHAUSTED,
+            runner, PROVIDER_RECOVERY_EXHAUSTED.replace("FIX", invocation.phase.upper()),
         )
     try:
         problem = await provider_retry_problem(runner)
@@ -483,11 +487,14 @@ async def resume_provider_failure(runner: PipelineRunner) -> bool:
         return await _defer_provider_observation(runner, f"ownership observation unavailable: {type(exc).__name__}")
     attempt.provider_retry_ready = True
     runner.state.error_message = None
-    runner.state.state = PipelineState.FIX
+    runner.state.state = PipelineState(invocation.phase.upper())
     await runner.publish_state()
     if await _operator_paused(runner):
         return True
-    await runner.handle_fix()
+    if invocation.phase == "coding":
+        await runner.handle_coding()
+    else:
+        await runner.handle_fix()
     return True
 
 
@@ -495,7 +502,8 @@ async def _defer_provider_observation(runner: PipelineRunner, boundary: str) -> 
     attempt = runner.state.publication_attempt
     now = datetime.now(timezone.utc)
     if attempt.reconcile_deadline is None or now >= attempt.reconcile_deadline:
-        message = f"Interrupted FIX {boundary}; observation budget exhausted; inspect and use Retry"
+        phase = runner.state.active_invocation.phase.upper()
+        message = f"Interrupted {phase} {boundary}; observation budget exhausted; inspect and use Retry"
         attempt.provider_observation_failure = message
         return await _park(runner, message)
     attempt.incident = boundary
@@ -507,7 +515,9 @@ async def _defer_provider_observation(runner: PipelineRunner, boundary: str) -> 
 
 def provider_retry_owns_failure(attempt: PublicationAttempt, message: str | None) -> bool:
     """Only clear provider-owned parks, never independent implementation failures."""
-    return message in {None, PROVIDER_RECOVERY_EXHAUSTED, PROVIDER_RECOVERY_CHANGED} or (
+    return message in {None, PROVIDER_RECOVERY_EXHAUSTED, PROVIDER_RECOVERY_CHANGED,
+                       PROVIDER_RECOVERY_EXHAUSTED.replace("FIX", "CODING"),
+                       PROVIDER_RECOVERY_CHANGED.replace("FIX", "CODING")} or (
         attempt.provider_observation_failure is not None and message == attempt.provider_observation_failure
     )
 
@@ -515,7 +525,9 @@ def provider_retry_owns_failure(attempt: PublicationAttempt, message: str | None
 async def provider_retry_problem(
     runner: PipelineRunner, *, allow_provider_park: bool = False,
 ) -> str | None:
-    """Observe retained FIX ownership without resetting allowance or dispatching."""
+    """Observe retained work without resetting allowance or dispatching."""
+    if runner.state.active_invocation is not None and runner.state.active_invocation.phase == "coding":
+        return await _coding_provider_retry_problem(runner, allow_provider_park=allow_provider_park)
     attempt = runner.state.publication_attempt
     pr = runner.state.current_pr
     if (attempt.contract_version != 2 or attempt.exit_classification != "failure"
@@ -562,4 +574,98 @@ async def provider_retry_problem(
     if outcome.state != gh_prs.ExactPRState.OPEN:
         return "Interrupted FIX exact PR is terminal; use Retry after inspection"
     attempt.provider_published_head_sha = remote[0]
+    return None
+
+
+async def _coding_provider_retry_problem(
+    runner: PipelineRunner, *, allow_provider_park: bool,
+) -> str | None:
+    """Prove the original CODING generation and any publication before continuing."""
+    from src.cancellation import task_spec_content_hash
+    from src.daemon.handlers.coding import _resolve_task_file_under_repo
+
+    attempt = runner.state.publication_attempt
+    if (attempt.contract_version != 2 or attempt.exit_classification != "failure"
+        or (attempt.provider_retries == 0 and attempt.provider_retry_command_id is None)
+        or not runner._publication_attempt_matches_dispatch() or not attempt.cleanup_confirmed
+        or attempt.baseline_numbers is None or attempt.initial_branch_head_sha is None
+        or any(message is not None and not (
+            allow_provider_park and provider_retry_owns_failure(attempt, message)
+        ) for message in (attempt.failure, runner.state.error_message))):
+        return "Interrupted CODING lacks matching identity, exit, or cleanup proof; inspect and use Retry"
+    if allow_provider_park:
+        coder_name, _ = runner._get_coder(allow_exploration=False)
+        if coder_name != runner.state.active_invocation.plugin_id:
+            return PROVIDER_RECOVERY_CHANGED.replace("FIX", "CODING")
+    if not _run_matches(runner):
+        await runner._restore_current_run_record()
+    if not _run_matches(runner):
+        return "Interrupted CODING run accounting is missing; restore bound run before Retry"
+    record = runner._current_run_record
+    if (not record.ended_at or record.run_phase != "coding" or not record.invocations
+        or record.invocations[-1] != runner.state.active_invocation):
+        return "Interrupted CODING exited invocation accounting differs; inspect before Retry"
+    pr = runner.state.current_pr
+    if pr is not None and (pr.number != attempt.pr_number or pr.branch != attempt.branch
+                           or pr.pr_id not in {None, attempt.task_id} or pr.is_cross_repository):
+        return "Interrupted CODING PR binding changed; preserve work and inspect before Retry"
+    task = runner.state.current_task
+    task_file = task.task_file or f"tasks/{task.pr_id}.md"
+    body = _resolve_task_file_under_repo(runner.repo_path, task_file).read_text(encoding="utf-8")
+    if attempt.coding_task_body is None and record.task_spec_hash == task_spec_content_hash(body):
+        # Older checkpoints can recover text from the unchanged bound generation.
+        attempt.coding_task_body = body
+    if (attempt.coding_task_body is None or not record.task_spec_hash
+        or task_spec_content_hash(body) != record.task_spec_hash
+        or task_spec_content_hash(attempt.coding_task_body) != record.task_spec_hash):
+        return "Interrupted CODING task generation or frozen context differs; preserve work and inspect before Retry"
+    branch = (await asyncio.to_thread(git_ops._git, runner.repo_path, "branch", "--show-current")).stdout.strip()
+    head = (await asyncio.to_thread(git_ops._git, runner.repo_path, "rev-parse", "HEAD")).stdout.strip()
+    if attempt.expected_head_sha is None:
+        # Capacity may fail before AUTO PR creates its branch. Only a proved
+        # unchanged, clean base permits the ordinary first branch-creation step.
+        local = await asyncio.to_thread(git_ops._git, runner.repo_path, "show-ref", "--verify", "--quiet",
+                                        f"refs/heads/{attempt.branch}", check=False)
+        dirty = (await asyncio.to_thread(git_ops._git, runner.repo_path, "status", "--porcelain")).stdout.strip()
+        if (local.returncode != 1 or attempt.initial_branch_head_sha != ""
+            or branch != attempt.base or head != record.base_sha or dirty):
+            return "Interrupted CODING lacks a retained branch or unchanged clean base; preserve work and use Retry"
+    elif branch != attempt.branch or head != attempt.expected_head_sha:
+        return "Interrupted CODING checkout changed; retain both versions and use Retry"
+    probe = await asyncio.to_thread(git_ops._git, runner.repo_path, "ls-remote", "--heads", "origin",
+                                    f"refs/heads/{attempt.branch}", check=False)
+    if probe.returncode:
+        raise RuntimeError("remote branch observation unavailable")
+    remote = probe.stdout.split()
+    if remote and (len(remote) != 2 or remote[1] != f"refs/heads/{attempt.branch}"
+                   or remote[0] not in {attempt.expected_head_sha, attempt.provider_published_head_sha}):
+        return "Interrupted CODING remote head changed independently; preserve both sides and use Retry"
+    if not remote and attempt.provider_published_head_sha is not None:
+        return "Interrupted CODING published branch disappeared; preserve work and use Retry"
+    publications = await asyncio.to_thread(gh_prs.get_branch_publications,
+                                         attempt.repo, attempt.base, attempt.branch)
+    fresh = [item for item in publications if item.number not in attempt.baseline_numbers]
+    if not fresh:
+        if attempt.pr_number is not None:
+            raise RuntimeError("bound PR observation unavailable")
+    else:
+        if len(fresh) != 1:
+            return "Interrupted CODING publication identity is ambiguous; inspect before Retry"
+        item = fresh[0]
+        if (not item.is_verified_ready or item.base_branch != attempt.base
+            or item.head_branch != attempt.branch or gh_prs.extract_queue_pr_id(item.title) != attempt.task_id
+            or item.created_at < attempt.started_at or attempt.pr_number not in {None, item.number}):
+            return "Interrupted CODING PR identity changed or is terminal; preserve work and use Retry"
+        if not remote or item.head_sha != remote[0]:
+            raise RuntimeError("branch and PR publication have not converged")
+        outcome = await asyncio.to_thread(gh_prs.get_exact_pr_outcome, attempt.repo, attempt.base,
+                                         item.number, remote[0], expected_branch=attempt.branch)
+        if not outcome.discovery_complete:
+            raise RuntimeError("exact PR observation unavailable")
+        if outcome.state != gh_prs.ExactPRState.OPEN:
+            return "Interrupted CODING exact PR is terminal; inspect before Retry"
+        attempt.pr_number = item.number
+        attempt.candidate = item.to_pr_info()
+    if remote:
+        attempt.provider_published_head_sha = remote[0]
     return None

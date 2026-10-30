@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -1935,3 +1936,490 @@ async def test_applied_provider_retry_replay_never_overrides_another_failure(lif
     elif change == 'receipt':
         assert await publication.resume_provider_failure(runner)
         assert runner.state.state == PipelineState.ERROR
+
+
+@pytest.fixture
+async def coding_provider(lifecycle, monkeypatch):
+    """Real Git, normal CODING/exit/persistence paths, controlled provider transport."""
+    runner, provider, repo, old, _, configure = lifecycle
+    remote = git(repo, 'remote', 'get-url', 'origin')
+    git(repo, 'checkout', 'main')
+    git(repo, 'branch', '-D', 'pr-001')
+    git(remote, 'update-ref', '-d', 'refs/heads/pr-001')
+    with (repo / '.git/info/exclude').open('a') as stream:
+        stream.write('artifacts/\n')
+    provider.update(published=False, created_at=None, calls_to_coder=[], fail=True, work='dirty')
+    runner.redis = h._FakeRedis()
+    runner._metrics_store = type(runner._metrics_store)(runner.redis)
+    runner._current_run_record = None
+    runner.state.current_pr = None
+    runner.state.active_invocation = None
+    runner.state.publication_attempt = None
+    runner.state.state = PipelineState.CODING
+    monkeypatch.setattr(coding, 'datetime', Clock)
+
+    def publications(*args):
+        if not provider['published']:
+            return []
+        return [prs.BranchPublication(
+            646, 'PR-001: repair', 'main', 'pr-001', provider['head'], 'OPEN', False, False,
+            provider['created_at'], 'https://github.com/octo/demo/pull/646',
+        )]
+
+    monkeypatch.setattr(prs, 'get_branch_publications', publications)
+
+    def setup(r):
+        configure(r)
+        r.repo_config.coder = 'codex'
+        r.app_config.daemon.coder_settings = {'codex': {'model': 'gpt-5.4', 'reasoning_effort': 'high'}}
+        r._refresh_auth_status_cache = AsyncMock()
+        r.usage_gate = AsyncMock(return_value=True)
+        def post(number):
+            assert r.state.current_pr.head_sha == provider['head']
+            provider['requests'].append(Clock.value)
+            r.state.review_requested_at = Clock.value
+            return True
+        r._post_codex_review = post
+        return r
+
+    setup(runner)
+    _, plugin = runner._get_coder()
+
+    async def coder(path, **kwargs):
+        calls = provider['calls_to_coder']
+        calls.append(kwargs)
+        first = len(calls) == 1
+        assert kwargs['model'] == 'gpt-5.4'
+        assert kwargs['reasoning_effort'] == 'high'
+        if first:
+            if provider['work'] != 'before_branch':
+                git(repo, 'checkout', '-b', 'pr-001')
+            if provider['work'] in {'commit', 'published'}:
+                (repo / 'repair').write_text('local implementation retained\n')
+                git(repo, 'add', 'repair')
+                git(repo, 'commit', '-m', 'retained implementation')
+            if provider['work'] in {'dirty', 'commit', 'published'}:
+                (repo / 'retained-test.py').write_text('# interrupted test\n')
+            if provider['work'] == 'published':
+                git(repo, 'push', 'origin', 'pr-001')
+                provider.update(published=True, head=git(repo, 'rev-parse', 'HEAD'),
+                                created_at=Clock.value + timedelta(seconds=1))
+            (repo / 'artifacts').mkdir(exist_ok=True)
+            (repo / 'artifacts/ci.log').write_text('pytest 2% -- unfinished')
+            provider['retained_head'] = git(repo, 'rev-parse', 'HEAD')
+        else:
+            assert git(repo, 'rev-parse', 'HEAD') == provider['retained_head']
+            assert kwargs['task_body'].startswith(calls[0]['task_body'])
+            assert 'gate is unfinished' in kwargs['task_body']
+            assert 'never create a duplicate' in kwargs['task_body']
+            assert (repo / 'artifacts/ci.log').read_text() == 'pytest 2% -- unfinished'
+            if provider['work'] in {'dirty', 'commit', 'published'}:
+                assert (repo / 'retained-test.py').read_text() == '# interrupted test\n'
+            if provider['work'] == 'before_branch':
+                assert 'Create the original task branch as usual' in kwargs['task_body']
+            else:
+                assert 'do not create or recreate it' in kwargs['task_body']
+        if provider['fail']:
+            return 1, '', provider.get('failure_text', (
+                'ERROR: Selected model is at capacity. Please try a different model.\n'
+                'ERROR: Selected model is at capacity. Please try a different model.\n'
+                'ERROR: rollout recording failed: missing thread'))
+        if provider['work'] == 'before_branch':
+            git(repo, 'checkout', '-b', 'pr-001')
+        (repo / 'repair').write_text('completed implementation marker\n')
+        git(repo, 'add', '.')
+        git(repo, 'commit', '-m', 'complete retained implementation')
+        git(repo, 'push', 'origin', 'pr-001')
+        (repo / 'artifacts/ci.log').write_text('gate completed successfully')
+        provider.update(published=True, head=git(repo, 'rev-parse', 'HEAD'),
+                        created_at=provider['created_at'] or Clock.value + timedelta(seconds=1))
+        return 0, 'Published the completed task to its one ready PR', ''
+
+    monkeypatch.setattr(type(plugin), 'run_auto_pr', lambda self, *args, **kwargs: coder(*args, **kwargs))
+    return runner, provider, repo, remote, setup
+
+
+@pytest.mark.parametrize('work', ['before_branch', 'branch', 'dirty', 'commit', 'published'])
+@pytest.mark.parametrize('single_error_exit', [False, True])
+async def test_coding_capacity_recovers_same_work_after_restart(coding_provider, work, single_error_exit):
+    runner, provider, repo, remote, setup = coding_provider
+    provider['work'] = work
+    runner.repo_config.feature_flags.use_single_error_exit = single_error_exit
+    await runner.handle_coding()
+    first = await runner._metrics_store.get(runner.state.active_invocation.run_id)
+    assert first.ended_at and first.outcome == 'paused' and first.run_phase == 'coding'
+    assert first.attempt_index == 1 and len(first.invocations) == 1
+    attempt = runner.state.publication_attempt
+    assert attempt.pending and attempt.provider_error == 'capacity' and attempt.cleanup_confirmed
+    assert attempt.coding_task_body == (repo / 'tasks/PR-001.md').read_text()
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.rate_limited_until is None
+    fresh = await restart(runner, setup)
+    fresh._recovered = True
+    fresh.repo_config.feature_flags.use_single_error_exit = single_error_exit
+    assert len(provider['calls_to_coder']) == 1
+    # A current model-setting change must not change the interrupted invocation.
+    fresh.app_config.daemon.coder_settings = {'codex': {'model': 'gpt-5.4-mini', 'reasoning_effort': 'low'}}
+    Clock.value = attempt.provider_retry_at + timedelta(seconds=1)
+    fresh.state.user_paused = True
+    await fresh.redis.set(pipeline_state(fresh.name), fresh.state.model_dump_json())
+    await fresh._run_cycle_body()
+    assert len(provider['calls_to_coder']) == 1
+    fresh.state.user_paused = False
+    fresh.state.rate_limited_until = Clock.value + timedelta(minutes=30)
+    await fresh.redis.set(pipeline_state(fresh.name), fresh.state.model_dump_json())
+    await fresh._run_cycle_body()
+    assert len(provider['calls_to_coder']) == 1
+    Clock.value += timedelta(minutes=31)
+    provider['fail'] = False
+    await fresh._run_cycle_body()
+    assert fresh.state.state == PipelineState.WATCH
+    assert fresh.state.current_task.pr_id == 'PR-001' and fresh.state.current_pr.number == 646
+    assert fresh.state.current_pr.head_sha == git(remote, 'rev-parse', 'refs/heads/pr-001')
+    assert fresh.state.current_pr.ci_status == CIStatus.PENDING
+    assert fresh.state.current_pr.review_status == ReviewStatus.PENDING
+    assert len(provider['requests']) == 1 and len(provider['calls_to_coder']) == 2
+    assert (repo / 'artifacts/ci.log').read_text() == 'gate completed successfully'
+    records = await fresh._metrics_store.list_task_runs(fresh.name, 'PR-001')
+    assert len(records) == 2 and all(r.ended_at for r in records)
+    assert {r.attempt_index for r in records} == {1, 2}
+    assert all(len(r.invocations) == 1 and r.fix_iterations == 0 for r in records)
+    original = await fresh._metrics_store.get(first.run_id)
+    assert original == first
+    successor = next(r for r in records if r.run_id != first.run_id)
+    assert successor.exit_reason == 'coding_complete' and successor.head_sha == provider['head']
+
+
+@pytest.mark.parametrize('single_error_exit', [False, True])
+async def test_persistent_coding_capacity_is_bounded_and_stable(coding_provider, single_error_exit):
+    runner, provider, repo, _, setup = coding_provider
+    runner.repo_config.feature_flags.use_single_error_exit = single_error_exit
+    await runner.handle_coding()
+    for _ in range(2):
+        runner = await restart(runner, setup)
+        runner._recovered = True
+        Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+        await runner._run_cycle_body()
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    for _ in range(4):
+        await runner._run_cycle_body()
+        assert runner.state.state == PipelineState.ERROR
+    assert len(provider['calls_to_coder']) == 3
+    assert runner.state.error_message == publication.PROVIDER_RECOVERY_EXHAUSTED.replace('FIX', 'CODING')
+    assert (repo / 'retained-test.py').read_text() == '# interrupted test\n'
+    assert (repo / 'artifacts/ci.log').read_text() == 'pytest 2% -- unfinished'
+    assert len([e for e in runner.state.history if e['event'].endswith(runner.state.error_message + '.')]) == 1
+    records = await runner._metrics_store.list_task_runs(runner.name, 'PR-001')
+    assert len(records) == 3 and all(r.ended_at and r.outcome == 'paused' for r in records)
+    assert all(len(r.invocations) == 1 and r.fix_iterations == 0 for r in records)
+
+
+@pytest.mark.parametrize('problem', [
+    'context', 'spec', 'run', 'proof', 'counter', 'failure', 'error', 'branch',
+    'local_head', 'remote_head', 'remote_unavailable', 'published_deleted',
+    'bound_pr_missing', 'ambiguous', 'pr_identity', 'pr_lag', 'pr_unavailable', 'terminal',
+    'dirty_base', 'provider_changed',
+])
+async def test_coding_recovery_preserves_independent_blockers(coding_provider, monkeypatch, problem):
+    runner, provider, repo, remote, _ = coding_provider
+    if problem == 'dirty_base':
+        provider['work'] = 'before_branch'
+    await runner.handle_coding()
+    attempt = runner.state.publication_attempt
+    if problem == 'context':
+        attempt.coding_task_body = None
+        runner._current_run_record.task_spec_hash = None
+    elif problem == 'spec':
+        with (repo / 'tasks/PR-001.md').open('a') as stream:
+            stream.write('\nDifferent generation\n')
+    elif problem == 'run':
+        await runner.redis.delete('metrics:run:' + attempt.run_id)
+        runner._current_run_record = None
+    elif problem == 'proof':
+        attempt.cleanup_confirmed = False
+    elif problem == 'counter':
+        attempt.provider_retries = 0
+    elif problem == 'failure':
+        attempt.failure = 'Independent guardrail failure'
+    elif problem == 'error':
+        runner.state.error_message = 'Independent operator decision'
+    elif problem == 'branch':
+        git(repo, 'checkout', 'main')
+    elif problem == 'local_head':
+        git(repo, 'commit', '--allow-empty', '-m', 'independent local work')
+    elif problem == 'remote_head':
+        git(repo, 'commit', '--allow-empty', '-m', 'independent remote work')
+        git(repo, 'push', 'origin', 'pr-001')
+        git(repo, 'reset', '--hard', attempt.expected_head_sha)
+    elif problem == 'remote_unavailable':
+        git(repo, 'remote', 'set-url', 'origin', str(repo / 'missing-remote'))
+    elif problem == 'published_deleted':
+        attempt.provider_published_head_sha = attempt.expected_head_sha
+    elif problem == 'bound_pr_missing':
+        attempt.pr_number = 646
+    elif problem in {'ambiguous', 'pr_identity', 'pr_lag', 'pr_unavailable', 'terminal'}:
+        from dataclasses import replace
+        git(repo, 'push', 'origin', 'pr-001')
+        provider.update(published=True, head=attempt.expected_head_sha,
+                        created_at=attempt.started_at + timedelta(seconds=1))
+        observe = prs.get_branch_publications
+        if problem == 'ambiguous':
+            monkeypatch.setattr(prs, 'get_branch_publications', lambda *a: observe(*a) * 2)
+        elif problem == 'pr_identity':
+            monkeypatch.setattr(prs, 'get_branch_publications',
+                                lambda *a: [replace(observe(*a)[0], is_cross_repository=True)])
+        elif problem == 'pr_lag':
+            monkeypatch.setattr(prs, 'get_branch_publications',
+                                lambda *a: [replace(observe(*a)[0], head_sha='a' * 40)])
+        elif problem == 'pr_unavailable':
+            provider['error'] = 'network outage'
+        else:
+            provider['state'] = prs.ExactPRState.MERGED
+    elif problem == 'dirty_base':
+        (repo / 'unknown-work').write_text('preserve unknown base work')
+    elif problem == 'provider_changed':
+        runner.repo_config.coder = 'claude'
+    Clock.value = attempt.provider_retry_at + timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    assert len(provider['calls_to_coder']) == 1
+    assert runner.state.state in {PipelineState.ERROR, PipelineState.PAUSED}
+    if problem not in {'dirty_base'}:
+        assert (repo / 'retained-test.py').read_text() == '# interrupted test\n'
+    if runner.state.state == PipelineState.PAUSED:
+        # Observation outages share the bounded publication observation budget.
+        Clock.value = attempt.reconcile_deadline + timedelta(seconds=1)
+        assert await publication.resume_provider_failure(runner)
+        assert runner.state.state == PipelineState.ERROR
+    before = len(runner.state.history)
+    for _ in range(3):
+        assert await publication.resume_provider_failure(runner)
+        assert runner.state.state == PipelineState.ERROR
+    assert len(provider['calls_to_coder']) == 1 and len(runner.state.history) == before
+
+
+async def test_coding_exhaustion_retry_preserves_work_and_receipt(coding_provider):
+    from src.cancellation import get_cancellation_cause, task_spec_content_hash
+    from src.daemon.retry_commands import RetryCommandMixin, RetryDispatch
+    from src.retry_commands import (
+        RetryCommandStatus,
+        enqueue_retry_command,
+        load_retry_command,
+        new_retry_command,
+        retry_failure_identity,
+    )
+
+    runner, provider, repo, _, _ = coding_provider
+    await runner.handle_coding()
+    attempt = runner.state.publication_attempt
+    attempt.provider_retries = 3
+    Clock.value = attempt.provider_retry_at + timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.state == PipelineState.ERROR
+    task = runner.state.current_task.model_copy(update={'status': TaskStatus.ERROR})
+    runner.state.current_queue = [task]
+    await runner.publish_state()
+    cause = await get_cancellation_cause(runner.redis, runner.name, task.pr_id, refresh_ttl=False)
+    command = new_retry_command(
+        repo_slug=runner.name, task_id=task.pr_id, task_file=task.task_file, task_branch=task.branch,
+        task_fingerprint=task_spec_content_hash((repo / task.task_file).read_text()),
+        request_binding='d' * 64, failure_id=retry_failure_identity(task, runner.state, cause), retry_cap=3,
+    )
+    await enqueue_retry_command(runner.redis, command)
+    runner._commit_task_status_change = AsyncMock(return_value=True)
+    runner._consume_retry_command = RetryCommandMixin._consume_retry_command.__get__(runner)
+    assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    receipt = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert receipt.status == RetryCommandStatus.APPLIED, receipt.outcome_reason
+    assert runner.state.publication_attempt.provider_retries == 0
+    assert (repo / 'retained-test.py').read_text() == '# interrupted test\n'
+    provider['fail'] = False
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.state == PipelineState.WATCH
+    assert len(provider['calls_to_coder']) == 2
+    assert await runner._consume_retry_command() == RetryDispatch.NONE
+    assert len(provider['calls_to_coder']) == 2
+
+
+async def test_coding_capacity_real_cli_exit_and_cleanup_survive_restart(coding_provider, monkeypatch, tmp_path):
+    """Actual CLI subprocesses/supervisor, with a disposable executable provider shim."""
+    import os
+    import sys
+
+    from src import codex_cli
+
+    runner, provider, repo, remote, setup = coding_provider
+    bindir = tmp_path / 'bin'
+    bindir.mkdir()
+    receipt = tmp_path / 'cli-calls.json'
+    executable = bindir / 'codex'
+    executable.write_text(f'''#!{sys.executable}
+import json, pathlib, subprocess, sys
+receipt = pathlib.Path({str(receipt)!r})
+calls = json.loads(receipt.read_text()) if receipt.exists() else []
+calls.append(sys.argv[1:]); receipt.write_text(json.dumps(calls))
+def git(*args): subprocess.run(['git', *args], check=True, capture_output=True)
+artifact = pathlib.Path('artifacts/ci.log'); artifact.parent.mkdir(exist_ok=True)
+if len(calls) == 1:
+    git('checkout', '-b', 'pr-001')
+    pathlib.Path('retained-test.py').write_text('# real retained work\\n')
+    artifact.write_text('pytest 2% -- no terminal result')
+    print('ERROR: Selected model is at capacity. Please try a different model.', file=sys.stderr)
+    print('ERROR: rollout recording failed: missing thread', file=sys.stderr)
+    sys.exit(1)
+assert pathlib.Path('retained-test.py').read_text() == '# real retained work\\n'
+assert artifact.read_text() == 'pytest 2% -- no terminal result'
+assert 'do not create or recreate it' in sys.argv[-1]
+pathlib.Path('repair').write_text('completed real CLI marker\\n')
+git('add', '.'); git('commit', '-m', 'complete real retained work'); git('push', 'origin', 'pr-001')
+artifact.write_text('gate completed successfully')
+print('Complete; one matching ready PR published')
+''')
+    executable.chmod(0o755)
+    monkeypatch.setenv('PATH', str(bindir) + os.pathsep + os.environ['PATH'])
+    monkeypatch.setattr(codex_cli, '_maybe_wrap_sandbox', lambda cmd, cwd, environment: cmd)
+    _, plugin = runner._get_coder()
+
+    async def actual_cli(self, path, **kwargs):
+        result = await codex_cli.run_auto_pr_async(path, **kwargs)
+        if result[0] == 0:
+            provider.update(published=True, head=git(repo, 'rev-parse', 'HEAD'),
+                            created_at=Clock.value + timedelta(seconds=1))
+        return result
+
+    monkeypatch.setattr(type(plugin), 'run_auto_pr', actual_cli)
+    await runner.handle_coding()
+    assert runner.state.state == PipelineState.PAUSED
+    assert runner.state.publication_attempt.cleanup_confirmed
+    original_id = runner.state.active_invocation.run_id
+    original = await runner._metrics_store.get(original_id)
+    assert original.ended_at and original.outcome == 'paused'
+    fresh = await restart(runner, setup)
+    Clock.value = fresh.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    await publication.resume_provider_failure(fresh)
+    assert fresh.state.state == PipelineState.WATCH
+    assert fresh.state.current_pr.head_sha == git(remote, 'rev-parse', 'refs/heads/pr-001')
+    assert git(repo, 'show', 'HEAD:retained-test.py') == '# real retained work'
+    import json
+    calls = json.loads(receipt.read_text())
+    assert len(calls) == 2 and all('--model' in args and 'gpt-5.4' in args for args in calls)
+    assert await fresh._metrics_store.get(original_id) == original
+    records = await fresh._metrics_store.list_task_runs(fresh.name, 'PR-001')
+    assert len(records) == 2 and all(r.ended_at and len(r.invocations) == 1 for r in records)
+
+
+@pytest.mark.parametrize('change', [
+    'missing', 'incomplete_pr', 'foreign_pr', 'wrong_snapshot', 'restorable_run', 'restored_context',
+])
+async def test_coding_context_and_record_identity(coding_provider, change):
+    runner, provider, repo, _, _ = coding_provider
+    if change == 'incomplete_pr':
+        provider['work'] = 'published'
+    await runner.handle_coding()
+    attempt = runner.state.publication_attempt
+    if change == 'missing':
+        (repo / 'tasks/PR-001.md').unlink()
+    elif change == 'incomplete_pr':
+        provider['complete'] = False
+    elif change == 'foreign_pr':
+        runner.state.current_pr = PRInfo(number=999, branch='pr-other', head_sha='b' * 40)
+    elif change == 'restored_context':
+        attempt.coding_task_body = None
+        provider['fail'] = False
+    elif change == 'wrong_snapshot':
+        runner._current_run_record.invocations[-1] = replace(runner.state.active_invocation, phase='fix')
+    else:
+        runner._current_run_record = None
+        provider['fail'] = False
+    Clock.value = attempt.provider_retry_at + timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    assert len(provider['calls_to_coder']) == (2 if change in {'restorable_run', 'restored_context'} else 1)
+    assert runner.state.state == (PipelineState.WATCH if change in {'restorable_run', 'restored_context'}
+                                  else PipelineState.ERROR if change in {'foreign_pr', 'wrong_snapshot'}
+                                  else PipelineState.PAUSED)
+
+
+@pytest.mark.parametrize('single_error_exit', [False, True])
+async def test_coding_real_rate_limit_keeps_reset_deadline(coding_provider, single_error_exit):
+    runner, provider, _, _, _ = coding_provider
+    provider['failure_text'] = 'ERROR: HTTP 429 Too Many Requests. Try again in 2 hours.'
+    runner.repo_config.feature_flags.use_single_error_exit = single_error_exit
+    await runner.handle_coding()
+    attempt = runner.state.publication_attempt
+    until = runner.state.rate_limited_until
+    assert attempt.provider_error == 'rate_limit'
+    assert until > Clock.value + timedelta(minutes=119)
+    Clock.value = until - timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    assert len(provider['calls_to_coder']) == 1 and runner.state.state == PipelineState.PAUSED
+    Clock.value = until + timedelta(seconds=1)
+    provider['fail'] = False
+    await runner._run_cycle_body()
+    assert runner.state.state == PipelineState.WATCH and runner.state.rate_limited_until is None
+    assert len(provider['calls_to_coder']) == 2
+
+
+@pytest.mark.parametrize('diagnostic', [
+    'ERROR: invalid API key / authentication failed',
+    'Task: PR-429\nFile: tasks/PR-429.md\nNetwork connection closed unexpectedly',
+])
+async def test_coding_non_provider_errors_do_not_get_capacity_retries(coding_provider, diagnostic):
+    runner, provider, repo, _, _ = coding_provider
+    provider['failure_text'] = diagnostic
+    await runner.handle_coding()
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.publication_attempt.provider_error is None
+    assert not await publication.resume_provider_failure(runner)
+    assert len(provider['calls_to_coder']) == 1
+    assert (repo / 'retained-test.py').read_text() == '# interrupted test\n'
+    record = await runner._metrics_store.get(runner.state.active_invocation.run_id)
+    assert record.ended_at and record.outcome == 'failed'
+
+
+@pytest.mark.parametrize('missing', ['attempt', 'invocation'])
+async def test_provider_failure_without_dispatch_evidence_is_not_scheduled(coding_provider, missing):
+    runner, _, _, _, _ = coding_provider
+    if missing == 'attempt':
+        runner.state.publication_attempt = None
+    else:
+        runner._start_current_run_record('codex', 'gpt-5.4')
+        runner._capture_invocation_snapshot('codex', {}, phase='coding')
+        runner._begin_publication_attempt(started_at=Clock.value, baseline_numbers=set())
+        runner.state.active_invocation = None
+    assert not await publication.pause_provider_failure(runner, 'ERROR: Selected model is at capacity', 'codex')
+
+
+async def test_coding_provider_retry_rechecks_selected_provider(coding_provider):
+    runner, provider, _, _, _ = coding_provider
+    await runner.handle_coding()
+    runner.repo_config.coder = 'claude'
+    problem = await publication.provider_retry_problem(runner, allow_provider_park=True)
+    assert problem == publication.PROVIDER_RECOVERY_CHANGED.replace('FIX', 'CODING')
+    assert len(provider['calls_to_coder']) == 1
+
+
+async def test_coding_checkout_change_during_auth_cannot_launch(coding_provider):
+    runner, provider, repo, _, _ = coding_provider
+    await runner.handle_coding()
+    original = await runner._metrics_store.get(runner.state.active_invocation.run_id)
+    runner._refresh_auth_status_cache = AsyncMock(side_effect=lambda: git(repo, 'checkout', 'main'))
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.state == PipelineState.ERROR and len(provider['calls_to_coder']) == 1
+    assert await runner._metrics_store.get(original.run_id) == original
+
+
+async def test_coding_pause_during_auth_prevents_new_invocation(coding_provider):
+    runner, provider, _, _, _ = coding_provider
+    await runner.handle_coding()
+    async def pause():
+        saved = runner.state.model_copy(deep=True)
+        saved.user_paused = True
+        await runner.redis.set(pipeline_state(runner.name), saved.model_dump_json())
+    runner._refresh_auth_status_cache = pause
+    runner._refresh_user_paused_from_redis = (
+        h.runner_module.PipelineRunner._refresh_user_paused_from_redis.__get__(runner)
+    )
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.user_paused and len(provider['calls_to_coder']) == 1
+    assert len(await runner._metrics_store.list_task_runs(runner.name, 'PR-001')) == 1
