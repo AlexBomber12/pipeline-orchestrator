@@ -10,8 +10,6 @@ import json
 import tempfile
 from pathlib import Path
 
-import pytest
-
 BATCH_COUNT = 3
 
 
@@ -21,6 +19,10 @@ def pytest_addoption(parser):
 
 
 def pytest_collection_modifyitems(config, items):
+    # Only the host pytest hook needs this dependency. The runtime container
+    # imports the same module for its standard-library-only write probe.
+    import pytest
+
     batch = config.getoption("--e2e-batch")
     if batch is None:
         return

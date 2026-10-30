@@ -128,3 +128,20 @@ def test_retained_state_probe_checks_real_permissions_without_changing_bytes(tmp
     assert journal.read_bytes() == b"retained audit\n"
     assert sorted(p.name for p in analytics.iterdir()) == [".outcomes.lock"]
     assert sorted(p.name for p in audit.iterdir()) == ["operator-actions.jsonl"]
+
+
+def test_container_state_probe_imports_and_runs_without_site_packages(tmp_path):
+    # daemon-test installs only production dependencies. -S reproduces the
+    # stronger boundary of no third-party packages, while host pytest still
+    # exercises the plugin hooks in the other regression tests.
+    code = (
+        'import importlib.util; assert importlib.util.find_spec("pytest") is None; '
+        'from pathlib import Path; '
+        'from tests.e2e.lib.pytest_batches import verify_runtime_writes; '
+        f'verify_runtime_writes(Path({str(tmp_path)!r}))'
+    )
+    result = subprocess.run(
+        [sys.executable, "-S", "-c", code], cwd=tmp_path,
+        env={**os.environ, "PYTHONPATH": str(ROOT)}, capture_output=True, text=True, timeout=15,
+    )
+    assert result.returncode == 0, result.stderr
