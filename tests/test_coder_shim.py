@@ -230,12 +230,23 @@ def test_success_shim_separates_branch_creation_from_head_publication(tmp_path: 
         ["bash", "-c", '''
 source "$1"
 ensure_pr_url() { printf 'https://example.invalid/pull/42'; }
-gh() { return 0; }
+gh() {
+    if [[ "$*" == *"/activity"* ]]; then
+        [[ ! -e tests/e2e-shim-marker.txt ]] || exit 8
+        printf 'poll\n' >> activity-polls
+        if [[ "$(wc -l < activity-polls)" -lt 3 ]]; then
+            printf '0\n'
+        else
+            printf '1\n'
+        fi
+    fi
+}
 $2 PR-42 pr-42-success
 ''', "bash", str(SHIM.resolve()), scenario],
         cwd=repo, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
+    assert (repo / "activity-polls").read_text().splitlines() == ["poll"] * 3
     head = git("rev-parse", "refs/heads/pr-42-success", cwd=remote)
     assert head != base
     assert "PR-42" in git("show", f"{head}:tests/e2e-shim-marker.txt", cwd=remote)
@@ -245,6 +256,26 @@ $2 PR-42 pr-42-success
     assert created[1] == base and pushed[0] == base and pushed[1] == head
     created_at, pushed_at = (int(event.split("\t", 1)[0].rsplit(" ", 2)[1]) for event in events)
     assert pushed_at > created_at
+
+
+def test_success_shim_does_not_publish_implementation_without_base_activity(tmp_path):
+    result = subprocess.run(
+        ["bash", "-c", '''
+source "$1"
+git_setup_branch() { :; }
+safe_push_branch() { printf 'base push\n'; }
+git() { printf '%040d\n' 1; }
+gh() { printf '0\n'; }
+sleep() { :; }
+write_marker_and_commit() { echo 'unexpected implementation' >&2; exit 8; }
+run_success_pending_ci PR-42 pr-42-success
+''', "bash", str(SHIM.resolve())],
+        cwd=tmp_path, capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 1
+    assert result.stdout == "base push\n"
+    assert "base publication activity unavailable for pr-42-success" in result.stderr
+    assert "unexpected implementation" not in result.stderr
 
 
 def test_crash_shim_signals_before_wait_and_never_publishes_on_timeout(tmp_path: Path) -> None:

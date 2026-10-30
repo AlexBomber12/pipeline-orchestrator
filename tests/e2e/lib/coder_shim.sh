@@ -165,6 +165,27 @@ safe_push_branch() {
     fi
 }
 
+wait_for_base_activity() {
+    # GitHub may record activity after git push returns. Sleeping from the
+    # local push alone can still put creation and the next push in one server
+    # timestamp. Observe the base activity first, then separate the next push.
+    local branch="$1" sha count poll
+    sha="$(git rev-parse HEAD)"
+    for ((poll=0; poll<30; poll++)); do
+        count="$(gh api --method GET repos/AlexBomber12/pipeline-orchestrator-testbed/activity \
+            -f "ref=refs/heads/${branch}" -f per_page=100 \
+            --jq "[.[] | select(.after == \"${sha}\" and (.activity_type == \"branch_creation\" or .activity_type == \"push\" or .activity_type == \"force_push\"))] | length" \
+            2>/dev/null || true)"
+        if [[ "${count}" =~ ^[1-9][0-9]*$ ]]; then
+            sleep 2
+            return 0
+        fi
+        sleep 1
+    done
+    printf 'shim: base publication activity unavailable for %s at %s\n' "${branch}" "${sha}" >&2
+    return 1
+}
+
 run_success() {
     local pr="$1" branch="$2"
     git_setup_branch "${branch}"
@@ -172,7 +193,7 @@ run_success() {
     # cannot share GitHub's second-resolution activity timestamp. An ambiguous
     # publication correctly blocks WATCH even with allow_merge_without_review.
     safe_push_branch "${branch}"
-    sleep 2
+    wait_for_base_activity "${branch}"
     write_marker_and_commit "${pr}"
     safe_push_branch "${branch}"
     local pr_url
@@ -190,7 +211,7 @@ run_success_pending_ci() {
     local pr="$1" branch="$2"
     git_setup_branch "${branch}"
     safe_push_branch "${branch}"
-    sleep 2
+    wait_for_base_activity "${branch}"
     write_marker_and_commit "${pr}"
     safe_push_branch "${branch}"
     local sha
