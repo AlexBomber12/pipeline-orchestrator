@@ -776,10 +776,11 @@ class CodingMixin:
                     f"{pr_id}: {exc}; stale marker cleared so recovery "
                     f"falls back to crash-branch on this run."
                 )
-        await self._prepare_current_run_record_dispatch_metadata(
-            task_hash=task_hash,
-            previous_task_hash=previous_task_hash,
-        )
+        if not provider_resume:
+            await self._prepare_current_run_record_dispatch_metadata(
+                task_hash=task_hash,
+                previous_task_hash=previous_task_hash,
+            )
 
         try:
             coder_kwargs = await self._prepare_coder_invocation(
@@ -888,6 +889,8 @@ class CodingMixin:
         breach_dir = self._current_breach_dir
         breach_run_id = self._current_breach_run_id
         breach_flag: dict[str, bool] = {"breached": False}
+        retained = self.state.publication_attempt
+        provider_resume = retained is not None and retained.provider_retry_ready
 
         base_branch = self.repo_config.branch or "main"
         publication_not_before = datetime.now(timezone.utc).replace(
@@ -902,6 +905,12 @@ class CodingMixin:
                 target_branch,
             )
         except Exception as exc:
+            if provider_resume:
+                await self._restore_current_run_record()
+                await publication_lifecycle._defer_provider_observation(
+                    self, f"publication baseline unavailable: {type(exc).__name__}",
+                )
+                return None
             self.log_event(
                 f"[CODING] Publication baseline unavailable for "
                 f"{target_branch!r}: {exc}; deferring coder invocation."
@@ -924,7 +933,16 @@ class CodingMixin:
                 "[CODING] Coder invocation deferred while credential login "
                 "owns its credential location."
             )
+            if provider_resume:
+                await self._restore_current_run_record()
             return None
+        if provider_resume:
+            # Discovery and credential deferrals are not coder dispatches.
+            # The provider proof already established this unchanged generation.
+            task_hash = task_spec_content_hash(task_body)
+            await self._prepare_current_run_record_dispatch_metadata(
+                task_hash=task_hash, previous_task_hash=task_hash,
+            )
         heartbeat: asyncio.Task[None] | None = None
         invocation_supervised_process: SupervisedProcess | None = None
         configured_process_callback = coder_kwargs.get(

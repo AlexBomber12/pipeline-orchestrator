@@ -2472,3 +2472,47 @@ async def test_coding_renewed_usage_pause_creates_no_phantom_attempt(coding_prov
     assert len(provider['calls_to_coder']) == 1
     assert await runner._metrics_store.get(original.run_id) == original
     assert len(await runner._metrics_store.list_task_runs(runner.name, 'PR-001')) == 1
+
+
+@pytest.mark.parametrize('boundary', ['baseline', 'credentials'])
+async def test_coding_prelaunch_deferral_keeps_retained_dispatch(coding_provider, monkeypatch, boundary):
+    runner, provider, _, _, _ = coding_provider
+    await runner.handle_coding()
+    original = await runner._metrics_store.get(runner.state.active_invocation.run_id)
+    frozen = runner.state.publication_attempt.model_copy(deep=True)
+    observe = prs.get_branch_publications
+    reserve = runner._reserve_coder_credentials
+    reads = 0
+
+    def flaky_baseline(*args):
+        nonlocal reads
+        reads += 1
+        if reads == 3:
+            raise OSError('temporary prelaunch baseline outage')
+        return observe(*args)
+
+    if boundary == 'baseline':
+        monkeypatch.setattr(prs, 'get_branch_publications', flaky_baseline)
+    else:
+        runner._reserve_coder_credentials = lambda *a, **kw: False
+    Clock.value = frozen.provider_retry_at + timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    assert len(provider['calls_to_coder']) == 1
+    assert runner.state.current_task is not None and runner.state.current_task.pr_id == 'PR-001'
+    assert runner.state.publication_attempt.run_id == runner.state.active_invocation.run_id == original.run_id
+    assert runner.state.publication_attempt.expected_head_sha == frozen.expected_head_sha
+    assert runner.state.publication_attempt.provider_retries == frozen.provider_retries
+    assert runner._current_run_record.run_id == original.run_id
+    assert await runner._metrics_store.get(original.run_id) == original
+    assert await runner.redis.get(runner._attempt_count_key(runner.name, 'PR-001')) == '1'
+    assert len(await runner._metrics_store.list_task_runs(runner.name, 'PR-001')) == 1
+    # Clearing a real transient boundary must progress, not merely avoid ERROR.
+    runner._reserve_coder_credentials = reserve
+    provider['fail'] = False
+    Clock.value += timedelta(seconds=runner.app_config.daemon.fix_poll_interval_sec + 1)
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.state == PipelineState.WATCH
+    assert len(provider['calls_to_coder']) == 2
+    records = await runner._metrics_store.list_task_runs(runner.name, 'PR-001')
+    assert sorted(r.attempt_index for r in records) == [1, 2]
+    assert all(r.ended_at for r in records)
