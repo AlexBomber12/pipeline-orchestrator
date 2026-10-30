@@ -328,6 +328,7 @@ def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 150) -> None:
     if response.status_code not in (200, 204):
         raise RuntimeError(f"failed to stop daemon for {slug}: status_code={response.status_code}")
 
+    stopped_at = datetime.now(timezone.utc)
     deadline = time.monotonic() + timeout_sec
     last_state = None
     last_user_paused = None
@@ -346,12 +347,28 @@ def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 150) -> None:
                     last_user_paused = entry.get("user_paused")
                     history = entry.get("history") or []
                     last_event = history[-1].get("event") if history and isinstance(history[-1], dict) else None
-                    # ERROR retains its state under operator pause. This is
+                    try:
+                        updated = datetime.fromisoformat(entry.get("last_updated") or "")
+                    except (ValueError, TypeError):
+                        updated = None
+                    # IDLE retains user pause, too. The pause log is deduplicated
+                    # and later config events can replace it. Require a heartbeat
+                    # after Stop returned, rather than accepting the web snapshot.
+                    idle_ack = (
+                        last_state == "IDLE" and last_user_paused is True
+                        and updated is not None and updated.tzinfo is not None
+                        and updated > stopped_at
+                    )
+                    # WATCH/ERROR retain their state under operator pause. Stop
+                    # can keep its control key set in WATCH without a pause log.
+                    # Neither retained state can dispatch another coder. This is
                     # only a pause acknowledgement: reset callers must stop
                     # the fixture-owned service before deleting any state.
-                    if (last_state == "ERROR" and last_user_paused is True) or last_state == "PAUSED" or (
-                        last_user_paused is True
-                        and last_event == "[INFRA] Paused. Press Play to resume."
+                    if (
+                        idle_ack
+                        or (last_state in {"WATCH", "ERROR"} and last_user_paused is True)
+                        or last_state == "PAUSED"
+                        or (last_user_paused is True and last_event == "[INFRA] Paused. Press Play to resume.")
                     ):
                         return
         time.sleep(0.5)
