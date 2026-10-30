@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from tests.e2e.lib.pytest_batches import BATCH_COUNT, verify_batch_coverage
+from tests.e2e.lib.pytest_batches import BATCH_COUNT, verify_batch_coverage, verify_runtime_writes
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -93,6 +93,9 @@ def test_ci_keeps_one_serialized_gate_and_refreshes_both_roles_per_bounded_batch
     mint = [step for step in steps if step.get("uses") == "actions/create-github-app-token@v1"]
     assert [step["id"] for step in mint] == ["testbed-token", "testbed-reviewer-token"]
     assert all(step["with"]["repositories"] == "pipeline-orchestrator-testbed" for step in mint)
+    seed = next(step for step in steps if step.get("name") == "Seed gh auth for in-container shim")
+    assert "sudo chown -R 1000:1000 tests/e2e/data\n" in seed["run"]
+    assert any("verify_runtime_writes(Path(" in step.get("run", "") for step in steps)
     tests = next(step for step in steps if step.get("name") == "Run e2e tests")
     assert tests["env"] == {
         "GH_TOKEN": "${{ steps.testbed-token.outputs.token }}",
@@ -101,3 +104,27 @@ def test_ci_keeps_one_serialized_gate_and_refreshes_both_roles_per_bounded_batch
     assert '--e2e-batch=${{ inputs.batch }}' in tests["run"]
     assert steps[-1]["if"] == "always()" and steps[-1]["run"].endswith("down -v")
     assert any("tests.e2e.lib.pytest_batches" in step.get("run", "") for step in integration["steps"])
+
+
+@pytest.mark.parametrize("readonly", ["file", "directory"])
+def test_retained_state_probe_checks_real_permissions_without_changing_bytes(tmp_path, readonly):
+    analytics = tmp_path / "analytics"
+    audit = tmp_path / "audit"
+    analytics.mkdir()
+    audit.mkdir()
+    lock = analytics / ".outcomes.lock"
+    journal = audit / "operator-actions.jsonl"
+    lock.write_bytes(b"retained lock")
+    journal.write_bytes(b"retained audit\n")
+    blocked = lock if readonly == "file" else audit
+    blocked.chmod(0o444 if readonly == "file" else 0o555)
+    try:
+        with pytest.raises(PermissionError):
+            verify_runtime_writes(tmp_path)
+    finally:
+        blocked.chmod(0o644 if readonly == "file" else 0o755)
+    verify_runtime_writes(tmp_path)
+    assert lock.read_bytes() == b"retained lock"
+    assert journal.read_bytes() == b"retained audit\n"
+    assert sorted(p.name for p in analytics.iterdir()) == [".outcomes.lock"]
+    assert sorted(p.name for p in audit.iterdir()) == ["operator-actions.jsonl"]

@@ -109,7 +109,9 @@ runs:
       chmod 600 tests/e2e/data/auth/gh/hosts.yml
       chmod 600 tests/e2e/data/auth/.gitconfig
       mkdir -p tests/e2e/data/events
-      sudo chown -R 1000:1000 tests/e2e/data/auth tests/e2e/data/repos tests/e2e/data/uploads tests/e2e/data/events
+      # Previous batches also retain analytics/audit state and lock files.
+      # Restore all container-written data, including future state directories.
+      sudo chown -R 1000:1000 tests/e2e/data
 
   - name: Bring up test stack
     shell: bash
@@ -163,6 +165,16 @@ runs:
       '
         echo "OK: $service loaded the prepared reviewer identity"
       done
+
+  - name: Verify retained analytics and audit are writable by the container
+    shell: bash
+    run: |
+      docker compose -f docker-compose.test.yml exec -T daemon-test python -c '
+      from pathlib import Path
+      from tests.e2e.lib.pytest_batches import verify_runtime_writes
+      verify_runtime_writes(Path("/data"))
+      print("Container can create and append retained analytics/audit state")
+      '
 
   - name: Run e2e tests
     env:

@@ -114,6 +114,10 @@ three **sequential** module batches. Python/dependency/browser/image preparation
 runs before token issuance. Each `.github/actions/testbed-batch` invocation
 creates fresh author and independent reviewer tokens, reseeds the stopped
 isolated test stack, runs its tests, captures evidence and tears that stack down.
+Before starting each batch, ownership of the entire retained test-data tree is
+restored to container UID 1000, including analytics/audit lock and journal files.
+A container-side create/append probe fails setup if those directories or existing
+files are unwritable; it does not alter their contents.
 Its 45-minute step bound leaves a margin below the one-hour credential lifetime;
 a timeout fails the gate, rather than silently dropping tests. Later batches
 still run after an earlier failure. No private key is mounted in the stack.

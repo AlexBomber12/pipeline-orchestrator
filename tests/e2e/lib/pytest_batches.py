@@ -7,6 +7,7 @@ real pytest collection, and CI verifies the disjoint union before accepting it.
 from __future__ import annotations
 
 import json
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -37,6 +38,21 @@ def pytest_collection_modifyitems(config, items):
     }, indent=2) + "\n")
     config.hook.pytest_deselected(items=[item for item in items if item not in selected])
     items[:] = selected
+
+
+def verify_runtime_writes(data: Path) -> None:
+    """Probe real create/append permissions without altering retained content."""
+    for name in ("analytics", "audit"):
+        directory = data / name
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=directory) as probe:
+            probe.write(b"testbed state write probe")
+        for path in directory.rglob("*"):
+            if path.is_file() and not path.is_symlink():
+                # Existing lock/JSONL files can fail even when directory creation
+                # succeeds. Append-open checks that boundary without writing.
+                with path.open("ab"):
+                    pass
 
 
 def verify_batch_coverage(evidence: Path) -> int:
