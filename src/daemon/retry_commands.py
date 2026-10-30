@@ -662,10 +662,14 @@ class RetryCommandMixin:
         if (attempt is not None and attempt.pending and attempt.provider_error is not None
             and attempt.exit_classification == "failure"):
             pr = self.state.current_pr
-            if ((command.task_id, command.task_branch, command.bound_pr_number,
-                 command.bound_pr_branch, command.bound_pr_head_sha) != (
-                    attempt.task_id, attempt.branch, attempt.pr_number,
-                    pr.branch if pr is not None else None, pr.head_sha if pr is not None else None)):
+            unbound_coding = (self.state.active_invocation is not None
+                              and self.state.active_invocation.phase == "coding"
+                              and pr is None)
+            if ((command.task_id, command.task_branch) != (attempt.task_id, attempt.branch)
+                or (not unbound_coding and (command.bound_pr_number,
+                    command.bound_pr_branch, command.bound_pr_head_sha) != (
+                        attempt.pr_number, pr.branch if pr is not None else None,
+                        pr.head_sha if pr is not None else None))):
                 return await self._fail_retry_command(command, "Provider Retry task/PR binding changed.")
             try:
                 problem = await publication.provider_retry_problem(self, allow_provider_park=True)
@@ -673,6 +677,13 @@ class RetryCommandMixin:
                     return await self._defer_retry_command(command, problem)
             except Exception as exc:
                 return await self._defer_retry_command(command, f"Provider Retry ownership unavailable: {exc}.")
+            if unbound_coding:
+                pr = attempt.candidate
+                if ((command.bound_pr_number, command.bound_pr_branch, command.bound_pr_head_sha)
+                    != (None, None, None) and (pr is None or (
+                        command.bound_pr_number, command.bound_pr_branch, command.bound_pr_head_sha
+                    ) != (pr.number, pr.branch, pr.head_sha))):
+                    return await self._fail_retry_command(command, "Provider Retry publication binding changed.")
             # Preserve the durable receipt identifier for both provider phases.
             return "provider_fix", pr
         try:
@@ -1041,7 +1052,8 @@ class RetryCommandMixin:
             return continuation
         continuation_name, pr = continuation
 
-        if continuation_name == "watch":
+        if continuation_name == "watch" or (continuation_name == "provider_fix"
+                                              and pr is not None and self.state.current_pr is None):
             assert pr is not None
 
             def bind_publication(current: RetryCommand) -> None:
@@ -1058,6 +1070,13 @@ class RetryCommandMixin:
                 if bound is None:
                     raise RuntimeError("retry command disappeared before publication binding")
                 command = bound
+                if continuation_name == "provider_fix":
+                    # Persist the receipt first. If state publication fails or the
+                    # daemon restarts, selection reproves that exact PR before
+                    # completing this binding or granting the provider allowance.
+                    self.state.current_pr = pr
+                    self.state.publication_attempt.pr_number = pr.number
+                    await self.publish_state()
             except Exception as exc:
                 return await self._defer_retry_command(
                     command, f"Could not bind Retry publication: {exc}.",

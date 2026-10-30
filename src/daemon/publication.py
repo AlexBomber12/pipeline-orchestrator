@@ -646,7 +646,7 @@ async def _coding_provider_retry_problem(
                                          attempt.repo, attempt.base, attempt.branch)
     fresh = [item for item in publications if item.number not in attempt.baseline_numbers]
     if not fresh:
-        if attempt.pr_number is not None:
+        if attempt.pr_number is not None or attempt.candidate is not None:
             raise RuntimeError("bound PR observation unavailable")
     else:
         if len(fresh) != 1:
@@ -664,7 +664,8 @@ async def _coding_provider_retry_problem(
             raise RuntimeError("exact PR observation unavailable")
         if outcome.state != gh_prs.ExactPRState.OPEN:
             return "Interrupted CODING exact PR is terminal; inspect before Retry"
-        attempt.pr_number = item.number
+        if not allow_provider_park:
+            attempt.pr_number = item.number
         attempt.candidate = item.to_pr_info()
     if remote:
         attempt.provider_published_head_sha = remote[0]

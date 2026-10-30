@@ -2198,7 +2198,13 @@ async def test_coding_recovery_preserves_independent_blockers(coding_provider, m
     assert len(provider['calls_to_coder']) == 1 and len(runner.state.history) == before
 
 
-async def test_coding_exhaustion_retry_preserves_work_and_receipt(coding_provider):
+@pytest.mark.parametrize(('delayed_publication', 'restart_at'), [
+    (False, 'none'), (True, 'none'), (True, 'observed'), (True, 'receipt'), (True, 'state'),
+    (True, 'missing'), (True, 'changed'),
+])
+async def test_coding_exhaustion_retry_preserves_work_and_receipt(
+    coding_provider, delayed_publication, restart_at, monkeypatch,
+):
     from src.cancellation import get_cancellation_cause, task_spec_content_hash
     from src.daemon.retry_commands import RetryCommandMixin, RetryDispatch
     from src.retry_commands import (
@@ -2209,9 +2215,21 @@ async def test_coding_exhaustion_retry_preserves_work_and_receipt(coding_provide
         retry_failure_identity,
     )
 
-    runner, provider, repo, _, _ = coding_provider
+    monkeypatch.setattr('src.retry_commands.utc_now', lambda: Clock.value)
+    runner, provider, repo, _, configure = coding_provider
+    if delayed_publication:
+        provider['work'] = 'published'
+        provider['hidden'] = restart_at != 'observed'
+        observe = prs.get_branch_publications
+        monkeypatch.setattr(prs, 'get_branch_publications',
+                            lambda *a: [] if provider.get('hidden', True) else observe(*a))
     await runner.handle_coding()
     attempt = runner.state.publication_attempt
+    if delayed_publication:
+        assert attempt.pr_number == (646 if restart_at == 'observed' else None)
+        assert (runner.state.current_pr.number if runner.state.current_pr else None) == (
+            646 if restart_at == 'observed' else None
+        )
     attempt.provider_retries = 3
     Clock.value = attempt.provider_retry_at + timedelta(seconds=1)
     assert await publication.resume_provider_failure(runner)
@@ -2220,17 +2238,68 @@ async def test_coding_exhaustion_retry_preserves_work_and_receipt(coding_provide
     runner.state.current_queue = [task]
     await runner.publish_state()
     cause = await get_cancellation_cause(runner.redis, runner.name, task.pr_id, refresh_ttl=False)
+    pr = runner.state.current_pr
     command = new_retry_command(
         repo_slug=runner.name, task_id=task.pr_id, task_file=task.task_file, task_branch=task.branch,
         task_fingerprint=task_spec_content_hash((repo / task.task_file).read_text()),
         request_binding='d' * 64, failure_id=retry_failure_identity(task, runner.state, cause), retry_cap=3,
+        bound_pr_number=pr.number if pr else None, bound_pr_branch=pr.branch if pr else None,
+        bound_pr_head_sha=pr.head_sha if pr else None,
     )
     await enqueue_retry_command(runner.redis, command)
+    provider['hidden'] = False
     runner._commit_task_status_change = AsyncMock(return_value=True)
     runner._consume_retry_command = RetryCommandMixin._consume_retry_command.__get__(runner)
+    first = await runner._metrics_store.get(attempt.run_id)
+    if restart_at not in {'none', 'observed'}:
+        checkpoint = runner.publish_state
+
+        class Interrupted(BaseException):
+            pass
+
+        async def crash_binding():
+            if runner.state.current_pr is not None:
+                if restart_at == 'state':
+                    await checkpoint()
+                raise Interrupted()
+            await checkpoint()
+
+        monkeypatch.setattr(runner, 'publish_state', crash_binding)
+        with pytest.raises(Interrupted):
+            await runner._consume_retry_command()
+        stored = await load_retry_command(runner.redis, runner.name, command.command_id)
+        assert stored.bound_pr_number == 646 and stored.retry_count is None
+        Clock.value += timedelta(minutes=6)
+        fresh = configure(h._make_runner(publication_contract=2))
+        fresh.redis = runner.redis
+        fresh._metrics_store = type(runner._metrics_store)(fresh.redis)
+        fresh.state = RepoState.model_validate_json(await fresh.redis.get(pipeline_state(fresh.name)))
+        await fresh._hydrate_current_task_from_persisted_state()
+        runner = fresh
+        attempt = runner.state.publication_attempt
+        runner._consume_retry_command = RetryCommandMixin._consume_retry_command.__get__(runner)
+        runner._commit_task_status_change = AsyncMock(return_value=True)
+        if restart_at == 'missing':
+            provider['hidden'] = True
+        elif restart_at == 'changed':
+            from dataclasses import replace
+            observe_changed = prs.get_branch_publications
+            monkeypatch.setattr(prs, 'get_branch_publications',
+                                lambda *a: [replace(item, number=647) for item in observe_changed(*a)])
     assert await runner._consume_retry_command() == RetryDispatch.HANDLED
     receipt = await load_retry_command(runner.redis, runner.name, command.command_id)
+    if restart_at in {'missing', 'changed'}:
+        assert receipt.status in {RetryCommandStatus.DEFERRED, RetryCommandStatus.FAILED}
+        assert receipt.retry_count is None and attempt.provider_retries == 3
+        assert runner.state.state == PipelineState.ERROR
+        assert len(provider['calls_to_coder']) == 1
+        assert await runner._metrics_store.get(first.run_id) == first
+        return
     assert receipt.status == RetryCommandStatus.APPLIED, receipt.outcome_reason
+    if delayed_publication:
+        assert receipt.bound_pr_number == attempt.pr_number == runner.state.current_pr.number == 646
+        assert receipt.bound_pr_branch == runner.state.current_pr.branch == 'pr-001'
+        assert receipt.bound_pr_head_sha == runner.state.current_pr.head_sha == provider['head']
     assert runner.state.publication_attempt.provider_retries == 0
     assert (repo / 'retained-test.py').read_text() == '# interrupted test\n'
     provider['fail'] = False
@@ -2239,6 +2308,10 @@ async def test_coding_exhaustion_retry_preserves_work_and_receipt(coding_provide
     assert len(provider['calls_to_coder']) == 2
     assert await runner._consume_retry_command() == RetryDispatch.NONE
     assert len(provider['calls_to_coder']) == 2
+    assert receipt.retry_count == 1
+    assert await runner._metrics_store.get(first.run_id) == first
+    records = await runner._metrics_store.list_task_runs(runner.name, 'PR-001')
+    assert len(records) == 2 and all(record.ended_at for record in records)
 
 
 async def test_coding_capacity_real_cli_exit_and_cleanup_survive_restart(coding_provider, monkeypatch, tmp_path):
