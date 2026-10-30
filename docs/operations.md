@@ -822,3 +822,159 @@ There are no deployment prerequisites for these tests/docs. Follow-up release
 verification must separately prove real GitHub access/terminal semantics and
 process restart containment; source merge is not deployment. Existing crash,
 Approve, fairness, completion and pause behavior is unchanged.
+
+## Operational restore inventory and disposable proof (PR-434)
+
+Investigated source: `7fc17185054688d7a116b4696ae90e9385a5c791` (origin/main,
+2026-10-30). Historical audit reference:
+`7167c2e916a2bbb843ecb6a6ce7fc15795e61802`; IMP-10, A16/A38/U23.
+This extends the PR-410 work-preservation investigation above and reuses its
+real-Git fixtures. It delivers tests and this report, with no production restore,
+runtime migration, secret export, deployment or live failure drill.
+
+### Authority and storage inventory
+
+“Authoritative” below means information cannot safely be recreated from a newer
+Git checkout alone. It does not mean a restored record grants execution authority.
+Paths describe source defaults/mounts, not an inspection of production contents.
+
+| Data / current boundary | Authority and recovery source | Existing backup coverage / constraint |
+| --- | --- | --- |
+| `config.yml`, `config.load_config` | Committed policy plus any local edits; effective config also merges sibling `config.production.yml`, then supported environment overrides | Bundle contains committed base only. Overlay is ignored; environment and local edits are absent. `PO_CONFIG_PATH` can select a different base. |
+| Auth path references (`AuthConfig`), Compose environment and mounts | References/selectors are policy; credential material is separately authoritative | Defaults include `/data/auth/claude`, `/data/auth/gh`, `/data/auth` (Codex home); Compose mounts `codex-auth` at `/data/auth/.codex`. `/data/secrets` and injected variables are separate. Bundling a managed repo is no credential backup. Recover via operator-managed secure provisioning; never put credentials in bundles or this fixture. |
+| `/data/repos/<owner>__<repo>` refs and committed task bytes | Local-only commits/refs may be the only work copy; origin is an external publication source, not an independent backup | `backups.create_repo_bundle --all` includes reachable commits, branches, tags, remote-tracking refs and advertised HEAD. It verifies Git integrity, not operational completeness. |
+| Index, tracked dirty, untracked/ignored files, detached/unreachable work | Authoritative unfinished work | Bundle omits index/worktree bytes and reflog-only objects; PR-410 already proves missing capture. Raw Git config/hooks/alternates are not restored configuration. Linked worktrees/LFS payloads/submodules are not proved here. |
+| `tasks/PR-*.md`, `tasks/completions.json`, GitHub PR/merge evidence | Accepted spec/status and exact-byte/ancestry completion evidence are durable inputs | Committed versions survive bundles. Newer uncommitted tasks and GitHub comments/reactions/checks are absent. Revalidate the actual provider; old review/merge observations are not current authorization. |
+| `tasks/QUEUE.md`, dashboard display, usage/catalog observations | Derived; rebuild from task headers, current external evidence and fresh probes | No need to restore stale observations as authority. Startup recovery does not use QUEUE for task selection. |
+| Redis `pipeline:<repo>` / `runner.publish_state` | Mixed: derived queue/display plus non-derivable `user_paused`, invocation/run identity, publication holds/watermarks and CI attempt state | JSON writer is a state checkpoint, not a backup/export. Matching production readers restore selected fields; arbitrary JSON hydration is not full startup recovery. |
+| Redis `control:<repo>:stop`, inhibitors, panic/control state | Operator safety intent; a wake/pubsub message is only a hint | Missing keys cannot prove permission to resume. A Git bundle cannot reconstruct pause/Stop or pending control effects. |
+| `approval_commands`, `retry_commands`, reservations and dedupe/pending indexes | Decision-bound command intent, effect progress and attempt ownership; retain indexes with payloads | Approval records have no TTL. Retry records/pointers/pending index use 90-day TTLs. Redis “durable” command storage is conditional on Redis persistence; no independent command journal is exported. |
+| `metrics.MetricsStore`, invocation/attempt counters, recovery backup pointer | Run/attempt accounting and recovery identity can constrain replay | Run records/task-run sets expire after 365 days; recent list is capped at 200. Other counters/pointers have their own TTLs. Bundle cannot restore them. Restored process metadata is never kernel ownership (PR-431). |
+| `cancellation.storage`, suppression store / operator Reject | Failure/rejection intent and diagnostics; current Reject is not a permanent generation fence (PR-427) | Cause TTL is 30 days, refreshed on reads to 90 days. Loss/expiry can erase rejection evidence even with task status ERROR retained. Do not infer final Reject from a task header or replay old approvals. |
+| `/data/uploads` staged task bytes plus Redis upload manifest | Pending operator input until accepted into the task/Git path | Must retain bytes and matching manifest together; upload staging has configurable age cleanup (default 24 hours). Neither is included in repo bundles. |
+| `/data/analytics/YYYY-MM.jsonl`, `analytics.outcome_logger` | Durable merged-outcome accounting/deduplication, not a replay command | Append lock, flush/fsync and cross-partition dedupe exist. No automated off-host copy/retention policy is established by this path; rollback can erase completion accounting. |
+| `/data/events/<repo>/YYYY-MM-DD.jsonl`, Redis event/CLI history | Forensic evidence; disk events are best-effort, not a command journal | Redis event history is bounded; disk mirror survives Redis loss only if its filesystem survives. Repo bundles omit both. No off-host retention is proved. |
+| Compose `redis_data` volume | Redis's separate persistence substrate | Named volume survives ordinary container replacement, not volume/host loss. Compose specifies `redis:7-alpine`, with no explicit AOF or snapshot policy; actual Redis settings and last successful save are unobserved here. `/data` bind-mount backup alone does not include this named volume or `codex-auth`. |
+
+Existing backup artifacts are verified timestamped bundles under configured
+`git_bundle_backup_dir/<repo>/`, remote `crash-backup/<task>/<timestamp>` refs
+from recovery fallback, and task-format migration copies under
+`artifacts/task-format-backups/<timestamp>/`. The latter only protect that
+migration's task bytes. Review `ci.log`, `pr.patch`, and `structure.txt` are
+review evidence, not operational backups. Current recovery also uses
+`git stash push --include-untracked` for dirty work, scans the stash diff for
+secrets, and pushes its commit to a crash-backup ref. This supersedes the older
+PR-410 paragraph's committed-only description of recovery. It changes the source
+index/worktree and excludes ignored files; it is not a complete file inventory.
+The backup still shares the origin failure domain; its Redis pointer can expire.
+
+Bundle creation is disabled by default; enabled IDLE scheduling defaults to
+24 hours and anchors its first run after startup, not immediately. Restarts
+reset the in-memory cadence. Pruning retains the newest 7 bundles plus the
+newest bundle on each of 4 distinct Sunday UTC dates by default, using mtimes;
+“daily” counts files, not distinct days. Backup directory placement, free space,
+copy integrity, independent retention and access separation need operator
+verification. No off-host copy, encrypted archive, retention SLA, RPO or RTO
+has been demonstrated. A local bundle on the same disk shares its loss domain.
+
+### What the disposable experiment proves
+
+Run `python -m pytest tests/recovery/test_restore_contract.py -q` (4 cases).
+All repositories, files and state belong to pytest temporary fixtures. The
+reused runner constructor is prevented from inspecting its default live checkout
+candidates. No live Redis, credentials, GitHub transport or coder is used.
+
+The bundle case calls production `create_repo_bundle`, checks that capture did
+not change source worktree/index bytes, deletes only the fixture source, then
+fetches all refs into a separate unborn repository and checks out the feature
+branch. Exact `show-ref`, full local/base commit SHAs, binary committed content
+and ERROR task bytes match. There is no remote configured on the restored repo.
+Both staged and unstaged README content disappear in favor of committed content;
+untracked/ignored bytes and the ignored config overlay disappear. The effective
+poll interval changes from synthetic overlay 17 to committed base 60. Successful
+Git verification therefore demonstrably fails complete operational restoration.
+
+The same case writes an outcome through production `log_merged_pr` to a temporary
+analytics partition. A bundle-only restore cannot find that completion. An
+explicit separate copy of that synthetic partition retains exact JSONL bytes
+and lets `has_merged_outcome` recognize it. This proves the need to retain that
+side store, not cross-store atomicity or a production file-copy backup protocol.
+Auth references are synthetic path strings only; credential contents are never
+created, read or copied.
+
+The crash-backup case exercises `_preserve_crashed_run_commits` and its pointer
+writer against a fixture-owned bare remote. The exact pushed stash SHA and
+30-day pointer duration match. After deleting the fixture source, fetching that
+ref and applying it with `--index` in a separate checkout restores exact staged
+and unstaged diffs and untracked content; ignored work is absent. This proves
+local Git stash/push/restore semantics, not real GitHub acceptance or secure
+secret detection. The pointer is discovery evidence, not replay authorization.
+
+Active and rejected cases use existing runner/approval/Retry fixtures and the
+production state writer, run checkpoint/store, command enqueue/readers, pause
+consumer and approval evaluators. A **test-only diagnostic JSON capsule** copies
+the Redis double's strings, list/set/sorted-set indexes and declared TTL durations
+to a separate restore directory. Exact values/indexes, snapshot fields, run and
+invocation identity, Stop, pause, Retry and approval receipt survive decoding.
+No production application state export/restore path was found to exercise beyond
+these checkpoint/reader boundaries. This unsupported result is part of the
+investigation, not an implemented backup path.
+
+The declared TTLs in this capsule are diagnostic metadata, not absolute expiry
+or a real Redis RDB/AOF image. The double does not prove transaction isolation,
+expiry across downtime, Redis restart, eviction, crash consistency or persistence.
+Redis executables are unavailable in this local environment; Docker remains
+GHA-owned. No real-Redis restore or off-host success is claimed. A future test
+must use an isolated real Redis image and its actual snapshot configuration
+before making those guarantees; existing provider e2e coverage is not that test.
+
+Restored `operator_reject` fails production approval construction; a prior
+approval does not match a changed invocation attempt. Restored active metadata
+has no process handles. Tests call readers/evaluators only, never dispatch or
+resume. They also show that an empty Redis double loses pause/Stop and decisions
+while the ERROR task bytes remain. This is a safety gap characterization, not
+proof that startup will park all Redis-loss cases. Do not start restored web or
+daemon services against these files, copy commands into live Redis, or treat
+active/rejected state, pending approval or IDLE as authorization to replay.
+
+### Rollback constraints and minimal follow-up
+
+A bundle is suitable for inspecting/recovering Git objects in an isolated
+checkout. A complete operational restore remains **unsupported**. Before any
+operator release exercise, select a consistent capture boundary with confirmed
+writer quiescence (including coder ownership), stop live dispatch, preserve the
+operator pause externally, and keep the original data intact. Unknown process
+ownership must remain parked. Inspect restored bytes without production network,
+credentials, attached services or automatically executed hooks.
+
+Git, Redis, config/overlay, uploads and outcome files have no shared snapshot
+transaction. A mixed-age restore can resurrect consumed commands, lose rejected
+intent, reset attempt/cost limits, roll back a safety watermark, or remove
+accounting for a merge that remains real on GitHub. Never merge restored state
+into current live state or overwrite newer refs as a rollback shortcut. Reconcile
+exact repository/task/spec/attempt/PR/full-head and current provider terminal
+outcomes before separately authorizing any continuation. Old approval/review
+records are not fresh authority. Keep historical completion and the current
+operator pause; source rollback is not external-effect rollback. Schema versions,
+Redis version/settings, absolute expiry and environment compatibility must be
+checked before any future reader adopts an archive.
+
+The minimum concrete follow-up is one explicitly scoped operational capture and
+inspection contract using the existing backup boundary: a versioned manifest of
+selected config/overlay and non-secret side stores, exact Git/work preservation
+references, real Redis snapshot/settings plus absolute-expiry evidence, hashes
+and a common capture identity. Specify fail-closed restore admission for missing
+pause, rejected intent and mismatched attempts; prove it with isolated real Redis
+and temporary Git before permitting any live continuation. Define the secure
+credential reprovisioning boundary separately. Select and verify an independent
+off-host destination/retention policy with operator authorization; until tested,
+report off-host durability and recovery time as unknown.
+
+Reuse PR-410's missing-work capture proposal, existing command binding readers,
+completion evaluators and PR-427/431's rejection/ownership proposals rather than
+implementing competing stores. A follow-up would replace the bundle-only-as-full-
+backup assumption and ad hoc snapshot hydration as restore admission, not remove
+periodic bundles, crash-backup refs, status Git writes or diagnostic history.
+No obsolete runtime path is removed here. There are no deployment prerequisites
+for these tests/docs; actual restore implementation, secure provisioning and
+provider/deployment smoke remain separate operator-authorized release work.
