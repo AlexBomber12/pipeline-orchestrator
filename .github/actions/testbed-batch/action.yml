@@ -113,6 +113,21 @@ runs:
       # Restore all container-written data, including future state directories.
       sudo chown -R 1000:1000 tests/e2e/data
 
+  - name: Restore host shim control access
+    shell: bash
+    run: |
+      # pytest writes the scenario; containers only read it. Retained shim
+      # handshakes and runtime state remain owned by the container UID.
+      control=tests/e2e/data/shim-scenario
+      if [[ -f "$control" ]]; then
+        sudo chown "$(id -u):$(id -g)" "$control"
+      fi
+      python - <<'PY'
+      from tests.e2e.lib.coder_shim import coder_shim
+      with coder_shim("success"):
+          pass
+      PY
+
   - name: Bring up test stack
     shell: bash
     run: docker compose -f docker-compose.test.yml up -d --wait

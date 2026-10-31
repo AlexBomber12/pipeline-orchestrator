@@ -146,3 +146,10 @@ Common issues and fixes:
 - **`tests/e2e/test_ci_evidence_access.py` fails on check-runs**: the App lacks Checks read access or the install has not been re-approved after adding that permission. In the App's "Permissions & events" page, set "Checks" to Read-only, then approve the updated installation for `pipeline-orchestrator-testbed`.
 - **`tests/e2e/test_ci_evidence_access.py` fails on combined status**: the App lacks Commit statuses read access or cannot see the testbed repository. Confirm "Commit statuses" is Read and write and repeat Step D for `pipeline-orchestrator-testbed`.
 - **Missing `TESTBED_REVIEWER_APP_ID` or `TESTBED_REVIEWER_APP_PRIVATE_KEY`**: complete Step E2. The workflow intentionally fails before e2e setup instead of letting the review test create a PR with the author identity.
+
+The batch reset keeps UID 1000 ownership for container-written state and shim
+handshakes, then restores host ownership only for `shim-scenario`, which pytest
+writes and containers read. Before container startup, the real `coder_shim`
+context verifies host read/write access and restores the previous scenario.
+This catches retained control-file permission failures without discarding
+analytics, audit, invocation evidence, or changing provider settings.

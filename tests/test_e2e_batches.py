@@ -96,6 +96,10 @@ def test_ci_keeps_one_serialized_gate_and_refreshes_both_roles_per_bounded_batch
     seed = next(step for step in steps if step.get("name") == "Seed gh auth for in-container shim")
     assert "sudo chown -R 1000:1000 tests/e2e/data\n" in seed["run"]
     assert any("verify_runtime_writes(Path(" in step.get("run", "") for step in steps)
+    host = next(step for step in steps if step.get("name") == "Restore host shim control access")
+    start = next(step for step in steps if step.get("name") == "Bring up test stack")
+    assert steps.index(seed) < steps.index(host) < steps.index(start)
+    assert 'sudo chown "$(id -u):$(id -g)" "$control"' in host["run"]
     tests = next(step for step in steps if step.get("name") == "Run e2e tests")
     assert tests["env"] == {
         "GH_TOKEN": "${{ steps.testbed-token.outputs.token }}",
@@ -145,3 +149,27 @@ def test_container_state_probe_imports_and_runs_without_site_packages(tmp_path):
         env={**os.environ, "PYTHONPATH": str(ROOT)}, capture_output=True, text=True, timeout=15,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_host_shim_preflight_checks_retained_control_without_changing_evidence(tmp_path, monkeypatch):
+    from tests.e2e.lib import coder_shim as shim
+
+    control = tmp_path / "shim-scenario"
+    handshake = tmp_path / "shim-scenario.settings-started"
+    control.write_text("fix_existing_pr\n")
+    handshake.write_bytes(b"retained launch evidence")
+    original_owner = handshake.stat().st_uid
+    monkeypatch.setattr(shim, "SHIM_SCENARIO_PATH", control)
+    action = yaml.safe_load((ROOT / ".github/actions/testbed-batch/action.yml").read_text())
+    step = next(s for s in action["runs"]["steps"] if s.get("name") == "Restore host shim control access")
+    probe = step["run"].split("python - <<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    control.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            exec(compile(probe, "workflow-host-shim-probe", "exec"), {})
+    finally:
+        control.chmod(0o644)
+    exec(compile(probe, "workflow-host-shim-probe", "exec"), {})
+    assert control.read_text() == "fix_existing_pr\n"
+    assert handshake.read_bytes() == b"retained launch evidence"
+    assert handshake.stat().st_uid == original_owner
