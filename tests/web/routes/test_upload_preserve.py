@@ -601,3 +601,35 @@ def test_upload_zip_with_duplicate_entry_earlier_non_utf8(
     assert (repo_dir / "tasks" / "PR-322.md").read_text() == _historical_task_text(
         "PR-322", status="DONE", title="Already merged",
     )
+
+
+@pytest.mark.parametrize(
+    "stored,incoming,expected",
+    [
+        (
+            "---\nstatus: DONE\nnotes: a long\n  rationale\n---\nbody\n",
+            "---\nstatus: TODO\nnotes: a long rationale\n---\nbody\n",
+            True,
+        ),
+        ("---\nstatus: DONE\nnotes: old\n---\nbody\n", "---\nstatus: TODO\nnotes: new\n---\nbody\n", False),
+        ("---\nstatus: DONE\n---\nold\n", "---\nstatus: TODO\n---\nnew\n", False),
+        ("---\n[]\n---\nbody\n", "---\n{}\n---\nbody\n", False),
+        ("---\na: [\n---\nbody\n", "---\na: 1\n---\nbody\n", False),
+        ("plain old", "plain new", False),
+    ],
+)
+def test_upload_replay_frontmatter_presentation_only(stored, incoming, expected):
+    assert upload_validation.task_spec_replay_matches(stored, incoming) is expected
+
+
+@pytest.mark.parametrize("value", ["true", "1.0", "'1'"])
+def test_upload_replay_does_not_conflate_yaml_scalar_types(value):
+    stored="---\nstatus: DONE\ncustom: 1\n---\nbody\n"
+    incoming=f"---\nstatus: TODO\ncustom: {value}\n---\nbody\n"
+    assert not upload_validation.task_spec_replay_matches(stored,incoming)
+
+
+def test_upload_replay_allows_mapping_order_but_retains_types():
+    stored="---\nstatus: DONE\ncustom: {a: 1, b: true}\n---\nbody\n"
+    incoming="---\ncustom: {b: true, a: 1}\nstatus: TODO\n---\nbody\n"
+    assert upload_validation.task_spec_replay_matches(stored,incoming)

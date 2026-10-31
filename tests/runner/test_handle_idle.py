@@ -4714,3 +4714,27 @@ def test_idle_all_resources_wait_then_quota_recovery_preserves_priority(
     runner.state.user_paused = False
     asyncio.run(runner.handle_idle())
     assert calls == [("PR-001", "claude")]
+
+
+def test_persisted_upload_rejection_does_not_repeat_idle_retry_notice(monkeypatch, tmp_path):
+    h._patch_subprocess(monkeypatch)
+    runner = h._make_runner()
+    runner.repo_path = str(tmp_path)
+    runner.state.state = PipelineState.IDLE
+    runner.sync_to_main = lambda: None
+    git_ops_module._git(runner.repo_path, "rev-parse", "HEAD")
+    manifest = json.dumps(
+        {
+            "files": ["PR-468.md"],
+            "admission_error": "PR-468: completed task replacement blocked",
+            "admission_base_sha": git_ops_module._git(runner.repo_path, "rev-parse", "HEAD").stdout.strip(),
+        }
+    )
+    runner.redis.store[f"upload:{runner.name}:pending"] = manifest
+    for _ in range(3):
+        asyncio.run(runner.handle_idle())
+        assert runner._idle_dispatch_deferred
+        assert runner.state.state == PipelineState.IDLE
+        assert runner.state.current_task is None
+    assert runner.redis.store[f"upload:{runner.name}:pending"] == manifest
+    assert not any("Pending upload failed" in event["message"] for event in runner.state.history)

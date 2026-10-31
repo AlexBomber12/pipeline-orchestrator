@@ -42,6 +42,7 @@ from src.web.services.upload_validation import (
     effective_recorded_completions,
     effective_task_headers,
     read_frontmatter_status,
+    task_spec_replay_matches,
     validate_effective_task_graph,
 )
 
@@ -53,6 +54,10 @@ def _uploaded_repo_path(filename: str) -> Path:
     if filename in {"AGENTS.md", "CLAUDE.md"}:
         return Path(filename)
     return Path("tasks") / filename
+
+
+class _UploadAdmissionBlocked(RuntimeError):
+    """A rejected batch needs corrected input, not another identical attempt."""
 
 
 class RepoOpsMixin:
@@ -281,6 +286,7 @@ return 0
         the recovery-failure path where the working tree may contain
         uncommitted crash-recovery work that must not be discarded.
         """
+        self._upload_admission_blocked = False
         key = upload_pending(self.name)
         try:
             raw = await self.redis.get(key)
@@ -304,6 +310,15 @@ return 0
             await self.redis.delete(key)
             await self._delete_upload_pending_count()
             return False
+
+        if manifest.get("admission_error"):
+            try:
+                base_sha = git_ops._git(self.repo_path, "rev-parse", "HEAD").stdout.strip()
+            except (subprocess.SubprocessError, OSError):
+                return None
+            if manifest.get("admission_base_sha") == base_sha:
+                self._upload_admission_blocked = True
+                return None
 
         staging_dir = Path(manifest["staging_dir"]) if "staging_dir" in manifest else Path("/data/uploads") / self.name
         filenames: list[str] = manifest.get("files", [])
@@ -376,7 +391,7 @@ return 0
             )
             graph_errors = validate_effective_task_graph(headers, merged_pr_ids=merged)
             if graph_errors:
-                raise RuntimeError(f"current task graph invalid: {graph_errors}")
+                raise _UploadAdmissionBlocked(f"current task graph invalid: {graph_errors}")
             replay_filenames: set[str] = set()
             for fname in stageable_filenames:
                 src = staging_dir / fname
@@ -387,10 +402,12 @@ return 0
                 dest = Path(self.repo_path) / _uploaded_repo_path(fname)
                 existing_text = dest.read_text(encoding="utf-8") if dest.is_file() else None
                 if existing_text is not None:
-                    if task_spec_content_hash(existing_text) == incoming_hash:
+                    if task_spec_replay_matches(existing_text, src.read_text(encoding="utf-8")):
                         replay_filenames.add(fname)
                         continue
-                    if read_frontmatter_status(existing_text) in {"DONE", "DOING"}:
+                    if read_frontmatter_status(existing_text) == "DONE":
+                        raise _UploadAdmissionBlocked(f"{task_id}: completed task replacement blocked")
+                    if read_frontmatter_status(existing_text) == "DOING":
                         raise RuntimeError(f"{task_id}: completed/active task replacement blocked")
                 accepted_hash = await get_task_spec_hash(self.redis, self.name, task_id)
                 if accepted_hash == incoming_hash:
@@ -417,7 +434,31 @@ return 0
                 set(task_hashes),
             )
             if completed:
-                raise RuntimeError(f"Recorded completion replacement blocked: {sorted(completed)}")
+                raise _UploadAdmissionBlocked(f"Recorded completion replacement blocked: {sorted(completed)}")
+        except _UploadAdmissionBlocked as exc:
+            # Keep rejected source bytes and the manifest, including across restart.
+            # A new upload creates a new manifest without this verdict. CAS prevents
+            # a late rejection from overwriting a concurrently submitted batch.
+            manifest["admission_error"] = str(exc)
+            try:
+                manifest["admission_base_sha"] = git_ops._git(
+                    self.repo_path, "rev-parse", "HEAD"
+                ).stdout.strip()
+                saved = await self.redis.eval(
+                    """if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end
+redis.call('set', KEYS[1], ARGV[2]); return 1""",
+                    1, key, raw, json.dumps(manifest),
+                )
+            except Exception:
+                logger.warning("%s: failed recording upload rejection", self.name)
+                return None
+            self._upload_admission_blocked = True
+            if saved:
+                self.log_event(
+                    f"[INFRA] Task upload blocked: {exc}. Staged files retained; "
+                    "upload a corrected batch to continue."
+                )
+            return None
         except Exception as exc:
             self.log_event(f"[INFRA] Upload admission blocked: {exc}.")
             return None

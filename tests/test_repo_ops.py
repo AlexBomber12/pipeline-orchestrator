@@ -62,6 +62,12 @@ class _FakeRedis:
     async def eval(self, script: str, numkeys: int, *args: Any) -> Any:
         if self.eval_error is not None:
             raise self.eval_error
+        if "redis.call('set', KEYS[1], ARGV[2])" in script:
+            key, expected, replacement = args
+            if self.store.get(key) != expected:
+                return 0
+            self.store[key] = replacement
+            return 1
         if args and len(args) >= 2 and self.eval_result:
             key = args[0]
             if numkeys >= 2:
@@ -1279,6 +1285,12 @@ def test_upload_conflict_keeps_entire_batch_staged(upload_git: _Runner, conflict
     before = task.read_bytes() if task.exists() else None
     history = dict(runner.redis.store)
     assert _run(runner.process_pending_uploads()) is None
+    if conflict == "done":
+        verdict = json.loads(runner.redis.store[key])
+        assert "completed task replacement blocked" in verdict.pop("admission_error")
+        assert verdict.pop("admission_base_sha")
+        assert verdict == json.loads(history[key])
+        history[key] = runner.redis.store[key]
     assert runner.redis.store == history
     assert staging.is_dir()
     assert (task.read_bytes() if task.exists() else None) == before
@@ -1409,3 +1421,161 @@ def test_pending_upload_rechecks_current_effective_graph(upload_git: _Runner, co
     assert (staging / "PR-001.md").read_bytes() == content.encode()
     assert (Path(runner.repo_path) / "tasks/PR-001.md").read_bytes() == before
     assert any("current task graph invalid" in event for event in runner.events)
+
+
+def test_status_writer_reflow_replay_publishes_sibling_without_touching_history(upload_git):
+    from src.queue_parser import write_frontmatter_status
+
+    runner = upload_git
+    task = Path(runner.repo_path) / "tasks/PR-001.md"
+    incoming = _upload_spec().replace("status: TODO\n", "status: TODO\nnotes: " + "a long rationale " * 12 + "\n")
+    task.write_text(incoming)
+    write_frontmatter_status(task, "DONE")
+    accepted = task.read_bytes()
+    assert task_spec_content_hash(accepted.decode()) != task_spec_content_hash(incoming)
+    git = repo_ops.git_ops._git
+    git(runner.repo_path, "add", ".")
+    git(runner.repo_path, "commit", "-m", "task completed")
+    git(runner.repo_path, "push", "origin", "main")
+    history = dict(runner.redis.store)
+    staging, key = _stage_upload(runner, incoming)
+    sibling = _upload_spec().replace("PR-001", "PR-002").replace("task-one", "task-two")
+    (staging / "PR-002.md").write_text(sibling)
+    manifest = json.loads(runner.redis.store[key])
+    manifest["files"].append("PR-002.md")
+    runner.redis.store[key] = json.dumps(manifest)
+    assert _run(runner.process_pending_uploads()) is True
+    assert task.read_bytes() == accepted
+    assert (task.parent / "PR-002.md").read_text() == sibling
+    for k, v in history.items():
+        assert runner.redis.store[k] == v
+    assert runner._crashed_task_pr_ids == {"PR-001"}
+    assert key not in runner.redis.store
+    assert git(runner.repo_path, "show", "origin/main:tasks/PR-001.md").stdout.encode() == accepted
+    assert git(runner.repo_path, "show", "origin/main:tasks/PR-002.md").stdout == sibling
+
+
+def test_blocked_upload_survives_restart_and_rechecks_changed_base(upload_git, monkeypatch):
+    runner = upload_git
+    task = Path(runner.repo_path) / "tasks/PR-001.md"
+    task.write_text(_upload_spec("DONE"))
+    incoming = _upload_spec(instruction="changed instructions")
+    staging, key = _stage_upload(runner, incoming)
+    assert _run(runner.process_pending_uploads()) is None
+    verdict = runner.redis.store[key]
+    assert len(runner.events) == 1
+    restarted = _Runner(Path(runner.repo_path).parent)
+    restarted.redis = runner.redis
+    monkeypatch.setattr(repo_ops, "get_merged_pr_ids", lambda *a: pytest.fail("unchanged batch revalidated"))
+    for _ in range(3):
+        assert _run(restarted.process_pending_uploads()) is None
+    assert restarted.events == []
+    assert restarted.redis.store[key] == verdict
+    assert (staging / "PR-001.md").read_text() == incoming
+    monkeypatch.setattr(repo_ops, "get_merged_pr_ids", lambda *a: set())
+    # A fetched base change can resolve a conflict; do not cache across it.
+    task.write_text(incoming)
+    git = repo_ops.git_ops._git
+    git(runner.repo_path, "add", ".")
+    git(runner.repo_path, "commit", "-m", "accepted corrected task")
+    git(runner.repo_path, "push", "origin", "main")
+    assert _run(restarted.process_pending_uploads()) is True
+    assert key not in runner.redis.store
+    assert not staging.exists()
+
+
+@pytest.mark.parametrize("race", [False, True])
+def test_blocked_upload_cas_never_overwrites_newer_batch(upload_git, race):
+    runner = upload_git
+    (Path(runner.repo_path) / "tasks/PR-001.md").write_text(_upload_spec("DONE"))
+    staging, key = _stage_upload(runner, _upload_spec(instruction="changed"))
+    original = runner.redis.store[key]
+
+    async def fail_or_race(*args):
+        if not race:
+            raise RuntimeError("Redis unavailable")
+        runner.redis.store[key] = "newer upload"
+        return 0
+
+    runner.redis.eval = fail_or_race
+    assert _run(runner.process_pending_uploads()) is None
+    assert runner.redis.store[key] == ("newer upload" if race else original)
+    assert staging.is_dir()
+    assert not any("Task upload blocked" in event for event in runner.events)
+
+
+def test_blocked_upload_base_read_failure_retains_source(upload_git, monkeypatch):
+    runner = upload_git
+    (Path(runner.repo_path) / "tasks/PR-001.md").write_text(_upload_spec("DONE"))
+    staging, key = _stage_upload(runner, _upload_spec(instruction="changed"))
+    assert _run(runner.process_pending_uploads()) is None
+    manifest = runner.redis.store[key]
+
+    def unavailable(*args, **kwargs):
+        raise subprocess.CalledProcessError(1, "git rev-parse")
+
+    monkeypatch.setattr(repo_ops.git_ops, "_git", unavailable)
+    assert _run(runner.process_pending_uploads()) is None
+    assert runner.redis.store[key] == manifest
+    assert staging.is_dir()
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_reflow_replay_preserves_exact_completion_receipt(upload_git, pending):
+    from src.queue_parser import write_frontmatter_status
+    from src.web.services.upload_validation import effective_recorded_completions
+
+    runner = upload_git
+    task = Path(runner.repo_path) / "tasks/PR-001.md"
+    incoming = _upload_spec().replace("status: TODO\n", "status: TODO\nnotes: " + "long rationale " * 14 + "\n")
+    task.write_text(incoming)
+    write_frontmatter_status(task, "DONE")
+    accepted = task.read_bytes()
+    git = repo_ops.git_ops._git
+    git(runner.repo_path, "add", ".")
+    git(runner.repo_path, "commit", "-m", "completed task")
+    sha = git(runner.repo_path, "rev-parse", "HEAD").stdout.strip()
+    (task.parent / "completions.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "repository": "repo",
+                "base_branch": "main",
+                "completions": {
+                    "PR-001": {
+                        "task_sha256": hashlib.sha256(accepted).hexdigest(),
+                        "merge_commit": sha,
+                        "pull_request": 1,
+                        "reason": "completed outside task branch",
+                    }
+                },
+            }
+        )
+    )
+    git(runner.repo_path, "add", ".")
+    git(runner.repo_path, "commit", "-m", "receipt")
+    git(runner.repo_path, "push", "origin", "main")
+    _, key = _stage_upload(runner, incoming)
+    assert effective_recorded_completions(
+        runner.repo_path,
+        "main",
+        {"PR-001"},
+        {} if pending else {"PR-001.md": incoming},
+        runner.redis.store[key] if pending else None,
+    ) == {"PR-001"}
+    assert _run(runner.process_pending_uploads()) is True
+    assert task.read_bytes() == accepted
+
+
+def test_upload_replay_receipt_reader_keeps_unrelated_unreadable_legacy_bytes(upload_git):
+    runner = upload_git
+    runner.state.current_queue = None
+    legacy = Path(runner.repo_path) / "tasks/PR-002.md"
+    legacy.write_bytes(b"\xff historical data")
+    git = repo_ops.git_ops._git
+    git(runner.repo_path, "add", ".")
+    git(runner.repo_path, "commit", "-m", "legacy bytes")
+    git(runner.repo_path, "push", "origin", "main")
+    _stage_upload(runner, _upload_spec(instruction="corrected task"))
+    assert _run(runner.process_pending_uploads()) is True
+    assert legacy.read_bytes() == b"\xff historical data"
