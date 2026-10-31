@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, replace
 from typing import Any
 
 import pytest
-from src.metrics import RunRecord
-from src.models import QueueTask, TaskStatus
+from src.metrics import MetricsStore, RunRecord, task_attempt_totals
+from src.models import InvocationSnapshot, QueueTask, TaskStatus
 from src.web import app as web_app
 from src.web.routes import repo_control
 
@@ -68,8 +69,11 @@ async def test_latest_failed_fix_is_visible(status):
                 run_phase="fix", exit_reason="error", outcome="failed", cause="CRASH"),
     ]))
     metrics = _views(context, status.value.lower())[0]["metrics"]
-    assert metrics == {"coder": "codex", "model": "gpt-5", "duration_ms": 12345,
-                       "fix_iterations": 2, "exit_reason": "error"}
+    assert metrics["duration_ms"] == 24690
+    assert metrics["fix_iterations"] == 2
+    assert metrics["telemetry"]["fix_iterations"]["status"] == "partial"
+    assert metrics["exit_reason"] == "error"
+    assert metrics["attempt_count"] == 2
     rendered = web_app.templates.get_template("components/tasks_panel.html").render(
         **context,
     )
@@ -87,7 +91,7 @@ async def test_recency_uses_end_time_then_run_id():
         result = await repo_control._recent_metrics_by_task_id(
             "example__alpha", MetricsRedis(ordered), ["PR-001"],
         )
-        assert result["PR-001"]["duration_ms"] == 20
+        assert result["PR-001"]["duration_ms"] == 60
 
 
 @pytest.mark.asyncio
@@ -131,13 +135,17 @@ async def test_unavailable_fields_are_not_defaulted(profile, duration):
     result = await repo_control._recent_metrics_by_task_id(
         "example__alpha", MetricsRedis([_record(profile_id=profile, duration_ms=duration)]), ["PR-001"],
     )
-    assert result["PR-001"]["duration_ms"] == duration
+    assert result["PR-001"]["duration_ms"] is None
     assert result["PR-001"]["model"] is None
     assert result["PR-001"]["coder"] == (profile or None)
     assert "cost" not in result["PR-001"]
 
 
 def _render_tasks_panel(task_metrics: dict[str, object] | None) -> str:
+    if task_metrics is not None:
+        base = task_attempt_totals([_record(telemetry_sources={"duration_ms": "clock", "fix_iterations": "counter"})])
+        base.update(task_metrics)
+        task_metrics = base
     template = web_app.templates.get_template("components/tasks_panel.html")
     return template.render(
         repo_name="example__alpha",
@@ -191,6 +199,65 @@ def test_template_distinguishes_missing_duration_from_zero(duration, expected):
         "coder": None, "model": None, "duration_ms": duration,
         "fix_iterations": 0, "exit_reason": "error",
     })
-    assert ("0s</span>" in rendered) is expected
+    assert (bool(re.search(r"0s\s*</span>", rendered))) is expected
     assert "0 fix" in rendered
     assert "$0" not in rendered
+
+
+async def test_writer_query_panel_includes_failed_fix_merged_and_legacy() -> None:
+    from tests.test_metrics import _FakeRedis
+
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    records = [
+        _record(run_id="failed", exit_reason="error", outcome="failed", cause="CRASH",
+                duration_ms=1000, fix_iterations=0, tokens_in=10, operator_intervention=True),
+        _record(run_id="fix", exit_reason="coding_complete", outcome="superseded",
+                run_phase="fix", duration_ms=2000, fix_iterations=2, tokens_in=20,
+                invocations=[InvocationSnapshot(
+                    plugin_id="codex", model_override=None, reasoning_effort_override=None,
+                    run_id="fix", attempt_index=2, phase="fix", fix_iteration=2,
+                )]),
+        _record(run_id="merged", duration_ms=3000, fix_iterations=1, tokens_in=30),
+        _record(run_id="legacy", duration_ms=None, fix_iterations=0, tokens_in=0),
+    ]
+    for record in records:
+        await store.save(record)
+    # Simulate an existing payload written before provenance was introduced.
+    payload = json.loads(redis.store["metrics:run:legacy"])
+    payload.pop("telemetry_sources")
+    redis.store["metrics:run:legacy"] = json.dumps(payload)
+    await store.save(_record(run_id="other-repo", repo_name="other", tokens_in=999))
+    await store.save(_record(run_id="other-task", task_id="PR-002", tokens_in=999))
+    context = await _panel([_task("PR-001", TaskStatus.DONE)], redis)
+    totals = _views(context, "done")[0]["metrics"]
+    assert totals["duration_ms"] == 6000
+    assert totals["tokens_in"] == 60
+    assert totals["fix_iterations"] == 2
+    assert totals["attempt_count"] == 4
+    rendered = web_app.templates.get_template("components/tasks_panel.html").render(**context)
+    for text in ("4 runs", "6s", "2 fix", "60 input tokens", "output tokens unknown",
+                 "partial; 3/4 runs known", "1 runs with operator intervention",
+                 "API price unavailable", "Subscription quota unavailable"):
+        assert text in rendered
+    assert "$0" not in rendered
+
+
+@pytest.mark.parametrize("measured", [False, True])
+async def test_writer_zero_provenance_reaches_view(measured):
+    from tests.test_metrics import _FakeRedis
+
+    redis = _FakeRedis()
+    fields = ("duration_ms", "fix_iterations", "tokens_in", "tokens_out")
+    record = _record(duration_ms=0, fix_iterations=0, tokens_in=0, tokens_out=0,
+                     telemetry_sources={field: "measurement" for field in fields} if measured else {})
+    await MetricsStore(redis).save(record)
+    context = await _panel([_task("PR-001", TaskStatus.ERROR)], redis)
+    totals = _views(context, "error")[0]["metrics"]
+    for field in fields:
+        assert totals[field] == (0 if measured else None)
+        assert totals["telemetry"][field]["status"] == ("complete" if measured else "unknown")
+    rendered = web_app.templates.get_template("components/tasks_panel.html").render(**context)
+    assert ("output tokens unknown" in rendered) is not measured
+    assert ("0 output tokens" in rendered) is measured
+    assert "API price unavailable" in rendered

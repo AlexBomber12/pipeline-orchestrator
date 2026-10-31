@@ -80,6 +80,10 @@ class RunRecord:
     # an allowance credit without erasing dispatched-attempt history.
     fix_recovery_baseline: int = 0
 
+    # Per-field provenance permits measured zero without reinterpreting legacy
+    # placeholder zeros as usage. Older payloads need no migration.
+    telemetry_sources: dict[str, str] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         self.invocations = [
             (
@@ -113,6 +117,52 @@ class RunRecord:
             raise ValueError(
                 "cause_subsource only valid when cause == 'ESCALATE'"
             )
+
+
+def task_attempt_totals(records: list[RunRecord]) -> dict[str, object]:
+    """Sum known telemetry across every run; partial sums are lower bounds.
+
+    Duration and tokens belong to each run, but FIX counters span continuation
+    records. Count each run's captured dispatches instead of inherited counters.
+    """
+    runs = {record.run_id: record for record in records}.values()
+    totals: dict[str, object] = {"attempt_count": len(runs)}
+    completeness = {}
+    for name in ("duration_ms", "fix_iterations", "tokens_in", "tokens_out"):
+        values = [
+            value for record in runs
+            if (value := (_run_fix_dispatches(record) if name == "fix_iterations"
+                          else getattr(record, name))) is not None
+            and value >= 0 and (value > 0 or record.telemetry_sources.get(name)
+                                or (name == "fix_iterations" and record.invocations))
+        ]
+        totals[name] = sum(values) if values else None
+        completeness[name] = {
+            "known_runs": len(values), "total_runs": len(runs),
+            "status": ("unknown" if not values else
+                       "complete" if len(values) == len(runs) else "partial"),
+        }
+    totals["telemetry"] = completeness
+    totals["operator_interventions"] = sum(r.operator_intervention for r in runs)
+    # RunRecord has no metered money or subscription quota source. These must
+    # never be inferred from tokens, profile names or operator interventions.
+    totals["metered_cost_usd"] = None
+    totals["subscription_quota"] = None
+    return totals
+
+
+def _run_fix_dispatches(record: RunRecord) -> int | None:
+    """Use dispatch evidence; a legacy FIX counter has no per-run baseline."""
+    if record.invocations:
+        # Iteration numbers identify dispatches within this run. Separate coding
+        # and Retry chains may legitimately reuse the same iteration numbers.
+        return len({snapshot.fix_iteration for snapshot in record.invocations
+                    if snapshot.phase == "fix"})
+    if record.run_phase == "fix":
+        return None
+    # Older coding records retained their FIX work in place, before separate
+    # continuation records were introduced. Their positive counters are local.
+    return record.fix_iterations
 
 
 class MetricsStore:
