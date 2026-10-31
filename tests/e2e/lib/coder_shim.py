@@ -19,6 +19,7 @@ SHIM_STARTED_PATH = Path(str(SHIM_SCENARIO_PATH) + ".started")
 VALID_SCENARIOS = {
     "success",
     "success_pending_ci",
+    "coding_capacity_once",
     "fix_existing_pr",
     "fix_existing_pr_pending_ci",
     "fix_published_wait",

@@ -241,6 +241,7 @@ class CodingMixin:
         if self._publication_matches_attempt(observed):
             attempt.pr_number = observed.number
             attempt.candidate = observed.to_pr_info()
+            await publication_lifecycle.retain_coding_publication(self, observed)
             await self._resolve_published_attempt(resolve_terminal=False)
             await self.publish_state()
 
@@ -605,7 +606,10 @@ class CodingMixin:
         3. ``_post_coder_resolution`` — CLI log save, exit classification,
            publication reconciliation and run record save.
         """
-        if await self._hold_unresolved_publication():
+        retained = self.state.publication_attempt
+        provider_resume = retained is not None and retained.provider_retry_ready
+        provider_snapshot = self.state.active_invocation if provider_resume else None
+        if not provider_resume and await self._hold_unresolved_publication():
             return
         self._stop_requested = False
         current_pr_id = (
@@ -618,8 +622,15 @@ class CodingMixin:
         # pick an ineligible coder that no later refresh can undo.
         await self._refresh_auth_status_cache()
         try:
-            coder_name, plugin = self._get_coder()
+            coder_name, plugin = (
+                self._get_coder(allow_exploration=False) if provider_resume else self._get_coder()
+            )
         except CoderSelectionUnavailable as exc:
+            if provider_resume:
+                await publication_lifecycle._defer_provider_observation(
+                    self, f"selected provider unavailable: {exc}",
+                )
+                return
             await self._transition_to_error(
                 str(exc),
                 publish=False,
@@ -635,14 +646,38 @@ class CodingMixin:
         plugin_run_kwargs = plugin.build_run_kwargs(
             daemon_config=self.app_config.daemon,
         )
-        self._start_current_run_record(coder_name, plugin_run_kwargs["model"])
+        if provider_snapshot is not None and provider_snapshot.plugin_id != coder_name:
+            await publication_lifecycle._park(
+                self, publication_lifecycle.PROVIDER_RECOVERY_CHANGED.replace("FIX", "CODING"),
+            )
+            return
+        if provider_snapshot is not None:
+            # Auth/selection awaits may outlive an operator's checkout change.
+            try:
+                problem = await publication_lifecycle.provider_retry_problem(self)
+            except Exception as exc:
+                await publication_lifecycle._defer_provider_observation(
+                    self, f"ownership observation unavailable: {type(exc).__name__}",
+                )
+                return
+            if problem is not None:
+                await publication_lifecycle._park(self, problem)
+                return
+            if await publication_lifecycle._operator_paused(self):
+                return
+            if not await self.usage_gate(proactive_coder=coder_name):
+                return
+        self._start_current_run_record(
+            coder_name, provider_snapshot.model_override if provider_snapshot is not None
+            else plugin_run_kwargs["model"],
+        )
 
         # Run the usage gate before the branch guard so an active
         # or renewed pause window is honored as PAUSED. If this ran
         # after the guard, a malformed task would short-circuit through
         # ``_transition_to_error`` and bypass the cooldown that
         # ``usage_gate`` is responsible for enforcing.
-        if not await self.usage_gate(proactive_coder=coder_name):
+        if provider_snapshot is None and not await self.usage_gate(proactive_coder=coder_name):
             await self._save_current_run_record("rate_limit")
             return
 
@@ -742,10 +777,11 @@ class CodingMixin:
                     f"{pr_id}: {exc}; stale marker cleared so recovery "
                     f"falls back to crash-branch on this run."
                 )
-        await self._prepare_current_run_record_dispatch_metadata(
-            task_hash=task_hash,
-            previous_task_hash=previous_task_hash,
-        )
+        if not provider_resume:
+            await self._prepare_current_run_record_dispatch_metadata(
+                task_hash=task_hash,
+                previous_task_hash=previous_task_hash,
+            )
 
         try:
             coder_kwargs = await self._prepare_coder_invocation(
@@ -754,6 +790,9 @@ class CodingMixin:
         except CoderUnavailable:
             return
 
+        if provider_snapshot is not None:
+            coder_kwargs["model"] = provider_snapshot.model_override
+            coder_kwargs["reasoning_effort"] = provider_snapshot.reasoning_effort_override
         self._write_active_pr_runtime_file(pr_id)
         self._write_expected_branch(target_branch)
         # Expected-branch cleanup belongs in a finally so the pre-push
@@ -851,6 +890,8 @@ class CodingMixin:
         breach_dir = self._current_breach_dir
         breach_run_id = self._current_breach_run_id
         breach_flag: dict[str, bool] = {"breached": False}
+        retained = self.state.publication_attempt
+        provider_resume = retained is not None and retained.provider_retry_ready
 
         base_branch = self.repo_config.branch or "main"
         publication_not_before = datetime.now(timezone.utc).replace(
@@ -865,6 +906,12 @@ class CodingMixin:
                 target_branch,
             )
         except Exception as exc:
+            if provider_resume:
+                await self._restore_current_run_record()
+                await publication_lifecycle._defer_provider_observation(
+                    self, f"publication baseline unavailable: {type(exc).__name__}",
+                )
+                return None
             self.log_event(
                 f"[CODING] Publication baseline unavailable for "
                 f"{target_branch!r}: {exc}; deferring coder invocation."
@@ -887,7 +934,16 @@ class CodingMixin:
                 "[CODING] Coder invocation deferred while credential login "
                 "owns its credential location."
             )
+            if provider_resume:
+                await self._restore_current_run_record()
             return None
+        if provider_resume:
+            # Discovery and credential deferrals are not coder dispatches.
+            # The provider proof already established this unchanged generation.
+            task_hash = task_spec_content_hash(task_body)
+            await self._prepare_current_run_record_dispatch_metadata(
+                task_hash=task_hash, previous_task_hash=task_hash,
+            )
         heartbeat: asyncio.Task[None] | None = None
         invocation_supervised_process: SupervisedProcess | None = None
         configured_process_callback = coder_kwargs.get(
@@ -922,6 +978,29 @@ class CodingMixin:
             self.state.publication_attempt.initial_branch_head_sha = await asyncio.to_thread(
                 _initial_branch_head_sha, self.repo_path, self.state.current_task.branch,
             )
+            retained = previous_publication_attempt
+            resume = retained is not None and retained.provider_retry_ready
+            self.state.publication_attempt.coding_task_body = task_body
+            if resume:
+                attempt = self.state.publication_attempt
+                attempt.provider_retries = retained.provider_retries
+                attempt.provider_retry_command_id = retained.provider_retry_command_id
+                attempt.provider_published_head_sha = retained.provider_published_head_sha
+                attempt.initial_branch_head_sha = retained.initial_branch_head_sha
+                attempt.baseline_numbers = retained.baseline_numbers
+                attempt.started_at = retained.started_at
+                attempt.pr_number, attempt.candidate = retained.pr_number, retained.candidate
+                attempt.coding_task_body = retained.coding_task_body
+                task_body = retained.coding_task_body + "\n\n" + (
+                    "PROVIDER RECOVERY -- CONTINUE THE SAME CODING TASK\n"
+                    "The provider failed. If a gate is unfinished, complete required validation for this HEAD. "
+                    "Preserve local commits and dirty changes. Do not reset, stash or clean the checkout. "
+                    + ("Continue on the existing task branch; do not create or recreate it. "
+                       if retained.expected_head_sha is not None else "Create the original task branch as usual. ")
+                    + "Look up the existing PR for this branch and reuse it if present; never create a duplicate. "
+                    "Publish only after successful validation and use the normal AUTO PR publication handoff. "
+                    "These recovery instructions replace the initial branch-creation step when it already exists."
+                )
             await self.publish_state()
             await self._checkpoint_current_run_record()
             heartbeat = asyncio.create_task(
@@ -975,6 +1054,7 @@ class CodingMixin:
                     target_branch=target_branch,
                     baseline_numbers=publication_baseline,
                     not_before=publication_not_before,
+                    **({"retained_attempt": previous_publication_attempt} if provider_resume else {}),
                 )
             )
             publication_monitors.append(monitor)
@@ -1301,8 +1381,12 @@ class CodingMixin:
         target_branch: str,
         baseline_numbers: set[int] | None,
         not_before: datetime,
+        retained_attempt: PublicationAttempt | None = None,
     ) -> gh_prs.BranchPublication | None:
-        """Observe a newly-created ready PR without blocking the event loop."""
+        """Observe publication; a resumed coder must finish validation naturally."""
+        if retained_attempt is not None:
+            baseline_numbers = retained_attempt.baseline_numbers
+            not_before = retained_attempt.started_at
         if baseline_numbers is None:
             await asyncio.wait({cli_task})
             return None
@@ -1332,7 +1416,12 @@ class CodingMixin:
                     expected_head_sha=local_head,
                 )
                 if candidate is not None:
-                    return candidate
+                    if retained_attempt is None:
+                        return candidate
+                    # A resumed invocation must finish validation naturally.
+                    # Observe its owned PR updates on the original discovery
+                    # floor, without using a ready PR to terminate this coder.
+                    await self._retain_observed_publication(candidate)
             await asyncio.sleep(self.app_config.daemon.fix_poll_interval_sec)
         return None
 
@@ -1590,6 +1679,11 @@ class CodingMixin:
             else:
                 await publication_lifecycle.record_exit(self, code, stdout, stderr)
         if code != 0 and not (publication and publication.cancelled_by_publication):
+            if (self.state.publication_attempt is not None
+                and self.state.publication_attempt.provider_error is not None):
+                # record_exit owns the pause and terminal attempt accounting.
+                # Remote absence must not delete the retained CODING branch.
+                return
             resolved = await self._resolve_published_attempt()
             if resolved and self.state.current_pr is None:
                 return

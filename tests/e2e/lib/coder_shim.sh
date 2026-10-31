@@ -170,7 +170,7 @@ wait_for_base_activity() {
     # local push alone can still put creation and the next push in one server
     # timestamp. Observe the base activity first, then separate the next push.
     local branch="$1" sha count poll
-    sha="$(git rev-parse HEAD)"
+    sha="${2:-$(git rev-parse HEAD)}"
     for ((poll=0; poll<30; poll++)); do
         count="$(gh api --method GET repos/AlexBomber12/pipeline-orchestrator-testbed/activity \
             -f "ref=refs/heads/${branch}" -f per_page=100 \
@@ -447,6 +447,73 @@ PYTHON
                     ;;
                 *) run_success "${pr}" "${branch}" ;;
             esac
+            ;;
+        coding_capacity_once)
+            # Fixture-owned journal outside the checkout survives the failed CLI.
+            printf '%s\t%s\n' "${pr}" "${branch}" >> "${PO_SHIM_SCENARIO_FILE}.capacity-calls"
+            if [[ "$(wc -l < "${PO_SHIM_SCENARIO_FILE}.capacity-calls")" -eq 1 ]]; then
+                git_setup_branch "${branch}"
+                mkdir -p tests
+                printf 'retained commit for %s\n' "${pr}" > tests/e2e-capacity-commit.txt
+                git add tests/e2e-capacity-commit.txt
+                git commit -m "${pr}: retain pre-capacity work"
+                git push -u origin "${branch}"
+                gh api -X POST "repos/AlexBomber12/pipeline-orchestrator-testbed/statuses/$(git rev-parse HEAD)" \
+                    -f state=pending -f context=e2e/watch-merge-gate >/dev/null
+                pr_url="$(ensure_pr_url "${branch}" "${pr}")"
+                # Read only the fixture Redis. Advance past A only after the
+                # real live publication monitor durably checkpoints ownership.
+                python - "${pr}" "${branch}" "$(git rev-parse HEAD)" "${PO_SHIM_SCENARIO_FILE}.capacity-proof" <<'PY'
+import json, os, pathlib, sys, time
+from redis import Redis
+task, branch, head, destination = sys.argv[1:]
+client = Redis.from_url(os.environ['REDIS_URL'])
+deadline = time.monotonic() + 30
+while time.monotonic() < deadline:
+    state = json.loads(client.get('pipeline:AlexBomber12__pipeline-orchestrator-testbed') or '{}')
+    attempt = state.get('publication_attempt') or {}
+    invocation = state.get('active_invocation') or {}
+    if ((state.get('current_task') or {}).get('pr_id') == task
+        and attempt.get('branch') == branch and attempt.get('provider_published_head_sha') == head
+        and attempt.get('run_id') == invocation.get('run_id')
+        and attempt.get('expected_head_sha') is None and attempt.get('exit_classification') is None):
+        pathlib.Path(destination).write_text(json.dumps({
+            'task': task, 'branch': branch, 'head': head,
+            'run_id': attempt['run_id'], 'pr': attempt['pr_number'],
+            'exit_classification': attempt['exit_classification'],
+        }) + '\n')
+        break
+    time.sleep(0.05)
+else:
+    raise AssertionError('live monitor did not checkpoint intermediate publication A')
+client.close()
+PY
+                printf 'retained unpublished followup for %s\n' "${pr}" > tests/e2e-capacity-followup.txt
+                git add tests/e2e-capacity-followup.txt
+                git commit -m "${pr}: retain unpublished followup after publication"
+                printf 'retained dirty work for %s\n' "${pr}" > tests/e2e-capacity-retained.txt
+                printf 'unfinished\n' > "${PO_SHIM_SCENARIO_FILE}.capacity-gate"
+                printf 'ERROR: Selected model is at capacity. Please try a different model.\n' >&2
+                exit 1
+            fi
+            # Never call git_setup_branch here: recovery must supply the same
+            # committed and untracked work, rather than recreate the task.
+            [[ "$(git branch --show-current)" == "${branch}" ]]
+            [[ "$(git show HEAD:tests/e2e-capacity-commit.txt)" == "retained commit for ${pr}" ]]
+            [[ "$(git show HEAD:tests/e2e-capacity-followup.txt)" == "retained unpublished followup for ${pr}" ]]
+            [[ "$(cat tests/e2e-capacity-retained.txt)" == "retained dirty work for ${pr}" ]]
+            [[ "$(cat "${PO_SHIM_SCENARIO_FILE}.capacity-gate")" == unfinished ]]
+            # Keep B unpublished until validation finishes; A is the verified
+            # earlier publication whose activity must precede the final push.
+            wait_for_base_activity "${branch}" "$(git rev-parse HEAD^)"
+            git add tests/e2e-capacity-retained.txt
+            write_marker_and_commit "${pr}"
+            printf 'completed-after-capacity\n' > "${PO_SHIM_SCENARIO_FILE}.capacity-gate"
+            git push -u origin "${branch}"
+            pr_url="$(ensure_pr_url "${branch}" "${pr}")"
+            gh api -X POST "repos/AlexBomber12/pipeline-orchestrator-testbed/statuses/$(git rev-parse HEAD)" \
+                -f state=pending -f context=e2e/watch-merge-gate >/dev/null
+            gh pr comment "${pr_url}" --body "@codex review"
             ;;
         exit_nonzero)
             # Fail with bound, clean work already preserved on the remote base.
