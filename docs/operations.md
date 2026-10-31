@@ -978,3 +978,146 @@ periodic bundles, crash-backup refs, status Git writes or diagnostic history.
 No obsolete runtime path is removed here. There are no deployment prerequisites
 for these tests/docs; actual restore implementation, secure provisioning and
 provider/deployment smoke remain separate operator-authorized release work.
+
+## PR-435: compatible form protection investigation (2026-10-30)
+
+Investigated source base `915f15ae2d4719c47de249995c76f900c657a017` using
+Python 3.12.15 and synthetic TestClient/ASGI requests only. No SERVER requests,
+production processes, runtime config, Redis, pins or security policy changed.
+The retained test from the interrupted invocation was completed, including Ruff
+fixture-import cleanup and direct ASGI stream checks; its earlier passes were
+not treated as completion evidence.
+
+### Advisory and application input paths
+
+The official [Starlette advisory GHSA-82w8-qh3p-5jfq](https://github.com/Kludex/starlette/security/advisories/GHSA-82w8-qh3p-5jfq)
+(CVE-2026-54283) affects `>=0.4.1,<1.3.1`; 1.3.1 enforces URL-encoded
+`max_fields` and `max_part_size`. The current 0.49.3 parser ignores these limits
+for URL-encoded bodies. Multipart parser limits do not protect that input type.
+
+`src/web/app.py` installs the operator heartbeat middleware, which does not bound
+request bodies. Explicit `request.form()` consumers in `src/web/routes/settings.py`
+are webhook testing, daemon coder settings, HTMX device-login start and allow-listed
+config-field editing. FastAPI also parses `Form` parameters in settings,
+repo_control and onboarding; uploads uses `UploadFile` plus `Form(subject)`.
+Consequently a route-local `request.form(max_fields=...)` edit on the existing
+pins cannot close the advisory. The regression uses both the explicit parser
+route `POST /settings/webhook/test` and implicit FastAPI parsing on
+`PUT /settings/daemon`, with the real app/lifespan/heartbeat and existing upload
+fixtures. Config/upload bytes are temporary and Redis is the fixture double.
+
+### Disposable matrix and reproducible commands
+
+Each environment was created with `python -m venv /tmp/pr435-{pins,upgrade}`.
+The pins environment installed `requirements.txt`; the upgrade environment
+installed a temporary copy changing only FastAPI to 0.162.0 and Starlette to
+1.3.1. Both installed `pytest==8.4.2 pytest-asyncio pytest-cov ruff` and passed
+`python -m pip check`. No installed application environment was upgraded.
+
+| Installed package | Pinned environment | Upgrade environment |
+| --- | --- | --- |
+| fastapi | 0.120.4 | 0.162.0 |
+| starlette | 0.49.3 | 1.3.1 |
+| mcp | 1.27.0 | 1.27.0 |
+| python-multipart | 0.0.27 | 0.0.27 |
+| pydantic / httpx | 2.11.3 / 0.28.1 | 2.11.3 / 0.28.1 |
+| anyio / pydantic-settings | 4.15.1 / 2.16.2 | 4.15.1 / 2.16.2 |
+| pytest / pytest-asyncio | 8.4.2 / 1.4.1 | 8.4.2 / 1.4.1 |
+
+Use each environment's `bin/python` for these commands:
+
+```sh
+python -m pytest tests/test_form_limits_contract.py -q
+python -m pytest tests/test_form_limits_contract.py tests/test_settings.py tests/test_upload.py tests/mcp tests/test_mcp_main.py tests/web/routes/test_settings_webhook.py tests/web/routes/test_settings_spend_ceiling.py -q
+```
+
+The focused module passed 20 tests in each environment. The broader selection
+passed 579 tests on pins; the upgrade passed 575 and failed four existing tests:
+`test_put_repo_empty_review_timeout_clears_override`,
+`test_put_repo_clear_review_timeout_override_lets_daemon_default_apply`,
+`test_registered_plugin_round_trips_through_every_coder_mutation_endpoint`, and
+`test_repo_coder_override_clear` (all in `tests/test_settings.py`). Empty form
+values left timeout/coder overrides set instead of clearing/inheriting them;
+the configured-plugin automatic-selection HTML assertion also failed.
+Application/MCP imports and ordinary settings/upload requests succeeded, but
+this upgrade candidate is **not compatible** with the existing request contract.
+These candidate-only failures are investigation evidence, not waived local gates.
+
+FastAPI 0.120.4's installed metadata requires `starlette>=0.40.0,<0.50.0`;
+FastAPI 0.162.0 requires `starlette>=0.46.0`. A disposable
+`python -m pip install --dry-run fastapi==0.120.4 starlette==1.3.1` failed with
+`ResolutionImpossible`, confirming that an independent Starlette bump violates
+current dependency constraints. A broader framework migration needs its own
+compatibility work; this investigation neither selects new production pins nor
+claims every possible compatible version pair has been exhausted.
+
+### Selected minimal proposal and protection evidence
+
+Select a small outer ASGI preflight for URL-encoded forms on the current web
+stack. The test-only `CandidateFormGuard` bounds received body bytes to 64 KiB
+and raw fields to 1000, returning 413 before parsing. This is a proposed stricter
+application contract, not an installed fix. It counts actual stream bytes,
+ignores Content-Length for admission, handles charset parameters, preserves
+encoded delimiters, and replays accepted bytes once. Empty segments count
+conservatively. Multipart bypasses this guard and keeps existing upload/parser
+limits; JSON and non-HTTP traffic also bypass it.
+
+On both real route shapes the unguarded pins accept a 1 MiB-plus-one-byte value
+and 1001 fields (200); the upgrade rejects both (400). The candidate rejects
+64 KiB-plus bodies and 1001 fields (413), including missing or false short
+Content-Length. A patched parser spy fails if rejected input reaches parsing.
+Direct ASGI tests additionally prove multi-message rejection without draining a
+suffix; TestClient alone may coalesce chunks. Exact byte/field boundaries,
+escaped delimiters and disconnect handling pass. Ordinary daemon settings persist
+45 seconds, an empty webhook target remains usable without network traffic, and
+multipart task upload stages the exact fixture bytes with and without the guard.
+
+This bounds retained preflight bytes and parsing work per accepted request, not
+total concurrent connections, slow clients or server transport allocations. An
+ASGI server may deliver an already-large chunk; the guard rejects before copying
+it. Proxy/server concurrency/timeouts remain separate deployment concerns.
+
+Separately estimated implementation delta: about 70 production lines in an
+existing web boundary plus app wiring (2 production files), 100 test lines and
+20 documentation lines (about 190 additions/deletions across 4 files). Reuse this
+prototype and existing fixtures; add production middleware ordering, non-form
+passthrough, duplicate-header and accepted multi-chunk replay tests before
+shipping. Replace reliance on ineffective URL-encoded parser defaults with this
+single admission boundary; retain parser calls, multipart limits and heartbeat.
+No runtime code is removed or migrated here. A later fully compatible framework
+upgrade can replace the temporary guard after preserving its application limits.
+Implementation/release and deployment smoke require separate work; this PR's
+source-only tests/docs have no deployment prerequisites and fix no live service.
+
+### MCP applicability by enabled features
+
+`src/mcp/server.py` uses FastMCP Streamable HTTP with installed defaults
+`stateless_http=False`, `auth=None`. No source calls `enable_tasks` or registers
+experimental task handlers: [GHSA-hvrp-rf83-w775](https://github.com/modelcontextprotocol/python-sdk/security/advisories/GHSA-hvrp-rf83-w775)
+(fixed 1.27.2) is not enabled by this application despite the affected 1.27.0 pin.
+
+[GHSA-jpw9-pfvf-9f58](https://github.com/modelcontextprotocol/python-sdk/security/advisories/GHSA-jpw9-pfvf-9f58)
+(fixed 1.27.2) concerns authenticated stateful HTTP session ownership. The local
+listener has no SDK bearer authentication. The optional remote listener wraps
+stateful MCP in custom Cloudflare Access middleware: it validates JWT signature,
+issuer and audience but discards the returned identity and does not bind a
+session to that identity. Do not infer per-user session isolation from this
+wrapper or an SDK bump; custom-auth principal binding needs a separate scoped
+review/test before making that guarantee.
+
+[GHSA-w4fh-qvv9-3v23](https://github.com/modelcontextprotocol/python-sdk/security/advisories/GHSA-w4fh-qvv9-3v23)
+(fixed 1.30.0 with additional configuration) targets SDK bearer audience checks,
+which are not configured here. The custom verifier already supplies explicit
+issuer/audience checks; a version-only finding is insufficient.
+
+Conversely, stateful HTTP session retention in
+[GHSA-84m7-p3x7-pcfv](https://github.com/modelcontextprotocol/python-sdk/security/advisories/GHSA-84m7-p3x7-pcfv)
+(fixed 1.30.0) and HTTP body allocation in
+[GHSA-fmmv-w9g8-j3gc](https://github.com/modelcontextprotocol/python-sdk/security/advisories/GHSA-fmmv-w9g8-j3gc)
+(fixed 1.29.1) have relevant enabled transport paths. Authentication restricts
+admission but does not bound sessions per admitted client. No production gateway
+body cap or live reachability was verified. The proposed web form guard does not
+cover the separate MCP JSON listener. Track MCP transport limits and principal
+binding as separate maintenance; no MCP upgrade or auth-policy change is made
+here. Existing MCP tests use controlled transports/synthetic assertions and do
+not prove provider access, real-account security or deployed gateway behavior.

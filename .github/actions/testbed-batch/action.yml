@@ -1,0 +1,212 @@
+name: Testbed integration batch
+description: Run one complete, disjoint e2e batch with fresh scoped author and reviewer tokens.
+inputs:
+  batch:
+    description: One of the three module batches (1, 2, 3).
+    required: true
+  app-id:
+    description: Existing testbed author App ID.
+    required: true
+  private-key:
+    description: Existing testbed author App private key; never mounted in containers.
+    required: true
+  reviewer-app-id:
+    description: Existing independent reviewer App ID.
+    required: true
+  reviewer-private-key:
+    description: Existing independent reviewer App private key; never mounted in containers.
+    required: true
+runs:
+  using: composite
+  steps:
+  - name: Confirm the preceding batch's owned test stack is stopped
+    shell: bash
+    run: docker compose -f docker-compose.test.yml down -v
+
+  - name: Reclaim only this job's stopped test-data directory
+    shell: bash
+    run: |
+      mkdir -p tests/e2e/data
+      sudo chown -R "$(id -u):$(id -g)" tests/e2e/data
+
+  - id: testbed-token
+    uses: actions/create-github-app-token@v1
+    with:
+      app-id: ${{ inputs.app-id }}
+      private-key: ${{ inputs.private-key }}
+      owner: AlexBomber12
+      repositories: pipeline-orchestrator-testbed
+
+  - name: Require independent reviewer App credentials
+    env:
+      HAS_REVIEWER_APP_ID: ${{ inputs.reviewer-app-id != '' }}
+      HAS_REVIEWER_APP_PRIVATE_KEY: ${{ inputs.reviewer-private-key != '' }}
+    shell: bash
+    run: |
+      if [[ "$HAS_REVIEWER_APP_ID" != "true" || "$HAS_REVIEWER_APP_PRIVATE_KEY" != "true" ]]; then
+        echo "::error::Missing TESTBED_REVIEWER_APP_ID or TESTBED_REVIEWER_APP_PRIVATE_KEY; see docs/ci-setup.md"
+        exit 1
+      fi
+
+  - id: testbed-reviewer-token
+    uses: actions/create-github-app-token@v1
+    with:
+      app-id: ${{ inputs.reviewer-app-id }}
+      private-key: ${{ inputs.reviewer-private-key }}
+      owner: AlexBomber12
+      repositories: pipeline-orchestrator-testbed
+
+  - name: Verify gh auth
+    env:
+      GH_TOKEN: ${{ steps.testbed-token.outputs.token }}
+    shell: bash
+    run: gh api repos/AlexBomber12/pipeline-orchestrator-testbed --jq .full_name
+
+  - name: Prepare integration reviewer config
+    id: prepare-test-reviewer
+    env:
+      GH_TOKEN: ${{ steps.testbed-reviewer-token.outputs.token }}
+      TESTBED_REVIEWER_APP_SLUG: ${{ steps.testbed-reviewer-token.outputs.app-slug }}
+    shell: bash
+    run: |
+      python scripts/prepare_test_reviewer_config.py \
+        --app-slug "$TESTBED_REVIEWER_APP_SLUG" \
+        --config config.test.yml \
+        --github-output "$GITHUB_OUTPUT"
+
+  - name: Install shared integration config
+    env:
+      TESTBED_STATUS_APP_SLUG: ${{ steps.testbed-token.outputs.app-slug }}
+      TESTBED_STATUS_APP_ID: ${{ inputs.app-id }}
+    shell: bash
+    run: |
+      python scripts/prepare_test_config.py config.test.yml tests/e2e/data/config.test.yml \
+        --status-app-slug "$TESTBED_STATUS_APP_SLUG" \
+        --status-app-id "$TESTBED_STATUS_APP_ID"
+      # Host pytest and UID-1000 containers both atomically replace files here.
+      chmod 0777 tests/e2e/data
+
+  - name: Initialize codex-auth-test volume
+    shell: bash
+    run: bash scripts/init-test-volume.sh
+
+  - name: Seed gh auth for in-container shim
+    env:
+      TESTBED_TOKEN: ${{ steps.testbed-token.outputs.token }}
+    shell: bash
+    run: |
+      mkdir -p tests/e2e/data/auth/gh tests/e2e/data/repos tests/e2e/data/uploads
+      cat > tests/e2e/data/auth/gh/hosts.yml <<EOF
+      github.com:
+          user: x-access-token
+          oauth_token: ${TESTBED_TOKEN}
+          git_protocol: https
+      EOF
+      cat > tests/e2e/data/auth/.gitconfig <<EOF
+      [url "https://x-access-token:${TESTBED_TOKEN}@github.com/"]
+          insteadOf = https://github.com/
+      EOF
+      chmod 600 tests/e2e/data/auth/gh/hosts.yml
+      chmod 600 tests/e2e/data/auth/.gitconfig
+      mkdir -p tests/e2e/data/events
+      # Previous batches also retain analytics/audit state and lock files.
+      # Restore all container-written data, including future state directories.
+      sudo chown -R 1000:1000 tests/e2e/data
+
+  - name: Restore host shim control access
+    shell: bash
+    run: |
+      # pytest writes the scenario; containers only read it. Retained shim
+      # handshakes and runtime state remain owned by the container UID.
+      control=tests/e2e/data/shim-scenario
+      if [[ -f "$control" ]]; then
+        sudo chown "$(id -u):$(id -g)" "$control"
+      fi
+      python - <<'PY'
+      from tests.e2e.lib.coder_shim import coder_shim
+      with coder_shim("success"):
+          pass
+      PY
+
+  - name: Bring up test stack
+    shell: bash
+    run: docker compose -f docker-compose.test.yml up -d --wait
+
+  - name: Verify shim is mounted in daemon-test
+    shell: bash
+    run: |
+      actual=$(docker compose -f docker-compose.test.yml exec -T daemon-test which claude)
+      if [ "$actual" != "/usr/local/bin/claude" ]; then
+        echo "ERROR: shim not mounted; daemon-test which claude returned: $actual" >&2
+        echo "Expected /usr/local/bin/claude. Check docker-compose.test.yml volume mounts and PATH env." >&2
+        exit 1
+      fi
+      echo "OK: shim mounted at $actual"
+
+  - name: Verify prepared reviewer config in test services
+    env:
+      EXPECTED_REVIEWER_ID: ${{ steps.prepare-test-reviewer.outputs.user-id }}
+      EXPECTED_REVIEWER_LOGIN: ${{ steps.prepare-test-reviewer.outputs.login }}
+      EXPECTED_STATUS_APP_ID: ${{ inputs.app-id }}
+      EXPECTED_STATUS_APP_SLUG: ${{ steps.testbed-token.outputs.app-slug }}
+    shell: bash
+    run: |
+      for service in web-test daemon-test; do
+        docker compose -f docker-compose.test.yml exec -T \
+          -e "EXPECTED_REVIEWER_ID=$EXPECTED_REVIEWER_ID" \
+          -e "EXPECTED_REVIEWER_LOGIN=$EXPECTED_REVIEWER_LOGIN" \
+          -e "EXPECTED_STATUS_APP_ID=$EXPECTED_STATUS_APP_ID" \
+          -e "EXPECTED_STATUS_APP_SLUG=$EXPECTED_STATUS_APP_SLUG" \
+          "$service" python -c '
+      import os
+      from src.config import load_config
+
+      expected_id = int(os.environ["EXPECTED_REVIEWER_ID"])
+      expected_login = os.environ["EXPECTED_REVIEWER_LOGIN"].casefold()
+      identities = load_config().daemon.trusted_reviewer_identities
+      if not any(
+          identity.user_id == expected_id
+          and identity.login.casefold() == expected_login
+          for identity in identities
+      ):
+          raise SystemExit("prepared reviewer identity is missing")
+      repos = load_config().repositories
+      expected_producers = {
+          "app:" + os.environ["EXPECTED_STATUS_APP_ID"],
+          "user:" + os.environ["EXPECTED_STATUS_APP_SLUG"] + "[bot]",
+      }
+      if len(repos) != 1 or set(repos[0].ci_fix_trusted_statuses.get("e2e/watch-merge-gate", [])) != expected_producers:
+          raise SystemExit("prepared CI status producer policy is missing")
+      '
+        echo "OK: $service loaded the prepared reviewer identity"
+      done
+
+  - name: Verify retained analytics and audit are writable by the container
+    shell: bash
+    run: |
+      docker compose -f docker-compose.test.yml exec -T daemon-test python -c '
+      from pathlib import Path
+      from tests.e2e.lib.pytest_batches import verify_runtime_writes
+      verify_runtime_writes(Path("/data"))
+      print("Container can create and append retained analytics/audit state")
+      '
+
+  - name: Run e2e tests
+    env:
+      GH_TOKEN: ${{ steps.testbed-token.outputs.token }}
+      TESTBED_REVIEWER_TOKEN: ${{ steps.testbed-reviewer-token.outputs.token }}
+    shell: bash
+    run: >-
+      pytest tests/e2e/ -v --e2e-batch=${{ inputs.batch }}
+      --junitxml=tests/e2e/evidence/batch-${{ inputs.batch }}-results.xml
+
+  - name: Capture batch stack logs on failure
+    if: failure()
+    shell: bash
+    run: |
+      docker compose -f docker-compose.test.yml logs --no-color --tail 200 > tests/e2e/evidence/batch-${{ inputs.batch }}-stack-logs.txt 2>&1 || true
+
+  - name: Tear down this batch's test stack
+    if: always()
+    shell: bash
+    run: docker compose -f docker-compose.test.yml down -v

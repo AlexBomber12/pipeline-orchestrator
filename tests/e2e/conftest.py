@@ -14,6 +14,8 @@ import pytest
 import requests
 from src.config import update_daemon_config, update_repository
 
+from tests.e2e.lib.pytest_batches import pytest_addoption as pytest_addoption
+from tests.e2e.lib.pytest_batches import pytest_collection_modifyitems as pytest_collection_modifyitems
 from tests.e2e.lib.review_api import ReviewApi
 from tests.e2e.lib.testbed_reset import clear_testbed_redis_state, reset_testbed_full
 
