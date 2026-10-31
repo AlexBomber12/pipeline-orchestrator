@@ -2034,6 +2034,20 @@ async def coding_provider(lifecycle, monkeypatch):
                 assert 'Create the original task branch as usual' in kwargs['task_body']
             else:
                 assert 'do not create or recreate it' in kwargs['task_body']
+        if provider.get('publication_chain') and len(calls) == 2:
+            provider['resumed_cli_running'] = True
+            provider['publication_seen'] = asyncio.Event()
+            provider['intermediate_head'] = git(repo, 'rev-parse', 'HEAD')
+            git(repo, 'push', 'origin', 'pr-001')
+            provider['head'] = provider['intermediate_head']
+            await asyncio.wait_for(provider['publication_seen'].wait(), timeout=5)
+            # Existing ready PR evidence must not terminate resumed validation.
+            await asyncio.sleep(0.1)
+            (repo / 'second-local-followup').write_text('second unpublished followup retained\n')
+            git(repo, 'add', 'second-local-followup')
+            git(repo, 'commit', '-m', 'second unpublished followup after push')
+            provider['retained_head'] = git(repo, 'rev-parse', 'HEAD')
+            provider['resumed_cli_running'] = False
         if provider['fail']:
             return 1, '', provider.get('failure_text', (
                 'ERROR: Selected model is at capacity. Please try a different model.\n'
@@ -2727,3 +2741,81 @@ async def test_coding_monitor_retains_intermediate_publication(
     assert sorted(i.phase for record in records for i in record.invocations) == ['coding', 'coding']
     assert all(record.fix_iterations == 0 for record in records)
     assert await fresh._metrics_store.get(first.run_id) == first
+
+
+@pytest.mark.parametrize('single_error_exit', [False, True])
+@pytest.mark.parametrize('operator_retry', [False, True])
+async def test_repeated_coding_publication_retains_each_owned_head(
+    coding_provider, monkeypatch, single_error_exit, operator_retry,
+):
+    from src.daemon.retry_commands import RetryDispatch
+
+    runner, provider, repo, remote, configure = coding_provider
+    provider.update(work='intermediate', publication_chain=True, publication_seen=asyncio.Event(),
+                    cleanup_during_resumed_cli=[])
+
+    def setup(r):
+        configure(r)
+        r.repo_config.feature_flags.use_single_error_exit = single_error_exit
+        r.app_config.daemon.fix_poll_interval_sec = 1
+        r.app_config.daemon.coder_terminate_grace_sec = 0.05
+        async def terminate():
+            # Normal EOF cleanup remains required. Publication must not signal
+            # the coder while its resumed validation is still executing.
+            provider['cleanup_during_resumed_cli'].append(provider.get('resumed_cli_running', False))
+            return True
+        r._terminate_current_coder = AsyncMock(side_effect=terminate)
+        checkpoint = r.publish_state
+
+        async def observed_checkpoint():
+            await checkpoint()
+            attempt = r.state.publication_attempt
+            if (attempt is not None and attempt.candidate is not None
+                and attempt.candidate.head_sha == provider.get('intermediate_head')
+                and attempt.provider_published_head_sha == provider.get('intermediate_head')):
+                provider['publication_seen'].set()
+
+        r.publish_state = observed_checkpoint
+        return r
+
+    setup(runner)
+    await runner.handle_coding()
+    original = await runner._metrics_store.get(runner.state.active_invocation.run_id)
+    a, b = provider['intermediate_head'], git(repo, 'rev-parse', 'HEAD')
+    runner = await restart(runner, setup)
+    runner._recovered = True
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    assert await publication.resume_provider_failure(runner)
+    attempt = runner.state.publication_attempt
+    c = git(repo, 'rev-parse', 'HEAD')
+    assert runner.state.state == PipelineState.PAUSED and c != b
+    assert attempt.expected_head_sha == c and attempt.provider_published_head_sha == b
+    assert git(repo, 'rev-parse', c + '^') == b and git(repo, 'rev-parse', b + '^') == a
+    assert git(remote, 'rev-parse', 'refs/heads/pr-001') == b
+    assert not any(provider['cleanup_during_resumed_cli'])
+    before = await runner._metrics_store.list_task_runs(runner.name, 'PR-001')
+    assert len(before) == 2 and all(r.ended_at and r.outcome == 'paused' for r in before)
+    runner = await restart(runner, setup)
+    runner._recovered = True
+    Clock.value = runner.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    if operator_retry:
+        runner.state.publication_attempt.provider_retries = 3
+        assert await publication.resume_provider_failure(runner)
+        assert runner.state.state == PipelineState.ERROR
+        await enqueue_bound_provider_retry(runner, repo)
+        assert await runner._consume_retry_command() == RetryDispatch.HANDLED
+    provider['fail'] = False
+    assert await publication.resume_provider_failure(runner)
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.number == 646 and len(provider['calls_to_coder']) == 3
+    assert len(provider['requests']) == 1
+    assert git(repo, 'show', 'HEAD:second-local-followup') == 'second unpublished followup retained'
+    assert git(repo, 'rev-parse', 'HEAD^') == c
+    assert (repo / 'artifacts/ci.log').read_text() == 'gate completed successfully'
+    records = await runner._metrics_store.list_task_runs(runner.name, 'PR-001')
+    assert sorted(r.attempt_index for r in records) == [1, 2, 3]
+    assert all(r.ended_at and r.fix_iterations == 0 for r in records)
+    assert sorted(i.phase for r in records for i in r.invocations) == ['coding'] * 3
+    for record in before:
+        assert await runner._metrics_store.get(record.run_id) == record
+    assert await runner._metrics_store.get(original.run_id) == original

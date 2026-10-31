@@ -141,6 +141,9 @@ head. If the coder then adds an unpublished commit before a capacity failure,
 exit freezes the later local head without discarding the earlier publication
 proof. Restart and bound Retry can continue against that same owned remote head;
 an unproved ancestor or independently changed remote still parks recovery.
+On subsequent CODING attempts the same monitor retains the original discovery
+floor and observes updates to the owned PR without terminating the resumed coder.
+A ready PR cannot replace natural successful completion of the unfinished gate.
 
 CODING retains the canonical task text on the existing publication attempt. Its
 continuation preserves the original branch/PR discovery floor and uses a fresh

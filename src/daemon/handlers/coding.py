@@ -1054,6 +1054,7 @@ class CodingMixin:
                     target_branch=target_branch,
                     baseline_numbers=publication_baseline,
                     not_before=publication_not_before,
+                    **({"retained_attempt": previous_publication_attempt} if provider_resume else {}),
                 )
             )
             publication_monitors.append(monitor)
@@ -1380,8 +1381,12 @@ class CodingMixin:
         target_branch: str,
         baseline_numbers: set[int] | None,
         not_before: datetime,
+        retained_attempt: PublicationAttempt | None = None,
     ) -> gh_prs.BranchPublication | None:
-        """Observe a newly-created ready PR without blocking the event loop."""
+        """Observe publication; a resumed coder must finish validation naturally."""
+        if retained_attempt is not None:
+            baseline_numbers = retained_attempt.baseline_numbers
+            not_before = retained_attempt.started_at
         if baseline_numbers is None:
             await asyncio.wait({cli_task})
             return None
@@ -1411,7 +1416,12 @@ class CodingMixin:
                     expected_head_sha=local_head,
                 )
                 if candidate is not None:
-                    return candidate
+                    if retained_attempt is None:
+                        return candidate
+                    # A resumed invocation must finish validation naturally.
+                    # Observe its owned PR updates on the original discovery
+                    # floor, without using a ready PR to terminate this coder.
+                    await self._retain_observed_publication(candidate)
             await asyncio.sleep(self.app_config.daemon.fix_poll_interval_sec)
         return None
 
