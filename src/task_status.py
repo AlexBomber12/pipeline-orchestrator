@@ -78,7 +78,9 @@ def _resolve_merged_state(
     candidate_pr_ids = set(candidate_pr_ids)
     candidate_branches = {header.branch for header in headers if header.branch}
     try:
-        merged_branches = gh_pr_get_merged_branches(owner_repo, candidate_branches)
+        merged_branches = gh_pr_get_merged_branches(
+            owner_repo, candidate_branches, base_branch=base_branch,
+        )
         api_available = True
     except (
         GhPrMergedBranchesUnavailable,
@@ -90,7 +92,6 @@ def _resolve_merged_state(
         api_available = False
         log_event(f"[INFRA] gh pr list merged-branches probe failed: {exc}")
 
-    merged_pr_ids = get_merged_pr_ids(repo_path, base_branch, candidate_pr_ids)
     try:
         recorded = get_recorded_completions(
             repo_path, base_branch, owner_repo, candidate_pr_ids,
@@ -99,7 +100,7 @@ def _resolve_merged_state(
     except CompletionEvidenceUnavailable as exc:
         raise MergeStatusUnavailable(str(exc)) from exc
     return MergedState(
-        merged_pr_ids=set(merged_pr_ids) | recorded,
+        merged_pr_ids=recorded,
         merged_branches=set(merged_branches),
         api_available=api_available,
     )
@@ -133,6 +134,12 @@ def derive_task_status(
     """Derive task status from frontmatter suppression and GitHub merge state."""
     if task_header.frontmatter_status == "error":
         return TaskStatus.ERROR
+    # A current open PR can reuse a previously merged branch. Keep that
+    # generation attached rather than completing it from the older merge.
+    if find_matching_open_pr(
+        task_header.pr_id, task_header.branch, open_prs,
+    ) is not None:
+        return TaskStatus.DOING
     if (
         task_header.branch
         and task_header.branch in state.merged_branches
@@ -150,12 +157,6 @@ def derive_task_status(
         is not None
     ):
         return TaskStatus.DONE
-    if find_matching_open_pr(
-        task_header.pr_id,
-        task_header.branch,
-        open_prs,
-    ) is not None:
-        return TaskStatus.DOING
     if not state.api_available:
         raise MergeStatusUnavailable(
             f"GitHub merge status unavailable for {task_header.pr_id}; "
@@ -243,7 +244,7 @@ def get_merged_pr_ids(
     base_branch: str,
     candidate_pr_ids: Iterable[str] | None = None,
 ) -> set[str]:
-    """Return queue PR identifiers already present in ``origin/base_branch`` history."""
+    """Return base-history subject mentions, not proof of task completion."""
     candidate_set = {pr_id for pr_id in candidate_pr_ids or () if pr_id}
     if candidate_set:
         result = _scan_candidate_merged_pr_ids(

@@ -79,10 +79,10 @@ from src.queue_parser import (
 from src.subsource_registry import SuppressionReason
 from src.task_status import (
     MergeStatusUnavailable,
+    _load_task_header,
     _resolve_merged_state,
     derive_task_status,
     find_matching_open_pr,
-    get_merged_pr_ids,
 )
 
 logger = logging.getLogger(__name__)
@@ -584,19 +584,22 @@ class RecoveryMixin:
         on every daemon restart, redoing completed work and creating
         duplicate follow-up activity.
 
+        Use the shared branch/receipt contract, never task-ID commit subjects.
         Probe failures (missing ref, transient git error) report
         ``False`` so the caller falls through to the existing recovery
         paths instead of dropping a real interrupted DOING entry.
         """
         try:
-            merged = get_merged_pr_ids(
-                self.repo_path,
-                self.repo_config.branch,
-                {doing.pr_id},
+            header = getattr(self, "_recovery_task_headers", {}).get(doing.pr_id)
+            if header is None:
+                header = _load_task_header(doing, self.repo_path)
+            state = _resolve_merged_state(
+                self.repo_path, self.repo_config.branch, self.owner_repo,
+                {doing.pr_id}, [header], log_event=self.log_event,
             )
-        except (RuntimeError, OSError, subprocess.SubprocessError):
+            return derive_task_status(header, state, ()) == TaskStatus.DONE
+        except (RuntimeError, OSError, subprocess.SubprocessError, QueueValidationError):
             return False
-        return doing.pr_id in merged
 
     async def recover_state(self) -> bool:
         """Reconstruct state from task headers + GitHub.

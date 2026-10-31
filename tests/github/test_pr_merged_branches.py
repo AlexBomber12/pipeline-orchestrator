@@ -301,3 +301,18 @@ def test_subprocess_invocation_does_not_pass_R_flag_to_gh_api(
     assert "-R" not in captured_argv
     assert "owner/name" not in captured_argv[captured_argv.index("api") :]
     assert captured_argv[:3] == ["gh", "api", "graphql"]
+
+
+def test_merged_branch_query_is_scoped_to_configured_base(monkeypatch):
+    def run(args):
+        query = next(arg for arg in args if arg.startswith('query='))
+        assert 'baseRefName: $base' in query
+        assert '$base: String!' in query
+        assert 'base=release' in args
+        return {'data': {'repository': {'b0': {'nodes': [
+            {'headRefName': 'pr-404-current', 'mergedAt': '2026-10-31T00:00:00Z'},
+        ]}}}}
+    monkeypatch.setattr('src.github.gh_runner.run_gh', run)
+    assert gh_pr_get_merged_branches(
+        'octo/demo', ['pr-404-current'], base_branch='release',
+    ) == {'pr-404-current'}

@@ -254,20 +254,14 @@ def test_resolve_merged_state_api_primary(monkeypatch) -> None:
     header = _header("pr-085-status-from-git")
     seen: dict[str, object] = {}
 
-    def fake_merged_branches(repo: str, branches: set[str]) -> set[str]:
+    def fake_merged_branches(repo: str, branches: set[str], **kwargs) -> set[str]:
         seen["repo"] = repo
         seen["branches"] = set(branches)
+        assert kwargs["base_branch"] == "main"
         return {"pr-085-status-from-git"}
 
-    def fake_merged_pr_ids(
-        repo_path: str,
-        base_branch: str,
-        candidate_pr_ids,
-    ) -> set[str]:
-        seen["repo_path"] = repo_path
-        seen["base_branch"] = base_branch
-        seen["candidate_pr_ids"] = set(candidate_pr_ids)
-        return set()
+    def fake_merged_pr_ids(*args, **kwargs):
+        raise AssertionError("subject history must not be queried for completion")
 
     monkeypatch.setattr(
         "src.task_status.gh_pr_get_merged_branches",
@@ -291,9 +285,6 @@ def test_resolve_merged_state_api_primary(monkeypatch) -> None:
     assert seen == {
         "repo": "owner/repo",
         "branches": {"pr-085-status-from-git"},
-        "repo_path": "/repo",
-        "base_branch": "main",
-        "candidate_pr_ids": {"PR-085"},
     }
     assert derive_task_status(header, state, []) == TaskStatus.DONE
 
@@ -308,11 +299,11 @@ def test_derive_todo_when_merged_branch_matches_different_pr_id() -> None:
     assert status == TaskStatus.TODO
 
 
-def test_resolve_merged_state_git_log_fallback(monkeypatch) -> None:
+def test_resolve_merged_state_subjects_do_not_resolve_outage(monkeypatch) -> None:
     header = _header("pr-085-status-from-git")
     logs: list[str] = []
 
-    def fake_merged_branches(repo: str, branches: set[str]) -> set[str]:
+    def fake_merged_branches(repo: str, branches: set[str], **kwargs) -> set[str]:
         raise GhPrMergedBranchesUnavailable("graphql unavailable")
 
     monkeypatch.setattr(
@@ -333,20 +324,21 @@ def test_resolve_merged_state_git_log_fallback(monkeypatch) -> None:
         log_event=logs.append,
     )
 
-    assert state == _merged_state({"PR-085"}, api_available=False)
-    assert derive_task_status(header, state, []) == TaskStatus.DONE
+    assert state == _merged_state(api_available=False)
+    with pytest.raises(MergeStatusUnavailable):
+        derive_task_status(header, state, [])
     assert logs == [
         "[INFRA] gh pr list merged-branches probe failed: graphql unavailable"
     ]
 
 
-def test_resolve_merged_state_invalid_branch_falls_back_to_git_log(
+def test_resolve_merged_state_invalid_branch_defers(
     monkeypatch,
 ) -> None:
     header = _header("pr 085 invalid branch")
     logs: list[str] = []
 
-    def fake_merged_branches(repo: str, branches: set[str]) -> set[str]:
+    def fake_merged_branches(repo: str, branches: set[str], **kwargs) -> set[str]:
         raise ValueError("Invalid branch name: 'pr 085 invalid branch'")
 
     monkeypatch.setattr(
@@ -367,21 +359,22 @@ def test_resolve_merged_state_invalid_branch_falls_back_to_git_log(
         log_event=logs.append,
     )
 
-    assert state == _merged_state({"PR-085"}, api_available=False)
-    assert derive_task_status(header, state, []) == TaskStatus.DONE
+    assert state == _merged_state(api_available=False)
+    with pytest.raises(MergeStatusUnavailable):
+        derive_task_status(header, state, [])
     assert logs == [
         "[INFRA] gh pr list merged-branches probe failed: "
         "Invalid branch name: 'pr 085 invalid branch'"
     ]
 
 
-def test_resolve_merged_state_timeout_falls_back_to_git_log(
+def test_resolve_merged_state_timeout_defers(
     monkeypatch,
 ) -> None:
     header = _header("pr-085-status-from-git")
     logs: list[str] = []
 
-    def fake_merged_branches(repo: str, branches: set[str]) -> set[str]:
+    def fake_merged_branches(repo: str, branches: set[str], **kwargs) -> set[str]:
         raise subprocess.TimeoutExpired(cmd=["gh", "api"], timeout=30)
 
     monkeypatch.setattr(
@@ -402,8 +395,9 @@ def test_resolve_merged_state_timeout_falls_back_to_git_log(
         log_event=logs.append,
     )
 
-    assert state == _merged_state({"PR-085"}, api_available=False)
-    assert derive_task_status(header, state, []) == TaskStatus.DONE
+    assert state == _merged_state(api_available=False)
+    with pytest.raises(MergeStatusUnavailable):
+        derive_task_status(header, state, [])
     assert logs[0].startswith(
         "[INFRA] gh pr list merged-branches probe failed: "
         "Command '['gh', 'api']' timed out"
@@ -414,7 +408,7 @@ def test_resolve_merged_state_both_disagree_branch_wins(monkeypatch) -> None:
     header = _header("pr-262-megaraid-dashboard", pr_id="PR-262")
     monkeypatch.setattr(
         "src.task_status.gh_pr_get_merged_branches",
-        lambda repo, branches: {"pr-262-megaraid-dashboard"},
+        lambda repo, branches, **kwargs: {"pr-262-megaraid-dashboard"},
     )
     monkeypatch.setattr(
         "src.task_status.get_merged_pr_ids",
@@ -433,11 +427,11 @@ def test_resolve_merged_state_both_disagree_branch_wins(monkeypatch) -> None:
     assert derive_task_status(header, state, []) == TaskStatus.DONE
 
 
-def test_resolve_merged_state_both_disagree_pr_id_only(monkeypatch) -> None:
+def test_resolve_merged_state_subject_only_does_not_complete(monkeypatch) -> None:
     header = _header("pr-085-deleted-after-merge")
     monkeypatch.setattr(
         "src.task_status.gh_pr_get_merged_branches",
-        lambda repo, branches: set(),
+        lambda repo, branches, **kwargs: set(),
     )
     monkeypatch.setattr(
         "src.task_status.get_merged_pr_ids",
@@ -453,14 +447,14 @@ def test_resolve_merged_state_both_disagree_pr_id_only(monkeypatch) -> None:
         log_event=lambda event: None,
     )
 
-    assert derive_task_status(header, state, []) == TaskStatus.DONE
+    assert derive_task_status(header, state, []) == TaskStatus.TODO
 
 
 def test_resolve_merged_state_neither_returns_todo(monkeypatch) -> None:
     header = _header("pr-085-not-merged")
     monkeypatch.setattr(
         "src.task_status.gh_pr_get_merged_branches",
-        lambda repo, branches: set(),
+        lambda repo, branches, **kwargs: set(),
     )
     monkeypatch.setattr(
         "src.task_status.get_merged_pr_ids",
@@ -559,11 +553,11 @@ def test_dag_selector_uses_resolved_state(monkeypatch, tmp_path: Path) -> None:
     }
 
 
-def test_branch_field_empty_falls_back_to_pr_id(monkeypatch) -> None:
+def test_branch_field_empty_does_not_fall_back_to_subject(monkeypatch) -> None:
     header = _header("", pr_id="PR-085")
     seen_branches: list[set[str]] = []
 
-    def fake_merged_branches(repo: str, branches: set[str]) -> set[str]:
+    def fake_merged_branches(repo: str, branches: set[str], **kwargs) -> set[str]:
         seen_branches.append(set(branches))
         return set()
 
@@ -586,7 +580,7 @@ def test_branch_field_empty_falls_back_to_pr_id(monkeypatch) -> None:
     )
 
     assert seen_branches == [set()]
-    assert derive_task_status(header, state, []) == TaskStatus.DONE
+    assert derive_task_status(header, state, []) == TaskStatus.TODO
 
 
 def test_get_merged_pr_ids(monkeypatch) -> None:
@@ -1047,7 +1041,7 @@ def test_derive_queue_task_statuses_does_not_trust_stale_done_queue_status(
     )
     monkeypatch.setattr(
         "src.task_status.gh_pr_get_merged_branches",
-        lambda repo, branches: set(),
+        lambda repo, branches, **kwargs: set(),
     )
     monkeypatch.setattr(
         "src.task_status._load_task_header",
@@ -1069,7 +1063,7 @@ def test_derive_queue_task_statuses_does_not_trust_stale_done_queue_status(
     assert derived[0].status == TaskStatus.TODO
 
 
-def test_derive_queue_task_statuses_marks_done_from_merged_pr_history(
+def test_derive_queue_task_statuses_ignores_subject_history(
     monkeypatch,
 ) -> None:
     task = QueueTask(
@@ -1085,7 +1079,7 @@ def test_derive_queue_task_statuses_marks_done_from_merged_pr_history(
     )
     monkeypatch.setattr(
         "src.task_status.gh_pr_get_merged_branches",
-        lambda repo, branches: set(),
+        lambda repo, branches, **kwargs: set(),
     )
     monkeypatch.setattr(
         "src.task_status._load_task_header",
@@ -1104,7 +1098,7 @@ def test_derive_queue_task_statuses_marks_done_from_merged_pr_history(
         log_event=lambda event: None,
     )
 
-    assert derived[0].status == TaskStatus.DONE
+    assert derived[0].status == TaskStatus.TODO
 
 
 def test_derive_queue_task_statuses_skips_merged_probe_when_queue_is_empty(
@@ -1532,7 +1526,7 @@ def test_missing_completion_manifest_preserves_existing_behavior(tmp_path) -> No
 @pytest.mark.parametrize("available", [True, False])
 def test_resolver_uses_receipt_with_or_without_github(completion_repo, monkeypatch, available) -> None:
     repo, record = completion_repo
-    def branches(*args):
+    def branches(*args, **kwargs):
         if not available:
             raise GhPrMergedBranchesUnavailable("offline")
         return set()
@@ -1576,7 +1570,7 @@ def test_restart_and_idle_agree_without_dispatch(
         "task_id_hash": compute_task_id_hash("PR-085", "octo__demo"),
     }) + "\n")
 
-    def branches(*args):
+    def branches(*args, **kwargs):
         if evidence == "receipt_offline":
             raise GhPrMergedBranchesUnavailable("offline")
         return set() if is_receipt else {f"{evidence}/pr-085-planned"}
