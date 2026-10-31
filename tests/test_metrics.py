@@ -559,7 +559,8 @@ async def test_all_attempt_totals_roundtrip_with_unknown_and_measured_zero() -> 
         _record("failed", exit_reason="error", duration_ms=1000, tokens_in=10,
                 tokens_out=0, fix_iterations=0, operator_intervention=True),
         _record("fix", exit_reason="coding_complete", run_phase="fix",
-                duration_ms=None, tokens_in=0, tokens_out=0, fix_iterations=2),
+                duration_ms=None, tokens_in=0, tokens_out=0, fix_iterations=2,
+                invocations=[_fix_snapshot("fix", 1), _fix_snapshot("fix", 2)]),
         _record("merged", duration_ms=0, tokens_in=0, tokens_out=0,
                 telemetry_sources={name: "provider" for name in
                                    ("duration_ms", "tokens_in", "tokens_out", "fix_iterations")}),
@@ -590,3 +591,57 @@ def test_legacy_zero_unknown_positive_known_and_empty_totals() -> None:
     assert task_attempt_totals([])["attempt_count"] == 0
     known = task_attempt_totals([_record("known", fix_iterations=1)])
     assert known["telemetry"]["tokens_in"]["status"] == "complete"
+
+
+def _fix_snapshot(run_id: str, iteration: int) -> InvocationSnapshot:
+    return InvocationSnapshot(
+        plugin_id="codex", model_override=None, reasoning_effort_override=None,
+        run_id=run_id, attempt_index=1, phase="fix", fix_iteration=iteration,
+    )
+
+
+async def test_fix_dispatch_totals_preserve_continuations_and_independent_chains() -> None:
+    store = MetricsStore(_FakeRedis())
+    records = [
+        _record("coding", fix_iterations=0, invocations=[InvocationSnapshot(
+            plugin_id="codex", model_override=None, reasoning_effort_override=None,
+            run_id="coding", attempt_index=1, phase="coding",
+        )]),
+        _record("fix-1", run_phase="fix", fix_iterations=1,
+                invocations=[_fix_snapshot("fix-1", 1)]),
+        _record("fix-2", run_phase="fix", fix_iterations=2,
+                invocations=[_fix_snapshot("fix-2", 2)]),
+        _record("retry", run_phase="fix", fix_iterations=3, fix_recovery_baseline=2,
+                operator_intervention=True, invocations=[_fix_snapshot("retry", 3)]),
+        # A separate coding attempt starts a new counter for the same task.
+        _record("independent", fix_iterations=2, invocations=[
+            _fix_snapshot("independent", 1), _fix_snapshot("independent", 2),
+            _fix_snapshot("independent", 2),  # repeated checkpoint, same dispatch
+        ]),
+    ]
+    for record in records:
+        await store.save(record)
+    stored = await store.list_task_runs(records[0].repo_name, records[0].task_id)
+    totals = task_attempt_totals(stored + stored)
+    assert totals["fix_iterations"] == 5
+    assert totals["attempt_count"] == 5
+    assert totals["operator_interventions"] == 1
+    assert totals["telemetry"]["fix_iterations"] == {
+        "known_runs": 5, "total_runs": 5, "status": "complete",
+    }
+
+
+def test_legacy_fix_cumulative_counter_is_unknown_without_dispatch_evidence() -> None:
+    records = [
+        _record("legacy-fix-1", run_phase="fix", fix_iterations=1),
+        _record("legacy-fix-2", run_phase="fix", fix_iterations=2,
+                telemetry_sources={"fix_iterations": "counter"}),
+    ]
+    totals = task_attempt_totals(records)
+    assert totals["fix_iterations"] is None
+    assert totals["telemetry"]["fix_iterations"]["status"] == "unknown"
+    totals = task_attempt_totals(records + [_record("legacy-coding", fix_iterations=2)])
+    assert totals["fix_iterations"] == 2
+    assert totals["telemetry"]["fix_iterations"] == {
+        "known_runs": 1, "total_runs": 3, "status": "partial",
+    }

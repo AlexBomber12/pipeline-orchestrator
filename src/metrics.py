@@ -122,8 +122,8 @@ class RunRecord:
 def task_attempt_totals(records: list[RunRecord]) -> dict[str, object]:
     """Sum known telemetry across every run; partial sums are lower bounds.
 
-    A run is updated in place across its FIX invocations, so sum each run once,
-    rather than summing invocation snapshots or cumulative checkpoints.
+    Duration and tokens belong to each run, but FIX counters span continuation
+    records. Count each run's captured dispatches instead of inherited counters.
     """
     runs = {record.run_id: record for record in records}.values()
     totals: dict[str, object] = {"attempt_count": len(runs)}
@@ -131,8 +131,10 @@ def task_attempt_totals(records: list[RunRecord]) -> dict[str, object]:
     for name in ("duration_ms", "fix_iterations", "tokens_in", "tokens_out"):
         values = [
             value for record in runs
-            if (value := getattr(record, name)) is not None
-            and value >= 0 and (value > 0 or record.telemetry_sources.get(name))
+            if (value := (_run_fix_dispatches(record) if name == "fix_iterations"
+                          else getattr(record, name))) is not None
+            and value >= 0 and (value > 0 or record.telemetry_sources.get(name)
+                                or (name == "fix_iterations" and record.invocations))
         ]
         totals[name] = sum(values) if values else None
         completeness[name] = {
@@ -147,6 +149,20 @@ def task_attempt_totals(records: list[RunRecord]) -> dict[str, object]:
     totals["metered_cost_usd"] = None
     totals["subscription_quota"] = None
     return totals
+
+
+def _run_fix_dispatches(record: RunRecord) -> int | None:
+    """Use dispatch evidence; a legacy FIX counter has no per-run baseline."""
+    if record.invocations:
+        # Iteration numbers identify dispatches within this run. Separate coding
+        # and Retry chains may legitimately reuse the same iteration numbers.
+        return len({snapshot.fix_iteration for snapshot in record.invocations
+                    if snapshot.phase == "fix"})
+    if record.run_phase == "fix":
+        return None
+    # Older coding records retained their FIX work in place, before separate
+    # continuation records were introduced. Their positive counters are local.
+    return record.fix_iterations
 
 
 class MetricsStore:

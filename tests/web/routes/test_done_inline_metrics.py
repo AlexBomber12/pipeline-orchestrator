@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 from src.metrics import MetricsStore, RunRecord, task_attempt_totals
-from src.models import QueueTask, TaskStatus
+from src.models import InvocationSnapshot, QueueTask, TaskStatus
 from src.web import app as web_app
 from src.web.routes import repo_control
 
@@ -70,13 +70,14 @@ async def test_latest_failed_fix_is_visible(status):
     ]))
     metrics = _views(context, status.value.lower())[0]["metrics"]
     assert metrics["duration_ms"] == 24690
-    assert metrics["fix_iterations"] == 4
+    assert metrics["fix_iterations"] == 2
+    assert metrics["telemetry"]["fix_iterations"]["status"] == "partial"
     assert metrics["exit_reason"] == "error"
     assert metrics["attempt_count"] == 2
     rendered = web_app.templates.get_template("components/tasks_panel.html").render(
         **context,
     )
-    assert "codex" in rendered and "error</span>" in rendered and "4 fix" in rendered
+    assert "codex" in rendered and "error</span>" in rendered and "2 fix" in rendered
 
 
 @pytest.mark.asyncio
@@ -212,7 +213,11 @@ async def test_writer_query_panel_includes_failed_fix_merged_and_legacy() -> Non
         _record(run_id="failed", exit_reason="error", outcome="failed", cause="CRASH",
                 duration_ms=1000, fix_iterations=0, tokens_in=10, operator_intervention=True),
         _record(run_id="fix", exit_reason="coding_complete", outcome="superseded",
-                run_phase="fix", duration_ms=2000, fix_iterations=2, tokens_in=20),
+                run_phase="fix", duration_ms=2000, fix_iterations=2, tokens_in=20,
+                invocations=[InvocationSnapshot(
+                    plugin_id="codex", model_override=None, reasoning_effort_override=None,
+                    run_id="fix", attempt_index=2, phase="fix", fix_iteration=2,
+                )]),
         _record(run_id="merged", duration_ms=3000, fix_iterations=1, tokens_in=30),
         _record(run_id="legacy", duration_ms=None, fix_iterations=0, tokens_in=0),
     ]
@@ -228,10 +233,10 @@ async def test_writer_query_panel_includes_failed_fix_merged_and_legacy() -> Non
     totals = _views(context, "done")[0]["metrics"]
     assert totals["duration_ms"] == 6000
     assert totals["tokens_in"] == 60
-    assert totals["fix_iterations"] == 3
+    assert totals["fix_iterations"] == 2
     assert totals["attempt_count"] == 4
     rendered = web_app.templates.get_template("components/tasks_panel.html").render(**context)
-    for text in ("4 runs", "6s", "3 fix", "60 input tokens", "output tokens unknown",
+    for text in ("4 runs", "6s", "2 fix", "60 input tokens", "output tokens unknown",
                  "partial; 3/4 runs known", "1 runs with operator intervention",
                  "API price unavailable", "Subscription quota unavailable"):
         assert text in rendered
