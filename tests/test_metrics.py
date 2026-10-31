@@ -4,7 +4,7 @@ import json
 from typing import Any
 
 import pytest
-from src.metrics import MetricsStore, RunRecord
+from src.metrics import MetricsStore, RunRecord, task_attempt_totals
 from src.models import InvocationSnapshot
 
 
@@ -254,6 +254,7 @@ async def test_record_serialization() -> None:
         "test_file_ratio": 0.0,
         "tokens_in": 1200,
         "tokens_out": 800,
+        "telemetry_sources": {},
     }
 
 
@@ -549,3 +550,43 @@ def test_runrecord_stage_accepts_planner_reviewer() -> None:
 def test_runrecord_rejects_invalid_fix_recovery_baseline() -> None:
     with pytest.raises(ValueError, match="FIX recovery baseline"):
         _record("bad-baseline", fix_iterations=1, fix_recovery_baseline=2)
+
+
+async def test_all_attempt_totals_roundtrip_with_unknown_and_measured_zero() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    for record in [
+        _record("failed", exit_reason="error", duration_ms=1000, tokens_in=10,
+                tokens_out=0, fix_iterations=0, operator_intervention=True),
+        _record("fix", exit_reason="coding_complete", run_phase="fix",
+                duration_ms=None, tokens_in=0, tokens_out=0, fix_iterations=2),
+        _record("merged", duration_ms=0, tokens_in=0, tokens_out=0,
+                telemetry_sources={name: "provider" for name in
+                                   ("duration_ms", "tokens_in", "tokens_out", "fix_iterations")}),
+    ]:
+        await store.save(record)
+    runs = await store.list_task_runs("AlexBomber12__pipeline-orchestrator", "PR-080")
+    totals = task_attempt_totals(runs + runs)
+    assert totals["attempt_count"] == 3
+    assert totals["duration_ms"] == 1000
+    assert totals["fix_iterations"] == 2
+    assert totals["tokens_in"] == 10
+    assert totals["tokens_out"] == 0
+    assert totals["operator_interventions"] == 1
+    assert totals["metered_cost_usd"] is None
+    assert totals["subscription_quota"] is None
+    assert totals["telemetry"]["tokens_out"] == {
+        "status": "partial", "known_runs": 1, "total_runs": 3,
+    }
+    assert totals["telemetry"]["tokens_in"]["known_runs"] == 2
+
+
+def test_legacy_zero_unknown_positive_known_and_empty_totals() -> None:
+    legacy = _record("legacy", duration_ms=0, fix_iterations=0, tokens_in=0, tokens_out=0)
+    totals = task_attempt_totals([legacy])
+    for name in ("duration_ms", "fix_iterations", "tokens_in", "tokens_out"):
+        assert totals[name] is None
+        assert totals["telemetry"][name]["status"] == "unknown"
+    assert task_attempt_totals([])["attempt_count"] == 0
+    known = task_attempt_totals([_record("known", fix_iterations=1)])
+    assert known["telemetry"]["tokens_in"]["status"] == "complete"

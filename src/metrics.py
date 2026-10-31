@@ -80,6 +80,10 @@ class RunRecord:
     # an allowance credit without erasing dispatched-attempt history.
     fix_recovery_baseline: int = 0
 
+    # Per-field provenance permits measured zero without reinterpreting legacy
+    # placeholder zeros as usage. Older payloads need no migration.
+    telemetry_sources: dict[str, str] = field(default_factory=dict)
+
     def __post_init__(self) -> None:
         self.invocations = [
             (
@@ -113,6 +117,36 @@ class RunRecord:
             raise ValueError(
                 "cause_subsource only valid when cause == 'ESCALATE'"
             )
+
+
+def task_attempt_totals(records: list[RunRecord]) -> dict[str, object]:
+    """Sum known telemetry across every run; partial sums are lower bounds.
+
+    A run is updated in place across its FIX invocations, so sum each run once,
+    rather than summing invocation snapshots or cumulative checkpoints.
+    """
+    runs = {record.run_id: record for record in records}.values()
+    totals: dict[str, object] = {"attempt_count": len(runs)}
+    completeness = {}
+    for name in ("duration_ms", "fix_iterations", "tokens_in", "tokens_out"):
+        values = [
+            value for record in runs
+            if (value := getattr(record, name)) is not None
+            and value >= 0 and (value > 0 or record.telemetry_sources.get(name))
+        ]
+        totals[name] = sum(values) if values else None
+        completeness[name] = {
+            "known_runs": len(values), "total_runs": len(runs),
+            "status": ("unknown" if not values else
+                       "complete" if len(values) == len(runs) else "partial"),
+        }
+    totals["telemetry"] = completeness
+    totals["operator_interventions"] = sum(r.operator_intervention for r in runs)
+    # RunRecord has no metered money or subscription quota source. These must
+    # never be inferred from tokens, profile names or operator interventions.
+    totals["metered_cost_usd"] = None
+    totals["subscription_quota"] = None
+    return totals
 
 
 class MetricsStore:

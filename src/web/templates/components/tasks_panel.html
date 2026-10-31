@@ -34,8 +34,20 @@
     <div class="mt-1 flex flex-wrap gap-3 text-[11px] text-gray-500">
         {% if task.metrics.coder %}<span>{{ task.metrics.coder }}</span>{% endif %}
         {% if task.metrics.model %}<span class="font-mono">{{ task.metrics.model }}</span>{% endif %}
-        {% if task.metrics.duration_ms is not none %}<span>{{ ((task.metrics.duration_ms | int) / 1000) | round(0) | int }}s</span>{% endif %}
-        {% if task.metrics.fix_iterations is not none %}<span>{{ task.metrics.fix_iterations }} fix</span>{% endif %}
+        <span>{{ task.metrics.attempt_count }} runs</span>
+        {% for field, label in [('duration_ms', 'duration'), ('fix_iterations', 'fix'), ('tokens_in', 'input tokens'), ('tokens_out', 'output tokens')] %}
+        {% set value = task.metrics[field] %}
+        {% set coverage = task.metrics.telemetry[field] %}
+        <span data-task-telemetry="{{ field }}">
+            {% if value is none %}{{ label }} unknown{% else %}
+            {% if field == 'duration_ms' %}{{ ((value | int) / 1000) | round(0) | int }}s{% else %}{{ value }} {{ label }}{% endif %}
+            {% if coverage.status == 'partial' %} (partial; {{ coverage.known_runs }}/{{ coverage.total_runs }} runs known){% endif %}
+            {% endif %}
+        </span>
+        {% endfor %}
+        <span>API price unavailable</span>
+        <span>Subscription quota unavailable</span>
+        <span>{{ task.metrics.operator_interventions }} runs with operator intervention</span>
         {% if task.metrics.exit_reason %}<span class="text-gray-600">{{ task.metrics.exit_reason }}</span>{% endif %}
     </div>
     {% endif %}
