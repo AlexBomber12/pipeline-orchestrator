@@ -1303,7 +1303,9 @@ task graph retains the whole batch and an `admission_error` in its upload manife
 The dashboard and repository summary show **Task upload blocked**, the reason and
 the recovery action. The same rejected generation is not re-admitted each tick or
 after restart at the same base commit. New uploads or a fetched base change trigger
-fresh admission; transient transport/push failures and active-work holds keep their
+fresh admission. Admission requires an available GitHub branch-completion probe
+before caching a graph rejection; an unavailable probe remains retryable at the
+same base, including after restart. Transient transport/push failures and active-work holds keep their
 existing retry behavior. Operator pause and Stop still prevent upload consumption.
 
 Correct and re-upload the conflicting files; the upload endpoint retains staged

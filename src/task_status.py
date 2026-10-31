@@ -106,14 +106,22 @@ def _resolve_merged_state(
     )
 
 
-def get_merged_branch_pr_ids(owner_repo: str, headers: Iterable[TaskHeader]) -> set[str]:
-    """Return task IDs backed by the daemon's verified merged-branch evidence."""
+def get_merged_branch_pr_ids(
+    owner_repo: str, headers: Iterable[TaskHeader], *, require_available: bool = False,
+) -> set[str]:
+    """Read verified branch completions; admission can require a complete probe.
+
+    Best-effort readers retain their conservative empty-set fallback. A caller
+    caching an admission verdict must distinguish an outage from no matches.
+    """
     headers = list(headers)
     try:
         branches = gh_pr_get_merged_branches(
             owner_repo, {header.branch for header in headers if header.branch},
         )
-    except (GhPrMergedBranchesUnavailable, ValueError, subprocess.SubprocessError, OSError):
+    except (GhPrMergedBranchesUnavailable, ValueError, subprocess.SubprocessError, OSError) as exc:
+        if require_available:
+            raise MergeStatusUnavailable(f"GitHub merge evidence unavailable: {exc}") from exc
         # Missing evidence never releases branch reservations or dependency edges.
         return set()
     return {

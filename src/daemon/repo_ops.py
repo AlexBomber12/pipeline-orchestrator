@@ -385,6 +385,7 @@ return 0
             merged |= await asyncio.to_thread(
                 get_merged_branch_pr_ids,
                 Path(self.repo_path).name.replace("__", "/", 1), headers.values(),
+                require_available=True,
             )
             merged |= effective_recorded_completions(
                 self.repo_path, branch, candidates, {}, effective_manifest,

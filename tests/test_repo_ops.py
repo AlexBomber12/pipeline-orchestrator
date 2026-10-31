@@ -19,7 +19,7 @@ from src.daemon import repo_ops
 def _merged_transport(monkeypatch: pytest.MonkeyPatch) -> None:
     """Graph admission uses production evaluators with controlled GitHub reads."""
     monkeypatch.setattr(repo_ops, "get_merged_pr_ids", lambda *args: set())
-    monkeypatch.setattr(repo_ops, "get_merged_branch_pr_ids", lambda *args: set())
+    monkeypatch.setattr(repo_ops, "get_merged_branch_pr_ids", lambda *args, **kwargs: set())
 
 
 class _FakeCompletedProcess:
@@ -1579,3 +1579,58 @@ def test_upload_replay_receipt_reader_keeps_unrelated_unreadable_legacy_bytes(up
     _stage_upload(runner, _upload_spec(instruction="corrected task"))
     assert _run(runner.process_pending_uploads()) is True
     assert legacy.read_bytes() == b"\xff historical data"
+
+
+def test_upload_merge_evidence_outage_retries_after_restart_and_publishes(upload_git, monkeypatch):
+    from src import task_status
+
+    runner = upload_git
+    runner.state.current_queue = None
+    stored = Path(runner.repo_path) / "tasks/PR-001.md"
+    stored.write_text(
+        _upload_spec().replace("task-one", "pr-001-task").replace("Depends on: none", "Depends on: PR-999")
+    )
+    accepted = stored.read_bytes()
+    git = repo_ops.git_ops._git
+    git(runner.repo_path, "add", ".")
+    git(runner.repo_path, "commit", "-m", "historical task")
+    git(runner.repo_path, "push", "origin", "main")
+    sibling = (
+        _upload_spec()
+        .replace("PR-001", "PR-002")
+        .replace("task-one", "pr-002-task")
+        .replace("Depends on: none", "Depends on: PR-001")
+    )
+    staging, key = _stage_upload(runner, sibling)
+    (staging / "PR-002.md").write_text(sibling)
+    manifest = json.loads(runner.redis.store[key])
+    manifest["files"] = ["PR-002.md"]
+    runner.redis.store[key] = json.dumps(manifest)
+    original = runner.redis.store[key]
+    observation = {"available": False, "calls": 0}
+
+    def probe(repo, branches):
+        observation["calls"] += 1
+        assert "pr-001-task" in branches
+        if not observation["available"]:
+            raise task_status.GhPrMergedBranchesUnavailable("temporary GitHub outage")
+        return {"pr-001-task"}
+
+    monkeypatch.setattr(task_status, "gh_pr_get_merged_branches", probe)
+    monkeypatch.setattr(repo_ops, "get_merged_branch_pr_ids", task_status.get_merged_branch_pr_ids)
+    assert _run(runner.process_pending_uploads()) is None
+    assert runner.redis.store[key] == original
+    assert not runner._upload_admission_blocked
+    restarted = _Runner(Path(runner.repo_path).parent)
+    restarted.redis = runner.redis
+    assert _run(restarted.process_pending_uploads()) is None
+    assert restarted.redis.store[key] == original
+    observation["available"] = True
+    assert _run(restarted.process_pending_uploads()) is True
+    assert observation["calls"] == 3
+    assert key not in restarted.redis.store
+    assert stored.read_bytes() == accepted
+    assert git(runner.repo_path, "show", "origin/main:tasks/PR-002.md").stdout == sibling
+    head = git(runner.repo_path, "rev-parse", "HEAD").stdout
+    assert _run(restarted.process_pending_uploads()) is False
+    assert git(runner.repo_path, "rev-parse", "HEAD").stdout == head
