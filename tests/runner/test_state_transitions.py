@@ -46,6 +46,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from src.task_status import MergedState
 from src import codex_cli
 from src.coder_login import CoderCredentialReservations
 from src.coders import claude as claude_plugin_module
@@ -91,7 +92,7 @@ claude_cli = claude_plugin_module.claude_cli
 def _default_no_merged_branch_api(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "src.task_status.gh_pr_get_merged_branches",
-        lambda repo, branches: set(),
+        lambda repo, branches, **kwargs: set(),
     )
 
 
@@ -155,8 +156,8 @@ def test_recovery_clears_task_on_already_merged_doing(
     )
     monkeypatch.setattr(
         recovery_module,
-        "get_merged_pr_ids",
-        lambda repo_path, branch, ids: {"PR-100"},
+        "_resolve_merged_state",
+        lambda *args, **kwargs: MergedState({"PR-100"}, set(), True),
     )
 
     runner = h._make_runner()
@@ -197,8 +198,8 @@ def test_recovery_clears_task_on_no_pr_after_crash(
     )
     monkeypatch.setattr(
         recovery_module,
-        "get_merged_pr_ids",
-        lambda repo_path, branch, ids: set(),
+        "_resolve_merged_state",
+        lambda *args, **kwargs: MergedState(set(), set(), True),
     )
 
     runner = h._make_runner()

@@ -51,7 +51,7 @@ def _merged_state(
 def _default_no_merged_branch_api(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         "src.task_status.gh_pr_get_merged_branches",
-        lambda repo, branches: set(),
+        lambda repo, branches, **kwargs: set(),
     )
 
 

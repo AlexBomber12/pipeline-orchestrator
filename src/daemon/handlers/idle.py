@@ -48,7 +48,6 @@ from src.queue_parser import (
 )
 from src.task_status import (
     MergeStatusUnavailable,
-    _branch_name_matches_task_pr_id,
     _resolve_merged_state,
     derive_task_status,
     find_matching_open_pr,
@@ -428,12 +427,13 @@ class IdleMixin:
             self._idle_degraded_done_check_logged = True
         # Match admission's completion evidence before resolving blockers or
         # validating cycles. Completed tasks no longer need their old inputs.
-        merged_pr_ids = state.merged_pr_ids | {
-            header.pr_id
-            for header in headers
-            if header.branch in state.merged_branches
-            and _branch_name_matches_task_pr_id(header.pr_id, header.branch)
-        }
+        open_prs = list(getattr(self, "_idle_open_prs", ()))
+        merged_prs = list(getattr(self, "_idle_merged_prs", ()))
+        merged_pr_ids = state.merged_pr_ids - {header.pr_id for header in headers}
+        merged_pr_ids.update(
+            header.pr_id for header in headers
+            if derive_task_status(header, state, open_prs, merged_prs) == TaskStatus.DONE
+        )
         headers = [
             replace(header, depends_on=[]) if header.pr_id in merged_pr_ids else header
             for header in headers

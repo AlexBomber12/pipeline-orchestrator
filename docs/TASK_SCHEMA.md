@@ -36,8 +36,12 @@ unstructured historical records byte-for-byte unchanged, and verifies
 that those records were not changed. Invalid frontmatter files fail
 validation before any migration writes.
 
-DONE is derived from positive Git/GitHub merge evidence, not from the
-frontmatter word alone. If GitHub merge lookup fails and no positive
+DONE requires a matching merged PR on the configured repository/base and
+exact task branch/identity, or a validated hash-bound completion receipt
+as described below. Commit subjects, task-number prefixes, and frontmatter
+DONE alone are not completion evidence for a structured task. Repair commits
+or a reused task ID cannot complete its current specification. A matching
+open PR remains DOING even if an older merge used that branch. If GitHub merge lookup fails and no positive
 evidence resolves a task, IDLE defers selection and recovery retries on
 a later cycle. This does not assign TODO or fail the task. An existing
 queue snapshot is preserved, and an INFRA event explains the delay.

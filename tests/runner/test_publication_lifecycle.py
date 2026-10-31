@@ -832,7 +832,7 @@ async def test_header_recovery_defers_if_snapshot_read_is_unavailable(lifecycle,
 @pytest.mark.parametrize('local_work,deferred', [(False, False), (False, True), (True, False)])
 async def test_prepublication_crash_finalizes_only_after_safe_release(lifecycle, monkeypatch, local_work, deferred):
     runner, provider, repo, _, _, configure = lifecycle
-    monkeypatch.setattr('src.task_status.gh_pr_get_merged_branches', lambda *a: set())
+    monkeypatch.setattr('src.task_status.gh_pr_get_merged_branches', lambda *a, **kw: set())
     monkeypatch.setattr(prs, 'get_merged_prs_discovery',
                         lambda *a, **kw: prs.PRDiscovery('octo/demo', 'main', [], not provider.get('merged_down')))
     provider['merged_down'] = deferred

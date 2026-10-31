@@ -335,7 +335,9 @@ def get_branch_publications(
     return publications
 
 
-def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
+def gh_pr_get_merged_branches(
+    repo: str, branches: Iterable[str], *, base_branch: str | None = None,
+) -> set[str]:
     """Return the input branch names that GitHub reports as merged PR heads."""
     branch_names = list(branches)
     for branch in branch_names:
@@ -351,16 +353,18 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
     for offset in range(0, len(branch_names), _GH_HEAD_QUERY_CHUNK):
         chunk = branch_names[offset : offset + _GH_HEAD_QUERY_CHUNK]
         branch_variables = ", ".join(f"$branch{index}: String!" for index in range(len(chunk)))
+        base_filter = ", baseRefName: $base" if base_branch is not None else ""
         branch_queries = " ".join(
             (
                 f"b{index}: pullRequests("
-                f"first: 1, states: MERGED, headRefName: $branch{index}"
+                f"first: 1, states: MERGED, headRefName: $branch{index}{base_filter}"
                 ") { nodes { headRefName mergedAt } }"
             )
             for index in range(len(chunk))
         )
         query = (
-            f"query($owner: String!, $repo: String!, {branch_variables}) "
+            f"query($owner: String!, $repo: String!, {branch_variables}"
+            f"{', $base: String!' if base_branch is not None else ''}) "
             f"{{ repository(owner: $owner, name: $repo) {{ {branch_queries} }} }}"
         )
         args = [
@@ -373,6 +377,8 @@ def gh_pr_get_merged_branches(repo: str, branches: Iterable[str]) -> set[str]:
             "-f",
             f"repo={repo_name}",
         ]
+        if base_branch is not None:
+            args.extend(["-f", f"base={base_branch}"])
         for index, branch in enumerate(chunk):
             args.extend(["-f", f"branch{index}={branch}"])
         try:
