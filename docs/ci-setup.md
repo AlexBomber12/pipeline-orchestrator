@@ -153,3 +153,11 @@ writes and containers read. Before container startup, the real `coder_shim`
 context verifies host read/write access and restores the previous scenario.
 This catches retained control-file permission failures without discarding
 analytics, audit, invocation evidence, or changing provider settings.
+
+The dirty-work continuity scenario retains its synthetic marker throughout all
+preservation and restart assertions. Its teardown then stops the owned test
+daemon and disposes only that marker after validating its exact task content
+and branch, retaining the disposed bytes in evidence. The existing GitHub/Redis
+reset completes while that test daemon is stopped, before restart. Reset alone
+does not clean local untracked files; later tests must not depend on an
+intervening scenario to clear the marker. Other dirty files remain untouched.
