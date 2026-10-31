@@ -3,11 +3,13 @@ import subprocess
 import time
 
 import requests
+from playwright.sync_api import expect
 
 from tests.e2e.lib.coder_shim import coder_shim
 
 
 def test_stop_during_coding_then_resume_picks_next_task(
+    page,
     dashboard_url,
     testbed_slug,
     wait_for_state,
@@ -37,12 +39,15 @@ def test_stop_during_coding_then_resume_picks_next_task(
         # tests so this case exercises stop/resume behavior, not poll timing.
         wait_for_state(["CODING"], timeout_sec=150)
 
-        stop_resp = requests.post(
-            f"{dashboard_url}/repos/{testbed_slug}/stop", timeout=10
-        )
-        assert stop_resp.status_code in (200, 204), (
-            f"stop returned status {stop_resp.status_code}: {stop_resp.text!r}"
-        )
+        page.goto(f"{dashboard_url}/repo/{testbed_slug}", wait_until="domcontentloaded")
+        page.wait_for_function("Boolean(window.htmx)")
+        summary = page.locator('[data-repo-summary]')
+        expect(summary).to_contain_text(f"PR-{first_pr_id_int}")
+        page.once("dialog", lambda dialog: dialog.accept())
+        with page.expect_response(f"**/repos/{testbed_slug}/stop") as response:
+            summary.get_by_role("button", name="Stop current run", exact=True).click()
+        assert response.value.status == 200
+        assert response.value.request.headers.get("hx-request") == "true"
 
         # The slow shim sleeps 30s before any side effect, so its natural
         # completion path is CODING -> WATCH -> ... -> IDLE and never visits
@@ -70,13 +75,22 @@ def test_stop_during_coding_then_resume_picks_next_task(
         status = upload_zip(zip_path)
         assert status in (200, 201), f"second upload failed with status {status}"
 
-        resume_resp = requests.post(
-            f"{dashboard_url}/repos/{testbed_slug}/resume", timeout=10
+        # The persisted pause survives a full load as well as summary swaps.
+        page.reload(wait_until="domcontentloaded")
+        expect(summary.locator('[data-state-label]')).to_have_text("PAUSED")
+        expect(summary.locator('[data-work-summary]')).to_contain_text(
+            "Operator paused this repository."
         )
-        assert resume_resp.status_code in (200, 204), (
-            f"resume returned status {resume_resp.status_code}: "
-            f"{resume_resp.text!r}"
-        )
+        expect(summary.locator('[data-work-summary]')).to_contain_text("Activity: Unknown")
+        # Passive diagnostics remain usable and do not act as Resume.
+        with page.expect_response(f"**/partials/repo/{testbed_slug}/cancellations") as diagnostics:
+            page.get_by_text("Recent cancellations", exact=True).click()
+        assert diagnostics.value.status == 200
+        assert get_state()["user_paused"] is True
+        with page.expect_response(f"**/repos/{testbed_slug}/resume") as response:
+            summary.get_by_role("button", name="Resume daemon", exact=True).click()
+        assert response.value.status == 200
+        assert response.value.request.headers.get("hx-request") == "true"
 
         coding_entry = wait_for_state(["CODING"], timeout_sec=150)
         coding_task = coding_entry.get("current_task") or {}
