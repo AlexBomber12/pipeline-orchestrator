@@ -378,6 +378,24 @@ def read_recovered_task_pr_ids(slug: str) -> set[str]:
     return set(decoded)
 
 
+def remove_owned_continuity_marker(repo: Path, task_id: str, branch: str) -> str:
+    """Dispose only this stopped fixture's synthetic dirty file, after proof."""
+    marker = repo / "continuity-dirty.txt"
+    if marker.is_symlink():
+        raise ValueError("continuity marker is not a fixture-owned regular file")
+    current = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--show-current"],
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout.strip()
+    if current != branch:
+        raise ValueError("continuity fixture branch changed; retaining marker")
+    content = marker.read_text()
+    if content != f"unpreserved work for {task_id}\n":
+        raise ValueError("continuity marker ownership differs; retaining file")
+    marker.unlink()
+    return content
+
+
 def reset_testbed_full(slug: str) -> dict:
     """Full reset: close PRs, delete branches, wipe tasks/. Returns counts dict.
 

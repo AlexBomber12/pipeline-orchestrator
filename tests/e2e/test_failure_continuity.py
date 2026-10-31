@@ -21,6 +21,7 @@ from tests.e2e.conftest import (
     _wait_for_fresh_idle,
 )
 from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
+from tests.e2e.lib.testbed_reset import clear_testbed_redis_state, reset_testbed_full
 from tests.e2e.test_cancellation_cause_crash import _entry_for, _fetch_cancellations
 
 TESTBED = "AlexBomber12/pipeline-orchestrator-testbed"
@@ -223,9 +224,36 @@ def test_failed_a_independent_b(
                                  "subsource": cause["payload"]["subsource"]}
             evidence["calls"] = _calls()
         finally:
-            # Context exits before reset; normal reset owns dirty checkout
-            # disposal. No git clean, signal, Redis injection or preset status.
             _stop_daemon_and_wait_paused(testbed_slug)
+            if dirty and evidence.get("cleanup_confirmed"):
+                # Preservation/restart assertions precede fixture disposal.
+                # Stop this owned test service; pause alone is not ownership
+                # proof for filesystem cleanup. Never clean unrelated work.
+                subprocess.run(
+                    ["docker", "compose", "-f", "docker-compose.test.yml", "stop", "daemon-test"],
+                    cwd=REPO_DIR, check=True, timeout=60,
+                )
+                try:
+                    disposed = subprocess.run(
+                        ["docker", "compose", "-f", "docker-compose.test.yml", "exec", "-T",
+                         "web-test", "python", "-c",
+                         "import json,sys; from pathlib import Path; "
+                         "from tests.e2e.lib.testbed_reset import remove_owned_continuity_marker; "
+                         "disposed=remove_owned_continuity_marker(Path(sys.argv[1]), sys.argv[2], sys.argv[3]); "
+                         "print(json.dumps(disposed))",
+                         f"/data/repos/{testbed_slug}", a, branches[0]],
+                        cwd=REPO_DIR, check=True, capture_output=True, text=True, timeout=15,
+                    )
+                    evidence["disposed_fixture_marker"] = json.loads(disposed.stdout)
+                    # Finish the existing reset before restarting this owned
+                    # service, so it cannot redispatch the disposed queue.
+                    reset_testbed_full(testbed_slug)
+                    clear_testbed_redis_state(testbed_slug)
+                finally:
+                    subprocess.run(
+                        ["docker", "compose", "-f", "docker-compose.test.yml", "start", "daemon-test"],
+                        cwd=REPO_DIR, check=True, timeout=60,
+                    )
             CALLS.unlink(missing_ok=True)
             EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
             (EVIDENCE_DIR / f"continuity-{nonce}.json").write_text(json.dumps(evidence, indent=2) + "\n")

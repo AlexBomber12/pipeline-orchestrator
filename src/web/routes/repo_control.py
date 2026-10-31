@@ -52,7 +52,7 @@ from src.keyspace import (
     control_stop,
     pipeline_state,
 )
-from src.metrics import MetricsStore, RunRecord
+from src.metrics import MetricsStore, RunRecord, task_attempt_totals
 from src.models import PipelineState, QueueTask, RepoState, TaskStatus
 from src.publication_migration import MigrationChanged
 from src.publication_migration import enqueue as enqueue_publication_migration
@@ -933,7 +933,7 @@ async def _recent_metrics_by_task_id(
     redis_client: aioredis.Redis | None,
     task_ids: list[str],
 ) -> dict[str, dict[str, object]]:
-    """Return the latest RunRecord per task id as ``{pr_id: metrics}``."""
+    """Return all-attempt totals with the latest run identity per task."""
     if redis_client is None:
         return {}
 
@@ -953,7 +953,7 @@ async def _recent_metrics_by_task_id(
                     record.run_id,
                 ),
             )
-            result[pr_id] = _inline_metrics_payload(latest)
+            result[pr_id] = {**_inline_metrics_payload(latest), **task_attempt_totals(records)}
         except Exception:
             # Missing/corrupt records or storage outages must not hide tasks
             # or metrics belonging to other tasks. Never synthesize defaults.
@@ -966,8 +966,6 @@ def _inline_metrics_payload(record: RunRecord) -> dict[str, object]:
     return {
         "coder": profile_parts[0] or None,
         "model": profile_parts[1] if len(profile_parts) > 1 else None,
-        "duration_ms": record.duration_ms,
-        "fix_iterations": record.fix_iterations,
         "exit_reason": record.exit_reason,
     }
 

@@ -11,12 +11,12 @@ from datetime import datetime
 from pathlib import Path
 from uuid import NAMESPACE_URL, uuid5
 
-from src.config import load_config
 from src.github.checks import _classify_ci_retrieval, _retrieve_ci_status_evidence
 from src.github.reviewer_policy import reviewer_policy_from_config
 from src.github.reviews import clear_review_status_cache, get_pr_review_status, read_review_feedback
 from src.models import CIStatus, ReviewStatus
 
+from tests.e2e.conftest import _load_shared_config
 from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
 from tests.e2e.lib.review_api import MergeOutcomeApi, ReviewApi, task_released_and_done
 
@@ -49,7 +49,7 @@ def test_review_feedback_reaches_new_reviewed_head_and_merge(
     testbed_slug, get_state, upload_zip, make_task_zip, post_review, reset_testbed,
 ):
     repo = testbed_slug.replace("__", "/", 1)
-    config = load_config(str(Path(__file__).parent / "data/config.test.yml"))
+    config = _load_shared_config()
     configured = next(item for item in config.repositories if repo in item.url)
     assert configured.allow_merge_without_checks  # explicit testbed exemption
     policy = reviewer_policy_from_config(config)

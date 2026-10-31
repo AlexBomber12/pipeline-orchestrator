@@ -6,14 +6,16 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from uuid import uuid4
 
+import pytest
 import redis.asyncio as aioredis
 from src.metrics import MetricsStore, RunRecord
-from src.models import QueueTask, TaskStatus
+from src.models import InvocationSnapshot, QueueTask, TaskStatus
 from src.web import app as web_app
 from src.web.routes.repo_control import _build_tasks_panel_context
 
 
-def test_task_metrics_writer_reader_round_trip() -> None:
+@pytest.mark.parametrize("with_dispatch_evidence", [True, False], ids=["current", "legacy"])
+def test_task_metrics_writer_reader_round_trip(with_dispatch_evidence: bool) -> None:
     """Use isolated DB 15 and delete only keys owned by this test."""
     address = subprocess.run(
         ["docker", "inspect", "--format",
@@ -23,10 +25,12 @@ def test_task_metrics_writer_reader_round_trip() -> None:
     ).stdout.strip()
     assert address
     with ThreadPoolExecutor(max_workers=1) as pool:
-        pool.submit(lambda: asyncio.run(_exercise(address))).result(timeout=30)
+        pool.submit(lambda: asyncio.run(_exercise(
+            address, with_dispatch_evidence=with_dispatch_evidence,
+        ))).result(timeout=30)
 
 
-async def _exercise(address: str, port: int = 6379) -> None:
+async def _exercise(address: str, port: int = 6379, *, with_dispatch_evidence: bool = True) -> None:
     slug = "metrics-test-" + uuid4().hex
     redis = aioredis.Redis(host=address, port=port, db=15, decode_responses=False)
     store = MetricsStore(redis)
@@ -46,6 +50,11 @@ async def _exercise(address: str, port: int = 6379) -> None:
             record, run_id=slug + "-new", started_at="2026-05-02T10:00:00+00:00",
             duration_ms=None, fix_iterations=2, run_phase="fix", attempt_index=2,
             exit_reason="error", outcome="failed", cause="CRASH",
+            # This continuation inherited counter 2 but dispatched only FIX 2.
+            invocations=[InvocationSnapshot(
+                plugin_id="codex", model_override="gpt-5", reasoning_effort_override=None,
+                run_id=slug + "-new", attempt_index=2, phase="fix", fix_iteration=2,
+            )] if with_dispatch_evidence else [],
         ))
         await store.save(replace(record, run_id=slug + "-bad", task_id="PR-002"))
         await redis.set(f"metrics:run:{slug}-bad", "{malformed")
@@ -59,15 +68,28 @@ async def _exercise(address: str, port: int = 6379) -> None:
             redis_client=redis, retry_cap=3,
         )
         metrics = context["tasks_by_status"]["error"][0]["metrics"]
-        assert metrics["exit_reason"] == "error" and metrics["fix_iterations"] == 2
-        assert metrics["duration_ms"] is None and "cost" not in metrics
+        assert metrics["exit_reason"] == "error"
+        assert metrics["attempt_count"] == 2
+        assert metrics["fix_iterations"] == (1 if with_dispatch_evidence else None)
+        assert metrics["telemetry"]["fix_iterations"] == {
+            "status": "partial" if with_dispatch_evidence else "unknown",
+            "known_runs": 1 if with_dispatch_evidence else 0, "total_runs": 2,
+        }
+        assert metrics["duration_ms"] == 12000
+        assert metrics["telemetry"]["duration_ms"] == {
+            "status": "partial", "known_runs": 1, "total_runs": 2,
+        }
+        assert metrics["metered_cost_usd"] is None and metrics["subscription_quota"] is None
         assert all(v["metrics"] is None for v in context["tasks_by_status"]["done"])
         rendered = web_app.templates.get_template("components/tasks_panel.html").render(
             **context,
         )
         assert all(pr_id in rendered for pr_id in ("PR-001", "PR-002", "PR-003"))
-        assert "codex" in rendered and "gpt-5" in rendered and "2 fix" in rendered
-        assert "error</span>" in rendered and "12s</span>" not in rendered
+        assert "codex" in rendered and "gpt-5" in rendered and "2 runs" in rendered
+        assert ("1 fix" if with_dispatch_evidence else "fix unknown") in rendered
+        assert "error</span>" in rendered and "12s" in rendered
+        assert "partial; 1/2 runs known" in rendered
+        assert "API price unavailable" in rendered and "Subscription quota unavailable" in rendered
         assert "$0" not in rendered
         assert before == {key: await redis.dump(key) for key in keys}
     finally:

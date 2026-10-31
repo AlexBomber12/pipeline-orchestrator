@@ -108,12 +108,12 @@ def test_rejects_invalid_bot_user_lookup_results(
         reviewer_config.resolve_reviewer_identity("reviewer")
 
 
-def test_workflow_prepares_config_before_build_and_verifies_both_services() -> None:
-    workflow = Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+def test_workflow_prepares_config_before_start_and_verifies_both_services() -> None:
+    workflow = Path(".github/actions/testbed-batch/action.yml").read_text(encoding="utf-8")
 
     assert workflow.index("Prepare integration reviewer config") < workflow.index(
-        "Build test stack image"
-    )
+        "Install shared integration config"
+    ) < workflow.index("Bring up test stack") < workflow.index("Verify prepared reviewer config in test services")
     assert "steps.testbed-reviewer-token.outputs.app-slug" in workflow
     assert "for service in web-test daemon-test" in workflow
     configured = yaml.safe_load(

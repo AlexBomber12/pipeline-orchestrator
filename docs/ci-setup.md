@@ -6,7 +6,7 @@ This is a one-time setup procedure performed by the human operator (AlexBomber12
 
 ## Why GitHub App and not a PAT
 
-GitHub Apps generate ephemeral 1-hour tokens per workflow run, expose fine-grained per-repository permissions, and require no manual rotation. A long-lived personal access token (PAT) would have to be rotated periodically and is harder to scope precisely (PATs grant access to every repo the user can reach). For a tool intended to run for years, App-based authentication is the future-proof choice.
+GitHub Apps issue ephemeral 1-hour installation tokens, expose fine-grained per-repository permissions, and require no manual rotation. A long-lived personal access token (PAT) would have to be rotated periodically and is harder to scope precisely (PATs grant access to every repo the user can reach). For a tool intended to run for years, App-based authentication is the future-proof choice.
 
 ## Step-by-step setup
 
@@ -65,7 +65,7 @@ Install it only on `AlexBomber12/pipeline-orchestrator-testbed`, generate its pr
 - `TESTBED_REVIEWER_APP_ID`
 - `TESTBED_REVIEWER_APP_PRIVATE_KEY`
 
-The workflow exposes the separate installation token as `TESTBED_REVIEWER_TOKEN`; the fixture overrides `GH_TOKEN` only in reviewer subprocesses and never falls back to other credentials. Check only the names with `gh secret list --repo AlexBomber12/pipeline-orchestrator`.
+Each integration batch exposes its fresh separate installation token as `TESTBED_REVIEWER_TOKEN`; the fixture overrides `GH_TOKEN` only in reviewer subprocesses and never falls back to other credentials. Check only the names with `gh secret list --repo AlexBomber12/pipeline-orchestrator`.
 
 ### Step F: Verify
 
@@ -103,21 +103,61 @@ From this point, all PRs to `main` require both checks green plus valid current-
 
 ## Token rotation
 
-GitHub Apps automatically generate ephemeral tokens per workflow run; no manual rotation is needed. The private key (the `TESTBED_APP_PRIVATE_KEY` secret) does not expire by default. If you suspect compromise: regenerate the private key in App settings (delete the old one, generate a new one), then update the repository secret. The old key is invalidated immediately by GitHub.
+GitHub App installation tokens expire after one hour; a token copied into
+`GH_TOKEN`, the reviewer environment or the test-container credential files is
+not refreshed automatically. A former single full-suite invocation exceeded that
+lifetime and failed with HTTP 401 during its final test despite earlier passing
+checks. Existing App IDs/private-key secrets remain unchanged.
+
+The single required `integration` job now holds the same shared-testbed lock for
+three **sequential** module batches. Python/dependency/browser/image preparation
+runs before token issuance. Each `.github/actions/testbed-batch` invocation
+creates fresh author and independent reviewer tokens, reseeds the stopped
+isolated test stack, runs its tests, captures evidence and tears that stack down.
+Before starting each batch, ownership of the entire retained test-data tree is
+restored to container UID 1000, including analytics/audit lock and journal files.
+A container-side create/append probe fails setup if those directories or existing
+files are unwritable; it does not alter their contents.
+Its 45-minute step bound leaves a margin below the one-hour credential lifetime;
+a timeout fails the gate, rather than silently dropping tests. Later batches
+still run after an earlier failure. No private key is mounted in the stack.
+
+`--e2e-batch=1`, `2`, `3` partitions the actual pytest module collection, preserving
+every parameterized case and automatically including newly added modules. CI
+retains each collection manifest and JUnit report in `e2e-evidence` and verifies
+that their disjoint union equals the full collection. Missing or contradictory
+manifests fail the gate. The default local `pytest tests/e2e/ -v` remains unbatched.
+There is no change to required check names, trusted review/status identities,
+repository permissions, shared concurrency policy or test assertions. The private key (the `TESTBED_APP_PRIVATE_KEY` secret) does not expire by default. If you suspect compromise: regenerate the private key in App settings (delete the old one, generate a new one), then update the repository secret. The old key is invalidated immediately by GitHub.
 
 ## Cost and quota
 
-`pipeline-orchestrator` is a public repository; GitHub Actions runner minutes are unlimited on the free tier for public repos. The integration job consumes about 12 to 18 minutes per run; the global concurrency lock means at most one integration runs at a time, so there is no parallelism multiplier. Expect 2 to 4 integration runs per active development day, well within unlimited free-tier capacity.
+`pipeline-orchestrator` is a public repository; GitHub Actions runner minutes are unlimited on the free tier for public repos. The integration job consumes roughly an hour for the full suite (split across three credential batches); the global concurrency lock means at most one integration runs at a time, so there is no parallelism multiplier. Expect 2 to 4 integration runs per active development day, well within unlimited free-tier capacity.
 
 ## Troubleshooting
 
 Common issues and fixes:
 
 - **"App not installed on repository"**: Step D was missed or the wrong repo was selected. Re-do Step D.
-- **"Bad credentials" from `gh` CLI in workflow**: the App private key in the secret is malformed. Re-do Step E, ensuring you paste the entire `.pem` contents including the BEGIN/END lines.
+- **"Bad credentials" from `gh` CLI in workflow**: distinguish setup failure from a token that has expired during a long run. Check the failing batch, issuance time and its collection/JUnit artifacts first. If token creation fails immediately, verify the existing App installation and private-key secret (Step E); a late HTTP 401 does not by itself mean the private key is malformed.
 - **Integration job hangs at `docker compose up -d --wait`**: the Dockerfile build is failing or a service healthcheck is failing. Check the prior step's output for image build errors, then check the redis-test healthcheck (uses `redis-cli ping`, which is in the `redis:7-alpine` image by default).
 - **"Permission denied" pushing to testbed**: the App is installed but the Contents permission is read-only. Re-do Step A, ensuring Contents is "Read and write".
 - **`tests/e2e/test_fix_external_merge.py` fails while posting or reading commit statuses**: the App is missing required Commit statuses access. In the App's "Permissions & events" page, change "Commit statuses" from no access to Read and write, then re-grant access on the install (the App owner will get an "approve permission update" prompt at the install URL).
 - **`tests/e2e/test_ci_evidence_access.py` fails on check-runs**: the App lacks Checks read access or the install has not been re-approved after adding that permission. In the App's "Permissions & events" page, set "Checks" to Read-only, then approve the updated installation for `pipeline-orchestrator-testbed`.
 - **`tests/e2e/test_ci_evidence_access.py` fails on combined status**: the App lacks Commit statuses read access or cannot see the testbed repository. Confirm "Commit statuses" is Read and write and repeat Step D for `pipeline-orchestrator-testbed`.
 - **Missing `TESTBED_REVIEWER_APP_ID` or `TESTBED_REVIEWER_APP_PRIVATE_KEY`**: complete Step E2. The workflow intentionally fails before e2e setup instead of letting the review test create a PR with the author identity.
+
+The batch reset keeps UID 1000 ownership for container-written state and shim
+handshakes, then restores host ownership only for `shim-scenario`, which pytest
+writes and containers read. Before container startup, the real `coder_shim`
+context verifies host read/write access and restores the previous scenario.
+This catches retained control-file permission failures without discarding
+analytics, audit, invocation evidence, or changing provider settings.
+
+The dirty-work continuity scenario retains its synthetic marker throughout all
+preservation and restart assertions. Its teardown then stops the owned test
+daemon and disposes only that marker after validating its exact task content
+and branch, retaining the disposed bytes in evidence. The existing GitHub/Redis
+reset completes while that test daemon is stopped, before restart. Reset alone
+does not clean local untracked files; later tests must not depend on an
+intervening scenario to clear the marker. Other dirty files remain untouched.

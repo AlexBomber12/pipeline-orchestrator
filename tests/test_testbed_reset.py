@@ -6,7 +6,8 @@ is importable as ``tests.e2e.lib.testbed_reset``. These unit tests live
 under tests/ root (not tests/e2e/) so they are collected by the default
 pytest invocation; tests/e2e/ is excluded by ``norecursedirs``.
 
-All subprocess.run calls are mocked; no real GitHub API or git calls happen.
+Remote-reset subprocesses are mocked. Owned-marker regressions use real
+temporary Git repositories and the production dirty-tree reader.
 """
 
 from __future__ import annotations
@@ -1089,3 +1090,66 @@ def test_stop_daemon_waits_for_runner_pause_ack(terminal_state) -> None:
     assert posts == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/repos/{slug}/stop", 10)]
     assert opens == [(f"{e2e_conftest.TEST_DASHBOARD_URL}/api/states", 5)] * (4 + len(invalid_idle))
     assert sleeps == [0.5] * (3 + len(invalid_idle))
+
+
+def _continuity_repo(tmp_path):
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "init", "-b", "fixture-branch", str(repo)], check=True, capture_output=True)
+    marker = repo / "continuity-dirty.txt"
+    marker.write_text("unpreserved work for PR-123\n")
+    return repo, marker
+
+
+@pytest.mark.parametrize("foreign_work", [False, True])
+def test_owned_dirty_fixture_cleanup_allows_next_preflight_without_discarding_foreign_work(tmp_path, foreign_work):
+    from src.daemon.git_ops import _working_tree_dirty
+
+    repo, marker = _continuity_repo(tmp_path)
+    foreign = repo / "unrelated.txt"
+    if foreign_work:
+        foreign.write_text("retain unrelated changes")
+    # Existing remote/Redis reset does not dispose a local fixture marker.
+    with (
+        patch.object(testbed_reset, "close_all_open_prs", return_value=0),
+        patch.object(testbed_reset, "delete_non_main_branches", return_value=0),
+        patch.object(testbed_reset, "wipe_tasks_dir_on_main", return_value=False),
+    ):
+        reset_testbed_full("AlexBomber12__pipeline-orchestrator-testbed")
+    assert _working_tree_dirty(str(repo))
+    disposed = testbed_reset.remove_owned_continuity_marker(repo, "PR-123", "fixture-branch")
+    assert disposed == "unpreserved work for PR-123\n" and not marker.exists()
+    assert _working_tree_dirty(str(repo)) is foreign_work
+    if foreign_work:
+        assert foreign.read_text() == "retain unrelated changes"
+
+
+@pytest.mark.parametrize("conflict", ["branch", "content", "symlink"])
+def test_owned_dirty_fixture_cleanup_refuses_unproven_marker(tmp_path, conflict):
+    repo, marker = _continuity_repo(tmp_path)
+    branch = "different-branch" if conflict == "branch" else "fixture-branch"
+    if conflict == "content":
+        marker.write_text("foreign content")
+    if conflict == "symlink":
+        target = tmp_path / "unrelated.txt"
+        target.write_text("unpreserved work for PR-123\n")
+        marker.unlink()
+        marker.symlink_to(target)
+    before = marker.read_text()
+    with pytest.raises(ValueError):
+        testbed_reset.remove_owned_continuity_marker(repo, "PR-123", branch)
+    assert marker.read_text() == before
+    assert marker.is_symlink() is (conflict == "symlink")
+
+
+def test_owned_dirty_fixture_cleanup_runs_in_stdlib_only_container_boundary(tmp_path):
+    repo, marker = _continuity_repo(tmp_path)
+    project = Path(testbed_reset.__file__).resolve().parents[3]
+    code = (
+        f"import sys; sys.path.insert(0, {str(project)!r}); "
+        "from pathlib import Path; "
+        "from tests.e2e.lib.testbed_reset import remove_owned_continuity_marker; "
+        f"remove_owned_continuity_marker(Path({str(repo)!r}), 'PR-123', 'fixture-branch')"
+    )
+    result = subprocess.run([sys.executable, "-S", "-c", code], capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert not marker.exists()

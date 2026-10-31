@@ -5,6 +5,169 @@ Pipeline-orchestrator reads runtime connection settings such as
 longer has rollout flags: daemon startup always reconstructs queue state
 from structured `tasks/PR-*.md` headers.
 
+## Release and rollback procedure
+
+This is the canonical release procedure; the [deploy checklist](../scripts/deploy-checklist.md)
+links here. Source merge, container recreation and verified running behavior are
+three separate observations. These instructions authorize no production action.
+Production execution, branch-protection changes and any one-time review waiver
+require separate explicit operator decisions; a waiver is not ordinary approval.
+Never change protection or weaken CI as part of deployment.
+
+### Candidate, pause and preservation gate
+
+1. Record the full immutable candidate SHA and the prior release evidence. Verify
+   the candidate contains the approved PR HEAD and required successful `unit` and
+   `integration` checks, with valid current-change trusted Codex `+1` and no later
+   blocking findings (see [AGENTS.md](../AGENTS.md#codex-review-gate-github-pr)).
+   Status-only commits after a merge need their ancestry recorded too. A ready PR
+   or green local gate alone does not authorize promotion.
+2. Select the actual deployment checkout, Compose file/project and enabled
+   profiles on the host. Do not confuse the deployment checkout with the daemon's
+   managed `/data/repos/...` clones. Record current user pause externally and
+   preserve it throughout. Pause new dispatch through the operator controls;
+   allow existing work to drain. Confirm task/PR publication, pending commands,
+   coder/helper/login/catalog owners and children are quiescent before stopping.
+   IDLE alone is insufficient. Unknown process ownership blocks release; never
+   kill an unconfirmed owner or clear its hold to continue.
+3. Preserve original config bytes, local modifications and environment/mount
+   references in an operator-controlled secure location outside the checkout.
+   Include the selected base (`PO_CONFIG_PATH` if set), sibling production overlay,
+   provider config and applicable Compose overrides/`.env`. Do not print secrets
+   or commit these copies. Record hashes and restore locations. Never use reset,
+   clean, checkout of config paths or a template copy to erase local settings.
+4. Review the [PR-434 restore inventory](#operational-restore-inventory-and-disposable-proof-pr-434).
+   Its four disposable cases prove Git/stash and selected reader semantics, **not
+   complete operational restore**. Verify the capture identity, integrity, age,
+   restore inspection and independent destination for the actual selected backup.
+   Repo bundles omit dirty/ignored work, config overlays, Redis, uploads, analytics
+   and credentials. The `./data` bind does not include named `redis_data` or
+   `codex-auth` volumes. Redis persistence/settings/absolute expiry and cross-store
+   consistency must be checked separately. Preserve pause/Stop, decisions,
+   invocation/publication identity and completion accounting. Never advertise
+   bundle-only rollback as verified recovery. If the required backup or rollback
+   compatibility cannot be established, stop and record the unsupported boundary.
+
+### Scoped host actions and identity evidence
+
+The following is a **Bash template for a separately authorized host session**.
+Replace every placeholder, verify the checkout/project against existing container
+mounts and labels, and review each command's output before the next mutation.
+Do not run it inside an AUTO PR container. Do not use `docker compose down -v`.
+
+```bash
+DEPLOY_CHECKOUT=/absolute/path/to/intended/deployment-checkout
+COMPOSE_PROJECT=existing-project-name
+CANDIDATE_SHA=full-approved-40-character-sha
+cd "$DEPLOY_CHECKOUT"
+dc() { docker compose --project-directory "$DEPLOY_CHECKOUT" -p "$COMPOSE_PROJECT" -f "$DEPLOY_CHECKOUT/docker-compose.yml" "$@"; }
+# Include the deployment's actual override files/profiles in dc before proceeding.
+git status --short
+git rev-parse HEAD
+git rev-parse --verify "$CANDIDATE_SHA^{commit}"
+dc config --services
+dc ps -a
+for service in web daemon mcp; do
+  docker inspect --format '{{.Id}} {{.Image}} {{.State.StartedAt}} {{json .Mounts}} {{json .Config.Labels}}' "$(dc ps -q "$service")"
+done
+```
+
+Keep this evidence private where paths/labels are sensitive. Record image IDs
+for prior containers and retain the corresponding images. The current default
+Compose defines `web`, `daemon`, `mcp`, `redis`, plus optional `cloudflared`.
+Inspect actual mount sources: `web` mounts `.:/app`, while `daemon` and `mcp`
+mount it read-only. `/data` is a separate host bind for web/daemon. A checkout
+mutation changes mounted files immediately, even before recreation; drain first.
+
+After the preservation gate, stop only the source consumers (`dc stop web daemon
+mcp`) so control-plane writers and Python imports cannot race source changes.
+Keep Redis and its volume intact. Fetch the approved candidate, inspect its diff
+(including config/schema/dependency changes), then use `git switch --detach
+"$CANDIDATE_SHA"` only in the selected deployment checkout. If local changes
+would be carried across or overwritten, stop for explicit config reconciliation;
+never force the switch. Compare preserved config hashes and intentionally review
+new defaults against the existing overlay before starting anything.
+
+Choose exactly one application start path, after reviewing the candidate:
+
+```bash
+# Python/template-only change with compatible existing dependencies/image:
+dc up -d --no-deps --no-build --force-recreate web daemon mcp
+# OR: Dockerfile, requirements, CLI or system dependency change:
+dc build web daemon mcp
+dc up -d --no-deps --no-build --force-recreate web daemon mcp
+```
+
+The second path requires successful builds before `up`. Record resulting image
+IDs; rebuilding an old SHA is not necessarily the old image (base images and OS
+packages can drift). Do not recreate Redis/cloudflared unless separately scoped.
+The mounted source overrides image `/app`, but installed packages/CLIs come from
+the image. Recreate restarts Python processes; `up -d` alone need not do so.
+
+Repeat the container/image/mount inspection and record checkout SHA and selected
+source hashes inside each source consumer, for example:
+
+```bash
+dc exec -T daemon sha256sum /app/src/daemon/main.py /app/src/config.py
+dc logs --since 5m --tail 200 web daemon mcp
+```
+
+Compare hashes with the candidate's committed files, and privately hash the
+selected base/overlay on host and inside each relevant container. Validate config
+with the candidate's `src.config.load_config` under the intended environment;
+inspect only intended non-secret fields. An `exec` loader is a **new process**,
+not proof of the daemon's in-memory config. Record startup overlay warnings,
+reload/deferred-config evidence and effective-setting observations separately.
+
+**Missing proof:** the current stack has no unified startup attestation binding
+loaded modules, image, effective config and readiness to an immutable release ID.
+Container `Up`, checkout HEAD, mounted hashes, fresh parsing and quiet logs each
+prove only their own observation. They do not alone prove loaded code, provider
+access, recovered state or useful progress. Report identity/readiness as partially
+verified until the relevant behavior is observed; do not invent a health endpoint.
+
+### Bounded smoke and failure decision
+
+First inspect the dashboard and read-only diagnostics while pause remains set:
+expected repositories and retained task/completion history must appear, with no
+unexpected dispatch, replay, config error or ownership hold. Observe across at
+least two configured poll intervals; fresh display alone is not progress proof.
+
+A real-provider smoke is a separate operator-authorized action with an exact
+repository/task/spec/PR identity, one disposable task, cost/time bound and expected
+terminal result agreed before starting. Use only an already authorized test target;
+never create a repository or replay active/rejected/restored work. If the current
+user pause forbids dispatch, leave it in place and report smoke **not performed**.
+An operator may separately authorize a narrow resume, then re-pause/drain when the
+smoke finishes or its bound expires. Success requires the matching external PR
+merged with required checks/review and matching terminal bookkeeping, or the
+explicitly planned matching ERROR for a failure scenario. IDLE alone never passes.
+A mock-coder e2e does not verify real credentials/provider access.
+
+Record candidate/prior identities, timestamps, smoke evidence and unverified
+boundaries in the operator release record. Failure includes identity/config
+mismatch, lost pause/history, unexpected dispatch, stalled bound, error logs,
+missing required checks or wrong external outcome. Keep paused, preserve evidence
+and confirm process ownership before stopping; do not retry or roll back blindly.
+
+### Rollback admission
+
+Before release, compare old and new readers/writers for task frontmatter,
+completion ledger, Redis command/run/publication schemas and TTLs, config and
+side-store formats. There is no universal downgrade/migration guarantee. If the
+old version cannot safely read state already written by the candidate, source
+rollback is blocked pending a separately authorized recovery plan.
+
+For compatible state, a separately authorized rollback repeats the same pause,
+drain, config-preservation and scoped source-switch procedure using the recorded
+prior full SHA and retained compatible image IDs (an explicit Compose override
+may select those images). Recreate the same source consumers and repeat identity
+and smoke verification. Never overwrite local config, restore mixed-age Redis/Git
+archives into live state, delete volumes or undo real GitHub merges. Preserve
+historical completion and current pause. PR-434's complete-restore gap remains a
+blocker to claiming disaster recovery; source rollback cannot reverse external
+effects, consumed decisions or accounting. Forward repair may be safer.
+
 ## Read-only MCP diagnostics
 
 The localhost-scoped Orchestrator MCP exposes `get_orchestrator_status` for a
@@ -127,7 +290,8 @@ IDs never grant access.
 
 #### Verification and rollback
 
-After deployment, verify these separately:
+Apply the [release procedure](#release-and-rollback-procedure) for code/config
+changes, then verify these feature-specific predicates separately:
 
 - Direct requests to the origin or public `/mcp` endpoint without a valid
   Access login fail with a fixed authentication response and expose no tool
@@ -147,7 +311,8 @@ connection. Record live verification only after the browser authorization,
 connection initialization, tool discovery, and diagnostics call all succeed
 through the production hostname.
 
-To roll back, set `MCP_REMOTE_DIAGNOSTICS=0` and recreate the `mcp` container.
+For a feature disable, set `MCP_REMOTE_DIAGNOSTICS=0` and recreate only `mcp`
+through the scoped release procedure. This is not a source/state rollback.
 This immediately returns port 5173 to the restricted, Redis-free tool set while
 leaving local diagnostics on port 5174 available. Then disable Managed OAuth or
 the Access application only if the public non-diagnostic MCP endpoint should no
@@ -221,7 +386,9 @@ no retained task or Redis state contains these legacy artifacts.
 Before upgrading a deployment with an active legacy FIX, pause new dispatch
 and let the old invocation finish and its pending completion reconcile. Confirm
 that no coder or child process owns the checkout and that the task header and
-published PR agree. Upgrade at that quiescent boundary, then resume. If the
+published PR agree. Upgrade at that quiescent boundary using the
+[release procedure](#release-and-rollback-procedure); preserve the current user
+pause and resume only with separate operator authorization. If the
 invocation outcome cannot be established, preserve the checkout, task, and PR
 for the existing uncertainty/Retry procedure; an arbitrary restart during an
 active invocation is not a safe migration step.
@@ -978,3 +1145,146 @@ periodic bundles, crash-backup refs, status Git writes or diagnostic history.
 No obsolete runtime path is removed here. There are no deployment prerequisites
 for these tests/docs; actual restore implementation, secure provisioning and
 provider/deployment smoke remain separate operator-authorized release work.
+
+## PR-435: compatible form protection investigation (2026-10-30)
+
+Investigated source base `915f15ae2d4719c47de249995c76f900c657a017` using
+Python 3.12.15 and synthetic TestClient/ASGI requests only. No SERVER requests,
+production processes, runtime config, Redis, pins or security policy changed.
+The retained test from the interrupted invocation was completed, including Ruff
+fixture-import cleanup and direct ASGI stream checks; its earlier passes were
+not treated as completion evidence.
+
+### Advisory and application input paths
+
+The official [Starlette advisory GHSA-82w8-qh3p-5jfq](https://github.com/Kludex/starlette/security/advisories/GHSA-82w8-qh3p-5jfq)
+(CVE-2026-54283) affects `>=0.4.1,<1.3.1`; 1.3.1 enforces URL-encoded
+`max_fields` and `max_part_size`. The current 0.49.3 parser ignores these limits
+for URL-encoded bodies. Multipart parser limits do not protect that input type.
+
+`src/web/app.py` installs the operator heartbeat middleware, which does not bound
+request bodies. Explicit `request.form()` consumers in `src/web/routes/settings.py`
+are webhook testing, daemon coder settings, HTMX device-login start and allow-listed
+config-field editing. FastAPI also parses `Form` parameters in settings,
+repo_control and onboarding; uploads uses `UploadFile` plus `Form(subject)`.
+Consequently a route-local `request.form(max_fields=...)` edit on the existing
+pins cannot close the advisory. The regression uses both the explicit parser
+route `POST /settings/webhook/test` and implicit FastAPI parsing on
+`PUT /settings/daemon`, with the real app/lifespan/heartbeat and existing upload
+fixtures. Config/upload bytes are temporary and Redis is the fixture double.
+
+### Disposable matrix and reproducible commands
+
+Each environment was created with `python -m venv /tmp/pr435-{pins,upgrade}`.
+The pins environment installed `requirements.txt`; the upgrade environment
+installed a temporary copy changing only FastAPI to 0.162.0 and Starlette to
+1.3.1. Both installed `pytest==8.4.2 pytest-asyncio pytest-cov ruff` and passed
+`python -m pip check`. No installed application environment was upgraded.
+
+| Installed package | Pinned environment | Upgrade environment |
+| --- | --- | --- |
+| fastapi | 0.120.4 | 0.162.0 |
+| starlette | 0.49.3 | 1.3.1 |
+| mcp | 1.27.0 | 1.27.0 |
+| python-multipart | 0.0.27 | 0.0.27 |
+| pydantic / httpx | 2.11.3 / 0.28.1 | 2.11.3 / 0.28.1 |
+| anyio / pydantic-settings | 4.15.1 / 2.16.2 | 4.15.1 / 2.16.2 |
+| pytest / pytest-asyncio | 8.4.2 / 1.4.1 | 8.4.2 / 1.4.1 |
+
+Use each environment's `bin/python` for these commands:
+
+```sh
+python -m pytest tests/test_form_limits_contract.py -q
+python -m pytest tests/test_form_limits_contract.py tests/test_settings.py tests/test_upload.py tests/mcp tests/test_mcp_main.py tests/web/routes/test_settings_webhook.py tests/web/routes/test_settings_spend_ceiling.py -q
+```
+
+The focused module passed 20 tests in each environment. The broader selection
+passed 579 tests on pins; the upgrade passed 575 and failed four existing tests:
+`test_put_repo_empty_review_timeout_clears_override`,
+`test_put_repo_clear_review_timeout_override_lets_daemon_default_apply`,
+`test_registered_plugin_round_trips_through_every_coder_mutation_endpoint`, and
+`test_repo_coder_override_clear` (all in `tests/test_settings.py`). Empty form
+values left timeout/coder overrides set instead of clearing/inheriting them;
+the configured-plugin automatic-selection HTML assertion also failed.
+Application/MCP imports and ordinary settings/upload requests succeeded, but
+this upgrade candidate is **not compatible** with the existing request contract.
+These candidate-only failures are investigation evidence, not waived local gates.
+
+FastAPI 0.120.4's installed metadata requires `starlette>=0.40.0,<0.50.0`;
+FastAPI 0.162.0 requires `starlette>=0.46.0`. A disposable
+`python -m pip install --dry-run fastapi==0.120.4 starlette==1.3.1` failed with
+`ResolutionImpossible`, confirming that an independent Starlette bump violates
+current dependency constraints. A broader framework migration needs its own
+compatibility work; this investigation neither selects new production pins nor
+claims every possible compatible version pair has been exhausted.
+
+### Selected minimal proposal and protection evidence
+
+Select a small outer ASGI preflight for URL-encoded forms on the current web
+stack. The test-only `CandidateFormGuard` bounds received body bytes to 64 KiB
+and raw fields to 1000, returning 413 before parsing. This is a proposed stricter
+application contract, not an installed fix. It counts actual stream bytes,
+ignores Content-Length for admission, handles charset parameters, preserves
+encoded delimiters, and replays accepted bytes once. Empty segments count
+conservatively. Multipart bypasses this guard and keeps existing upload/parser
+limits; JSON and non-HTTP traffic also bypass it.
+
+On both real route shapes the unguarded pins accept a 1 MiB-plus-one-byte value
+and 1001 fields (200); the upgrade rejects both (400). The candidate rejects
+64 KiB-plus bodies and 1001 fields (413), including missing or false short
+Content-Length. A patched parser spy fails if rejected input reaches parsing.
+Direct ASGI tests additionally prove multi-message rejection without draining a
+suffix; TestClient alone may coalesce chunks. Exact byte/field boundaries,
+escaped delimiters and disconnect handling pass. Ordinary daemon settings persist
+45 seconds, an empty webhook target remains usable without network traffic, and
+multipart task upload stages the exact fixture bytes with and without the guard.
+
+This bounds retained preflight bytes and parsing work per accepted request, not
+total concurrent connections, slow clients or server transport allocations. An
+ASGI server may deliver an already-large chunk; the guard rejects before copying
+it. Proxy/server concurrency/timeouts remain separate deployment concerns.
+
+Separately estimated implementation delta: about 70 production lines in an
+existing web boundary plus app wiring (2 production files), 100 test lines and
+20 documentation lines (about 190 additions/deletions across 4 files). Reuse this
+prototype and existing fixtures; add production middleware ordering, non-form
+passthrough, duplicate-header and accepted multi-chunk replay tests before
+shipping. Replace reliance on ineffective URL-encoded parser defaults with this
+single admission boundary; retain parser calls, multipart limits and heartbeat.
+No runtime code is removed or migrated here. A later fully compatible framework
+upgrade can replace the temporary guard after preserving its application limits.
+Implementation/release and deployment smoke require separate work; this PR's
+source-only tests/docs have no deployment prerequisites and fix no live service.
+
+### MCP applicability by enabled features
+
+`src/mcp/server.py` uses FastMCP Streamable HTTP with installed defaults
+`stateless_http=False`, `auth=None`. No source calls `enable_tasks` or registers
+experimental task handlers: [GHSA-hvrp-rf83-w775](https://github.com/modelcontextprotocol/python-sdk/security/advisories/GHSA-hvrp-rf83-w775)
+(fixed 1.27.2) is not enabled by this application despite the affected 1.27.0 pin.
+
+[GHSA-jpw9-pfvf-9f58](https://github.com/modelcontextprotocol/python-sdk/security/advisories/GHSA-jpw9-pfvf-9f58)
+(fixed 1.27.2) concerns authenticated stateful HTTP session ownership. The local
+listener has no SDK bearer authentication. The optional remote listener wraps
+stateful MCP in custom Cloudflare Access middleware: it validates JWT signature,
+issuer and audience but discards the returned identity and does not bind a
+session to that identity. Do not infer per-user session isolation from this
+wrapper or an SDK bump; custom-auth principal binding needs a separate scoped
+review/test before making that guarantee.
+
+[GHSA-w4fh-qvv9-3v23](https://github.com/modelcontextprotocol/python-sdk/security/advisories/GHSA-w4fh-qvv9-3v23)
+(fixed 1.30.0 with additional configuration) targets SDK bearer audience checks,
+which are not configured here. The custom verifier already supplies explicit
+issuer/audience checks; a version-only finding is insufficient.
+
+Conversely, stateful HTTP session retention in
+[GHSA-84m7-p3x7-pcfv](https://github.com/modelcontextprotocol/python-sdk/security/advisories/GHSA-84m7-p3x7-pcfv)
+(fixed 1.30.0) and HTTP body allocation in
+[GHSA-fmmv-w9g8-j3gc](https://github.com/modelcontextprotocol/python-sdk/security/advisories/GHSA-fmmv-w9g8-j3gc)
+(fixed 1.29.1) have relevant enabled transport paths. Authentication restricts
+admission but does not bound sessions per admitted client. No production gateway
+body cap or live reachability was verified. The proposed web form guard does not
+cover the separate MCP JSON listener. Track MCP transport limits and principal
+binding as separate maintenance; no MCP upgrade or auth-policy change is made
+here. Existing MCP tests use controlled transports/synthetic assertions and do
+not prove provider access, real-account security or deployed gateway behavior.

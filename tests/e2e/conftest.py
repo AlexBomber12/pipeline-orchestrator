@@ -12,8 +12,10 @@ from pathlib import Path
 
 import pytest
 import requests
-from src.config import update_daemon_config, update_repository
+from src.config import load_config, update_daemon_config, update_repository
 
+from tests.e2e.lib.pytest_batches import pytest_addoption as pytest_addoption
+from tests.e2e.lib.pytest_batches import pytest_collection_modifyitems as pytest_collection_modifyitems
 from tests.e2e.lib.review_api import ReviewApi
 from tests.e2e.lib.testbed_reset import clear_testbed_redis_state, reset_testbed_full
 
@@ -176,6 +178,15 @@ def _shared_config_bytes() -> bytes:
 
 def _config_digest() -> str:
     return hashlib.sha256(_shared_config_bytes()).hexdigest()
+
+
+def _load_shared_config():
+    # Settings atomically replaces the shared file with container-owned 0600
+    # bytes. Parse a private snapshot without changing the live permissions.
+    with tempfile.TemporaryDirectory() as directory:
+        snapshot = Path(directory) / "config.yml"
+        snapshot.write_bytes(_shared_config_bytes())
+        return load_config(str(snapshot))
 
 
 def _daemon_log_count(message: str) -> int:
