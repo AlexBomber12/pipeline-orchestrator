@@ -190,11 +190,11 @@
         </h4>
         {% if error_guardrail %}
         <div class="error-subgroup error-subgroup-guardrail mb-3">
-            <h5 class="mb-2 inline-flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.16em] text-amber-300">
-                <span class="rounded border border-amber-400/40 bg-amber-400/10 px-2 py-0.5 text-[10px] text-amber-300">Guardrail</span>
+            <h5 class="mb-2 inline-flex items-center gap-2 text-[11px] font-medium uppercase tracking-[0.16em] text-warn">
+                <span class="rounded border border-warn/40 bg-warn/10 px-2 py-0.5 text-[10px] text-warn">Guardrail</span>
                 <span class="font-mono text-gray-500">{{ error_guardrail | length }}</span>
             </h5>
-            <p class="mb-2 text-xs italic text-amber-200/80">Operator decision needed: approve or reject from the guardrail panel.</p>
+            <p class="mb-2 text-xs italic text-warn">Operator decision needed: approve or reject from the guardrail panel.</p>
             <ul class="space-y-2">
                 {% for task in error_guardrail %}
                 {{ task_row(repo_name, task, 'error') }}
