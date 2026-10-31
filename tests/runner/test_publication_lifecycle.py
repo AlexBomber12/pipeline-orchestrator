@@ -1604,7 +1604,8 @@ async def enqueue_bound_provider_retry(runner, repo):
         repo_slug=runner.name, task_id=task.pr_id, task_file=task.task_file, task_branch=task.branch,
         task_fingerprint=task_spec_content_hash((repo / task.task_file).read_text()),
         request_binding='c' * 64, failure_id=retry_failure_identity(task, runner.state, cause), retry_cap=3,
-        bound_pr_number=pr.number, bound_pr_branch=pr.branch, bound_pr_head_sha=pr.head_sha,
+        bound_pr_number=pr.number if pr else None, bound_pr_branch=pr.branch if pr else None,
+        bound_pr_head_sha=pr.head_sha if pr else None,
     )
     await enqueue_retry_command(runner.redis, command)
     runner._consume_retry_command = RetryCommandMixin._consume_retry_command.__get__(runner)
@@ -1994,16 +1995,30 @@ async def coding_provider(lifecycle, monkeypatch):
         if first:
             if provider['work'] != 'before_branch':
                 git(repo, 'checkout', '-b', 'pr-001')
-            if provider['work'] in {'commit', 'published'}:
+            if provider['work'] in {'commit', 'published', 'intermediate'}:
                 (repo / 'repair').write_text('local implementation retained\n')
                 git(repo, 'add', 'repair')
                 git(repo, 'commit', '-m', 'retained implementation')
-            if provider['work'] in {'dirty', 'commit', 'published'}:
+            if provider['work'] in {'dirty', 'commit', 'published', 'intermediate'}:
                 (repo / 'retained-test.py').write_text('# interrupted test\n')
-            if provider['work'] == 'published':
+            if provider['work'] in {'published', 'intermediate'}:
                 git(repo, 'push', 'origin', 'pr-001')
                 provider.update(published=True, head=git(repo, 'rev-parse', 'HEAD'),
                                 created_at=Clock.value + timedelta(seconds=1))
+                if provider['work'] == 'intermediate':
+                    provider['intermediate_head'] = provider['head']
+                    if provider.get('proof_problem') == 'capture_unavailable':
+                        provider['error'] = 'exact PR API unavailable'
+                    elif provider.get('proof_problem') == 'capture_incomplete':
+                        provider['complete'] = False
+                    elif provider.get('proof_problem') == 'capture_remote':
+                        git(remote, 'update-ref', 'refs/heads/pr-001', git(repo, 'rev-parse', 'main'))
+                    # The actual monitor must observe A before this invocation
+                    # adds unpublished B. No transition or ownership result is mocked.
+                    await asyncio.wait_for(provider['publication_seen'].wait(), timeout=5)
+                    (repo / 'local-followup').write_text('unpublished followup retained\n')
+                    git(repo, 'add', 'local-followup')
+                    git(repo, 'commit', '-m', 'unpublished followup after push')
             (repo / 'artifacts').mkdir(exist_ok=True)
             (repo / 'artifacts/ci.log').write_text('pytest 2% -- unfinished')
             provider['retained_head'] = git(repo, 'rev-parse', 'HEAD')
@@ -2013,7 +2028,7 @@ async def coding_provider(lifecycle, monkeypatch):
             assert 'gate is unfinished' in kwargs['task_body']
             assert 'never create a duplicate' in kwargs['task_body']
             assert (repo / 'artifacts/ci.log').read_text() == 'pytest 2% -- unfinished'
-            if provider['work'] in {'dirty', 'commit', 'published'}:
+            if provider['work'] in {'dirty', 'commit', 'published', 'intermediate'}:
                 assert (repo / 'retained-test.py').read_text() == '# interrupted test\n'
             if provider['work'] == 'before_branch':
                 assert 'Create the original task branch as usual' in kwargs['task_body']
@@ -2622,4 +2637,93 @@ async def test_coding_crlf_task_recovery_preserves_original_fingerprint(
     assert provider['calls_to_coder'][1]['task_body'].startswith(original.decode('utf-8'))
     records = await fresh._metrics_store.list_task_runs(fresh.name, 'PR-001')
     assert len(records) == 2 and {r.task_spec_hash for r in records} == {first.task_spec_hash}
+    assert await fresh._metrics_store.get(first.run_id) == first
+
+
+@pytest.mark.parametrize('single_error_exit', [False, True])
+@pytest.mark.parametrize('recovery', [
+    'automatic', 'operator', 'missing_proof', 'foreign_remote',
+    'capture_unavailable', 'capture_incomplete', 'capture_remote',
+])
+async def test_coding_monitor_retains_intermediate_publication(
+    coding_provider, monkeypatch, single_error_exit, recovery,
+):
+    from src.daemon.retry_commands import RetryDispatch
+
+    runner, provider, repo, remote, setup = coding_provider
+    provider.update(work='intermediate', publication_seen=asyncio.Event(), proof_problem=recovery)
+    runner.app_config.daemon.fix_poll_interval_sec = 1
+    runner.repo_config.feature_flags.use_single_error_exit = single_error_exit
+    checkpoint = runner.publish_state
+
+    async def retain_monitor_checkpoint():
+        await checkpoint()
+        attempt = runner.state.publication_attempt
+        if (attempt is not None and attempt.pr_number == 646
+            and attempt.candidate is not None
+            and attempt.candidate.head_sha == provider.get('intermediate_head')):
+            provider['publication_seen'].set()
+
+    monkeypatch.setattr(runner, 'publish_state', retain_monitor_checkpoint)
+    await runner.handle_coding()
+    attempt = runner.state.publication_attempt
+    a, b = provider['intermediate_head'], git(repo, 'rev-parse', 'HEAD')
+    assert a != b and git(repo, 'rev-parse', b + '^') == a
+    capture_failed = recovery.startswith('capture_')
+    if recovery != 'capture_remote':
+        assert git(remote, 'rev-parse', 'refs/heads/pr-001') == a
+    assert attempt.expected_head_sha == b
+    assert attempt.provider_published_head_sha == (None if capture_failed else a)
+    # A late/replayed monitor observation cannot replace frozen exit evidence.
+    await runner._retain_observed_publication(prs.get_branch_publications()[0])
+    assert attempt.expected_head_sha == b
+    assert attempt.provider_published_head_sha == (None if capture_failed else a)
+    assert attempt.pending and not attempt.verified
+    assert runner.state.state == PipelineState.PAUSED
+    first = await runner._metrics_store.get(attempt.run_id)
+    assert first.ended_at and first.outcome == 'paused' and first.head_sha == b
+    assert (repo / 'artifacts/ci.log').read_text() == 'pytest 2% -- unfinished'
+    if capture_failed:
+        provider.update(error=None, complete=True)
+        git(remote, 'update-ref', 'refs/heads/pr-001', a)
+    if recovery == 'missing_proof':
+        # An ancestor alone cannot establish publication ownership after restart.
+        attempt.provider_published_head_sha = None
+        await runner.publish_state()
+    elif recovery == 'foreign_remote':
+        git(repo, 'commit', '--allow-empty', '-m', 'independent remote writer')
+        git(repo, 'push', 'origin', 'pr-001')
+        git(repo, 'reset', '--hard', b)
+    fresh = await restart(runner, setup)
+    fresh._recovered = True
+    fresh.repo_config.feature_flags.use_single_error_exit = single_error_exit
+    Clock.value = fresh.state.publication_attempt.provider_retry_at + timedelta(seconds=1)
+    if capture_failed or recovery in {'missing_proof', 'foreign_remote'}:
+        for _ in range(3):
+            assert await publication.resume_provider_failure(fresh)
+            assert fresh.state.state == PipelineState.ERROR
+        assert len(provider['calls_to_coder']) == 1
+        assert git(repo, 'rev-parse', 'HEAD') == b
+        assert (repo / 'local-followup').read_text() == 'unpublished followup retained\n'
+        assert await fresh._metrics_store.get(first.run_id) == first
+        return
+    if recovery == 'operator':
+        fresh.state.publication_attempt.provider_retries = 3
+        assert await publication.resume_provider_failure(fresh)
+        assert fresh.state.state == PipelineState.ERROR
+        await enqueue_bound_provider_retry(fresh, repo)
+        assert await fresh._consume_retry_command() == RetryDispatch.HANDLED
+    provider['fail'] = False
+    assert await publication.resume_provider_failure(fresh)
+    assert fresh.state.state == PipelineState.WATCH
+    assert fresh.state.current_pr.number == 646
+    assert len(provider['calls_to_coder']) == 2 and len(provider['requests']) == 1
+    assert git(repo, 'show', 'HEAD:local-followup') == 'unpublished followup retained'
+    assert git(repo, 'rev-parse', 'HEAD^') == b
+    assert git(remote, 'rev-parse', 'refs/heads/pr-001') == fresh.state.current_pr.head_sha
+    assert (repo / 'artifacts/ci.log').read_text() == 'gate completed successfully'
+    records = await fresh._metrics_store.list_task_runs(fresh.name, 'PR-001')
+    assert len(records) == 2 and all(record.ended_at for record in records)
+    assert sorted(i.phase for record in records for i in record.invocations) == ['coding', 'coding']
+    assert all(record.fix_iterations == 0 for record in records)
     assert await fresh._metrics_store.get(first.run_id) == first

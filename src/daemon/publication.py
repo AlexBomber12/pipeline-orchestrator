@@ -24,6 +24,47 @@ if TYPE_CHECKING:
     from src.retry_commands import RetryCommand
 
 
+async def retain_coding_publication(
+    runner: PipelineRunner, observed: gh_prs.BranchPublication,
+) -> None:
+    """Keep a live monitor's exact local/remote/PR proof without freezing exit."""
+    attempt = runner.state.publication_attempt
+    invocation = runner.state.active_invocation
+    if (attempt is None or attempt.contract_version != 2 or invocation is None
+        or invocation.phase != "coding" or attempt.expected_head_sha is not None
+        or not runner._publication_attempt_matches_dispatch()):
+        return
+    try:
+        branch = (await asyncio.to_thread(
+            git_ops._git, runner.repo_path, "branch", "--show-current",
+        )).stdout.strip()
+        head = (await asyncio.to_thread(
+            git_ops._git, runner.repo_path, "rev-parse", "HEAD",
+        )).stdout.strip()
+        remote = (await asyncio.to_thread(
+            git_ops._git, runner.repo_path, "ls-remote", "--heads", "origin",
+            f"refs/heads/{attempt.branch}",
+        )).stdout.split()
+        if branch != attempt.branch or head != observed.head_sha or remote != [
+            observed.head_sha, f"refs/heads/{attempt.branch}",
+        ]:
+            return
+        outcome = await asyncio.to_thread(
+            gh_prs.get_exact_pr_outcome, attempt.repo, attempt.base, observed.number,
+            observed.head_sha, expected_branch=attempt.branch,
+        )
+        if (outcome.discovery_complete and outcome.state == gh_prs.ExactPRState.OPEN
+            and runner.state.publication_attempt is attempt
+            and runner._publication_attempt_matches_dispatch()):
+            # record_exit still freezes the eventual local B, independently of
+            # this earlier published A. Ancestry alone never supplies this proof.
+            attempt.provider_published_head_sha = observed.head_sha
+    except Exception as exc:
+        runner.log_event(
+            f"[CODING] Intermediate publication proof unavailable: {type(exc).__name__}."
+        )
+
+
 async def record_exit(
     runner: PipelineRunner, code: int, stdout: str, stderr: str, *, publication_cancelled: bool = False,
     terminal_cancelled: bool = False,
@@ -639,7 +680,8 @@ async def _coding_provider_retry_problem(
     remote = probe.stdout.split()
     if remote and (len(remote) != 2 or remote[1] != f"refs/heads/{attempt.branch}"
                    or remote[0] not in {attempt.expected_head_sha, attempt.provider_published_head_sha}):
-        return "Interrupted CODING remote head changed independently; preserve both sides and use Retry"
+        return ("Interrupted CODING remote head lacks retained publication proof or changed independently; "
+                "preserve both sides and use Retry")
     if not remote and attempt.provider_published_head_sha is not None:
         return "Interrupted CODING published branch disappeared; preserve work and use Retry"
     publications = await asyncio.to_thread(gh_prs.get_branch_publications,

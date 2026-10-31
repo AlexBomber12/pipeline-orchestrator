@@ -14,6 +14,7 @@ from tests.e2e.test_fix_feedback import _runs, _wait
 
 CALLS = Path(str(SHIM_SCENARIO_PATH) + '.capacity-calls')
 GATE = Path(str(SHIM_SCENARIO_PATH) + '.capacity-gate')
+PROOF = Path(str(SHIM_SCENARIO_PATH) + '.capacity-proof')
 
 
 def test_coding_capacity_retained_work_reaches_merge(
@@ -26,7 +27,7 @@ def test_coding_capacity_retained_work_reaches_merge(
     reviewer = ReviewApi.from_environment()
     identity = time.time_ns()
     task, branch = f'PR-{identity}', f'pr-{identity}-e2e-coding-capacity'
-    assert not CALLS.exists() and not GATE.exists(), 'capacity journal belongs to another owner'
+    assert not any(path.exists() for path in (CALLS, GATE, PROOF)), 'capacity journal belongs to another owner'
     evidence = {'tested_sha': _tested_sha(), 'task': task, 'branch': branch}
 
     def ready(state):
@@ -61,7 +62,14 @@ def test_coding_capacity_retained_work_reaches_merge(
                 assert first['invocations'][0][key] == second['invocations'][0][key]
             assert CALLS.read_text().splitlines() == [f'{task}\t{branch}'] * 2
             assert GATE.read_text().strip() == 'completed-after-capacity'
+            proof = json.loads(PROOF.read_text())
+            assert proof['task'] == task and proof['branch'] == branch
+            assert proof['run_id'] == first['run_id'] and proof['pr'] == number
+            assert proof['exit_classification'] is None
+            assert [p['sha'] for p in outcome._get(f"commits/{first['head_sha']}")['parents']] == [proof['head']]
+            evidence['intermediate_publication_proof'] = proof
             for path, text in [('tests/e2e-capacity-commit.txt', f'retained commit for {task}\n'),
+                               ('tests/e2e-capacity-followup.txt', f'retained unpublished followup for {task}\n'),
                                ('tests/e2e-capacity-retained.txt', f'retained dirty work for {task}\n')]:
                 content = outcome._get(f'contents/{path}?ref={head}')
                 assert base64.b64decode(content['content']).decode() == text
@@ -93,3 +101,4 @@ def test_coding_capacity_retained_work_reaches_merge(
             _stop_daemon_and_wait_paused(testbed_slug)
             CALLS.unlink(missing_ok=True)
             GATE.unlink(missing_ok=True)
+            PROOF.unlink(missing_ok=True)

@@ -241,6 +241,7 @@ class CodingMixin:
         if self._publication_matches_attempt(observed):
             attempt.pr_number = observed.number
             attempt.candidate = observed.to_pr_info()
+            await publication_lifecycle.retain_coding_publication(self, observed)
             await self._resolve_published_attempt(resolve_terminal=False)
             await self.publish_state()
 

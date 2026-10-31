@@ -135,6 +135,13 @@ retained FIX's subsequent attempts so replay can acknowledge an already-started
 handoff without resetting its budget or executing CODING. Operator pause and quota
 deadlines still gate execution.
 
+A live CODING publication monitor also retains an intermediate head only after
+the local checkout, remote branch and exact open PR independently agree on that
+head. If the coder then adds an unpublished commit before a capacity failure,
+exit freezes the later local head without discarding the earlier publication
+proof. Restart and bound Retry can continue against that same owned remote head;
+an unproved ancestor or independently changed remote still parks recovery.
+
 CODING retains the canonical task text on the existing publication attempt. Its
 continuation preserves the original branch/PR discovery floor and uses a fresh
 run/attempt/invocation with the bound model and effort. It explicitly continues
