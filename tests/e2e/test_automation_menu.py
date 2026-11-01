@@ -1,7 +1,19 @@
 """Shared automation menu interactions; GHA owns Chromium execution."""
 
+from pathlib import Path
+
 import pytest
 from playwright.sync_api import Page, expect
+
+
+@pytest.fixture(autouse=True)
+def local_htmx(page: Page):
+    # Exercise the real pinned runtime without a first-page CDN dependency.
+    # Source: https://unpkg.com/htmx.org@2.0.4/dist/htmx.min.js (0BSD).
+    script = Path(__file__).parent / 'assets' / 'htmx-2.0.4.min.js'
+    page.route('https://unpkg.com/htmx.org@2.0.4', lambda route: route.fulfill(
+        path=script, content_type='application/javascript',
+    ))
 
 
 @pytest.mark.parametrize('path', ['/', '/repo/AlexBomber12__pipeline-orchestrator-testbed', '/settings'])
@@ -16,7 +28,8 @@ def test_automation_menu_cancel_and_focus(page: Page, dashboard_url: str, path: 
         posts.append(route.request.url) if route.request.method == 'POST' else None,
         route.fulfill(json={'repos': []}),
     ))
-    page.goto(dashboard_url.rstrip('/') + path)
+    page.goto(dashboard_url.rstrip('/') + path, wait_until='domcontentloaded')
+    page.wait_for_function("Boolean(window.htmx)")
     toggle = page.locator('#automation-menu-toggle')
     expect(toggle).to_contain_text('Automation: panic, dispatch blocked')
     toggle.focus()
@@ -41,7 +54,8 @@ def test_unavailable_status_keeps_menu_usable(page: Page, dashboard_url: str):
         body='<span data-paused="false">Automation status unavailable</span>',
         content_type='text/html',
     ))
-    page.goto(dashboard_url)
+    page.goto(dashboard_url, wait_until='domcontentloaded')
+    page.wait_for_function("Boolean(window.htmx)")
     toggle = page.locator('#automation-menu-toggle')
     expect(toggle).to_contain_text('Automation status unavailable')
     toggle.click()
