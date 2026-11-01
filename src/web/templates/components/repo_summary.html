@@ -25,7 +25,7 @@
     <h2 class="max-w-full truncate font-mono text-xl text-gray-100 sm:text-2xl">{{ repo.name }}</h2>
     <span class="inline-flex items-center gap-2">
         <span class="inline-flex items-center gap-2 text-xs font-medium px-2 py-0.5 rounded border {{ style.badge }} {% if style.detail_pulse %}pulse-badge{% endif %}" data-state-label>
-            {{ repo.state.value }}
+            {% if style.glyph %}<span aria-hidden="true">{{ style.glyph }}</span> {% endif %}{{ repo.state.value }}
         </span>
     </span>
     {% set display_coder_id = active_invocation.plugin_id if active_invocation else effective_coder %}

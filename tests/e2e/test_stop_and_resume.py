@@ -77,7 +77,7 @@ def test_stop_during_coding_then_resume_picks_next_task(
 
         # The persisted pause survives a full load as well as summary swaps.
         page.reload(wait_until="domcontentloaded")
-        expect(summary.locator('[data-state-label]')).to_have_text("PAUSED")
+        expect(summary.locator('[data-state-label]')).to_have_text("⏸ PAUSED")
         expect(summary.locator('[data-work-summary]')).to_contain_text(
             "Operator paused this repository."
         )

@@ -12,7 +12,7 @@ CHANGED_COMPONENTS = (
     COMPONENT_DIR / "repo_list.html",
     COMPONENT_DIR / "activity_feed.html",
 )
-WARN_BADGE = "bg-warn/10 text-warn border-warn/30"
+PAUSED_BADGE = "bg-transparent text-muted border-muted"
 
 
 def _source(path: Path) -> str:
@@ -99,7 +99,7 @@ def test_paused_badge_consistent_across_components() -> None:
         _render_repo_list(repo),
         _render_repo_summary(repo),
     ):
-        assert WARN_BADGE in html
+        assert PAUSED_BADGE in html
 
 
 def test_repo_card_uses_registered_coder_id_for_active_custom_plugin() -> None:
@@ -131,3 +131,38 @@ def test_all_pipeline_states_render_in_each_component() -> None:
                 r"bg-[\w-]+(?:/\d+)? text-[\w-]+ border-[\w-]+(?:/\d+)?",
                 html,
             )
+
+
+def test_badge_keys_equal_pipeline_states() -> None:
+    styles = templates.get_template("components/_repo_state_styles.html").module.state_styles
+    assert set(styles) == {state.value for state in PipelineState}
+
+
+def test_stage_badge_appearance() -> None:
+    styles = templates.get_template("components/_repo_state_styles.html").module.state_styles
+    for state, color in {"CODING": "coding", "WATCH": "watch", "FIX": "fix", "MERGE": "ok", "ERROR": "fail"}.items():
+        assert styles[state]["badge"] == f"bg-{color}/10 text-{color} border-{color}/30"
+    assert "border-dashed" in styles["PREFLIGHT"]["badge"]
+    assert styles["PAUSED"]["glyph"] == "⏸"
+    assert styles["PAUSED"]["badge"] == PAUSED_BADGE
+
+
+def test_cards_and_summary_render_state_names_and_pause_glyph() -> None:
+    for state in PipelineState:
+        for render in (_render_repo_cards, _render_repo_summary):
+            html = render(_repo(state))
+            badge = re.search(r'<span class="[^"]*" data-state-label>(.*?)</span>\s*</span>', html, re.S)
+            assert badge is not None
+            assert state.value in badge[1]
+            assert ("⏸" in badge[1]) == (state == PipelineState.PAUSED)
+
+
+def test_active_coder_line_uses_stage_color() -> None:
+    for state, verb in ((PipelineState.CODING, "coding"), (PipelineState.FIX, "fixing")):
+        html = _render_repo_cards(_repo(state))
+        line = re.search(r'<div class="([^"]*)">[^<]* is ' + verb + r"\.\.\.</div>", html)
+        assert line is not None
+        classes = line[1].split()
+        assert f"text-{state.value.lower()}" in classes
+        assert "italic" not in classes
+        assert not any("opacity" in cls or "/" in cls for cls in classes)
