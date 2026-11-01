@@ -14,8 +14,13 @@ import re
 import shutil
 import time
 from dataclasses import replace
+from io import StringIO
 from pathlib import Path
 
+from ruamel.yaml import YAML
+from ruamel.yaml.error import YAMLError
+
+from src.cancellation import task_spec_content_hash
 from src.completion_evidence import get_recorded_completions
 from src.dag import build_task_dag
 from src.models import PipelineState
@@ -33,6 +38,37 @@ _ALLOWED_TASK_PATTERN = (
 _STAGING_MAX_AGE_HOURS = 24
 _FRONTMATTER_STATUS_LINE = re.compile(r"^status:\s*(.+?)\s*$", re.IGNORECASE)
 _TERMINAL_FRONTMATTER_STATUSES = frozenset({"DONE"})
+
+
+def task_spec_replay_matches(stored: str, incoming: str) -> bool:
+    """Recognize status-writer YAML reflow without changing stored identities.
+
+    Only YAML presentation and daemon-owned fields may differ. The complete
+    Markdown body must match; a replay never replaces the accepted file.
+    """
+    if task_spec_content_hash(stored) == task_spec_content_hash(incoming):
+        return True
+    pattern = r"\A---\n(.*?)^---\n(.*)\Z"
+    parts = [re.match(pattern, text, re.MULTILINE | re.DOTALL) for text in (stored, incoming)]
+    if not all(parts) or parts[0][2] != parts[1][2]:
+        return False
+    try:
+        values = [YAML(typ="safe").load(part[1]) for part in parts]
+    except YAMLError:
+        return False
+    if not all(isinstance(value, dict) for value in values):
+        return False
+    for value in values:
+        for key in ("status", "blocked_reason"):
+            value.pop(key, None)
+    # Python equality treats True, 1 and 1.0 as equal. Safe YAML emission
+    # retains scalar types and sorts mapping keys, without migrating hashes.
+    canonical = []
+    for value in values:
+        stream = StringIO()
+        YAML(typ="safe").dump(value, stream)
+        canonical.append(stream.getvalue())
+    return canonical[0] == canonical[1]
 
 
 def _strip_inline_frontmatter_comment(value: str) -> str:
@@ -367,12 +403,22 @@ def effective_recorded_completions(
     """Verify receipts against the exact effective bytes that will be committed."""
     tasks_dir = Path(repo_path) / "tasks"
     paths = _effective_task_paths(tasks_dir, pending_manifest)
-    contents = {
-        Path(fname).stem: path.read_bytes()
-        for fname, path in paths.items() if fname not in incoming
-    }
+    contents = {}
+    for fname, path in paths.items():
+        if fname in incoming:
+            continue
+        stored = tasks_dir / fname
+        if path != stored and stored.is_file() and task_spec_replay_matches(
+            stored.read_text(encoding="utf-8"), path.read_text(encoding="utf-8")
+        ):
+            path = stored
+        contents[Path(fname).stem] = path.read_bytes()
     for fname, content in incoming.items():
-        content, _ = preserve_terminal_status_on_collision(tasks_dir / fname, content)
+        stored = tasks_dir / fname
+        if stored.is_file() and task_spec_replay_matches(stored.read_text(encoding="utf-8"), content):
+            contents[Path(fname).stem] = stored.read_bytes()
+            continue
+        content, _ = preserve_terminal_status_on_collision(stored, content)
         contents[Path(fname).stem] = content.encode("utf-8")
     return get_recorded_completions(
         repo_path, base_branch, Path(repo_path).name.replace("__", "/", 1),

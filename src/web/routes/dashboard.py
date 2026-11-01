@@ -50,6 +50,7 @@ from src.keyspace import (
     daemon_panic_state,
     pipeline_state,
     recovery_backup_branch,
+    upload_pending,
     upload_pending_count,
 )
 from src.metrics import MetricsStore, RunRecord
@@ -161,6 +162,19 @@ async def get_upload_pending_count(
         return 0
 
 
+async def get_upload_admission_error(repo_slug: str, redis_client: aioredis.Redis | None) -> str | None:
+    """Read the current manifest verdict, never a stale previous-generation error."""
+    if redis_client is None:
+        return None
+    try:
+        raw = await redis_client.get(upload_pending(repo_slug))
+        manifest = json.loads(raw) if raw else {}
+        error = manifest.get("admission_error")
+        return error[:2000] if isinstance(error, str) and error else None
+    except Exception:
+        return None
+
+
 async def _attach_upload_pending_counts(
     states: list[RepoState],
     redis_client: aioredis.Redis | None,
@@ -170,6 +184,7 @@ async def _attach_upload_pending_counts(
     )
     for state, count in zip(states, counts):
         state.upload_pending_count = count
+        state.upload_admission_error = await get_upload_admission_error(state.name, redis_client)
     return states
 
 
@@ -595,6 +610,7 @@ async def _repo_template_context(
     state.upload_pending_count = await get_upload_pending_count(
         name, redis_client
     )
+    state.upload_admission_error = await get_upload_admission_error(name, redis_client)
     repo_config = _find_repo_config_by_name(config, name)
     effective_coder = _effective_coder_name(repo_config, config)
     guardrail_pending = await _build_guardrail_pending_view(

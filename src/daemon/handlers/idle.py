@@ -848,10 +848,11 @@ class IdleMixin:
         upload_result = await self.process_pending_uploads()
         if upload_result is None:
             self._idle_dispatch_deferred = True
-            self.log_event(
-                "[INFRA] Pending upload failed; skipping task dispatch "
-                "to retry next cycle."
-            )
+            if not getattr(self, "_upload_admission_blocked", False):
+                self.log_event(
+                    "[INFRA] Pending upload failed; skipping task dispatch "
+                    "to retry next cycle."
+                )
             return
         if upload_result:
             try:

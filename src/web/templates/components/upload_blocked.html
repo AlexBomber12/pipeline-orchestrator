@@ -1,0 +1,7 @@
+{% if repo.upload_admission_error %}
+<div role="alert" data-upload-blocked class="my-3 rounded-lg border border-fail/40 bg-fail/10 px-4 py-3 text-sm text-fail">
+    <p class="font-medium">Task upload blocked</p>
+    <p class="break-words">{{ repo.upload_admission_error }}</p>
+    <p>Queued files are preserved. Re-upload the conflicting files with corrected contents to continue. Completed tasks must match their accepted specification.</p>
+</div>
+{% endif %}
