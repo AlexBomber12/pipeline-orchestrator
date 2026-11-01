@@ -3630,6 +3630,7 @@ def test_retained_retry_durably_binds_before_admission_can_defer(monkeypatch, fa
 
     from tests.runner.test_retry_commands import _command, _task_text
 
+    text = _task_text(task_id="PR-001", branch="pr-001")
     runner = _runner(monkeypatch)
     _publication_transport(monkeypatch, runner)
     asyncio.run(runner.handle_coding())
@@ -3653,6 +3654,8 @@ def test_retained_retry_durably_binds_before_admission_can_defer(monkeypatch, fa
         return failure != "status"
 
     monkeypatch.setattr(runner, "_validate_retry_command", validate)
+    monkeypatch.setattr(runner, "_origin_retry_task_text", lambda command: text)
+    monkeypatch.setattr(runner, "_retry_task_path", lambda command: SimpleNamespace(read_text=lambda **kw: text))
     monkeypatch.setattr(runner, "_retry_blocker", no_blocker)
     monkeypatch.setattr(runner, "_commit_task_status_change", commit)
     if failure in {"binding", "binding_missing"}:
@@ -3846,7 +3849,9 @@ def test_watch_terminal_keeps_unverified_publication(monkeypatch):
     assert runner.state.state == PipelineState.ERROR
 
 
-@pytest.mark.parametrize("scenario", ["missing", "incomplete", "incomplete_status", "complete", "empty", "testbed", "required_exempt"])
+@pytest.mark.parametrize("scenario", [
+    "missing", "incomplete", "incomplete_status", "complete", "empty", "testbed", "required_exempt",
+])
 def test_coding_hydrates_ci_with_repository_policy(monkeypatch, scenario):
     from src.github import cache, checks
     from src.models import CIStatus

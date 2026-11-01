@@ -2444,6 +2444,12 @@ async def _real_repaired_fix(tmp_path, monkeypatch, mode="success"):
         git(status, "commit", "-m", "operator Retry")
         git(status, "push", "origin", "main")
         git(repo, "fetch", "origin", "main")
+        if mode == "accounting_snapshot_missing":
+            monkeypatch.setattr(runner, "_origin_retry_task_text", lambda command: None)
+        if mode == "accounting_local_unreadable":
+            def unreadable(**kwargs):
+                raise OSError("controlled read failure")
+            monkeypatch.setattr(runner, "_retry_task_path", lambda command: SimpleNamespace(read_text=unreadable))
         return True
 
     monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
@@ -2482,7 +2488,7 @@ async def test_operator_retry_preserves_reflowed_generation_and_published_repair
 @pytest.mark.asyncio
 @pytest.mark.parametrize("mode", [
     "unknown", "changed_head", "local_work", "not_descendant", "changed_spec", "fetch_failure",
-    "accounting_generation_changed",
+    "accounting_generation_changed", "accounting_snapshot_missing", "accounting_local_unreadable",
 ])
 async def test_repaired_fix_retry_retains_work_when_evidence_conflicts(tmp_path, monkeypatch, mode):
     runner, command, record, previous, original, _target, _git = await _real_repaired_fix(tmp_path, monkeypatch, mode)

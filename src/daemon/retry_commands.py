@@ -1240,8 +1240,14 @@ class RetryCommandMixin:
                 old_baseline = record.fix_recovery_baseline
                 if record.ended_at is not None:
                     current_text = self._origin_retry_task_text(command)
-                    local_text = self._retry_task_path(command).read_text(encoding="utf-8")
-                    if current_text is None or not task_spec_replay_matches(local_text, current_text):
+                    task_path = self._retry_task_path(command)
+                    if current_text is None or task_path is None:
+                        return await self._defer_retry_command(command, "Retry accounting task snapshot is missing.")
+                    try:
+                        local_text = task_path.read_text(encoding="utf-8")
+                    except (OSError, UnicodeError):
+                        return await self._defer_retry_command(command, "Retry accounting task snapshot is unreadable.")
+                    if not task_spec_replay_matches(local_text, current_text):
                         return await self._defer_retry_command(
                             command, "Retry accounting generation is unavailable or changed.",
                         )
