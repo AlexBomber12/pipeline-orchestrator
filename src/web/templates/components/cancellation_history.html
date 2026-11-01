@@ -41,7 +41,7 @@
     {% for cause in causes | sort(attribute='dependents_count', reverse=True) %}
         {{ cancellation_card(cause) }}
         {% if cause.dependents_count and cause.dependents_count > 0 %}
-        <div class="dependents-badge mt-1 text-xs text-amber-300/80">
+        <div class="dependents-badge mt-1 text-xs text-warn">
             Blocks {{ cause.dependents_count }} task(s)
         </div>
         {% endif %}
