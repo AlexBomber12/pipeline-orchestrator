@@ -1525,12 +1525,7 @@ class WatchMixin:
             for ctx in producers.values() if ctx.state == "failure"
         ]
         for check in check_runs:
-            if isinstance(check, dict) and ("check", check.get("id")) not in current_failures:
-                continue
-            if not isinstance(check, dict) or (
-                str(check.get("conclusion") or check.get("status") or "").upper()
-                not in gh_checks._REST_CI_FAILURE_STATES
-            ):
+            if not isinstance(check, dict) or ("check", check.get("id")) not in current_failures:
                 continue
             failing_count += 1
             identity = actions_job_identity(self.owner_repo, check)
