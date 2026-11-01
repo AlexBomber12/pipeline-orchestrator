@@ -109,6 +109,7 @@ def test_record_shape_correct(isolate_events_dir: Path) -> None:
         "payload",
         "tier",
         "kind",
+        "severity",
     }
     assert record["timestamp"] == when.isoformat()
     assert record["event_type"] == "state_changed"
@@ -116,6 +117,7 @@ def test_record_shape_correct(isolate_events_dir: Path) -> None:
     assert record["payload"] == {"state": "WATCH"}
     assert record["tier"] is None
     assert record["kind"] is None
+    assert record["severity"] is None
 
 
 def test_default_events_dir_when_env_unset(
@@ -251,3 +253,18 @@ def test_disk_log_resilient_to_event_with_non_serializable_payload(
     assert any(
         "Event disk write failed" in record.message for record in caplog.records
     )
+
+
+@pytest.mark.parametrize("payload, expected", [
+    ({"entry": {"severity": "error"}}, "error"),
+    ({"severity": "warn"}, "warn"),
+    ({"entry": {"severity": "ok"}, "severity": "info"}, "ok"),
+    ({"entry": {}, "severity": "info"}, "info"),
+    ({"entry": "legacy"}, None),
+])
+def test_record_severity(isolate_events_dir: Path, payload: dict, expected: str | None) -> None:
+    when = datetime(2026, 5, 19, 12, 0, tzinfo=timezone.utc)
+    disk_log.append_event_to_disk("owner__repo", "event_log_append", payload, timestamp=when)
+    record = json.loads(_read_lines(isolate_events_dir / "owner__repo" / "2026-05-19.jsonl")[0])
+    assert record["severity"] == expected
+    assert record["payload"] == payload

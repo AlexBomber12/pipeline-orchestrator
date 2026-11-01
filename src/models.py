@@ -172,12 +172,19 @@ class PRInfo(BaseModel):
         return merged_shas, self.push_count + len(new_shas)
 
 
+def validate_event_severity(severity: str | None) -> None:
+    """Reject unknown severity values; legacy events may omit severity."""
+    if severity is not None and severity not in ("error", "warn", "ok", "info"):
+        raise ValueError(f"Unknown event severity: {severity}")
+
+
 class EventEntry(TypedDict, total=False):
     time: str
     state: str
     event: str
     tier: NotRequired[str | None]
     kind: NotRequired[str | None]
+    severity: NotRequired[Literal["error", "warn", "ok", "info"]]
     count: NotRequired[int]
     last_seen_at: NotRequired[str]
 
