@@ -148,6 +148,7 @@ from src.models import (
     PublicationWatermark,
     RepoState,
     TaskStatus,
+    validate_event_severity,
 )
 from src.process_supervisor import SupervisedProcess
 from src.queue_parser import (
@@ -3591,6 +3592,7 @@ class PipelineRunner(
         *,
         tier: str | None = None,
         kind: str | None = None,
+        severity: str | None = None,
     ) -> None:
         """Append an event to ``state.history`` (capped) and log it.
 
@@ -3601,6 +3603,7 @@ class PipelineRunner(
         values stay visible, and ``last_seen_at`` is refreshed.
         """
         validate_event_tier(tier)
+        validate_event_severity(severity)
         if (tier is not None or kind is not None) and os.environ.get(
             "DEBUG_EVENT_LOG_BRACKETS"
         ):
@@ -3615,6 +3618,7 @@ class PipelineRunner(
             and last_entry.get("state") == state
             and last_entry.get("tier") == tier
             and last_entry.get("kind") == kind
+            and last_entry.get("severity") == severity
             and _normalize_for_dedup(last_entry.get("event", ""))
             == _normalize_for_dedup(event)
         ):
@@ -3634,6 +3638,8 @@ class PipelineRunner(
                 "count": 1,
                 "last_seen_at": now,
             }
+            if severity is not None:
+                entry["severity"] = severity
             self.state.history.append(entry)
             self._pending_event_log_entries.append(dict(entry))
         if len(self.state.history) > _HISTORY_LIMIT:
