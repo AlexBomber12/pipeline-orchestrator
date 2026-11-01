@@ -1,4 +1,4 @@
-"""Real Chromium controls; only the mixed global transport response is stubbed.
+"""Real Chromium controls; mixed global responses and their paused label are stubbed.
 
 The delayed-consumption/outage case uses real web routes and isolated Redis.
 GHA owns Docker execution and records the exact checkout SHA in e2e evidence.
@@ -37,6 +37,12 @@ def _refresh_summary(page, slug):
 
 
 def test_global_control_feedback(page: Page, dashboard_url: str) -> None:
+    # Transport stubs do not mutate Redis; keep Resume available independently
+    # of live state while exercising mixed-result and failed-request receipts.
+    page.route("**/partials/automation-status", lambda route: route.fulfill(
+        body='<span data-paused="true">Automation: paused (all repos)</span>',
+        content_type="text/html",
+    ))
     page.goto(dashboard_url, wait_until="domcontentloaded")
     page.wait_for_function("Boolean(window.htmx)")
     page.route("**/daemon/drain-progress", lambda route: route.fulfill(
@@ -52,6 +58,7 @@ def test_global_control_feedback(page: Page, dashboard_url: str) -> None:
         page.route(f"**/daemon/{action}", lambda route, request, code=status, rows=results: route.fulfill(
             status=code, json={"results": rows},
         ))
+    page.locator('#automation-menu-toggle').click()
     page.locator('[data-action="pause-all"]').click()
     expect(page.locator('#pause-all-affected-count')).to_have_text('?')
     page.locator('[data-pause-all-confirm]').click()
@@ -67,9 +74,11 @@ def test_global_control_feedback(page: Page, dashboard_url: str) -> None:
     expect(output).to_contain_text('beta (failed: corrupt_state)')
     expect(page.locator('[data-pause-all-confirm]')).to_be_enabled()
     page.locator('[data-pause-all-cancel]').click()
+    page.locator('#automation-menu-toggle').click()
     page.locator('[data-action="resume-all"]').click()
     expect(page.locator('#global-control-result')).to_contain_text('Accepted 0/1 requests')
     expect(page.locator('#global-control-result')).to_contain_text('redis_unavailable')
+    page.locator('#automation-menu-toggle').click()
     page.locator('[data-action="stop-all"]').click()
     page.locator('[data-stop-all-confirm]').click()
     expect(page.locator('#stop-all-modal [role="status"]')).to_contain_text(
@@ -77,8 +86,10 @@ def test_global_control_feedback(page: Page, dashboard_url: str) -> None:
     )
     page.locator('[data-stop-all-cancel]').click()
     page.route("**/daemon/resume", lambda route: route.abort("failed"))
+    page.locator('#automation-menu-toggle').click()
     page.locator('[data-action="resume-all"]').click()
     expect(page.locator('#global-control-result')).to_contain_text('Requests are unconfirmed')
+    page.locator('#automation-menu-toggle').click()
     expect(page.locator('[data-action="resume-all"]')).to_be_enabled()
 
 
@@ -96,6 +107,7 @@ def test_delayed_stop_resume_and_redis_outage(
         assert before["name"] == testbed_slug and before["state"] == "IDLE"
         page.goto(dashboard_url, wait_until="domcontentloaded")
         page.wait_for_function("Boolean(window.htmx)")
+        page.locator('#automation-menu-toggle').click()
         page.locator('[data-action="stop-all"]').click()
         with page.expect_response("**/daemon/stop") as response:
             page.locator('[data-stop-all-confirm]').click()
@@ -154,12 +166,16 @@ def test_delayed_stop_resume_and_redis_outage(
         redis_stopped = True
         page.goto(dashboard_url, wait_until="domcontentloaded")
         page.wait_for_function("Boolean(window.htmx)")
-        with page.expect_response("**/daemon/resume", timeout=30000) as response:
-            page.locator('[data-action="resume-all"]').click()
+        expect(page.locator('#automation-menu-toggle')).to_contain_text('Automation status unavailable')
+        page.locator('#automation-menu-toggle').click()
+        expect(page.locator('[data-action="resume-all"]')).not_to_be_visible()
+        page.locator('[data-action="pause-all"]').click()
+        with page.expect_response("**/daemon/pause", timeout=30000) as response:
+            page.locator('[data-pause-all-confirm]').click()
         assert response.value.status == 503
         assert response.value.json()["results"][0]["name"] == testbed_slug
         assert response.value.json()["results"][0]["status"] == "unavailable"
-        expect(page.locator('#global-control-result')).to_contain_text("Accepted 0/1 requests")
+        expect(page.locator('#pause-all-modal [role="status"]')).to_contain_text("Accepted 0/1 requests")
         card = page.locator(f'[data-repo-card][data-repo="{testbed_slug}"]')
         expect(card).to_contain_text("unavailable")
         page.goto(f"{dashboard_url}/repo/{testbed_slug}", wait_until="domcontentloaded")
@@ -168,7 +184,7 @@ def test_delayed_stop_resume_and_redis_outage(
         expect(page.get_by_text("Recent cancellations", exact=True)).to_be_visible()
         _compose("start", "redis-test")
         redis_stopped = False
-        assert _redis("GET", state_key) == snapshot, "unavailable Resume must not mutate state"
+        assert _redis("GET", state_key) == snapshot, "unavailable Pause must not mutate state"
     finally:
         if redis_stopped:
             _compose("start", "redis-test")

@@ -1995,6 +1995,36 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
     )
 
 
+@router.get("/partials/automation-status", response_class=HTMLResponse)
+async def partial_automation_status(request: Request) -> HTMLResponse:
+    """Summarize configured dispatch intent, without claiming process liveness."""
+    redis_client = getattr(request.app.state, "redis", None)
+    states, warning = await _app.get_all_repo_states(
+        redis_client, _app.CONFIG_PATH
+    )
+    unavailable = redis_client is None or bool(warning) or any(
+        state.error_message in {
+            "Redis unavailable — state unknown",
+            "Waiting for daemon to initialize",
+            "State decode failed",
+        }
+        for state in states
+    )
+    # Panic prevents runner cycles from refreshing repository snapshots.
+    # Use the same live record as the dashboard banner, including on resume.
+    panic = bool(await _read_panic_state_for_banner(redis_client))
+    return _app.templates.TemplateResponse(
+        request,
+        "components/automation_status.html",
+        {
+            "unavailable": unavailable,
+            "panic": panic,
+            "paused": sum(state.user_paused for state in states),
+            "total": len(states),
+        },
+    )
+
+
 @router.get("/partials/stats", response_class=HTMLResponse)
 async def partial_stats(request: Request) -> HTMLResponse:
     redis_client = getattr(request.app.state, "redis", None)

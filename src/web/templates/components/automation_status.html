@@ -1,0 +1,12 @@
+<span data-automation-status data-paused="{{ 'true' if paused else 'false' }}"
+      class="{{ 'text-fail' if panic else 'text-gray-200' }}">{%- if unavailable -%}
+    Automation status unavailable
+{%- elif panic -%}
+    Automation: panic, dispatch blocked
+{%- elif total and paused == total -%}
+    Automation: paused (all repos)
+{%- elif paused -%}
+    Automation: on · {{ paused }} of {{ total }} repos paused
+{%- else -%}
+    Automation: on
+{%- endif -%}</span>

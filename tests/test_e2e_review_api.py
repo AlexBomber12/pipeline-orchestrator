@@ -2,6 +2,7 @@ import base64
 import copy
 import json
 import subprocess
+from datetime import datetime, timezone
 
 import pytest
 
@@ -25,6 +26,9 @@ def test_reviewer_token_isolated_from_author_token(monkeypatch):
     calls = []
 
     def run(command, **kwargs):
+        if "--include" in command:
+            assert kwargs["env"]["GH_TOKEN"] == "reviewer-token"
+            return _result(stdout="HTTP/2.0 200 OK\r\nDate: Wed, 01 Jan 2020 00:00:03 GMT\r\n\r\n{}")
         calls.append((command, kwargs))
         return _result(stdout=json.dumps(payloads.pop(0)))
 
@@ -186,6 +190,9 @@ def test_approval_binds_current_head_and_fresh_anchor(actual_head):
     calls = []
 
     def run(command, **kwargs):
+        if "--include" in command:
+            assert kwargs["env"]["GH_TOKEN"] == "reviewer-token"
+            return _result(stdout="HTTP/2.0 200 OK\r\nDate: Wed, 01 Jan 2020 00:00:03 GMT\r\n\r\n{}")
         calls.append((command, kwargs))
         return _result(stdout=json.dumps(payloads.pop(0)))
 
@@ -234,3 +241,63 @@ def test_review_transport_failure_is_unknown_and_never_an_actionable_finding(mon
     assert feedback.findings == () and feedback.source_ids == ()
     assert "review feedback unavailable" in feedback.unknown_reason
     assert not feedback.provider_error_only
+
+
+@pytest.mark.parametrize("runner_hour", [8, 10])
+def test_review_clock_uses_github_time_despite_runner_skew(monkeypatch, runner_hour):
+    from tests.e2e.lib import review_api
+
+    class SkewedClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 11, 1, runner_hour, tzinfo=tz)
+
+    monkeypatch.setattr(review_api, "datetime", SkewedClock)
+    sleeps, calls = [], []
+    monkeypatch.setattr(review_api.time, "sleep", sleeps.append)
+    responses = iter([
+        "Sun, 01 Nov 2026 09:00:00 GMT",
+        "Sun, 01 Nov 2026 09:00:01 GMT",
+        "Sun, 01 Nov 2026 09:00:02 GMT",
+    ])
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _result(stdout=f"HTTP/2.0 200 OK\r\ndate: {next(responses)}\r\n\r\n{{}}")
+
+    ReviewApi("reviewer-token", runner=run)._wait_after(
+        17, datetime(2026, 11, 1, 9, tzinfo=timezone.utc),
+    )
+    assert sleeps == [0.25, 0.25]
+    assert len(calls) == 3
+    assert all("--include" in cmd and "Cache-Control: no-cache" in cmd for cmd, _ in calls)
+    assert all(kwargs["env"]["GH_TOKEN"] == "reviewer-token" for _, kwargs in calls)
+
+
+@pytest.mark.parametrize("response", [
+    "HTTP/2.0 200 OK\n\n{\nDate: Sun, 01 Nov 2026 09:00:02 GMT\n}",
+    "HTTP/2.0 200 OK\nDate: invalid\n\n{}",
+    "HTTP/2.0 200 OK\nDate: Sun, 01 Nov 2026 09:00:02\n\n{}",
+])
+def test_review_clock_requires_valid_server_date(response):
+    api = ReviewApi("reviewer-token", runner=lambda *a, **kw: _result(stdout=response))
+    with pytest.raises(ReviewApiError, match="missing or invalid GitHub Date"):
+        api._wait_after(17, datetime(2026, 11, 1, 9, tzinfo=timezone.utc))
+
+
+def test_review_clock_rejects_transport_failure():
+    api = ReviewApi("reviewer-token", runner=lambda *a, **kw: _result(1, '{"message":"unavailable"}'))
+    with pytest.raises(ReviewApiError, match="GitHub clock read failed.*unavailable"):
+        api._wait_after(17, datetime(2026, 11, 1, 9, tzinfo=timezone.utc))
+
+
+def test_review_clock_wait_is_bounded(monkeypatch):
+    from tests.e2e.lib import review_api
+
+    elapsed = iter([0, 11])
+    monkeypatch.setattr(review_api.time, "monotonic", lambda: next(elapsed))
+    api = ReviewApi("reviewer-token", runner=lambda *a, **kw: _result(
+        stdout="HTTP/2.0 200 OK\nDate: Sun, 01 Nov 2026 09:00:00 GMT\n\n{}",
+    ))
+    with pytest.raises(ReviewApiError, match="timed out waiting for GitHub review clock"):
+        api._wait_after(17, datetime(2026, 11, 1, 9, tzinfo=timezone.utc))

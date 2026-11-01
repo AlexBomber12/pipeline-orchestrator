@@ -1,47 +1,34 @@
-{# PR-340: daemon-wide pause/resume/stop controls. The buttons live in the
-   dashboard header so deploy and incident-response operators get single-
-   click access; Pause All and Stop All open confirmation modals because
-   both transition every configured repo at once. Resume All is reversible
-   and fires immediately without confirmation.
-
-   The component bundles the buttons, the <dialog> modals, and the inline
-   openers in one file so base.html only has to include this once. The
-   openers are exposed as globals (``window.openPauseAllModal``,
-   ``window.openStopAllModal``) because the buttons use inline
-   ``onclick=...`` handlers per the spec; this matches the existing
-   ``reset_modal.html`` pattern of inline ``<script>`` blocks rather than
-   an external static file (the FastAPI app does not mount /static). #}
-<div class="header-global-controls flex gap-2 items-center" data-global-controls>
-    <button data-action="pause-all"
-            type="button"
-            onclick="openPauseAllModal()"
-            class="text-xs px-3 py-1 rounded border border-warn/50 text-warn hover:bg-warn/10">
-        Pause All
-    </button>
-    <button data-action="resume-all"
-            type="button"
-            hx-post="/daemon/resume"
-            hx-target="body"
-            hx-swap="none"
-            hx-on::after-request="handleGlobalControlResult(event)"
-            class="text-xs px-3 py-1 rounded border border-ok/50 text-ok hover:bg-ok/10">
-        Resume All
-    </button>
-    <button data-action="stop-all"
-            type="button"
-            onclick="openStopAllModal()"
-            class="text-xs px-3 py-1 rounded border border-fail/50 text-fail hover:bg-fail/10">
-        Stop All
-    </button>
-</div>
+{# Shared automation controls; poll only the label to preserve menu focus. #}
+<details id="automation-menu" class="relative" data-global-controls>
+    <summary id="automation-menu-toggle" class="cursor-pointer text-xs px-3 py-2 rounded border border-white/10">
+        <span hx-get="/partials/automation-status"
+              hx-trigger="load, repo:state_change from:body, every 30s"
+              hx-swap="innerHTML"
+              hx-on::after-swap="document.getElementById('automation-resume').hidden = this.querySelector('[data-paused]').dataset.paused !== 'true'">
+            Automation status unavailable
+        </span>
+    </summary>
+    <div class="absolute right-0 z-50 mt-2 p-2 rounded border border-white/10 bg-surface-2 flex flex-col gap-2 min-w-48">
+        <button data-action="pause-all" type="button" onclick="openPauseAllModal()"
+                class="text-xs px-3 py-2 rounded bg-warn text-on-primary">Pause all</button>
+        <div id="automation-resume" hidden>
+            <button data-action="resume-all" type="button"
+                    hx-post="/daemon/resume" hx-target="body" hx-swap="none"
+                    hx-on::after-request="handleGlobalControlResult(event)"
+                    class="text-xs px-3 py-2 rounded bg-accent text-on-primary w-full">Resume all</button>
+        </div>
+        <button data-action="stop-all" type="button" onclick="openStopAllModal()"
+                class="text-xs px-3 py-2 rounded bg-fail text-on-fail">Stop all</button>
+    </div>
+</details>
 <p id="global-control-result" data-global-control-result role="status" aria-live="polite"></p>
 
 <dialog id="pause-all-modal" data-pause-all-modal
         class="modal bg-surface-2 rounded-lg p-6 max-w-md w-full border border-warn/50 text-gray-200">
     <h3 class="text-lg font-semibold mb-2 text-warn">Pause all repos</h3>
     <p class="text-sm">
-        Pause requests are saved for each available repo. Coders mid-cycle FINISH their current PR
-        cycle naturally (no kill). New work does not start until Resume All.
+        Pause requests are saved for each available repo. New automatic dispatch is paused;
+        an already executing coder is not cancelled. Use Resume all to allow new work.
     </p>
     <p class="text-xs text-gray-400 mt-2">Affected repos: <span data-affected-count id="pause-all-affected-count">-</span></p>
     <p data-global-control-result role="status" aria-live="polite"></p>
@@ -52,7 +39,7 @@
                 hx-target="body"
                 hx-swap="none"
                 hx-on::after-request="handleGlobalControlResult(event)"
-                class="px-4 py-2 rounded bg-warn/10 text-warn border border-warn/50">
+                class="px-4 py-2 rounded bg-warn text-on-primary border border-warn/50">
             Confirm pause all
         </button>
         <button type="button"
@@ -68,13 +55,9 @@
         class="modal bg-surface-2 rounded-lg p-6 max-w-md w-full border border-fail/50 text-gray-200">
     <h3 class="text-lg font-semibold mb-2 text-fail">Stop all repos - destructive</h3>
     <p class="text-sm">
-        Stop requests ask the daemon to have in-flight coders KILLED via SIGTERM
-        (then SIGKILL). Acceptance confirms the request was saved, not that a coder stopped.
-        Working trees may be left dirty. Resume All does NOT auto-recover dirty trees;
-        operator must reset working dir manually after Stop All.
-    </p>
-    <p class="text-xs text-gray-400 mt-2">
-        This is the deploy-time emergency stop. Use Pause All for graceful shutdown.
+        Stop all requests cancellation of confirmed owned coders. Acceptance confirms the
+        request was saved, not that a coder stopped. Retained dirty work or an unresolved
+        cleanup hold may remain. Resume all does not resolve those holds automatically.
     </p>
     <p data-global-control-result role="status" aria-live="polite"></p>
     <div class="flex gap-2 mt-3">
@@ -84,7 +67,7 @@
                 hx-target="body"
                 hx-swap="none"
                 hx-on::after-request="handleGlobalControlResult(event)"
-                class="px-4 py-2 rounded bg-fail/10 text-fail border border-fail/50">
+                class="px-4 py-2 rounded bg-fail text-on-fail border border-fail/50">
             Confirm stop all
         </button>
         <button type="button"
@@ -97,7 +80,27 @@
 </dialog>
 
 <script>
+    const automationMenu = document.getElementById('automation-menu');
+    const automationToggle = document.getElementById('automation-menu-toggle');
+    automationMenu.addEventListener('keydown', function (event) {
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            automationMenu.open = false;
+            automationToggle.focus();
+        }
+    });
+    ['pause-all-modal', 'stop-all-modal'].forEach(function (id) {
+        document.getElementById(id).addEventListener('close', function () {
+            automationToggle.focus();
+        });
+    });
+
     window.handleGlobalControlResult = function (event) {
+        if (event.target.matches('[data-action="resume-all"]')) {
+            automationMenu.open = false;
+            automationToggle.focus();
+        }
+        htmx.trigger(document.body, 'repo:state_change');
         const scope = event.target.closest('dialog') || document;
         const output = scope.querySelector('[data-global-control-result]');
         try {
@@ -128,6 +131,7 @@
     // immediately because the destructive copy already communicates the
     // blast radius and does not need a live count to be meaningful.
     window.openPauseAllModal = function openPauseAllModal() {
+        automationMenu.open = false;
         const modal = document.getElementById('pause-all-modal');
         const countEl = document.getElementById('pause-all-affected-count');
         if (countEl) {
@@ -158,6 +162,7 @@
     };
 
     window.openStopAllModal = function openStopAllModal() {
+        automationMenu.open = false;
         const modal = document.getElementById('stop-all-modal');
         if (modal && typeof modal.showModal === 'function') {
             modal.showModal();
