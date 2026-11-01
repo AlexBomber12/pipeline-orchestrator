@@ -8,7 +8,8 @@ import os
 import re
 import subprocess
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
+from email.utils import parsedate_to_datetime
 from typing import Callable
 from urllib.parse import quote
 
@@ -142,15 +143,42 @@ class ReviewApi:
             )
         return parsed
 
+    def _wait_after(self, pr_number: int, floor: datetime) -> None:
+        """Use GitHub's clock for GitHub evidence, independent of runner skew."""
+        deadline = time.monotonic() + 10
+        while True:
+            result = self._runner(
+                ["gh", "api", "--include", "-H", "Cache-Control: no-cache",
+                 f"repos/{self.repo}/pulls/{pr_number}"],
+                env={**os.environ, "GH_TOKEN": self.token},
+                capture_output=True, text=True, check=False, timeout=30,
+            )
+            if result.returncode != 0:
+                raise ReviewApiError(
+                    f"GitHub clock read failed for PR #{pr_number}: {_error_details(result)}"
+                )
+            # Only inspect the HTTP headers, never a Date-like line in JSON.
+            headers = result.stdout.replace("\r\n", "\n").split("\n\n", 1)[0]
+            try:
+                stamp = next(line.split(":", 1)[1].strip() for line in headers.splitlines()
+                             if line.lower().startswith("date:"))
+                now = parsedate_to_datetime(stamp)
+                if now.tzinfo is None:
+                    raise ValueError("timezone missing")
+            except (StopIteration, ValueError, TypeError) as exc:
+                raise ReviewApiError(f"missing or invalid GitHub Date header for PR #{pr_number}") from exc
+            if now > floor + timedelta(seconds=1):
+                return
+            if time.monotonic() >= deadline:
+                raise ReviewApiError(f"timed out waiting for GitHub review clock on PR #{pr_number}")
+            time.sleep(0.25)
+
     def approve_head(self, pr_number: int, head: str, publication_at: str) -> dict:
         """Post real, independent success evidence after proven publication."""
         pull = self._call("get_pull", pr_number, f"repos/{self.repo}/pulls/{pr_number}")
         assert pull["head"]["sha"] == head and re.fullmatch(r"[0-9a-f]{40}", head), pull
         floor = datetime.fromisoformat(publication_at.replace("Z", "+00:00"))
-        deadline = time.monotonic() + 10
-        while datetime.now(timezone.utc) <= floor + timedelta(seconds=1):
-            assert time.monotonic() < deadline, "publication timestamp is in the future"
-            time.sleep(0.1)
+        self._wait_after(pr_number, floor)
         review = self._call(
             "create_success_review", pr_number, f"repos/{self.repo}/pulls/{pr_number}/reviews",
             method="POST", payload={
@@ -212,11 +240,7 @@ class ReviewApi:
             raise ReviewApiError(
                 f"missing push or review-anchor timestamp for PR #{pr_number}"
             ) from exc
-        deadline = time.monotonic() + 10
-        while datetime.now(timezone.utc) <= floor + timedelta(seconds=1):
-            if time.monotonic() >= deadline:
-                raise ReviewApiError(f"timed out waiting for a fresh review timestamp on PR #{pr_number}")
-            time.sleep(0.1)
+        self._wait_after(pr_number, floor)
 
         review = self._call(
             "create_request_changes_review",
