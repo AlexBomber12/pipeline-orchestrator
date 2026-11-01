@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 import time
@@ -8,6 +9,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from datetime import datetime, timezone
+from html import unescape
 from pathlib import Path
 
 import pytest
@@ -103,6 +105,9 @@ def _write_failure_evidence(item, phase: str) -> None:
             _browser_evidence(item, record, destination)
         except Exception as exc:
             record["collection_errors"].append(f"browser: {type(exc).__name__}")
+    upload_error = getattr(item, "_evidence_upload_error", None)
+    if upload_error is not None:
+        record["upload_error"] = upload_error
     destination.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
 
 
@@ -653,7 +658,7 @@ def make_task_zip_multi(tmp_path):
 
 
 @pytest.fixture
-def upload_zip():
+def upload_zip(request):
     def _upload_zip(zip_path: Path, slug: str = TESTBED_SLUG) -> int:
         url = f"{TEST_DASHBOARD_URL}/repos/{slug}/upload-tasks"
         with open(zip_path, "rb") as fh:
@@ -662,6 +667,17 @@ def upload_zip():
                 files={"files": (zip_path.name, fh, "application/zip")},
                 timeout=30,
             )
+        if response.status_code not in (200, 201):
+            # Only retain text from the known upload-error fragment, never a
+            # complete page, headers, forms, redirects or credential payloads.
+            body = response.text[:16000]
+            messages = re.findall(r"<(?:p|li)(?:\s[^>]*)?>(.*?)</(?:p|li)>", body, re.DOTALL)
+            detail = " ".join(unescape(re.sub(r"<[^>]*>", "", item)) for item in messages)
+            if "data-upload-feedback-card" not in body:
+                detail = "Unrecognized response; body not retained."
+            error = {"status_code": response.status_code, "message": detail[:3000]}
+            request.node._evidence_upload_error = error
+            print(f"Task upload rejected: HTTP {response.status_code}: {error['message']}")
         return response.status_code
 
     return _upload_zip

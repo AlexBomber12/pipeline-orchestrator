@@ -230,3 +230,47 @@ def test_browser_listener_only_acquires_requested_page():
     assert requested == ["page"]
     assert node._evidence_browser_errors == ["pageerror", "console-error"]
     next(watcher, None)
+
+
+def test_upload_rejection_retains_http_reason_in_failure_evidence(tmp_path, monkeypatch, capsys):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from threading import Thread
+
+    class UploadHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(400)
+            self.end_headers()
+            self.wfile.write(
+                b'<div data-upload-feedback-card><p>Task validation failed</p>'
+                b'<li>PR-900: missing dependency &amp; branch evidence</li>'
+                b'<input value="do-not-retain-form-value"></div>'
+            )
+
+        def log_message(self, *_args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), UploadHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(evidence, "TEST_DASHBOARD_URL", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setattr(evidence, "EVIDENCE_DIR", tmp_path / "evidence")
+    monkeypatch.setattr(evidence, "_bounded_testbed_state", lambda: {"state": "IDLE"})
+    node = SimpleNamespace(nodeid="test_upload", funcargs={})
+    upload = evidence.upload_zip.__wrapped__(SimpleNamespace(node=node))
+    archive = tmp_path / "PR-900.zip"
+    archive.write_bytes(b"controlled request")
+    try:
+        assert upload(archive) == 400
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    evidence._write_failure_evidence(node, "call")
+    record = json.loads(next((tmp_path / "evidence").glob("failure-*.json")).read_text())
+    error = record["upload_error"]
+    assert error == {
+        "status_code": 400, "message": "Task validation failed PR-900: missing dependency & branch evidence",
+    }
+    assert "HTTP 400" in capsys.readouterr().out
+    assert "do-not-retain" not in json.dumps(record)

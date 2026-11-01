@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import subprocess
 import uuid
 from datetime import datetime, timezone
@@ -204,10 +205,17 @@ def _fetch_failed_ci_logs(
         except (RuntimeError, subprocess.TimeoutExpired, OSError):
             continue
         if isinstance(logs, str) and logs:
-            return (
-                f"[truncated]\n{logs[-_FIX_CI_LOG_TRUNCATE_CHARS:]}"
-                if len(logs) > _FIX_CI_LOG_TRUNCATE_CHARS else logs
-            )
+            if len(logs) <= _FIX_CI_LOG_TRUNCATE_CHARS:
+                return logs
+            # A failed Actions step can end with successful cleanup commands.
+            # Keep the actual assertion/exception, not just that cleanup tail.
+            diagnostic = re.search(
+                r"(?m)^.*\bE\s+[\w.]+(?:Error|Exception)\b.*$", logs,
+            ) or re.search(r"(?m)^.*(?:={3,} FAILURES |Traceback \(most recent call last\)).*$", logs)
+            if diagnostic is not None:
+                start = max(0, diagnostic.start() - 1000)
+                return "[failure excerpt; truncated]\n" + logs[start:start + _FIX_CI_LOG_TRUNCATE_CHARS]
+            return f"[truncated]\n{logs[-_FIX_CI_LOG_TRUNCATE_CHARS:]}"
     return None
 
 
@@ -520,7 +528,7 @@ class FixMixin(BreachMixin):
             )
             if ci_logs:
                 sections.append(
-                    "CI failure logs (last 5000 chars):\n" + ci_logs
+                    "CI failure logs (bounded diagnostic excerpt):\n" + ci_logs
                 )
             else:
                 sections.append(
