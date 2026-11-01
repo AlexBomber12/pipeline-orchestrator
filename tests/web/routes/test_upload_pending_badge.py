@@ -565,3 +565,80 @@ def test_repo_card_template_omits_badge_when_zero() -> None:
 
     assert "data-upload-pending-badge" not in html
     assert "Upload pending" not in html
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, None),
+        ("bad json", None),
+        ("[]", None),
+        ('{"admission_error": 7}', None),
+        ('{"admission_error":""}', None),
+        ('{"admission_error":"PR-468 blocked"}', "PR-468 blocked"),
+    ],
+)
+def test_upload_rejection_reader(raw, expected):
+    with TestClient(app) as client:
+        if raw is not None:
+            client.app.state.redis._store[upload_pending("example__alpha")] = raw
+        assert (
+            asyncio.run(dashboard_routes.get_upload_admission_error("example__alpha", client.app.state.redis))
+            == expected
+        )
+    assert asyncio.run(dashboard_routes.get_upload_admission_error("example__alpha", None)) is None
+
+
+def test_upload_rejection_visible_on_cards_and_detail_and_clears_with_manifest():
+    with TestClient(app) as client:
+        redis_client = client.app.state.redis
+        key = upload_pending("example__alpha")
+        redis_client._store[key] = json.dumps(
+            {"admission_error": "PR-468: completed task replacement blocked <script>bad()</script>"}
+        )
+        for path in ["/", "/partials/repo/example__alpha"]:
+            response = client.get(path)
+            assert response.status_code == 200
+            assert "data-upload-blocked" in response.text
+            assert 'role="alert"' in response.text
+            assert "PR-468: completed task replacement blocked" in response.text
+            assert "&lt;script&gt;bad()&lt;/script&gt;" in response.text
+            assert "<script>bad()</script>" not in response.text
+        redis_client._store[key] = json.dumps({"files": []})
+        assert "data-upload-blocked" not in client.get("/").text
+        assert "data-upload-blocked" not in client.get("/partials/repo/example__alpha").text
+
+
+def test_corrected_upload_replaces_verdict_and_retains_staged_sibling(uploads_dir, repo_dir):
+    from src.queue_parser import write_frontmatter_status
+
+    original = _task_file()[1][1]
+    tasks = repo_dir / "tasks"
+    tasks.mkdir()
+    task = tasks / "PR-001.md"
+    task.write_bytes(original)
+    write_frontmatter_status(task, "DONE")
+    accepted = task.read_bytes()
+    staging = uploads_dir / "old"
+    staging.mkdir()
+    (staging / "PR-001.md").write_bytes(original + b"changed instruction\n")
+    sibling = _task_file(name="PR-002.md", pr_id="PR-002")[1][1]
+    (staging / "PR-002.md").write_bytes(sibling)
+    with TestClient(app) as client:
+        key = upload_pending("example__alpha")
+        client.app.state.redis._store[key] = json.dumps(
+            {
+                "files": ["PR-001.md", "PR-002.md"],
+                "staging_dir": str(staging),
+                "admission_error": "PR-001 completed replacement blocked",
+                "admission_base_sha": "old",
+            }
+        )
+        response = client.post("/repos/example__alpha/upload-tasks", files=[_task_file()])
+        assert response.status_code == 200
+        manifest = json.loads(client.app.state.redis._store[key])
+        assert "admission_error" not in manifest
+        assert set(manifest["files"]) == {"PR-001.md", "PR-002.md"}
+        assert Path(manifest["staging_dir"], "PR-002.md").read_bytes() == sibling
+        assert "data-upload-blocked" not in client.get("/").text
+    assert task.read_bytes() == accepted

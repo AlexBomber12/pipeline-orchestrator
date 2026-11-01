@@ -392,6 +392,7 @@ class RepoState(BaseModel):
     merge_command_failed: bool = False
     publication_attempt: PublicationAttempt | None = None
     upload_pending_count: int = 0
+    upload_admission_error: str | None = None
 
     @field_validator("state", mode="before")
     @classmethod

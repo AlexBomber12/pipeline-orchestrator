@@ -113,6 +113,8 @@
             </div>
         </div>
 
+        {% include "components/upload_blocked.html" %}
+
         {% if is_synthetic and repo.error_message %}
         {# Synthetic/degraded variant: show warning instead of normal body #}
         <div class="px-2 py-1.5 rounded bg-warn/10 border border-warn/20 text-warn text-xs truncate"

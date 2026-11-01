@@ -1288,3 +1288,31 @@ cover the separate MCP JSON listener. Track MCP transport limits and principal
 binding as separate maintenance; no MCP upgrade or auth-policy change is made
 here. Existing MCP tests use controlled transports/synthetic assertions and do
 not prove provider access, real-account security or deployed gateway behavior.
+
+
+## Blocked task uploads
+
+Uploads are staged before daemon admission. A completed task replay retains the
+accepted file byte for byte, even when the status writer reflowed YAML. Only YAML
+presentation and daemon-owned status/blocked-reason fields may differ; Markdown
+instructions and all other frontmatter values must still match. Stored task hashes,
+completion receipts and retry/run history are not migrated or reset by a replay.
+
+A changed completed task, recorded completion replacement, or invalid effective
+task graph retains the whole batch and an `admission_error` in its upload manifest.
+The dashboard and repository summary show **Task upload blocked**, the reason and
+the recovery action. The same rejected generation is not re-admitted each tick or
+after restart at the same base commit. New uploads or a fetched base change trigger
+fresh admission. Admission requires an available GitHub branch-completion probe
+before caching a graph rejection; an unavailable probe remains retryable at the
+same base, including after restart. Transient transport/push failures and active-work holds keep their
+existing retry behavior. Operator pause and Stop still prevent upload consumption.
+
+Correct and re-upload the conflicting files; the upload endpoint retains staged
+siblings and creates a new generation without the old verdict. For completed tasks,
+use the accepted specification. Do not reset DONE, delete completion evidence or
+press task Retry to fix an upload. Existing pending revisions still defer task
+dispatch, so the UI warning identifies that queue blocker even while state is IDLE.
+Rejected bytes are retained in staging; replacement generations use the existing
+abandoned-staging retention policy. Redis rejection updates are compare-and-set,
+so a late verdict cannot overwrite a newer uploaded generation.
