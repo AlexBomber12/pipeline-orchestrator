@@ -15,11 +15,10 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from pathlib import Path
 
-import yaml
 from src.github.ci_evidence import _status_producer
 
+from tests.e2e.conftest import _load_shared_config
 from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
 
 TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
@@ -54,9 +53,7 @@ def _post_failed_status(head_sha: str) -> None:
     assert isinstance(payload, dict), payload
     assert payload.get("state") == "failure", payload
     assert payload.get("context") == WATCH_GATE_CONTEXT, payload
-    configured = yaml.safe_load(
-        (Path(__file__).resolve().parents[2] / "tests/e2e/data/config.test.yml").read_text()
-    )["repositories"][0]["ci_fix_trusted_statuses"][WATCH_GATE_CONTEXT]
+    configured = _load_shared_config().repositories[0].ci_fix_trusted_statuses[WATCH_GATE_CONTEXT]
     posted_producer = _status_producer(payload)
     assert posted_producer in configured, (
         f"POST status producer {posted_producer!r} does not match configured {configured!r}"
