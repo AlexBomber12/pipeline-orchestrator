@@ -3869,7 +3869,7 @@ def test_coding_hydrates_ci_with_repository_policy(monkeypatch, scenario):
     calls = []
 
     def check_pages(path):
-        assert path == "repos/octo/demo/commits/" + "a" * 40 + "/check-runs?per_page=100"
+        assert path == "repos/octo/demo/commits/" + "a" * 40 + "/check-runs?per_page=100&filter=all"
         calls.append(path)
         runs = [{"id": i, "name": name, "head_sha": "a" * 40,
                  "status": "completed", "conclusion": "success", "app": {"id": 1}}
