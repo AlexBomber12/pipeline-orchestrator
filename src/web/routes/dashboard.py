@@ -45,7 +45,6 @@ from src.config import AppConfig, RepoConfig, load_config
 from src.events.sse import format_sse_comment, format_sse_event
 from src.github import gh_runner
 from src.github import prs as gh_prs
-from src.inhibitor import InhibitorType
 from src.keyspace import (
     cli_log_latest,
     daemon_panic_state,
@@ -1995,12 +1994,9 @@ async def partial_automation_status(request: Request) -> HTMLResponse:
         }
         for state in states
     )
-    now = datetime.now(timezone.utc)
-    panic = any(
-        inhibitor.inhibitor_type == InhibitorType.CASCADE_PANIC
-        and inhibitor.is_blocking_now(now)
-        for state in states for inhibitor in state.active_inhibitors
-    )
+    # Panic prevents runner cycles from refreshing repository snapshots.
+    # Use the same live record as the dashboard banner, including on resume.
+    panic = bool(await _read_panic_state_for_banner(redis_client))
     return _app.templates.TemplateResponse(
         request,
         "components/automation_status.html",

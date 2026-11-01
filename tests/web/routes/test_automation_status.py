@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from fastapi.testclient import TestClient
 from src.inhibitor import InhibitorType, WorkInhibitor
-from src.keyspace import pipeline_state
+from src.keyspace import daemon_panic_state, pipeline_state
 from src.models import PipelineState, RepoState
 from src.web.app import app
 
@@ -26,11 +26,9 @@ def test_configured_automation_status(tmp_path, monkeypatch, paused, panic, labe
     for i, url in enumerate(urls):
         state = RepoState(name=f'example__repo{i}', url=url, user_paused=i < paused,
                           state=PipelineState.CODING)
-        if panic and i == 0:
-            state.active_inhibitors = [WorkInhibitor(
-                inhibitor_type=InhibitorType.CASCADE_PANIC, source_key='panic',
-            )]
         redis.values[pipeline_state(state.name)] = state.model_dump_json()
+    if panic:
+        redis.values[daemon_panic_state()] = '{"enabled": true}'
     with TestClient(app) as client:
         response = client.get('/partials/automation-status')
     assert response.status_code == 200
@@ -73,3 +71,29 @@ def test_empty_config_and_expired_panic(tmp_path, monkeypatch):
                           )])
         redis.values[pipeline_state(state.name)] = state.model_dump_json()
         assert '>Automation: on</span>' in client.get('/partials/automation-status').text
+
+
+@pytest.mark.parametrize('paused', [False, True])
+def test_live_panic_changes_without_snapshot_refresh(tmp_path, monkeypatch, paused):
+    """Panic and resume must show up even when no runner cycles publish state."""
+    _write_config(tmp_path, monkeypatch, repo_urls=['https://github.com/example/alpha.git'])
+    redis = _FakeRedis()
+    _stub_redis(monkeypatch, redis)
+    state = RepoState(name='example__alpha', url='https://github.com/example/alpha.git',
+                      user_paused=paused)
+    redis.values[pipeline_state(state.name)] = state.model_dump_json()
+    normal_label = 'Automation: paused (all repos)' if paused else 'Automation: on'
+    with TestClient(app) as client:
+        assert f'>{normal_label}</span>' in client.get('/partials/automation-status').text
+        redis.values[daemon_panic_state()] = '{"enabled": true}'
+        response = client.get('/partials/automation-status')
+        assert response.status_code == 200
+        assert '>Automation: panic, dispatch blocked</span>' in response.text
+        assert 'text-fail' in response.text
+        # A cycle may have published panic before stopping; resume must ignore it.
+        state.active_inhibitors = [WorkInhibitor(
+            inhibitor_type=InhibitorType.CASCADE_PANIC, source_key='panic',
+        )]
+        redis.values[pipeline_state(state.name)] = state.model_dump_json()
+        del redis.values[daemon_panic_state()]
+        assert f'>{normal_label}</span>' in client.get('/partials/automation-status').text
