@@ -5,9 +5,12 @@ import subprocess
 import time
 from pathlib import Path
 
-from src.config import load_config
-
-from tests.e2e.conftest import EVIDENCE_DIR, SHARED_CONFIG_PATH, _stop_daemon_and_wait_paused, _tested_sha
+from tests.e2e.conftest import (
+    EVIDENCE_DIR,
+    _load_shared_config,
+    _stop_daemon_and_wait_paused,
+    _tested_sha,
+)
 from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
 from tests.e2e.lib.review_api import MergeOutcomeApi, ReviewApi, task_released_and_done
 from tests.e2e.test_fix_feedback import _runs, _wait
@@ -21,7 +24,7 @@ def test_coding_capacity_retained_work_reaches_merge(
     testbed_slug, get_state, upload_zip, make_task_zip, reset_testbed,
 ):
     repo = testbed_slug.replace('__', '/', 1)
-    cfg = load_config(str(SHARED_CONFIG_PATH))
+    cfg = _load_shared_config()
     configured = next(r for r in cfg.repositories if repo in r.url)
     outcome = MergeOutcomeApi(repo, configured.branch)
     reviewer = ReviewApi.from_environment()
