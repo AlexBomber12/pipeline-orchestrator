@@ -1699,6 +1699,58 @@ async def test_cancellation_waits_for_shielded_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_cancelled_concurrent_cleanup_stops_orphaned_tree_only(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # SIG_IGN survives exec, so both descendants ignore TERM from birth.
+    child_code = CHILD_WITH_GRANDCHILD.replace(
+        "grandchild =", "signal.signal(signal.SIGTERM, signal.SIG_IGN)\ngrandchild ="
+    )
+    managed = await process_pool.launch(
+        f"import subprocess, sys; subprocess.Popen([sys.executable, '-c', {child_code!r}])"
+    )
+    child_pid, grandchild_pid = await _read_pids(managed.process)
+    assert await managed.process.wait() == 0
+    unrelated = await process_pool.launch_raw(SLEEPING_PROCESS)
+    (unrelated_pid,) = await _read_pids(unrelated)
+    term_sent = asyncio.Event()
+    real_signal = managed._signal_group
+
+    def tracked_signal(sig: signal.Signals) -> tuple[bool, str | None]:
+        result = real_signal(sig)
+        if sig == signal.SIGTERM and result[0]:
+            term_sent.set()
+        return result
+
+    monkeypatch.setattr(managed, "_signal_group", tracked_signal)
+    callers = [
+        asyncio.create_task(managed.cleanup(term_grace=0.1, kill_grace=0.5))
+        for _ in range(2)
+    ]
+    try:
+        await asyncio.wait_for(term_sent.wait(), 2)
+        for _ in range(2):
+            for caller in callers:
+                caller.cancel()
+            await asyncio.sleep(0)
+        settled = await asyncio.wait_for(
+            asyncio.gather(*callers, return_exceptions=True), 3
+        )
+        assert all(isinstance(item, asyncio.CancelledError) for item in settled)
+        result = await managed.cleanup(term_grace=0, kill_grace=0)
+        assert result.quiescent and result.term_sent and result.kill_sent
+        assert result.leader_returncode == 0
+        await _wait_not_live(child_pid, grandchild_pid)
+        assert await managed.process.communicate() == (b"", b"")
+        assert _pid_is_live(unrelated_pid) and unrelated.returncode is None
+    finally:
+        for caller in callers:
+            if not caller.done():
+                caller.cancel()
+        await asyncio.gather(*callers, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_unrelated_process_group_is_untouched(
     process_pool: ProcessPool,
 ) -> None:
@@ -1919,6 +1971,88 @@ async def test_reconcile_cleanup_freshly_observes_without_replacing_cache(
     assert reconciled.term_sent is False
     assert reconciled.kill_sent is False
     assert (await managed.cleanup()).status is CleanupStatus.FAILED
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("grace", [-1, math.inf, -math.inf, math.nan])
+async def test_reconciliation_rejects_unbounded_or_negative_grace(grace: float) -> None:
+    managed = SupervisedProcess(
+        process=object(),  # type: ignore[arg-type]
+        identity=ProcessIdentity(101, 101, 101, 1),
+        _proof=process_supervisor._LAUNCH_PROOF,
+    )
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        await managed.reconcile_cleanup(observation_grace=grace)
+    assert managed._cleanup_task is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_reconciliation_finishes_before_propagating_cancellation(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch, cancel: bool,
+) -> None:
+    managed = await process_pool.launch("pass")
+    assert await managed.process.wait() == 0
+    with monkeypatch.context() as patch:
+        patch.setattr(managed, "_observe_group", lambda: _GroupObservation(
+            _GroupState.UNKNOWN, "injected observation failure"
+        ))
+        cached = await managed.cleanup(term_grace=0, kill_grace=0)
+    assert not cached.quiescent
+    started, release = asyncio.Event(), asyncio.Event()
+    observations = []
+    real_observe = managed._wait_for_quiescence
+
+    async def delayed_observe(timeout: float) -> tuple[_GroupObservation, bool]:
+        started.set()
+        await release.wait()
+        result = await real_observe(timeout)
+        observations.append(result)
+        return result
+
+    monkeypatch.setattr(managed, "_wait_for_quiescence", delayed_observe)
+    reconcile = asyncio.create_task(managed.reconcile_cleanup(observation_grace=0.1))
+    try:
+        await asyncio.wait_for(started.wait(), 2)
+        if cancel:
+            for _ in range(2):
+                reconcile.cancel()
+                await asyncio.sleep(0)
+                assert not reconcile.done()
+        release.set()
+        if cancel:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(reconcile, 2)
+        else:
+            assert (await asyncio.wait_for(reconcile, 2)).quiescent
+        assert observations[0][0].state is _GroupState.QUIESCENT
+        assert (await managed.cleanup()) is cached
+    finally:
+        release.set()
+        await asyncio.gather(reconcile, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_live_reconciliation_fails_within_bound_without_signaling(
+    process_pool: ProcessPool, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed = await process_pool.launch(TERM_IGNORING_PROCESS)
+    (leader_pid,) = await _read_pids(managed.process)
+    with monkeypatch.context() as patch:
+        patch.setattr(managed, "_signal_group", lambda _sig: pytest.fail(
+            "observation-only reconciliation must never signal"
+        ))
+        started = time.monotonic()
+        result = await asyncio.wait_for(
+            managed.reconcile_cleanup(observation_grace=0.02), 1
+        )
+        assert time.monotonic() - started < 0.5
+    assert result.status is CleanupStatus.FAILED
+    assert result.detail == "process group remained live after the grace period"
+    assert not result.term_sent and not result.kill_sent
+    assert _pid_is_live(leader_pid)
+    assert managed._cleanup_task is None
+    assert (await managed.cleanup(term_grace=0, kill_grace=0.5)).quiescent
 
 
 @pytest.mark.asyncio

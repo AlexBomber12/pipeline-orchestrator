@@ -556,13 +556,9 @@ class SupervisedProcess:
                 self._cleanup_impl(term_grace, kill_grace)
             )
 
-        cancellation: asyncio.CancelledError | None = None
-        while not self._cleanup_task.done():
-            try:
-                await asyncio.shield(self._cleanup_task)
-            except asyncio.CancelledError as exc:
-                cancellation = exc
-        result = self._cleanup_task.result()
+        result, cancellation = await _await_task_preserving_cancellation(
+            self._cleanup_task
+        )
         if cancellation is not None:
             raise cancellation
         return result
@@ -577,7 +573,20 @@ class SupervisedProcess:
         This path never signals the process group and does not replace the
         first cleanup result. It only permits an owner that retained control
         after an unconfirmed cleanup to prove that the group later exited.
+        Observation grace must be finite and non-negative. Like cleanup,
+        reconciliation finishes within its bounds before propagating caller
+        cancellation, including witness release and leader-reaping confirmation.
         """
+        if not math.isfinite(observation_grace) or observation_grace < 0:
+            raise ValueError("observation grace must be finite and non-negative")
+        result, cancellation = await _await_task_preserving_cancellation(
+            asyncio.create_task(self._reconcile_cleanup_impl(observation_grace))
+        )
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+    async def _reconcile_cleanup_impl(self, observation_grace: float) -> CleanupResult:
         observation, _ = await self._wait_for_quiescence(observation_grace)
         term_sent = bool(self._signaled_members.get(signal.SIGTERM))
         kill_sent = bool(self._signaled_members.get(signal.SIGKILL))
