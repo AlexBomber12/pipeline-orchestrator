@@ -45,6 +45,7 @@ from src.config import AppConfig, RepoConfig, load_config
 from src.events.sse import format_sse_comment, format_sse_event
 from src.github import gh_runner
 from src.github import prs as gh_prs
+from src.inhibitor import InhibitorType
 from src.keyspace import (
     cli_log_latest,
     daemon_panic_state,
@@ -1975,6 +1976,39 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
             "subsource_lookup": _subsource_lookup,
             "drain_progress": drain_progress,
             "inhibitor_labels": INHIBITOR_LABELS,
+        },
+    )
+
+
+@router.get("/partials/automation-status", response_class=HTMLResponse)
+async def partial_automation_status(request: Request) -> HTMLResponse:
+    """Summarize configured dispatch intent, without claiming process liveness."""
+    redis_client = getattr(request.app.state, "redis", None)
+    states, warning = await _app.get_all_repo_states(
+        redis_client, _app.CONFIG_PATH
+    )
+    unavailable = redis_client is None or bool(warning) or any(
+        state.error_message in {
+            "Redis unavailable — state unknown",
+            "Waiting for daemon to initialize",
+            "State decode failed",
+        }
+        for state in states
+    )
+    now = datetime.now(timezone.utc)
+    panic = any(
+        inhibitor.inhibitor_type == InhibitorType.CASCADE_PANIC
+        and inhibitor.is_blocking_now(now)
+        for state in states for inhibitor in state.active_inhibitors
+    )
+    return _app.templates.TemplateResponse(
+        request,
+        "components/automation_status.html",
+        {
+            "unavailable": unavailable,
+            "panic": panic,
+            "paused": sum(state.user_paused for state in states),
+            "total": len(states),
         },
     )
 

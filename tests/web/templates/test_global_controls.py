@@ -1,15 +1,4 @@
-"""Tests for the header global pause/resume/stop controls (PR-340).
-
-PR-339 shipped daemon-wide endpoints (``/daemon/pause``, ``/daemon/resume``,
-``/daemon/stop``, ``/daemon/drain-progress``) but no UI surface for them.
-PR-340 adds three header buttons that consume those endpoints with
-confirmation modals on the destructive paths (Pause All, Stop All) and an
-immediate fire on the reversible path (Resume All).
-
-The tests render ``components/global_modals.html`` directly to assert the
-button row, the modal copy, the HTMX endpoint wiring, and the inline JS
-contract the cypress-style acceptance criteria in the spec rely on.
-"""
+"""Shared automation menu endpoint wiring and confirmation contracts."""
 
 from __future__ import annotations
 
@@ -23,19 +12,16 @@ def _render_component() -> str:
     return template.render()
 
 
-def test_header_renders_three_buttons() -> None:
-    # The dashboard header must carry exactly one Pause All, Resume All,
-    # and Stop All button so the operator surface matches the PR-339
-    # endpoint trio. Buttons are identified by ``data-action`` so the
-    # markup is robust to copy changes during follow-up sprints.
+def test_header_menu_contains_three_actions() -> None:
+    # Actions remain available inside the shared disclosure menu.
     rendered = _render_component()
 
     assert 'data-action="pause-all"' in rendered
     assert 'data-action="resume-all"' in rendered
     assert 'data-action="stop-all"' in rendered
-    assert "Pause All" in rendered
-    assert "Resume All" in rendered
-    assert "Stop All" in rendered
+    assert "Pause all" in rendered
+    assert "Resume all" in rendered
+    assert "Stop all" in rendered
 
 
 def test_pause_all_button_opens_modal() -> None:
@@ -115,19 +101,17 @@ def test_confirm_pause_all_posts_to_daemon_pause_endpoint() -> None:
 
 
 def test_stop_all_modal_describes_destructive_nature() -> None:
-    # The stop modal must communicate the blast radius in plain language
-    # so an operator cannot mistake it for the graceful pause path. Spec
-    # requires "destructive" and the SIGTERM/SIGKILL kill semantics to
-    # be visible before the operator confirms.
+    # Cancellation is bounded by confirmed process ownership and cleanup holds.
     rendered = _render_component()
 
     stop_segment = rendered.split('id="stop-all-modal"', 1)[1].split(
         "</dialog>", 1
     )[0]
     assert "destructive" in stop_segment.lower()
-    assert "KILLED" in stop_segment
-    assert "SIGTERM" in stop_segment
-    assert "SIGKILL" in stop_segment
+    assert "confirmed owned coders" in stop_segment
+    assert "Retained dirty work" in stop_segment
+    assert "cleanup hold" in stop_segment
+    assert "not that a coder stopped" in stop_segment
 
 
 def test_confirm_stop_all_posts_to_daemon_stop_endpoint() -> None:
