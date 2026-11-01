@@ -459,7 +459,9 @@ def _retrieve_ci_status_evidence(repo: str, sha: str, *, fresh: bool = False) ->
     # run beyond the cap masquerade as SUCCESS and misclassify the PR as
     # mergeable, so we walk every page rather than relying on ETag-cached
     # single-page reads.
-    check_runs_path = f"repos/{repo}/commits/{sha}/check-runs?per_page=100"
+    # GitHub's default latest filter can omit a required sibling job. Fetch
+    # all pages of history; the evidence policy selects current producer runs.
+    check_runs_path = f"repos/{repo}/commits/{sha}/check-runs?per_page=100&filter=all"
     cr_evidence = cache._gh_api_paginated_evidence(check_runs_path)
     check_runs_malformed = False
     for page in cr_evidence.items:
