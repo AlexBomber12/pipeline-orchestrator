@@ -1511,11 +1511,21 @@ class WatchMixin:
         rerunnable_checks: list[list[int | None]] = []
         unsupported = False
         failing_count = 0
+        # History discovery also returns superseded workflows. Reuse the gate's
+        # canonical context/producer selection before admitting rerun effects.
+        statuses = _statuses.get("statuses", []) if isinstance(_statuses, dict) else ()
+        evidence = evaluate_ci_evidence(
+            repo=self.owner_repo, pr_number=pr_number, sha=head_sha,
+            check_runs=[check for check in check_runs if isinstance(check, dict)],
+            statuses=[status for status in statuses if isinstance(status, dict)]
+            if isinstance(statuses, list) else (),
+        )
+        current_failures = [
+            ctx.run_id for producers in _latest(evidence.contexts).values()
+            for ctx in producers.values() if ctx.state == "failure"
+        ]
         for check in check_runs:
-            if not isinstance(check, dict) or (
-                str(check.get("conclusion") or check.get("status") or "").upper()
-                not in gh_checks._REST_CI_FAILURE_STATES
-            ):
+            if not isinstance(check, dict) or ("check", check.get("id")) not in current_failures:
                 continue
             failing_count += 1
             identity = actions_job_identity(self.owner_repo, check)

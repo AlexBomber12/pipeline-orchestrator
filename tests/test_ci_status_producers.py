@@ -91,3 +91,74 @@ def test_retrieve_ci_status_evidence_preserves_failure_with_malformed_entries(mo
         assert result.status_payload == payload
     finally:
         checks.clear_ci_status_cache()
+
+
+@pytest.mark.parametrize("scenario,expected", [
+    ("success", CIStatus.SUCCESS), ("in_progress", CIStatus.PENDING),
+    ("failure", CIStatus.FAILURE), ("missing_producer", CIStatus.PENDING),
+    ("wrong_sha", CIStatus.PENDING), ("truncated", CIStatus.PENDING),
+])
+def test_full_check_history_recovers_hidden_sibling_without_accepting_stale_success(monkeypatch,scenario,expected):
+    from urllib.parse import parse_qs, urlsplit
+    from src.github import gh_runner
+    sha = "fe32220c70efa4e4d08e58364b9b9171d536a0ce"
+    unit = {"id":124802114874,"name":"unit","head_sha":sha,"status":"completed",
+            "conclusion":"success","started_at":"2026-11-01T09:57:52Z","app":{"id":15368}}
+    integration = {**unit,"id":124803304453,"name":"integration","started_at":"2026-11-01T09:03:33Z"}
+    if scenario in {"in_progress", "failure"}:
+        integration.update(
+            status="in_progress" if scenario == "in_progress" else "completed",
+            conclusion=None if scenario == "in_progress" else "failure",
+        )
+    elif scenario == "missing_producer":
+        integration.pop("app")
+    elif scenario == "wrong_sha":
+        integration["head_sha"] = "b" * 40
+    # History includes old failing unit attempts. They cannot override the
+    # current unit, and its success cannot hide a newer integration retry.
+    history = [unit] + [
+        {**unit, "id": i, "conclusion": "failure", "started_at": "2026-10-31T09:00:00Z"} for i in range(1, 100)
+    ]
+    history.append(integration)
+    if scenario == "in_progress":
+        history.append(
+            {
+                **integration,
+                "id": 124803304452,
+                "status": "completed",
+                "conclusion": "success",
+                "started_at": "2026-11-01T08:00:00Z",
+            }
+        )
+    paths = []
+
+    def transport(args, **kwargs):
+        assert args[0] == "api"
+        url = urlsplit(args[1])
+        query = parse_qs(url.query)
+        paths.append(args[1])
+        assert url.path == f"repos/owner/repo/commits/{sha}/check-runs"
+        page = int(query["page"][0])
+        # Reproduce PR-472: the default API/UI view exposes just unit.
+        records = history if query.get("filter") == ["all"] else [unit]
+        if scenario == "truncated" and page == 2:
+            raise RuntimeError("HTTP 503 while reading second page")
+        return {"total_count": len(records), "check_runs": deepcopy(records[(page - 1) * 100 : page * 100])}
+
+    monkeypatch.setattr(gh_runner, "run_gh", transport)
+    monkeypatch.setattr(cache, "retry_transient", lambda fn, **kwargs: fn())
+    monkeypatch.setattr(
+        cache, "_etag_get", lambda path: {"sha": sha, "state": "success", "total_count": 0, "statuses": []}
+    )
+    checks.clear_ci_status_cache()
+    try:
+        result = checks._retrieve_ci_status_evidence("owner/repo", sha, fresh=True)
+        assert checks._classify_ci_retrieval(result, required_contexts=["unit", "integration"]) == expected
+        assert len(paths) == 2 and all("filter=all" in path for path in paths)
+        assert paths[-1].endswith("page=2")
+        assert result.check_runs_source.complete is (scenario not in {"truncated", "wrong_sha"})
+        if scenario == "success":
+            assert len(result.check_runs) == 101
+            assert {c.name for c in result.evidence.contexts} == {"unit", "integration"}
+    finally:
+        checks.clear_ci_status_cache()

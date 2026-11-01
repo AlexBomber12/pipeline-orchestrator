@@ -611,7 +611,7 @@ def test_retry_failed_workflow_returns_true_after_rerun(
             [
                 {
                     "id": 1, "name": "unit", "app": {"id": 15368},
-                    "run_attempt": 1,
+                    "head_sha": head_sha, "run_attempt": 1,
                     "conclusion": "FAILURE",
                     "details_url": (
                         "https://github.com/octo/demo/actions/runs/123456/job/1"
@@ -3570,9 +3570,9 @@ def test_partial_infra_rerun_retries_only_unissued_workflow(
     pr = _patch_infra_failure_pr(
         monkeypatch, pr_number=83, head_sha="d" * 40,
         check_runs=[
-            {"id": 101, "conclusion": "cancelled",
+            {"id": 101, "name": "unit", "conclusion": "cancelled",
              "details_url": _actions_url(11, 101)},
-            {"id": 202, "conclusion": "cancelled",
+            {"id": 202, "name": "integration", "conclusion": "cancelled",
              "details_url": _actions_url(22, 202)},
         ],
     )
@@ -3654,7 +3654,7 @@ def test_mixed_infra_failures_bound_unsupported_check_to_operator_recovery(
         monkeypatch, pr_number=84, head_sha="d" * 40,
         check_runs=[
             actions_check,
-            {"id": 202, "run_attempt": 1, "conclusion": "cancelled",
+            {"id": 202, "name": "external-custom", "run_attempt": 1, "conclusion": "cancelled",
              "details_url": "https://example.com/custom-check"},
         ],
     )
@@ -4260,7 +4260,7 @@ def _patch_check_runs(
         check["details_url"] = str(check.get("details_url") or "").replace(
             "github.com/example/repo/", "github.com/octo/demo/",
         )
-        check.setdefault("name", "unit")
+        check.setdefault("name", "unit" if len(check_runs) == 1 else f"matrix-{len(normalized) + 1}")
         check.setdefault("app", {"id": 15368})
         if "id" not in check:
             match = re.search(r"/job/(\d+)$", check["details_url"])
@@ -4269,7 +4269,7 @@ def _patch_check_runs(
         normalized.append(check)
     monkeypatch.setattr(
         "src.github.checks._fetch_ci_status_rest",
-        lambda repo, sha: (list(normalized), {}, True),
+        lambda repo, sha: ([{"head_sha": sha, **check} for check in normalized], {}, True),
     )
     monkeypatch.setattr(
         watch_module, "read_actions_run",
@@ -6797,3 +6797,98 @@ def test_ci_outage_deadline_cannot_use_unreadable_task_generation(monkeypatch, t
                                json.dumps({"at": 1})))
     (tmp_path / runner.state.current_task.task_file).unlink()
     assert not asyncio.run(runner._ci_infra_recovery_expired(pr))
+
+
+@pytest.mark.parametrize("current_state", ["cancelled", "in_progress", "success"])
+@pytest.mark.parametrize("reverse", [False, True])
+def test_full_history_retry_excludes_superseded_workflows(monkeypatch, tmp_path, current_state, reverse):
+    from src.github import cache, checks
+
+    real_fetch = checks._fetch_ci_status_rest
+    real_retrieve = checks._retrieve_ci_status_evidence
+    runner, pr = _lifecycle_watch(monkeypatch, tmp_path, True)
+    monkeypatch.setattr(checks, "_fetch_ci_status_rest", real_fetch)
+    monkeypatch.setattr(checks, "_retrieve_ci_status_evidence", real_retrieve)
+    old = {
+        "id": 111,
+        "name": "unit",
+        "head_sha": pr.head_sha,
+        "run_attempt": 1,
+        "app": {"id": 15368},
+        "status": "completed",
+        "conclusion": "failure",
+        "started_at": "2026-10-31T09:00:00Z",
+        "details_url": _actions_url(11, 111),
+    }
+    unit = {
+        **old,
+        "id": 221,
+        "conclusion": "success",
+        "started_at": "2026-11-01T09:00:00Z",
+        "details_url": _actions_url(22, 221),
+    }
+    integration = {
+        **unit,
+        "id": 222,
+        "name": "integration",
+        "conclusion": current_state,
+        "details_url": _actions_url(22, 222),
+    }
+    if current_state == "in_progress":
+        integration.update(status="in_progress", conclusion=None)
+    records = [old, unit, integration]
+    if reverse:
+        records.reverse()
+    reruns = []
+    views = []
+
+    def transport(args, **kwargs):
+        if args[0] == "api":
+            assert "check-runs?per_page=100&filter=all&page=1" in args[1]
+            return {"total_count": 3, "check_runs": records}
+        if args[:2] == ["run", "view"]:
+            run_id = int(args[2])
+            views.append(run_id)
+            jobs = [
+                {"databaseId": r["id"], "name": r["name"], "conclusion": r["conclusion"]}
+                for r in records
+                if f"/runs/{run_id}/" in r["details_url"]
+            ]
+            return {
+                "databaseId": run_id,
+                "headSha": pr.head_sha,
+                "attempt": 1,
+                "status": "completed",
+                "conclusion": "failure" if run_id == 11 else "cancelled",
+                "jobs": jobs,
+            }
+        assert args[:3] == ["run", "rerun", "--failed"]
+        reruns.append(args)
+        return ""
+
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", transport)
+    monkeypatch.setattr(
+        cache, "_etag_get", lambda path: {"sha": pr.head_sha, "state": "success", "total_count": 0, "statuses": []}
+    )
+    checks.clear_ci_status_cache()
+    try:
+        retrieval = real_retrieve(runner.owner_repo, pr.head_sha, fresh=True)
+        expected = {"cancelled": CIStatus.INFRA_FAILURE, "in_progress": CIStatus.PENDING, "success": CIStatus.SUCCESS}[
+            current_state
+        ]
+        assert checks._classify_ci_retrieval(retrieval, required_contexts=["unit", "integration"]) == expected
+        assert asyncio.run(runner._retry_failed_workflow(pr.number, pr.head_sha)) is (current_state == "cancelled")
+        assert reruns == ([["run", "rerun", "--failed", "22"]] if current_state == "cancelled" else [])
+        assert views == ([22] if current_state == "cancelled" else [])
+        assert 11 not in runner._infra_retry_target_run_ids
+        assert all(item[0] != 111 for item in runner._infra_retry_baseline)
+    finally:
+        checks.clear_ci_status_cache()
+
+
+def test_retry_ignores_malformed_check_identity_without_side_effect(monkeypatch):
+    runner = h._make_runner()
+    _patch_check_runs(monkeypatch, [{"id": [7], "conclusion": "cancelled", "details_url": _actions_url(7, 7)}])
+    assert _run_infra_retry(runner, 11, "a" * 40) is False
+    assert runner._infra_retry_target_run_ids == []
+    assert runner._infra_retry_unsupported
