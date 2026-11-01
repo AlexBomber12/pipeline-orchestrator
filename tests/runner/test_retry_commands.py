@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import subprocess
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -1063,6 +1063,7 @@ async def test_watch_retry_starts_active_record_after_completed_fix_run(
     completed.diff_lines_added = 8
     await runner._checkpoint_current_run_record()
     monkeypatch.setattr(runner, "_validate_retry_command", _async_value((object(), task)))
+    monkeypatch.setattr(runner, "_origin_retry_task_text", lambda command: _task_text())
     monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
     monkeypatch.setattr(runner, "_select_retry_continuation", _async_value(("watch", pr)))
     monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
@@ -1774,6 +1775,7 @@ async def test_retry_reconciles_retained_publication_before_replacing_invocation
     } if available else {})
     monkeypatch.setattr(cache, "_etag_payload_observed_at", lambda *_a: None)
     monkeypatch.setattr(runner, "_validate_retry_command", _async_value((object(), task)))
+    monkeypatch.setattr(runner, "_origin_retry_task_text", lambda command: _task_text())
     monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
     monkeypatch.setattr(runner, "_commit_task_status_change", _async_value(True))
     monkeypatch.setattr(runner, "_clear_retry_failure_evidence", _async_value(None))
@@ -2348,3 +2350,162 @@ async def test_startup_does_not_restore_unbound_fallback_error(
     assert restarted.state.state == PipelineState.IDLE
     assert restarted.state.current_task is None
     assert restarted.state.error_message is None
+
+
+async def _real_repaired_fix(tmp_path, monkeypatch, mode="success"):
+    from src.queue_parser import write_frontmatter_status
+    from src.web.routes.repo_control import _retry_binding_context
+
+    text = _task_text().replace("status: ERROR\nblocked_reason: daemon\n", "status: TODO\n")
+    text = text.replace("status: TODO\n", "status: TODO\nrationale: " + "retained task rationale " * 8 + "\n")
+    runner, command, task, repo = await _prepared_runner(tmp_path, text=text)
+
+    def git(path, *args):
+        return subprocess.check_output(["git", "-C", str(path), *args], text=True, stderr=subprocess.PIPE).strip()
+
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "--bare", str(remote)], check=True, capture_output=True)
+    git(repo, "init", "-b", "main")
+    git(repo, "config", "user.email", "fixture@test.invalid")
+    git(repo, "config", "user.name", "Recovery fixture")
+    git(repo, "add", "tasks/PR-42.md")
+    git(repo, "commit", "-m", "original specification")
+    original = git(repo, "rev-parse", "HEAD")
+    git(repo, "branch", task.branch)
+    git(repo, "remote", "add", "origin", str(remote))
+    write_frontmatter_status(repo / task.task_file, "ERROR", "coder_escalate")
+    git(repo, "add", task.task_file)
+    git(repo, "commit", "-m", "record failure with real YAML writer")
+    git(repo, "push", "origin", "main", task.branch)
+    git(repo, "checkout", task.branch)
+    repair = tmp_path / "repair"
+    subprocess.run(["git", "clone", "-b", task.branch, str(remote), str(repair)], check=True, capture_output=True)
+    git(repair, "config", "user.email", "fixture@test.invalid")
+    git(repair, "config", "user.name", "Repair fixture")
+    if mode == "not_descendant":
+        git(repair, "checkout", "--orphan", "independent-repair")
+    (repair / "marker.txt").write_text("reviewed repair\n")
+    if mode == "changed_spec":
+        (repair / task.task_file).write_text(text + "\nChanged requirement.\n")
+    git(repair, "add", ".")
+    git(repair, "commit", "-m", "repair")
+    target = git(repair, "rev-parse", "HEAD")
+    git(repair, "push", "origin", "HEAD:refs/heads/" + task.branch, "--force-with-lease")
+    pr = PRInfo(number=42, branch=task.branch, pr_id=task.pr_id, head_sha=original)
+    runner.state.current_pr = pr
+    runner._start_current_run_record("codex", "")
+    record = runner._current_run_record
+    record.task_spec_hash = task_spec_content_hash(text)
+    record.fix_iterations = 1
+    runner._capture_invocation_snapshot("codex", {}, phase="fix", fix_iteration=1)
+    runner._begin_publication_attempt(started_at=NOW)
+    attempt = runner.state.publication_attempt
+    attempt.contract_version = 2
+    attempt.pr_number, attempt.candidate = 42, pr.model_copy(deep=True)
+    attempt.expected_head_sha = original
+    attempt.exit_classification, attempt.failure, attempt.cleanup_confirmed = "failure", "prior failure", True
+    record.ended_at, record.outcome, record.exit_reason = NOW.isoformat(), "failed", "escalate"
+    await runner._checkpoint_current_run_record()
+    previous = asdict(await runner._metrics_store.get(record.run_id))
+    cause = CancellationCause(category="ERROR", payload={"subsource": "coder_escalate"})
+    await runner.redis.set(cause_key(runner.name, task.pr_id), cause.to_redis())
+    monkeypatch.setattr(retry_module.gh_prs, "get_pr_metadata", lambda *args: {"head_sha": target})
+    context = await _retry_binding_context(
+        runner.redis, runner.name, task, repo / task.task_file, task.task_file,
+        retry_count=0, state=runner.state, cause=cause,
+    )
+    assert context["pr_head_sha"] == target and context["fingerprint"] == record.task_spec_hash
+    command.bound_pr_number, command.bound_pr_branch, command.bound_pr_head_sha = 42, task.branch, target
+    command.request_binding, command.failure_id = context["binding"], context["failure_id"]
+    command.failure_subsource = "coder_escalate"
+    await runner.redis.set(retry_command(runner.name, command.command_id), command.model_dump_json())
+    from src.github.prs import ExactPRState
+    monkeypatch.setattr(retry_module.gh_prs, "get_exact_pr_outcome", lambda *a, **k: SimpleNamespace(
+        discovery_complete=mode != "unknown",
+        state=ExactPRState.CLOSED if mode == "changed_head" else ExactPRState.OPEN,
+    ))
+    if mode == "local_work":
+        (repo / "local.txt").write_text("unpublished work\n")
+        git(repo, "add", "local.txt")
+        git(repo, "commit", "-m", "retained local work")
+    if mode == "fetch_failure":
+        remote.rename(tmp_path / "offline.git")
+
+    async def status_write(*args, **kwargs):
+        status = tmp_path / "status"
+        subprocess.run(["git", "clone", "-b", "main", str(remote), str(status)], check=True, capture_output=True)
+        git(status, "config", "user.email", "fixture@test.invalid")
+        git(status, "config", "user.name", "Status fixture")
+        write_frontmatter_status(status / task.task_file, "TODO")
+        if mode == "accounting_generation_changed":
+            with (status / task.task_file).open("a") as output:
+                output.write("Concurrent specification change.\n")
+        git(status, "add", ".")
+        git(status, "commit", "-m", "operator Retry")
+        git(status, "push", "origin", "main")
+        git(repo, "fetch", "origin", "main")
+        return True
+
+    monkeypatch.setattr(runner, "_retry_blocker", _async_value(None))
+    monkeypatch.setattr(runner, "_commit_task_status_change", status_write)
+    return runner, command, record, previous, original, target, git
+
+
+@pytest.mark.asyncio
+async def test_operator_retry_preserves_reflowed_generation_and_published_repair(tmp_path, monkeypatch):
+    runner, command, record, previous, original, target, git = await _real_repaired_fix(tmp_path, monkeypatch)
+    assert await runner._apply_retry_command(command) == RetryDispatch.WATCH
+    assert runner.state.current_pr.number == 42 and runner.state.current_pr.head_sha == target
+    assert runner.state.current_pr.ci_status == CIStatus.PENDING
+    assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+    assert runner.state.publication_attempt.expected_head_sha == original
+    assert not runner.state.publication_attempt.pending
+    assert asdict(await runner._metrics_store.get(record.run_id)) == previous
+    successor = runner._current_run_record
+    assert successor.run_id != record.run_id and successor.invocations == []
+    assert successor.attempt_index == record.attempt_index + 1
+    assert successor.task_spec_hash == task_spec_content_hash(runner._origin_retry_task_text(command))
+    assert successor.task_spec_hash != record.task_spec_hash
+    assert git(Path(runner.repo_path), "rev-parse", "HEAD") == original
+    assert not git(Path(runner.repo_path), "status", "--porcelain")
+    receipt = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert receipt.status == RetryCommandStatus.APPLIED and receipt.retry_count == 1
+    await runner.publish_state()
+    restarted = h._make_runner()
+    restarted.redis, restarted._metrics_store = runner.redis, runner._metrics_store
+    restarted.repo_path = runner.repo_path
+    await restarted._hydrate_current_task_from_persisted_state()
+    assert asdict(await restarted._metrics_store.get(record.run_id)) == previous
+    assert (await restarted._metrics_store.get(successor.run_id)).invocations == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", [
+    "unknown", "changed_head", "local_work", "not_descendant", "changed_spec", "fetch_failure",
+    "accounting_generation_changed",
+])
+async def test_repaired_fix_retry_retains_work_when_evidence_conflicts(tmp_path, monkeypatch, mode):
+    runner, command, record, previous, original, _target, _git = await _real_repaired_fix(tmp_path, monkeypatch, mode)
+    assert await runner._apply_retry_command(command) == RetryDispatch.HANDLED
+    assert asdict(await runner._metrics_store.get(record.run_id)) == previous
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.publication_attempt.expected_head_sha == original
+    assert runner._current_run_record.run_id == record.run_id
+    assert len(runner._current_run_record.invocations) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("metadata", [{}, {"head_sha": "invalid"}, None])
+async def test_repair_retry_binding_requires_available_current_head(tmp_path, monkeypatch, metadata):
+    from src.web.routes.repo_control import _retry_binding_context
+    runner, _command_record, _record, _previous, _old, _new, _git = await _real_repaired_fix(tmp_path, monkeypatch)
+    def observe(*args):
+        if metadata is None:
+            raise RuntimeError("transport unavailable")
+        return metadata
+    monkeypatch.setattr(retry_module.gh_prs, "get_pr_metadata", observe)
+    task = runner.state.current_task
+    assert await _retry_binding_context(
+        runner.redis, runner.name, task, Path(runner.repo_path) / task.task_file,
+        task.task_file, retry_count=0, state=runner.state,
+    ) is None

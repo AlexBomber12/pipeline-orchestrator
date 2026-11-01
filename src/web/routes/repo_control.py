@@ -735,6 +735,23 @@ async def _retry_binding_context(
     pr_number = relevant_pr.number if relevant_pr is not None else None
     pr_branch = relevant_pr.branch if relevant_pr is not None else None
     pr_head_sha = relevant_pr.head_sha if relevant_pr is not None else None
+    attempt = state.publication_attempt if state is not None else None
+    if (relevant_pr is not None and attempt is not None and attempt.pending
+        and attempt.contract_version == 2 and attempt.cleanup_confirmed
+        and attempt.exit_classification == "failure" and attempt.provider_error is None
+        and state.active_invocation is not None and state.active_invocation.phase == "fix"
+        and cause is not None and cause.payload.get("subsource") == "coder_escalate"):
+        # Bind the operator's decision to the observed repair, not a stale
+        # ERROR snapshot. The daemon independently proves identity and retained work.
+        try:
+            metadata = await asyncio.to_thread(
+                gh_prs.get_pr_metadata, repo_slug.replace("__", "/", 1), relevant_pr.number,
+            )
+        except Exception:
+            return None
+        pr_head_sha = metadata.get("head_sha")
+        if not isinstance(pr_head_sha, str) or re.fullmatch(r"[a-f0-9]{40}", pr_head_sha) is None:
+            return None
     binding = retry_request_binding(
         repo_slug=repo_slug,
         task_id=task.pr_id,
