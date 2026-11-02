@@ -34,6 +34,14 @@ def test_managed_sections_contains_all_expected_names() -> None:
     assert set(MANAGED_SECTIONS) == EXPECTED_SECTION_NAMES
 
 
+def test_canonical_marker_counts_match_managed_sections() -> None:
+    original = AGENTS_MD_PATH.read_bytes()
+    assert len(MANAGED_SECTIONS) == len(set(MANAGED_SECTIONS))
+    for kind in (b"BEGIN", b"END"):
+        marker = b"<!-- pipeline-orchestrator: managed " + kind + b" "
+        assert original.count(marker) == len(MANAGED_SECTIONS)
+
+
 def test_managed_sections_includes_forbidden_actions() -> None:
     assert "forbidden_actions" in MANAGED_SECTIONS
 
@@ -68,10 +76,11 @@ def test_daemon_managed_content_applies_repo_specific_overrides() -> None:
 
 
 def test_round_trip_extract_then_apply_is_identity() -> None:
-    original = AGENTS_MD_PATH.read_text()
+    original_bytes = AGENTS_MD_PATH.read_bytes()
+    original = original_bytes.decode("utf-8")
     regions = daemon_managed_content()
     assert regions == extract_managed_regions(original)
-    assert apply_managed_regions(original, regions) == original
+    assert apply_managed_regions(original, regions).encode("utf-8") == original_bytes
 
 
 def test_daemon_managed_content_rejects_unknown_override_keys() -> None:
