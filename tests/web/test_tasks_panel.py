@@ -158,7 +158,9 @@ def test_stale_todo_snapshot_shows_retry_for_bound_failure(
         response = client.get("/repos/example__alpha/tasks")
     assert response.status_code == 200
     assert 'hx-post="/repos/example__alpha/tasks/PR-283/retry"' in response.text
-    assert response.text.index("PR-283") < response.text.index("Retry")
+    assert response.text.index("PR-283") < response.text.index(
+        'hx-post="/repos/example__alpha/tasks/PR-283/retry"'
+    )
 
 
 @pytest.mark.parametrize("queue_missing", [False, True])
