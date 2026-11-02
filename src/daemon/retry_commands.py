@@ -386,7 +386,7 @@ class RetryCommandMixin:
             attempt is not None and pr is not None and not pr.is_cross_repository and attempt.pending
             and attempt.contract_version == 2 and attempt.cleanup_confirmed
             and attempt.exit_classification == "failure" and attempt.provider_error is None
-            and not attempt.terminal_cancelled and command.failure_subsource in {None, "coder_escalate"}
+            and not attempt.terminal_cancelled and command.failure_subsource in {None, "crash", "coder_escalate"}
             and self._publication_attempt_matches_dispatch()
             and self.state.active_invocation.phase == "fix"
             and (command.task_id, command.task_branch, command.bound_pr_number,

@@ -155,10 +155,12 @@ def _codex_event_output(stdout: str, stderr: str) -> tuple[str, str]:
     A tool's quoted error is nested inside item.completed, never a top-level
     error/turn.failed event. Keep the JSONL stream intact in stderr for the
     existing diagnostic reader; final-answer consumers still receive plain
-    agent text, not tool output containing old PR URLs or ESCALATE examples.
+    agent text from a completed turn, not progress from an interrupted turn
+    or tool output containing old PR URLs or ESCALATE examples.
     """
     structured = False
     final_message = None
+    candidate = None
     for line in stdout.splitlines():
         try:
             event = json.loads(line)
@@ -167,10 +169,14 @@ def _codex_event_output(stdout: str, stderr: str) -> tuple[str, str]:
         if not isinstance(event, dict) or not isinstance(event.get("type"), str):
             continue
         structured = True
+        if event["type"] == "turn.started":
+            candidate, final_message = None, None
         item = event.get("item")
         if (event.get("type") == "item.completed" and isinstance(item, dict)
             and item.get("type") == "agent_message" and isinstance(item.get("text"), str)):
-            final_message = item["text"]
+            candidate = item["text"]
+        if event["type"] == "turn.completed":
+            final_message = candidate
     if structured:
         stderr = stdout + ("\n" if stdout and not stdout.endswith("\n") else "") + stderr
         stdout = final_message or ""

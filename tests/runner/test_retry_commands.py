@@ -2437,10 +2437,13 @@ async def _real_repaired_fix(tmp_path, monkeypatch, mode="success"):
     if mode in {"unfinished_fix", "diverged_prior"}:
         record.ended_at, record.exit_reason = None, ""
         record.cause = "CRASH"
+        attempt.failure = ("codex\nRunning the gate\nexec\npytest --full-gate\n"
+                           "ERROR: Selected model is at capacity. Please try a different model.")
+        runner.state.error_message = attempt.failure
     await runner._checkpoint_current_run_record()
     previous = asdict(await runner._metrics_store.get(record.run_id))
     cause = CancellationCause(category="ERROR", payload=(
-        {} if mode in {"unfinished_fix", "diverged_prior"} else {"subsource": "coder_escalate"}))
+        {"subsource": "crash"} if mode in {"unfinished_fix", "diverged_prior"} else {"subsource": "coder_escalate"}))
     await runner.redis.set(cause_key(runner.name, task.pr_id), cause.to_redis())
     monkeypatch.setattr(retry_module.gh_prs, "get_pr_metadata", lambda *args: {"head_sha": target})
     context = await _retry_binding_context(
@@ -2450,7 +2453,7 @@ async def _real_repaired_fix(tmp_path, monkeypatch, mode="success"):
     assert context["pr_head_sha"] == target and context["fingerprint"] == record.task_spec_hash
     command.bound_pr_number, command.bound_pr_branch, command.bound_pr_head_sha = 42, task.branch, target
     command.request_binding, command.failure_id = context["binding"], context["failure_id"]
-    command.failure_subsource = None if mode in {"unfinished_fix", "diverged_prior"} else "coder_escalate"
+    command.failure_subsource = "crash" if mode in {"unfinished_fix", "diverged_prior"} else "coder_escalate"
     await runner.redis.set(retry_command(runner.name, command.command_id), command.model_dump_json())
     from src.github.prs import ExactPRState
     monkeypatch.setattr(retry_module.gh_prs, "get_exact_pr_outcome", lambda *a, **k: SimpleNamespace(
@@ -2765,6 +2768,7 @@ async def test_explicit_repair_closes_unfinished_fix_and_preserves_unpublished_c
         )
         assert context["pr_head_sha"] == target
         command.failure_id, command.request_binding = context["failure_id"], context["binding"]
+        command.failure_subsource = None
         await runner.redis.set(retry_command(runner.name, command.command_id), command.model_dump_json())
     retained = runner.state.publication_attempt.expected_head_sha
     assert retained != original and git(Path(runner.repo_path), "rev-parse", "HEAD") == retained
@@ -2838,3 +2842,27 @@ async def test_explicit_repair_requires_durable_exact_exited_accounting(tmp_path
         assert (await runner._metrics_store.get(record.run_id)).ended_at
         receipt = await load_retry_command(runner.redis, runner.name, command.command_id)
         assert receipt.retry_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("blocker", ["guardrail", "cancelled"])
+async def test_repaired_head_binding_does_not_clear_independent_blocker(tmp_path, monkeypatch, blocker):
+    from src.web.routes.repo_control import _retry_binding_context
+
+    runner, command, record, previous, original, _target, _git = await _real_repaired_fix(
+        tmp_path, monkeypatch, "unfinished_fix",
+    )
+    cause = CancellationCause(category="ERROR", payload={"subsource": "crash"})
+    if blocker == "guardrail":
+        cause = CancellationCause(category="ERROR", payload={"subsource": "guardrail"})
+    else:
+        runner.state.publication_attempt.terminal_cancelled = True
+    monkeypatch.setattr(retry_module.gh_prs, "get_pr_metadata", lambda *args: pytest.fail("blocker admitted repair"))
+    context = await _retry_binding_context(
+        runner.redis, runner.name, runner.state.current_task,
+        Path(runner.repo_path) / command.task_file, command.task_file,
+        retry_count=0, state=runner.state, cause=cause,
+    )
+    assert context["pr_head_sha"] == original
+    assert asdict(await runner._metrics_store.get(record.run_id)) == previous
+    assert runner.state.publication_attempt.pending

@@ -858,6 +858,8 @@ async def test_json_cli_separates_unfinished_tool_history_from_provider_errors(m
             'quoted source: tasks/PR-429.md\n' + capacity + '\n' + rate +
             '\n' + json.dumps({"type": "error", "message": capacity})}},
     ]
+    events.append({"type": "item.completed", "item": {"type": "agent_message",
+                   "text": "ESCALATE: progress example, not a completed final answer"}})
     native = ""
     if kind == "native_capacity":
         native = capacity + "\n" + capacity + "\nERROR codex_core::session: rollout thread not found"
@@ -896,6 +898,7 @@ def test_json_cli_preserves_final_answer_and_raw_history_without_adopting_tool_t
         json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "progress"}}),
         json.dumps({"type": "item.completed", "item": {
             "type": "agent_message", "text": "ESCALATE: genuine final blocker"}}),
+        json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 2}}),
     ])
     stdout, stderr = codex_cli_module._codex_event_output(history, "native stderr")
     assert stdout == "ESCALATE: genuine final blocker"
@@ -903,3 +906,21 @@ def test_json_cli_preserves_final_answer_and_raw_history_without_adopting_tool_t
     assert stderr == history + "\nnative stderr"
     empty = '{"type":"item.completed","item":{"type":"agent_message","text":""}}\n'
     assert codex_cli_module._codex_event_output(empty, "")[0] == ""
+
+
+def test_json_cli_requires_current_turn_completion_for_final_answer():
+    import json
+
+    events = [
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "old answer"}},
+        {"type": "turn.completed"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "ESCALATE: incomplete progress"}},
+        {"type": "turn.failed", "error": {"message": "Selected model is at capacity"}},
+    ]
+    raw = "\n".join(json.dumps(event) for event in events)
+    stdout, stderr = codex_cli_module._codex_event_output(raw, "")
+    assert stdout == "" and raw in stderr
+    from src.provider_errors import is_capacity_error
+    assert is_capacity_error(stderr)

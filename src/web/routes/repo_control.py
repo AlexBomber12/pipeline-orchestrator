@@ -741,7 +741,7 @@ async def _retry_binding_context(
         and attempt.exit_classification == "failure" and attempt.provider_error is None
         and not attempt.terminal_cancelled
         and state.active_invocation is not None and state.active_invocation.phase == "fix"
-        and (cause is None or cause.payload.get("subsource") in {None, "coder_escalate"})):
+        and (cause is None or cause.payload.get("subsource") in {None, "crash", "coder_escalate"})):
         # Bind the operator's decision to the observed repair, not a stale
         # ERROR snapshot. The daemon independently proves identity and retained work.
         try:
