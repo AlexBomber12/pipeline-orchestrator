@@ -2617,3 +2617,77 @@ async def test_repaired_fix_retry_retries_durable_label_cleanup_without_duplicat
     receipt = await load_retry_command(runner.redis, runner.name, command.command_id)
     assert receipt.status == RetryCommandStatus.APPLIED and receipt.retry_count == 1
     assert asdict(await runner._metrics_store.get(record.run_id)) == previous
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["checkpoint", "publication", "acknowledgement"])
+async def test_repaired_retry_reuses_successor_after_interrupted_handoff(tmp_path, monkeypatch, boundary):
+    runner, command, record, previous, original, target, _git = await _real_repaired_fix(tmp_path, monkeypatch)
+    monkeypatch.setattr(retry_module.gh_prs, "get_open_prs", lambda *a: [PRInfo(
+        number=42, branch=command.task_branch, pr_id=command.task_id, head_sha=target,
+        is_escalated=bool(runner._fixture_pr_labels),
+    )])
+
+    class Restart(BaseException):
+        pass
+
+    checkpoint, publish, acknowledge = (
+        runner._checkpoint_current_run_record, runner.publish_state, runner._mark_retry_applied,
+    )
+
+    async def interrupted_checkpoint():
+        await checkpoint()
+        raise Restart()
+
+    async def interrupted_publication():
+        await publish()
+        if not runner.state.publication_attempt.pending:
+            raise Restart()
+
+    async def interrupted_acknowledgement(*a):
+        await publish()
+        raise Restart()
+
+    # Retain the pre-handoff state just as the daemon had published it.
+    await runner.publish_state()
+    monkeypatch.setattr(runner, "_checkpoint_current_run_record",
+                        interrupted_checkpoint if boundary == "checkpoint" else checkpoint)
+    monkeypatch.setattr(runner, "publish_state", interrupted_publication if boundary == "publication" else publish)
+    monkeypatch.setattr(runner, "_mark_retry_applied",
+                        interrupted_acknowledgement if boundary == "acknowledgement" else acknowledge)
+    with pytest.raises(Restart):
+        await runner._apply_retry_command(command)
+    saved_successor = asdict(runner._current_run_record)
+    assert saved_successor["run_id"] != record.run_id
+    monkeypatch.setattr(runner, "_checkpoint_current_run_record", checkpoint)
+    monkeypatch.setattr(runner, "publish_state", publish)
+    monkeypatch.setattr(runner, "_mark_retry_applied", acknowledge)
+    runner._current_run_record = None
+    runner.state = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    await runner._restore_current_run_record()
+    receipt = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert await runner._apply_retry_command(receipt) == RetryDispatch.WATCH
+    assert runner._current_run_record.run_id == saved_successor["run_id"]
+    assert runner._current_run_record.started_at == saved_successor["started_at"]
+    assert runner._current_run_record.coder_session_id == saved_successor["coder_session_id"]
+    assert runner._current_run_record.invocations == []
+    assert len(await runner._metrics_store.list_task_runs(runner.name, command.task_id)) == 2
+    assert asdict(await runner._metrics_store.get(record.run_id)) == previous
+    assert runner.state.current_pr.head_sha == target and not runner.state.publication_attempt.pending
+    receipt = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert receipt.status == RetryCommandStatus.APPLIED and receipt.retry_count == 1
+
+
+@pytest.mark.asyncio
+async def test_repaired_retry_preserves_conflicting_successor_identity(tmp_path, monkeypatch):
+    import uuid
+    runner, command, record, previous, _original, _target, _git = await _real_repaired_fix(tmp_path, monkeypatch)
+    conflicting = runner._new_fix_run_record(record, operator_retry=True)
+    conflicting.run_id = str(uuid.uuid5(uuid.NAMESPACE_URL,
+        f"{runner.name}:{command.command_id}:{record.run_id}:watch-retry"))
+    conflicting.task_id = "PR-999"
+    await runner._metrics_store.save(conflicting)
+    assert await runner._apply_retry_command(command) == RetryDispatch.HANDLED
+    assert runner.state.state == PipelineState.ERROR and runner.state.publication_attempt.pending
+    assert asdict(await runner._metrics_store.get(record.run_id)) == previous
+    assert (await runner._metrics_store.get(conflicting.run_id)).task_id == "PR-999"

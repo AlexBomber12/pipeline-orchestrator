@@ -7,6 +7,7 @@ import hashlib
 import re
 import subprocess
 import tempfile
+import uuid
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -1270,10 +1271,31 @@ class RetryCommandMixin:
                         return await self._defer_retry_command(
                             command, "Retry accounting generation is unavailable or changed.",
                         )
-                    record = self._new_fix_run_record(
-                        record, operator_retry=True,
-                        task_spec_hash=task_spec_content_hash(current_text),
-                    )
+                    # The receipt and predecessor are durable even if the
+                    # state publication still binds the exited invocation.
+                    # Reuse this identity after a lost checkpoint/acknowledgement.
+                    successor_id = str(uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"{self.name}:{command.command_id}:{record.run_id}:watch-retry",
+                    ))
+                    generation = task_spec_content_hash(current_text)
+                    successor = await self._metrics_store.get(successor_id)
+                    if successor is not None and (
+                        successor.task_id != task.pr_id or successor.repo_name != self.name
+                        or successor.attempt_index != record.attempt_index + 1
+                        or successor.task_spec_hash != generation
+                        or not successor.operator_intervention or successor.ended_at is not None
+                        or successor.invocations or successor.exit_reason
+                    ):
+                        return await self._defer_retry_command(
+                            command, "Retry successor accounting identity conflicts; records preserved.",
+                        )
+                    if successor is None:
+                        successor = self._new_fix_run_record(
+                            record, operator_retry=True, task_spec_hash=generation,
+                        )
+                        successor.run_id = successor_id
+                    record = successor
                     self._current_run_record = record
                 record.fix_recovery_baseline = record.fix_iterations
                 try:
