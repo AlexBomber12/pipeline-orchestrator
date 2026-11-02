@@ -29,6 +29,9 @@
     {% include "components/repo_summary.html" %}
 </div>
 
+{# Reset must survive summary, queue, and pending-retry polling swaps. #}
+<div id="repo-reset-dialog"></div>
+
 {% include "components/event_log.html" %}
 
 <details class="mt-4">
@@ -36,7 +39,7 @@
         Tasks queue
     </summary>
     <div hx-get="/repos/{{ repo.name }}/tasks"
-         hx-trigger="revealed"
+         hx-trigger="revealed, repo:history_updated from:body, repo:state_change from:body"
          hx-swap="innerHTML">
     </div>
 </details>

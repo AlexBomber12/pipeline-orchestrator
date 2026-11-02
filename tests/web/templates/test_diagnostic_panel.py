@@ -122,6 +122,7 @@ def test_diagnostic_panel_reset_button_visible_when_enabled() -> None:
 
     assert "Reset task (destructive)" in rendered
     assert "/reset-confirm" in rendered
+    assert 'hx-target="#repo-reset-dialog"' in rendered
 
 
 def test_diagnostic_panel_reset_button_omitted_when_disabled() -> None:

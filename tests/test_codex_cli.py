@@ -821,6 +821,7 @@ async def test_run_codex_async_cancellation_records_cleanup_failure(
                                         'ERROR: Selected model is at capacity. Please try a different model.'])
 async def test_echoed_task_examples_are_not_provider_diagnostics(monkeypatch, diagnostic):
     from src.provider_errors import diagnostic_text, is_capacity_error
+
     from tests.runner import _helpers as h
 
     prompt = _build_fix_feedback_prompt(
@@ -838,3 +839,88 @@ async def test_echoed_task_examples_are_not_provider_diagnostics(monkeypatch, di
     runner._detect_rate_limit(stderr, coder_name='codex')
     assert (runner.state.rate_limited_until is not None) is ('429' in diagnostic)
     assert is_capacity_error(stderr) is ('capacity' in diagnostic)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["native_capacity", "event_capacity", "event_rate_limit", "quoted_only"])
+async def test_json_cli_separates_unfinished_tool_history_from_provider_errors(monkeypatch, kind):
+    import json
+
+    from src.provider_errors import diagnostic_text, is_capacity_error
+
+    from tests.runner import _helpers as h
+
+    capacity = "ERROR: Selected model is at capacity. Please try a different model."
+    rate = "Error: HTTP 429 Too Many Requests. Try again in 2 hours."
+    events = [
+        {"type": "item.started", "item": {"type": "command_execution", "command": "pytest"}},
+        {"type": "item.updated", "item": {"type": "command_execution", "aggregated_output":
+            'quoted source: tasks/PR-429.md\n' + capacity + '\n' + rate +
+            '\n' + json.dumps({"type": "error", "message": capacity})}},
+    ]
+    events.append({"type": "item.completed", "item": {"type": "agent_message",
+                   "text": "ESCALATE: progress example, not a completed final answer"}})
+    native = ""
+    if kind == "native_capacity":
+        native = capacity + "\n" + capacity + "\nERROR codex_core::session: rollout thread not found"
+    elif kind == "event_capacity":
+        events.extend([{"type": "error", "message": capacity},
+                       {"type": "turn.failed", "error": {"message": capacity}}])
+    elif kind == "event_rate_limit":
+        events.append({"type": "turn.failed", "error": {"message": rate}})
+    raw = "\n".join(json.dumps(event) for event in events)
+    proc = _make_fake_proc(stdout=raw.encode(), stderr=native.encode(), returncode=1)
+    launch = AsyncMock(return_value=proc)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", launch)
+    code, stdout, stderr = await run_codex_async("repair", "/tmp", model="selected-model", reasoning_effort="high")
+    assert code == 1 and stdout == "" and raw in stderr
+    assert "--json" in launch.call_args.args
+    assert launch.call_args.args[launch.call_args.args.index("--model") + 1] == "selected-model"
+    assert 'model_reasoning_effort="high"' in launch.call_args.args
+    assert is_capacity_error(stderr) is ("capacity" in kind)
+    runner = h._make_runner()
+    runner._detect_rate_limit(stderr, coder_name="codex")
+    assert (runner.state.rate_limited_until is not None) is (kind == "event_rate_limit")
+    if kind == "quoted_only":
+        assert diagnostic_text(stderr) == ""
+
+
+def test_json_cli_preserves_final_answer_and_raw_history_without_adopting_tool_text():
+    import json
+
+    from src.daemon.fix_escalation import parse_escalate_marker
+
+    history = "\n".join([
+        'not-json', '[]', '{}', '{"type": 7}',
+        json.dumps({"type": "item.completed", "item": {"type": "command_execution",
+            "aggregated_output": "ESCALATE: quoted only\nhttps://github.com/octo/demo/pull/1"}}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": 7}}),
+        json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "progress"}}),
+        json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": "ESCALATE: genuine final blocker"}}),
+        json.dumps({"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 2}}),
+    ])
+    stdout, stderr = codex_cli_module._codex_event_output(history, "native stderr")
+    assert stdout == "ESCALATE: genuine final blocker"
+    assert parse_escalate_marker(stdout) == "genuine final blocker"
+    assert stderr == history + "\nnative stderr"
+    empty = '{"type":"item.completed","item":{"type":"agent_message","text":""}}\n'
+    assert codex_cli_module._codex_event_output(empty, "")[0] == ""
+
+
+def test_json_cli_requires_current_turn_completion_for_final_answer():
+    import json
+
+    events = [
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "old answer"}},
+        {"type": "turn.completed"},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"type": "agent_message", "text": "ESCALATE: incomplete progress"}},
+        {"type": "turn.failed", "error": {"message": "Selected model is at capacity"}},
+    ]
+    raw = "\n".join(json.dumps(event) for event in events)
+    stdout, stderr = codex_cli_module._codex_event_output(raw, "")
+    assert stdout == "" and raw in stderr
+    from src.provider_errors import is_capacity_error
+    assert is_capacity_error(stderr)

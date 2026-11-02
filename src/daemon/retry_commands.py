@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 import uuid
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -385,12 +386,12 @@ class RetryCommandMixin:
             attempt is not None and pr is not None and not pr.is_cross_repository and attempt.pending
             and attempt.contract_version == 2 and attempt.cleanup_confirmed
             and attempt.exit_classification == "failure" and attempt.provider_error is None
-            and not attempt.terminal_cancelled and command.failure_subsource == "coder_escalate"
+            and not attempt.terminal_cancelled and command.failure_subsource in {None, "crash", "coder_escalate"}
             and self._publication_attempt_matches_dispatch()
             and self.state.active_invocation.phase == "fix"
             and (command.task_id, command.task_branch, command.bound_pr_number,
                  command.bound_pr_branch) == (attempt.task_id, attempt.branch, pr.number, pr.branch)
-            and pr.head_sha == attempt.expected_head_sha
+            and pr.head_sha in {attempt.initial_pr_head_sha, attempt.expected_head_sha}
             and command.bound_pr_head_sha != pr.head_sha
             and re.fullmatch(r"[a-f0-9]{40}", command.bound_pr_head_sha or "")
         )
@@ -435,6 +436,14 @@ class RetryCommandMixin:
             if ancestry.returncode != 0:
                 return await self._defer_retry_command(
                     command, "Selected repair does not prove retention of the old FIX head.",
+                )
+            prior = await asyncio.to_thread(
+                git_ops._git, self.repo_path, "merge-base", "--is-ancestor",
+                pr.head_sha, attempt.expected_head_sha, check=False,
+            )
+            if prior.returncode != 0:
+                return await self._defer_retry_command(
+                    command, "Retained FIX and prior PR heads diverge; preserve both sides.",
                 )
             repaired_text = (await asyncio.to_thread(
                 git_ops._git, self.repo_path, "show", f"{target}:{command.task_file}",
@@ -1265,6 +1274,24 @@ class RetryCommandMixin:
             if record is not None and record.task_id == task.pr_id:
                 old_record = record
                 old_baseline = record.fix_recovery_baseline
+                if repaired_fix and record.ended_at is None:
+                    attempt = self.state.publication_attempt
+                    if (attempt is None or not publication._run_matches(self)
+                        or not record.invocations or record.invocations[-1] != self.state.active_invocation):
+                        return await self._defer_retry_command(
+                            command, "Exited FIX accounting does not match the retained invocation.",
+                        )
+                    unfinished_record = deepcopy(record)
+                    try:
+                        # An explicit repair is not success of the interrupted
+                        # CLI. Close its proven exit, then create the existing
+                        # deterministic successor for WATCH/merge accounting.
+                        await self._save_current_run_record("error", run_phase="fix")
+                    except Exception as exc:
+                        self._current_run_record = unfinished_record
+                        return await self._defer_retry_command(
+                            command, f"Exited FIX accounting could not be finalized: {exc}.",
+                        )
                 if record.ended_at is not None:
                     current_text = self._origin_retry_task_text(command)
                     task_path = self._retry_task_path(command)

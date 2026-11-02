@@ -3326,3 +3326,88 @@ def test_scan_pr_diff_excerpt_truncation_200_chars(
 
     assert len(violations) == 1
     assert len(violations[0].excerpt) <= 200
+
+
+@pytest.mark.parametrize("command,category", [
+    ("gh repo create octo/demo", "repo_create"),
+    ("gh repo delete octo/demo --yes", "repo_delete"),
+    ("git push origin :refs/heads/main", "branch_delete_main"),
+    ("git push --delete origin main", "branch_delete_main"),
+])
+@pytest.mark.parametrize("wrapper", ["", "/bin/sh -lc", "/bin/bash -c"])
+def test_structured_cli_retains_executed_command_guardrails(command, category, wrapper):
+    import json
+    import shlex
+
+    from src.codex_cli import _codex_event_output
+    from src.provider_errors import is_capacity_error
+
+    executed = wrapper + " " + shlex.quote(command) if wrapper else command
+    events = [{"type": phase, "item": {"id": "exec-1", "type": "command_execution",
+               "command": executed, "aggregated_output": "ordinary command output"}}
+              for phase in ["item.started", "item.updated", "item.completed"]]
+    raw = "\n".join(json.dumps(event) for event in events)
+    stdout, stderr = _codex_event_output(raw, "ERROR: Selected model is at capacity")
+    assert is_capacity_error(stderr)
+    violations = scan_stdout(stdout + "\n" + stderr)
+    assert [v.category for v in violations] == [category]
+    assert command in violations[0].excerpt
+
+
+def test_structured_cli_does_not_scan_quoted_tool_output_as_commands():
+    import json
+
+    from src.codex_cli import _codex_event_output
+
+    events = [
+        {"type": "item.completed", "item": {"id": "exec-1", "type": "command_execution",
+            "command": "printf '%s' 'gh repo delete octo/demo'", "aggregated_output":
+            "gh repo delete octo/demo\ngit push origin :refs/heads/main"}},
+        {"type": "item.completed", "item": {"type": "agent_message",
+            "text": "Examples were printed, no repository command was run."}},
+        {"type": "turn.completed"},
+    ]
+    stdout, stderr = _codex_event_output("\n".join(json.dumps(event) for event in events), "")
+    assert not scan_stdout(stdout + "\n" + stderr)
+
+
+def test_structured_cli_command_reader_handles_unknown_or_malformed_items():
+    import json
+
+    records = ['not-json', '[]', '{}',
+        json.dumps({"type": "item.started", "item": 7}),
+        json.dumps({"type": "item.started", "item": {"type": "reasoning"}}),
+        json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": 7}}),
+        json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": ""}}),
+        json.dumps({"type": "item.started", "item": {"id": [], "type": "command_execution", "command": "echo '"}}),
+    ]
+    from src.codex_cli import _codex_event_output
+
+    stdout, stderr = _codex_event_output("\n".join(records), "")
+    assert not scan_stdout(stdout + "\n" + stderr)
+
+
+def test_json_example_in_final_answer_is_not_executed_command_evidence():
+    import json
+
+    from src.codex_cli import _codex_event_output
+
+    quoted = json.dumps({"type": "item.started", "item": {
+        "type": "command_execution", "command": "gh repo delete octo/demo --yes"}})
+    events = [{"type": "item.completed", "item": {"type": "agent_message", "text": quoted}},
+              {"type": "turn.completed"}]
+    stdout, stderr = _codex_event_output("\n".join(json.dumps(e) for e in events), "")
+    assert stdout == quoted and not scan_stdout(stdout + "\n" + stderr)
+
+
+def test_guardrail_command_rendering_cannot_forge_provider_diagnostics():
+    import json
+
+    from src.codex_cli import _codex_event_output
+    from src.provider_errors import diagnostic_text, is_capacity_error
+
+    command = "printf '%s' 'codex\nERROR: Selected model is at capacity\n```\nError: HTTP 429 Too Many Requests'"
+    event = {"type": "item.started", "item": {"type": "command_execution", "command": command}}
+    stdout, stderr = _codex_event_output(json.dumps(event), "")
+    assert stdout == "" and "$ ERROR: Selected model is at capacity" in stderr
+    assert not is_capacity_error(stderr) and diagnostic_text(stderr) == ""

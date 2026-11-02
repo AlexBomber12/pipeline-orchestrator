@@ -84,17 +84,17 @@ def test_submit_disabled_initially() -> None:
     assert "disabled" in submit_segment
 
 
-def test_modal_lists_all_keys_to_be_deleted() -> None:
+def test_modal_lists_consequences_without_storage_keys() -> None:
     rendered = _render_modal(_base_diagnostic(retry_count=4))
-
-    # The six destructive operations the reset endpoint performs against
-    # Redis. The frontmatter rewrite and orphan PR close are separate
-    # bullets so they are intentionally not counted here.
-    assert "Delete cancellation_cause record" in rendered
-    assert "Delete retry_count (currently 4)" in rendered
-    assert "Delete retry_fingerprint" in rendered
-    assert "Delete current_run_started_at" in rendered
-    assert "ZREM from cancellation_index" in rendered
+    assert "reset the retry allowance (4 used)" in rendered
+    assert "Mark the task TODO" in rendered
+    for key in ("ZREM", "retry_fingerprint", "current_run_started_at", "cancellation_cause"):
+        assert key not in rendered
+    assert 'hx-swap="none"' in rendered
+    assert 'hx-target=' not in rendered
+    assert 'data-own-error' in rendered
+    assert 'role="alert"' in rendered
+    assert 'role="dialog"' in rendered
 
 
 def test_modal_cancel_button_present() -> None:
@@ -120,7 +120,7 @@ def test_modal_inline_script_gates_submit_on_repo_name_match() -> None:
 
     assert "data-reset-confirm-input" in rendered
     assert "addEventListener('input'" in rendered
-    assert "submit.disabled = (input.value !== target)" in rendered
+    assert "submit.disabled = busy || !reconciled || input.value !== target" in rendered
     assert 'const target = "example__alpha"' in rendered
 
 
@@ -135,7 +135,7 @@ def test_modal_selectors_are_scoped_to_current_instance() -> None:
     rendered = _render_modal(_base_diagnostic())
 
     # Cancel must close the modal it lives in, not the first one on the page.
-    assert "this.closest('[data-reset-modal]').remove()" in rendered
+    assert "cancel.addEventListener('click', close)" in rendered
     # HTMX submit gating filter must read the input inside this modal.
     assert (
         "this.closest('[data-reset-modal]')"
@@ -156,6 +156,13 @@ def test_modal_post_target_matches_reset_endpoint_contract() -> None:
     rendered = _render_modal(_base_diagnostic())
 
     assert "/api/reset-task/example__alpha/PR-322" in rendered
+
+
+def test_repo_tasks_refresh_on_reset_events() -> None:
+    source = Path("src/web/templates/repo.html").read_text()
+    tasks = source.split('hx-get="/repos/{{ repo.name }}/tasks"', 1)[1].split(">", 1)[0]
+    assert "repo:history_updated from:body" in tasks
+    assert "repo:state_change from:body" in tasks
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +365,7 @@ def test_cypress_typing_correct_name_enables_submit() -> None:
     # and must rely on the input value matching exactly. The asymmetric
     # gate (``!==``) keeps the button disabled for any non-match.
     assert 'const target = "example__alpha"' in rendered
-    assert "submit.disabled = (input.value !== target)" in rendered
+    assert "submit.disabled = busy || !reconciled || input.value !== target" in rendered
 
 
 def test_cypress_typing_wrong_name_keeps_submit_disabled() -> None:

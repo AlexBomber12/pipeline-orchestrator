@@ -10,6 +10,7 @@ surrounded by negating words.
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from dataclasses import dataclass
@@ -1551,6 +1552,50 @@ def _scan_branch_delete_main(coder_stdout: str) -> list[GuardrailViolation]:
             )
         )
     return violations
+
+
+def codex_command_evidence(event_stream: str) -> str:
+    """Decode only executed-command fields, never quoted tool output.
+
+    Only the CLI adapter calls this on its native event stream, never on
+    final answers or formatted logs. JSONL updates repeat the same command,
+    so retain one copy per item identity. Native shell wrappers are
+    transport: their -c/-lc payload is the command the existing catalog scans.
+    """
+    commands = []
+    seen = set()
+    for line in event_stream.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("type") not in {
+            "item.started", "item.updated", "item.completed",
+        }:
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "command_execution":
+            continue
+        command = item.get("command")
+        if not isinstance(command, str) or not command:
+            continue
+        item_id = item.get("id")
+        identity = (item_id if isinstance(item_id, str) else None, command)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        commands.append(command)
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            continue
+        if (len(argv) >= 3 and argv[0].rsplit("/", 1)[-1] in {"sh", "bash", "dash", "zsh"}
+            and argv[1] in {"-c", "-lc"}):
+            commands.append(argv[2])
+    # Existing guardrails recognize shell prompt prefixes. The provider
+    # diagnostic reader excludes these lines, including marker-like text
+    # inside multiline command arguments, so commands cannot forge errors.
+    return "\n".join("$ " + line for command in commands for line in command.splitlines())
 
 
 def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
