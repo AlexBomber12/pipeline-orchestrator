@@ -111,7 +111,7 @@ def test_list_repo_tasks_returns_grouped_tasks(
     assert "Second queued task" in body
     assert "PR-003" in body
     assert "In-flight task" in body
-    assert "In progress" in body
+    assert "Doing" in body
     assert 'hx-get="/repos/example__alpha/tasks/PR-001"' in body
     assert 'hx-get="/repos/example__alpha/tasks/PR-002"' in body
     assert 'hx-get="/repos/example__alpha/tasks/PR-003"' in body
@@ -185,7 +185,7 @@ def test_list_repo_tasks_omits_doing_section_when_absent(
     assert response.status_code == 200
     body = response.text
     assert "PR-100" in body
-    assert "In progress" not in body
+    assert "Doing" not in body
 
 
 def test_list_repo_tasks_renders_canceled_section(

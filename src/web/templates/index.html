@@ -74,7 +74,7 @@
                 const text = card.querySelector('[data-progress-text]');
                 const bar = card.querySelector('[data-progress-bar]');
                 if (text) {
-                    text.textContent = safeDone + ' / ' + safeTotal + ' done';
+                    text.textContent = 'Queue ' + safeDone + ' / ' + safeTotal;
                 }
                 if (bar) {
                     bar.style.width = percent.toFixed(1) + '%';
