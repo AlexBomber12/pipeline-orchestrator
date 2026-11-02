@@ -83,6 +83,25 @@ AVAILABILITY_SSE_POLL_INTERVAL_SECONDS = 0.1
 
 router = APIRouter()
 
+# Age of the published state report, not daemon/process liveness.
+OBSERVATION_STALE_AFTER = timedelta(minutes=10)
+
+
+def _observation_context(
+    states: list[RepoState], redis_client: aioredis.Redis | None, warning: str | None,
+) -> dict[str, Any]:
+    return {
+        "observation_now": datetime.now(timezone.utc),
+        "observation_stale_after": OBSERVATION_STALE_AFTER.total_seconds(),
+        "observation_available": redis_client is not None and not warning and not any(
+            state.error_message in {
+                "Redis unavailable — state unknown", "Waiting for daemon to initialize",
+                "State decode failed",
+            } for state in states
+        ),
+    }
+
+
 _HISTORY_LIMIT = 100
 _METRICS_PANEL_LIMIT = 20
 _METRICS_SCAN_LIMIT = 100
@@ -1550,6 +1569,7 @@ async def index(request: Request) -> HTMLResponse:
         "index.html",
         {
             "title": "Dashboard",
+            **_observation_context(states, redis_client, redis_warning),
             "repos": states,
             "stats": stats,
             "latest_alert": latest_alert,
@@ -1981,16 +2001,22 @@ async def partial_repo_list(request: Request) -> HTMLResponse:
     drain_progress = await _build_drain_progress_map(
         redis_client, states, config
     )
+    observation = _observation_context(states, redis_client, redis_warning)
     return _app.templates.TemplateResponse(
         request,
         "components/repo_cards.html",
         {
             "repos": states,
+            **observation,
             "redis_warning": redis_warning,
                 "cancellation_subsources": cancellation_subsources,
             "subsource_lookup": _subsource_lookup,
             "drain_progress": drain_progress,
             "inhibitor_labels": INHIBITOR_LABELS,
+        },
+        headers={
+            "X-Observation-Available": str(observation["observation_available"]).lower(),
+            "X-Observation-Time": observation["observation_now"].isoformat(),
         },
     )
 
