@@ -1287,6 +1287,10 @@ def test_partial_repo_list_renders_queue_progress(
             title="Dashboard",
             status=TaskStatus.DOING,
         ),
+        current_queue=[
+            QueueTask(pr_id=f"PR-{i:03}", title="Task", status=TaskStatus.DONE if i < 4 else TaskStatus.TODO)
+            for i in range(10)
+        ],
         queue_done=4,
         queue_total=10,
         last_updated=now,
@@ -1318,7 +1322,7 @@ def test_partial_repo_list_renders_queue_progress(
 
     assert response.status_code == 200
     body = response.text
-    assert "4 / 10 done" in body
+    assert "Queue 4 / 10" in body
     assert "PR-005" in body
     assert 'data-repo="example__alpha"' in body
     assert "data-progress-text" in body

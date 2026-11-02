@@ -1,3 +1,4 @@
+{% import "components/_status_vocabulary.html" as vocabulary %}
 {% from "components/_controls.html" import repo_controls %}
 {# Repo header + current-task + current-PR cards.
 
@@ -7,17 +8,12 @@
    stays mounted and keeps its user-selected filter. #}
 {% import "components/_repo_state_styles.html" as repo_state %}
 {% set ci_styles = {
-    'SUCCESS':       {'dot': 'bg-ok',   'pulse': false, 'label': 'success'},
-    'FAILURE':       {'dot': 'bg-fail', 'pulse': false, 'label': 'failure'},
-    'PENDING':       {'dot': 'bg-warn', 'pulse': true,  'label': 'pending'},
-    'INFRA_FAILURE': {'dot': 'bg-fail', 'pulse': false, 'label': 'infra failure'},
+    'SUCCESS':       {'dot': 'bg-ok',   'pulse': false},
+    'FAILURE':       {'dot': 'bg-fail', 'pulse': false},
+    'PENDING':       {'dot': 'bg-warn', 'pulse': true,  'label': ''},
+    'INFRA_FAILURE': {'dot': 'bg-fail', 'pulse': false},
 } %}
-{% set review_emoji = {
-    'APPROVED':          '👍',
-    'EYES':              '👀',
-    'CHANGES_REQUESTED': '✏️',
-    'PENDING':           '·',
-} %}
+
 {% set style = repo_state.state_styles.get(repo.state.value, repo_state.state_styles['IDLE']) %}
 
 <section data-repo-summary>
@@ -44,6 +40,8 @@
         updated <span data-ts="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">{{ repo.last_updated.strftime('%Y-%m-%d %H:%M:%S') }}</span>
     </span>
 </header>
+{{ vocabulary.queue(repo) }}
+{{ vocabulary.watch(repo) }}
 
 {% if coder_update_message %}
 <div class="mb-4 rounded-lg border border-accent/30 bg-accent/10 px-4 py-3 text-sm text-accent">
@@ -106,7 +104,7 @@
             {% endif %}
         </dl>
         {% else %}
-        <p class="text-gray-600 italic text-sm">No active task</p>
+        <p class="text-gray-600 italic text-sm">No active task.</p>
         {% endif %}
     </section>
 
@@ -134,13 +132,13 @@
                 <dt class="text-gray-500">CI</dt>
                 <dd class="flex items-center gap-2 font-mono text-xs text-gray-300">
                     <span class="w-2.5 h-2.5 rounded-full {{ ci.dot }} {% if ci.pulse %}pulse-dot{% endif %}"></span>
-                    {{ ci.label }}
+                    {{ vocabulary.ci_labels.get(repo.current_pr.ci_status.value, vocabulary.ci_labels.PENDING) }}
                 </dd>
             </div>
             <div class="flex flex-col items-start gap-1 sm:flex-row sm:items-center sm:justify-between sm:gap-3">
                 <dt class="text-gray-500">Review</dt>
                 <dd class="font-mono text-sm text-gray-300">
-                    {{ review_emoji.get(repo.current_pr.review_status.value, '·') }}
+                    {{ vocabulary.review_labels.get(repo.current_pr.review_status.value, vocabulary.review_labels.PENDING) }}
                 </dd>
             </div>
             <div class="flex flex-col items-start gap-1 sm:flex-row sm:items-baseline sm:justify-between sm:gap-3">
@@ -153,7 +151,7 @@
             </div>
         </dl>
         {% else %}
-        <p class="text-gray-600 italic text-sm">No active PR</p>
+        <p class="text-gray-600 italic text-sm">No active PR.</p>
         {% endif %}
     </section>
 </div>

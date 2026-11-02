@@ -1,3 +1,4 @@
+{% import "components/_status_vocabulary.html" as vocabulary %}
 {% from "components/_controls.html" import repo_controls %}
 {% import "components/_repo_state_styles.html" as repo_state %}
 {% import "components/subsource_badge.html" as subsource_badge %}
@@ -5,17 +6,10 @@
 {% set init_messages = ['Waiting for daemon to initialize', 'State decode failed', 'Redis unavailable — state unknown'] %}
 
 {% set ci_styles = {
-    'PENDING':       {'dot': 'bg-warn', 'pulse': true,  'label': 'CI pending'},
-    'SUCCESS':       {'dot': 'bg-ok',   'pulse': false, 'label': 'CI passed'},
-    'FAILURE':       {'dot': 'bg-fail', 'pulse': false, 'label': 'CI failed'},
-    'INFRA_FAILURE': {'dot': 'bg-fail', 'pulse': false, 'label': 'CI infra failure'},
-} %}
-
-{% set review_emojis = {
-    'PENDING':           '',
-    'EYES':              '👀',
-    'APPROVED':          '👍',
-    'CHANGES_REQUESTED': '✏️',
+    'PENDING':       {'dot': 'bg-warn', 'pulse': true,  'label': ''},
+    'SUCCESS':       {'dot': 'bg-ok',   'pulse': false},
+    'FAILURE':       {'dot': 'bg-fail', 'pulse': false},
+    'INFRA_FAILURE': {'dot': 'bg-fail', 'pulse': false},
 } %}
 
 {% set _card_only = card_only | default(false) %}
@@ -131,20 +125,14 @@
         {# Body: 2-column grid #}
         <div class="mb-2 grid grid-cols-1 gap-4 text-xs sm:grid-cols-2">
             <div>
-                <div class="text-gray-500 mb-1">Sprint progress</div>
-                <div class="text-gray-300 mb-1" data-progress-text>{{ repo.queue_done }} / {{ repo.queue_total }} done</div>
-                <div class="h-1 bg-surface-3 rounded-full overflow-hidden">
-                    <div class="h-full bg-ok rounded-full"
-                         data-progress-bar
-                         style="width: {{ ((repo.queue_done / repo.queue_total * 100) if repo.queue_total > 0 else 0)|round(1) }}%"></div>
-                </div>
+                {{ vocabulary.queue(repo) }}
             </div>
             <div>
                 <div class="text-gray-500 mb-1">Current task</div>
                 {% if repo.current_task %}
                 <div class="font-mono text-gray-300 truncate" title="{{ repo.current_task.title }}">{{ repo.current_task.pr_id }} {{ repo.current_task.title }}</div>
                 {% else %}
-                <div class="text-gray-600 italic">No tasks</div>
+                <div class="text-gray-600 italic">No active task.</div>
                 {% endif %}
             </div>
         </div>
@@ -152,19 +140,17 @@
         {# PR row #}
         {% if repo.current_pr %}
         {% set ci = ci_styles.get(repo.current_pr.ci_status.value, ci_styles['PENDING']) %}
-        {% set review_emoji = review_emojis.get(repo.current_pr.review_status.value, '') %}
         <div class="mt-2 flex flex-wrap items-center gap-2 border-t border-white/5 pt-2 text-xs text-gray-400">
             <a href="{{ repo.current_pr.url }}" class="secondary-interactive font-mono text-gray-300">#{{ repo.current_pr.number }}</a>
             <span class="w-2 h-2 rounded-full {{ ci.dot }} {% if ci.pulse %}pulse-dot{% endif %}"></span>
-            <span>{{ ci.label }}</span>
-            {% if review_emoji %}
-            <span>{{ review_emoji }}</span>
-            {% endif %}
+            <span>{{ vocabulary.ci_labels.get(repo.current_pr.ci_status.value, vocabulary.ci_labels.PENDING) }}</span>
+            <span>{{ vocabulary.review_labels.get(repo.current_pr.review_status.value, vocabulary.review_labels.PENDING) }}</span>
             {% if repo.current_pr.push_count > 1 %}
             <span class="text-gray-500">iter {{ repo.current_pr.push_count }}</span>
             {% endif %}
         </div>
         {% endif %}
+        {{ vocabulary.watch(repo) }}
         {% if repo.state.value == 'CODING' or repo.state.value == 'FIX' %}
         {% set _coder_name = 'Codex' if repo.coder == 'codex' else ('Claude' if repo.coder == 'claude' else (repo.coder or 'Coder')) %}
         <div class="text-xs {{ style.text }} mt-1">{{ _coder_name }} is {{ 'coding' if repo.state.value == 'CODING' else 'fixing' }}...</div>

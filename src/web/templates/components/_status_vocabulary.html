@@ -1,0 +1,43 @@
+{% set ci_labels = {
+    'SUCCESS': 'CI passed', 'FAILURE': 'CI failed',
+    'PENDING': 'CI pending', 'INFRA_FAILURE': 'CI infra failure',
+} %}
+{% set review_labels = {
+    'APPROVED': 'Review approved', 'CHANGES_REQUESTED': 'Review changes requested',
+    'EYES': 'Review in review', 'PENDING': 'Review pending',
+} %}
+{% macro watch(repo) -%}
+{% if repo.state.value == 'WATCH' %}
+<p class="mt-1 text-xs text-gray-400" data-watch-status>
+    {% if not repo.current_pr %}
+    Waiting for PR status
+    {% else %}
+    {% set ci = repo.current_pr.ci_status.value %}
+    {% set review = repo.current_pr.review_status.value %}
+    {{ review_labels.get(review, review_labels.PENDING) }} · {% if ci == 'PENDING' %}waiting for CI{% elif ci == 'FAILURE' %}CI failed{% elif ci == 'INFRA_FAILURE' %}CI infra failure{% elif review == 'APPROVED' %}CI passed · waiting for merge checks{% elif review == 'CHANGES_REQUESTED' %}CI passed · waiting for fixes{% else %}CI passed · waiting for review{% endif %}
+    {% endif %}
+</p>
+{% endif %}
+{%- endmacro %}
+{% macro queue(repo) -%}
+<div class="text-xs text-gray-400" data-queue-summary>
+    {% if repo.current_queue is none %}
+    Queue snapshot unavailable.
+    {% else %}
+    {% set tasks = repo.current_queue %}
+    {% set done = tasks | selectattr('status.value', 'equalto', 'DONE') | list %}
+    <span data-progress-text>Queue {{ done | length }} / {{ tasks | length }}</span>
+    <div class="h-1 bg-surface-3 rounded-full overflow-hidden">
+        <div class="h-full bg-ok rounded-full" data-progress-bar
+             style="width: {{ (((done | length) / (tasks | length) * 100) if tasks else 0) | round(1) }}%"></div>
+    </div>
+    {% if not tasks %}
+    <p>No eligible tasks in the queue snapshot.</p>
+    {% elif tasks | selectattr('status.value', 'equalto', 'ERROR') | list %}
+    <p>Error tasks retained; use Retry where available.</p>
+    {% elif tasks | selectattr('status.value', 'equalto', 'TODO') | selectattr('unresolved_deps') | list %}
+    <p>Tasks blocked by dependencies remain in the queue.</p>
+    {% endif %}
+    {% endif %}
+</div>
+{%- endmacro %}
