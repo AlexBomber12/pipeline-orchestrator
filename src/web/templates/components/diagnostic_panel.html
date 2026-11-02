@@ -60,7 +60,7 @@
     {% if reset_button_enabled %}
     <button type="button"
             hx-get="/repos/{{ diagnostic.repo_slug }}/tasks/{{ diagnostic.task_id }}/reset-confirm"
-            hx-target="closest [data-diagnostic-panel]"
+            hx-target="#repo-reset-dialog"
             hx-swap="beforeend"
             class="mt-3 text-xs px-2 py-1 rounded border border-fail/50 text-fail hover:bg-fail/10">
         Reset task (destructive)

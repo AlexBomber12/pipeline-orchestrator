@@ -13,6 +13,9 @@ def reset_dialog(page: Page, dashboard_url: str, testbed_slug: str):
     modal = web_app.templates.env.get_template('components/reset_modal.html').module.reset_modal(
         dict(repo_slug=slug, task_id='PR-490', retry_count=2), dict(number=444),
     )
+    diagnostic = web_app.templates.env.get_template('components/diagnostic_panel.html').module.diagnostic_panel(
+        dict(repo_slug=slug, task_id='PR-490', retry_count=2), 3, True,
+    )
     # Catch every reset POST before navigation, including accidental duplicate requests.
     posts = []
     outcome = dict(status=200, body=json.dumps(dict(frontmatter_pushed=True)))
@@ -31,22 +34,22 @@ def reset_dialog(page: Page, dashboard_url: str, testbed_slug: str):
 
     def read(route):
         reads.append(route.request.url)
-        route.fulfill(body='<p>Current state</p>', content_type='text/html')
+        body = str(diagnostic) if route.request.url.endswith('/tasks') and not posts else '<p>Current state</p>'
+        route.fulfill(body=body, content_type='text/html')
 
     page.route(f'**/partials/repo/{slug}', read)
     page.route(f'**/repos/{slug}/tasks', read)
     page.route(f'**/repos/{slug}/tasks/PR-490/reset-confirm',
                lambda route: route.fulfill(body=str(modal), content_type='text/html'))
-    page.evaluate('''() => {
-        const opener = document.createElement('button');
-        opener.id = 'reset-opener'; opener.textContent = 'Open test Reset';
-        document.body.append(opener);
-        opener.focus();
-        const slot = document.createElement('div'); slot.id = 'reset-slot';
-        document.body.append(slot);
-    }''')
-    page.evaluate('''url => htmx.ajax('GET', url, {target: '#reset-slot', swap: 'innerHTML'})''',
-                  f'/repos/{slug}/tasks/PR-490/reset-confirm')
+    # Use the real diagnostic opener inside the queue, including its production target.
+    page.evaluate('''slug => {
+        const queue = [...document.querySelectorAll('[hx-get]')].find(
+            el => el.getAttribute('hx-get') === '/repos/' + slug + '/tasks');
+        queue.closest('details').open = true;
+    }''', slug)
+    opener = page.locator('[data-diagnostic-panel] button[hx-get]')
+    opener.evaluate("button => { button.id = 'reset-opener'; }")
+    opener.click()
     expect(page.locator('[data-reset-confirm-input]')).to_be_focused()
     return page, slug, posts, outcome, reads
 
@@ -64,7 +67,6 @@ def test_confirmed_reset_refreshes_without_navigation(reset_dialog):
     page.on('framenavigated', lambda frame: navigations.append(frame.url))
     _submit(reset_dialog)
     expect(page.locator('[data-reset-modal]')).to_have_count(0)
-    expect(page.locator('#reset-opener')).to_be_focused()
     page.wait_for_function('''slug => [...document.querySelectorAll('[hx-get]')]
         .some(el => el.getAttribute('hx-get') === '/repos/' + slug + '/tasks' &&
                     el.textContent.includes('Current state'))''', arg=slug)
@@ -91,7 +93,15 @@ def test_failure_retains_confirmation(reset_dialog, status, body, abort, message
     expect(page.locator('[data-reset-submit]')).to_be_enabled()
     expect(page.locator('[data-reset-cancel]')).to_be_enabled()
     assert len(posts) == 1
-    assert reads
+    # Wait for the actual replacement, not merely an issued refresh request.
+    expect(page.locator('[data-diagnostic-panel]')).to_have_count(0)
+    expect(page.locator('#repo-reset-dialog [data-reset-modal]')).to_be_visible()
+    expect(page.locator('[data-reset-error]')).to_contain_text(message)
+    expect(page.locator('[data-reset-confirm-input]')).to_have_value(slug)
+    outcome.update(status=200, body=json.dumps(dict(frontmatter_pushed=True)), abort=False)
+    page.locator('[data-reset-submit]').click()
+    expect(page.locator('[data-reset-modal]')).to_have_count(0)
+    assert len(posts) == 2
 
 
 def test_escape_and_focus_trap(reset_dialog):

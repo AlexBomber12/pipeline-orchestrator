@@ -29,6 +29,9 @@
     {% include "components/repo_summary.html" %}
 </div>
 
+{# Reset must survive summary, queue, and pending-retry polling swaps. #}
+<div id="repo-reset-dialog"></div>
+
 {% include "components/event_log.html" %}
 
 <details class="mt-4">
