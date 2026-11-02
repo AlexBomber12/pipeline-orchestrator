@@ -28,8 +28,6 @@ def reset_dialog(page: Page, dashboard_url: str, testbed_slug: str):
             route.fulfill(status=outcome['status'], body=outcome['body'], content_type='application/json')
 
     page.route('**/api/reset-task/**', post)
-    page.goto(f'{dashboard_url}/repo/{slug}', wait_until='domcontentloaded')
-    page.wait_for_function('Boolean(window.htmx)')
     reads = []
 
     def read(route):
@@ -41,11 +39,17 @@ def reset_dialog(page: Page, dashboard_url: str, testbed_slug: str):
     page.route(f'**/repos/{slug}/tasks', read)
     page.route(f'**/repos/{slug}/tasks/PR-490/reset-confirm',
                lambda route: route.fulfill(body=str(modal), content_type='text/html'))
+    # Install reads before HTMX can issue load/revealed requests during navigation.
+    page.goto(f'{dashboard_url}/repo/{slug}', wait_until='domcontentloaded')
+    page.wait_for_function('Boolean(window.htmx)')
     # Use the real diagnostic opener inside the queue, including its production target.
+    # Revealed may already have fired while the details element was closed.
+    # Refresh explicitly through the production event instead of relying on it firing again.
     page.evaluate('''slug => {
         const queue = [...document.querySelectorAll('[hx-get]')].find(
             el => el.getAttribute('hx-get') === '/repos/' + slug + '/tasks');
         queue.closest('details').open = true;
+        htmx.trigger(document.body, 'repo:history_updated');
     }''', slug)
     opener = page.locator('[data-diagnostic-panel] button[hx-get]')
     opener.evaluate("button => { button.id = 'reset-opener'; }")
