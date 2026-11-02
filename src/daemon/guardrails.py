@@ -1554,16 +1554,17 @@ def _scan_branch_delete_main(coder_stdout: str) -> list[GuardrailViolation]:
     return violations
 
 
-def _structured_command_evidence(coder_stdout: str) -> str:
+def codex_command_evidence(event_stream: str) -> str:
     """Decode only executed-command fields, never quoted tool output.
 
-    Keep legacy text scanning unchanged. JSONL item updates repeat the same
-    command, so retain one copy per item identity. Native shell wrappers are
+    Only the CLI adapter calls this on its native event stream, never on
+    final answers or formatted logs. JSONL updates repeat the same command,
+    so retain one copy per item identity. Native shell wrappers are
     transport: their -c/-lc payload is the command the existing catalog scans.
     """
     commands = []
     seen = set()
-    for line in coder_stdout.splitlines():
+    for line in event_stream.splitlines():
         try:
             event = json.loads(line)
         except ValueError:
@@ -1591,12 +1592,14 @@ def _structured_command_evidence(coder_stdout: str) -> str:
         if (len(argv) >= 3 and argv[0].rsplit("/", 1)[-1] in {"sh", "bash", "dash", "zsh"}
             and argv[1] in {"-c", "-lc"}):
             commands.append(argv[2])
-    return coder_stdout + "\n" + "\n".join(commands)
+    # Existing guardrails recognize shell prompt prefixes. The provider
+    # diagnostic reader excludes these lines, including marker-like text
+    # inside multiline command arguments, so commands cannot forge errors.
+    return "\n".join("$ " + line for command in commands for line in command.splitlines())
 
 
 def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
     """Return guardrail violations found in captured coder stdout."""
-    coder_stdout = _structured_command_evidence(coder_stdout)
     violations: list[GuardrailViolation] = _scan_branch_delete_main(coder_stdout)
     for category in sorted(_TIER1_PATTERNS):
         pattern = _TIER1_PATTERNS[category]

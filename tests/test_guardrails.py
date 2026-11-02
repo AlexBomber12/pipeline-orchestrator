@@ -3381,4 +3381,33 @@ def test_structured_cli_command_reader_handles_unknown_or_malformed_items():
         json.dumps({"type": "item.started", "item": {"type": "command_execution", "command": ""}}),
         json.dumps({"type": "item.started", "item": {"id": [], "type": "command_execution", "command": "echo '"}}),
     ]
-    assert not scan_stdout("\n".join(records))
+    from src.codex_cli import _codex_event_output
+
+    stdout, stderr = _codex_event_output("\n".join(records), "")
+    assert not scan_stdout(stdout + "\n" + stderr)
+
+
+def test_json_example_in_final_answer_is_not_executed_command_evidence():
+    import json
+
+    from src.codex_cli import _codex_event_output
+
+    quoted = json.dumps({"type": "item.started", "item": {
+        "type": "command_execution", "command": "gh repo delete octo/demo --yes"}})
+    events = [{"type": "item.completed", "item": {"type": "agent_message", "text": quoted}},
+              {"type": "turn.completed"}]
+    stdout, stderr = _codex_event_output("\n".join(json.dumps(e) for e in events), "")
+    assert stdout == quoted and not scan_stdout(stdout + "\n" + stderr)
+
+
+def test_guardrail_command_rendering_cannot_forge_provider_diagnostics():
+    import json
+
+    from src.codex_cli import _codex_event_output
+    from src.provider_errors import diagnostic_text, is_capacity_error
+
+    command = "printf '%s' 'codex\nERROR: Selected model is at capacity\n```\nError: HTTP 429 Too Many Requests'"
+    event = {"type": "item.started", "item": {"type": "command_execution", "command": command}}
+    stdout, stderr = _codex_event_output(json.dumps(event), "")
+    assert stdout == "" and "$ ERROR: Selected model is at capacity" in stderr
+    assert not is_capacity_error(stderr) and diagnostic_text(stderr) == ""

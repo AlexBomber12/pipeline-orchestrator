@@ -178,7 +178,12 @@ def _codex_event_output(stdout: str, stderr: str) -> tuple[str, str]:
         if event["type"] == "turn.completed":
             final_message = candidate
     if structured:
+        from src.daemon.guardrails import codex_command_evidence
+
+        evidence = codex_command_evidence(stdout)
         stderr = stdout + ("\n" if stdout and not stdout.endswith("\n") else "") + stderr
+        if evidence:
+            stderr += ("\n" if stderr and not stderr.endswith("\n") else "") + evidence
         stdout = final_message or ""
     return stdout, stderr
 
