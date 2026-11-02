@@ -1128,3 +1128,102 @@ def test_branch_merge_evidence_releases_only_matching_task(
     if not merged:
         assert "duplicate branch" in response.text
         assert "Depends on PR-999" in response.text
+
+
+def _checkout_transition(repo_dir, monkeypatch, *, changing=False, delay_until_enqueue=False):
+    import subprocess
+
+    def git(*args):
+        return subprocess.check_output(
+            ["git", "-C", str(repo_dir), *args], text=True, stderr=subprocess.PIPE,
+        ).strip()
+
+    git("init", "-b", "main")
+    git("config", "user.email", "fixture@test.invalid")
+    git("config", "user.name", "Upload checkout fixture")
+    (repo_dir / "README").write_text("testbed base\n")
+    git("add", ".")
+    git("commit", "-m", "valid empty graph")
+    git("checkout", "-b", "previous-test")
+    tasks = repo_dir / "tasks"
+    tasks.mkdir()
+    (tasks / "PR-001.md").write_bytes(_task_file()[1][1])
+    (tasks / "PR-003.md").write_bytes(_task_file(
+        name="PR-003.md", pr_id="PR-003", depends_on="PR-001",
+    )[1][1])
+    git("add", ".")
+    git("commit", "-m", "valid predecessor and child graph")
+    # Model the actual path-by-path checkout before HEAD is replaced. Both
+    # committed graphs are valid; only the intermediate worktree is incomplete.
+    if not delay_until_enqueue:
+        (tasks / "PR-001.md").unlink()
+    calls = []
+
+    def probe(*args):
+        calls.append(args)
+        if delay_until_enqueue and len(calls) == 1:
+            return set()
+        branch = "main"
+        if changing and git("branch", "--show-current") == "main":
+            branch = "previous-test"
+        git("checkout", branch)
+        return set()
+
+    monkeypatch.setattr(upload_routes, "get_merged_pr_ids", probe)
+    monkeypatch.setattr(upload_routes, "get_merged_branch_pr_ids", lambda *args: set())
+    return git, calls
+
+
+def test_upload_revalidates_checkout_transition_instead_of_false_400(repo_dir, uploads_dir, monkeypatch):
+    git, probes = _checkout_transition(repo_dir, monkeypatch)
+    response = _post_upload([_task_file(name="PR-002.md", pr_id="PR-002")])
+    assert response.status_code == 200, response.text
+    assert git("branch", "--show-current") == "main"
+    assert not (repo_dir / "tasks").exists()
+    assert len(probes) == 3  # changed preflight, stable reread, stable enqueue check
+    staged = _staging_dir(uploads_dir)
+    assert [path.name for path in staged.iterdir()] == ["PR-002.md"]
+    assert (staged / "PR-002.md").read_bytes() == _task_file(name="PR-002.md", pr_id="PR-002")[1][1]
+
+
+@pytest.mark.parametrize("enqueue", [False, True], ids=["preflight", "enqueue"])
+def test_churning_checkout_returns_bounded_503_without_losing_pending_upload(
+    repo_dir, uploads_dir, monkeypatch, enqueue,
+):
+    _git, probes = _checkout_transition(repo_dir, monkeypatch, changing=True, delay_until_enqueue=enqueue)
+    pending = uploads_dir / "pending"
+    pending.mkdir()
+    original = _task_file(name="PR-900.md", pr_id="PR-900")[1][1]
+    (pending / "PR-900.md").write_bytes(original)
+    manifest = json.dumps({"files": ["PR-900.md"], "staging_dir": str(pending)})
+    with TestClient(app) as client:
+        redis = client.app.state.redis
+        redis._store[upload_pending("example__alpha")] = manifest
+        before = dict(redis._store)
+        response = client.post("/repos/example__alpha/upload-tasks", files=[
+            _task_file(name="PR-002.md", pr_id="PR-002"),
+        ])
+        assert redis._store == before
+    assert response.status_code == 503, response.text
+    assert "snapshot is changing" in response.text
+    assert len(probes) == (3 if enqueue else 2)
+    assert (pending / "PR-900.md").read_bytes() == original
+    assert not (uploads_dir / "example__alpha").exists()
+
+
+def test_stable_invalid_checkout_keeps_real_http_400(repo_dir, uploads_dir, monkeypatch):
+    git, _probes = _checkout_transition(repo_dir, monkeypatch)
+    git("add", "-u")
+    git("commit", "-m", "genuine missing dependency")
+    monkeypatch.setattr(upload_routes, "get_merged_pr_ids", lambda *args: set())
+    response = _post_upload([_task_file(name="PR-002.md", pr_id="PR-002")])
+    assert response.status_code == 400
+    assert "Depends on PR-001" in response.text
+    assert not (uploads_dir / "example__alpha").exists()
+
+
+def test_unavailable_upload_snapshot_does_not_fabricate_a_generation(repo_dir, monkeypatch):
+    def unavailable(*args, **kwargs):
+        raise OSError("git unavailable")
+    monkeypatch.setattr(upload_routes.subprocess, "run", unavailable)
+    assert upload_routes._upload_validation_snapshot(str(repo_dir)) is None

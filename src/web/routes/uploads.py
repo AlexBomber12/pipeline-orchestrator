@@ -14,6 +14,7 @@ import io
 import json
 import re
 import shutil
+import subprocess
 import tempfile
 import uuid
 import zipfile
@@ -286,7 +287,47 @@ def _extend_validation_errors(
         errors_by_file.setdefault(fname, []).extend(issues)
 
 
+class _UploadSnapshotChanging(RuntimeError):
+    """Checkout movement prevented a stable, read-only validation."""
+
+
+def _upload_validation_snapshot(repo_path: str) -> tuple | None:
+    try:
+        result = subprocess.run(
+            ["git", "--no-optional-locks", "-C", repo_path, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=5, check=False,
+        )
+        tasks = Path(repo_path) / "tasks"
+        paths = sorted(tasks.glob("PR-*.md"))
+        if (tasks / "completions.json").exists():
+            paths.append(tasks / "completions.json")
+        generation = []
+        for path in paths:
+            stat = path.stat()
+            generation.append((path.name, stat.st_ino, stat.st_size, stat.st_mtime_ns))
+        return result.stdout.strip() if result.returncode == 0 else None, tuple(generation)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 async def _graph_validation_errors(
+    repo_path: str, repo_branch: str, incoming: dict[str, TaskHeader],
+    pending_manifest: str | bytes | None, incoming_texts: dict[str, str],
+) -> dict[str, list[str]]:
+    # The daemon can switch this read-only checkout during GitHub probes.
+    # Never turn a mixed old/new task graph into a permanent spec rejection.
+    for _ in range(2):
+        before = await asyncio.to_thread(_upload_validation_snapshot, repo_path)
+        errors = await _graph_validation_errors_once(
+            repo_path, repo_branch, incoming, pending_manifest, incoming_texts,
+        )
+        after = await asyncio.to_thread(_upload_validation_snapshot, repo_path)
+        if before is not None and before == after:
+            return errors
+    raise _UploadSnapshotChanging("Repository task snapshot is changing; retry the upload after checkout settles.")
+
+
+async def _graph_validation_errors_once(
     repo_path: str, repo_branch: str, incoming: dict[str, TaskHeader],
     pending_manifest: str | bytes | None, incoming_texts: dict[str, str],
 ) -> dict[str, list[str]]:
@@ -556,9 +597,13 @@ async def upload_tasks(
         pending_manifest = await redis_client.get(upload_pending(name))
     except Exception:
         pending_manifest = None
-    _extend_validation_errors(errors_by_file, await _graph_validation_errors(
-        repo_path, repo_branch, parsed_headers, pending_manifest, parsed_task_texts,
-    ))
+    try:
+        graph_errors = await _graph_validation_errors(
+            repo_path, repo_branch, parsed_headers, pending_manifest, parsed_task_texts,
+        )
+    except _UploadSnapshotChanging as exc:
+        return _render_upload_error(request, str(exc), 503, repo_name=name)
+    _extend_validation_errors(errors_by_file, graph_errors)
 
     if errors_by_file:
         validation_errors = [
@@ -684,9 +729,12 @@ async def upload_tasks(
                 request, "Cannot validate pending task graph (Redis error). Upload blocked.",
                 503, repo_name=name,
             )
-        graph_errors = await _graph_validation_errors(
-            repo_path, repo_branch, parsed_headers, existing_raw, parsed_task_texts,
-        )
+        try:
+            graph_errors = await _graph_validation_errors(
+                repo_path, repo_branch, parsed_headers, existing_raw, parsed_task_texts,
+            )
+        except _UploadSnapshotChanging as exc:
+            return _render_upload_error(request, str(exc), 503, repo_name=name)
         if graph_errors:
             validation_errors = [
                 {"file": fname, "errors": issues}

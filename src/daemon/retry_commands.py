@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import re
 import subprocess
 import tempfile
+import uuid
 from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from pathlib import Path
@@ -21,9 +23,10 @@ from src.config import normalize_repo_url
 from src.daemon import git_ops, publication
 from src.daemon.recovery import MergeIdentityConflict
 from src.daemon.selector import CoderPurpose, resolve_active_coder
+from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, derive_active_inhibitors
-from src.models import PipelineState, PRInfo, QueueTask, TaskStatus
+from src.models import CIStatus, PipelineState, PRInfo, QueueTask, ReviewStatus, TaskStatus
 from src.queue_parser import QueueValidationError
 from src.queue_parser import parse_existing_task_header as parse_task_header
 from src.retry_commands import (
@@ -43,6 +46,7 @@ from src.retry_commands import (
 from src.subsource_registry import SuppressionReason
 from src.suppression.redis_store import RedisSuppressionStore
 from src.task_status import find_matching_open_pr
+from src.web.services.upload_validation import task_spec_replay_matches
 
 
 class RetryDispatch(StrEnum):
@@ -374,6 +378,82 @@ class RetryCommandMixin:
             return None
         return result.stdout
 
+    def _repaired_fix_retry_binding(self, command: RetryCommand) -> bool:
+        """An operator may select a fresh head for the same failed FIX."""
+        attempt, pr = self.state.publication_attempt, self.state.current_pr
+        return bool(
+            attempt is not None and pr is not None and not pr.is_cross_repository and attempt.pending
+            and attempt.contract_version == 2 and attempt.cleanup_confirmed
+            and attempt.exit_classification == "failure" and attempt.provider_error is None
+            and not attempt.terminal_cancelled and command.failure_subsource == "coder_escalate"
+            and self._publication_attempt_matches_dispatch()
+            and self.state.active_invocation.phase == "fix"
+            and (command.task_id, command.task_branch, command.bound_pr_number,
+                 command.bound_pr_branch) == (attempt.task_id, attempt.branch, pr.number, pr.branch)
+            and pr.head_sha == attempt.expected_head_sha
+            and command.bound_pr_head_sha != pr.head_sha
+            and re.fullmatch(r"[a-f0-9]{40}", command.bound_pr_head_sha or "")
+        )
+
+    async def _observe_repaired_fix_retry(self, command: RetryCommand) -> tuple[str, PRInfo] | RetryDispatch:
+        """Preserve the old attempt; prove the explicitly selected descendant."""
+        attempt, pr = self.state.publication_attempt, self.state.current_pr
+        target = command.bound_pr_head_sha
+        try:
+            outcome = await asyncio.to_thread(
+                gh_prs.get_exact_pr_outcome, self.owner_repo, self.repo_config.branch,
+                pr.number, target, expected_branch=command.task_branch,
+            )
+            if not outcome.discovery_complete:
+                if outcome.reason in {
+                    "head mismatch", "identity mismatch", "invalid identity",
+                    "head repository or branch mismatch",
+                }:
+                    return await self._fail_retry_command(
+                        command, "Repaired PR identity or HEAD changed; refresh Retry.",
+                    )
+                return await self._defer_retry_command(command, "Repaired PR publication evidence unavailable.")
+            if outcome.state != gh_prs.ExactPRState.OPEN:
+                return await self._fail_retry_command(
+                    command, "Repaired PR HEAD changed or is not open; refresh Retry.",
+                )
+            branch = (await asyncio.to_thread(
+                git_ops._git, self.repo_path, "branch", "--show-current",
+            )).stdout.strip()
+            head = (await asyncio.to_thread(
+                git_ops._git, self.repo_path, "rev-parse", "HEAD",
+            )).stdout.strip()
+            if branch != command.task_branch or head not in {attempt.expected_head_sha, target}:
+                return await self._defer_retry_command(
+                    command, "Retained local FIX work differs; preserve and inspect it.",
+                )
+            await asyncio.to_thread(git_ops._git, self.repo_path, "fetch", "origin", target, timeout=60)
+            ancestry = await asyncio.to_thread(
+                git_ops._git, self.repo_path, "merge-base", "--is-ancestor",
+                attempt.expected_head_sha, target, check=False,
+            )
+            if ancestry.returncode != 0:
+                return await self._defer_retry_command(
+                    command, "Selected repair does not prove retention of the old FIX head.",
+                )
+            repaired_text = (await asyncio.to_thread(
+                git_ops._git, self.repo_path, "show", f"{target}:{command.task_file}",
+            )).stdout
+            local_text = self._retry_task_path(command).read_text(encoding="utf-8")
+            if not task_spec_replay_matches(local_text, repaired_text):
+                return await self._fail_retry_command(command, "Selected repair changes the task specification.")
+        except Exception as exc:
+            return await self._defer_retry_command(
+                command, f"Repaired FIX ownership unavailable: {type(exc).__name__}.",
+            )
+        # Do not rewrite the exited attempt's frozen expected SHA or metrics.
+        # Existing reservation/status/acknowledgement code releases its hold.
+        return "watch", pr.model_copy(update={
+            "head_sha": target, "ci_status": CIStatus.PENDING,
+            "review_status": ReviewStatus.PENDING, "is_escalated": False,
+            "publication_at": None, "publication_observed": False,
+        })
+
     async def _validate_retry_command(
         self, command: RetryCommand
     ) -> tuple[Any, QueueTask] | RetryDispatch:
@@ -450,7 +530,8 @@ class RetryCommandMixin:
             return await self._defer_retry_command(
                 command, "Cannot verify the task specification on the base branch."
             )
-        if task_spec_content_hash(origin_text) != command.task_fingerprint:
+        if (task_spec_content_hash(origin_text) != command.task_fingerprint
+            and not task_spec_replay_matches(task_text, origin_text)):
             return await self._fail_retry_command(
                 command,
                 "Base-branch task specification differs from the accepted fingerprint.",
@@ -547,10 +628,10 @@ class RetryCommandMixin:
                     command, "Retry is stale: task is no longer in its failed state."
                 )
             pr = relevant_retry_pr(self.state, task)
-            if pr is not None and (pr.number, pr.branch, pr.head_sha) != (
+            if (pr is not None and (pr.number, pr.branch, pr.head_sha) != (
                 command.bound_pr_number, command.bound_pr_branch,
                 command.bound_pr_head_sha,
-            ):
+            ) and not self._repaired_fix_retry_binding(command)):
                 return await self._fail_retry_command(
                     command, "Retry is stale: current attempt/PR binding changed."
                 )
@@ -686,6 +767,8 @@ class RetryCommandMixin:
                     return await self._fail_retry_command(command, "Provider Retry publication binding changed.")
             # Preserve the durable receipt identifier for both provider phases.
             return "provider_fix", pr
+        if self._repaired_fix_retry_binding(command):
+            return await self._observe_repaired_fix_retry(command)
         try:
             floor = await publication.retry_floor(self, command)
         except Exception as exc:
@@ -1047,6 +1130,7 @@ class RetryCommandMixin:
             and command.selected_continuation == "provider_fix"):
             return await self._resume_provider_retry(command)
 
+        repaired_fix = self._repaired_fix_retry_binding(command)
         continuation = await self._select_retry_continuation(command)
         if isinstance(continuation, RetryDispatch):
             return continuation
@@ -1109,10 +1193,9 @@ class RetryCommandMixin:
             except Exception as exc:
                 return await self._defer_retry_command(command, f"Merge accounting Retry handoff deferred: {exc}.")
 
-        if continuation_name == "watch":
-            # Only transfer ownership after reservation succeeds: a cap failure
-            # removes the command from the queue, so the attempt must still hold
-            # the publication against normal ERROR diagnosis in that case.
+        if continuation_name == "watch" and not repaired_fix:
+            # Retain the established handoff timing for ordinary publication
+            # recovery. Descendant repairs additionally own label cleanup.
             attempt = self.state.publication_attempt
             if attempt is not None and attempt.pending:
                 attempt.pending = False
@@ -1144,6 +1227,24 @@ class RetryCommandMixin:
         if continuation_name == "provider_fix":
             return await self._resume_provider_retry(command)
 
+        # Clear the durable marker before creating successor accounting. A
+        # GitHub failure then remains replayable across daemon restart too.
+        try:
+            if (continuation_name == "watch" and pr is not None
+                and command.failure_subsource == "coder_escalate"
+                and (pr.is_escalated or self.state.current_pr is not None
+                     and self.state.current_pr.is_escalated)):
+                await asyncio.to_thread(
+                    gh_runner.run_gh,
+                    ["pr", "edit", str(pr.number), "--remove-label", "escalated"],
+                    repo=self.owner_repo,
+                )
+                pr = pr.model_copy(update={"is_escalated": False})
+        except Exception as exc:
+            return await self._defer_retry_command(
+                command, f"Retry escalation label cleanup is incomplete: {exc}.",
+            )
+
         if continuation_name == "watch":
             if (
                 self._current_run_record is None
@@ -1165,10 +1266,43 @@ class RetryCommandMixin:
                 old_record = record
                 old_baseline = record.fix_recovery_baseline
                 if record.ended_at is not None:
-                    record = self._new_fix_run_record(
-                        record, operator_retry=True,
-                        task_spec_hash=command.task_fingerprint,
-                    )
+                    current_text = self._origin_retry_task_text(command)
+                    task_path = self._retry_task_path(command)
+                    if current_text is None or task_path is None:
+                        return await self._defer_retry_command(command, "Retry accounting task snapshot is missing.")
+                    try:
+                        local_text = task_path.read_text(encoding="utf-8")
+                    except (OSError, UnicodeError):
+                        return await self._defer_retry_command(command, "Retry accounting task snapshot is unreadable.")
+                    if not task_spec_replay_matches(local_text, current_text):
+                        return await self._defer_retry_command(
+                            command, "Retry accounting generation is unavailable or changed.",
+                        )
+                    # The receipt and predecessor are durable even if the
+                    # state publication still binds the exited invocation.
+                    # Reuse this identity after a lost checkpoint/acknowledgement.
+                    successor_id = str(uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"{self.name}:{command.command_id}:{record.run_id}:watch-retry",
+                    ))
+                    generation = task_spec_content_hash(current_text)
+                    successor = await self._metrics_store.get(successor_id)
+                    if successor is not None and (
+                        successor.task_id != task.pr_id or successor.repo_name != self.name
+                        or successor.attempt_index != record.attempt_index + 1
+                        or successor.task_spec_hash != generation
+                        or not successor.operator_intervention or successor.ended_at is not None
+                        or successor.invocations or successor.exit_reason
+                    ):
+                        return await self._defer_retry_command(
+                            command, "Retry successor accounting identity conflicts; records preserved.",
+                        )
+                    if successor is None:
+                        successor = self._new_fix_run_record(
+                            record, operator_retry=True, task_spec_hash=generation,
+                        )
+                        successor.run_id = successor_id
+                    record = successor
                     self._current_run_record = record
                 record.fix_recovery_baseline = record.fix_iterations
                 try:
@@ -1187,6 +1321,15 @@ class RetryCommandMixin:
                 command,
                 f"Status is queued, but prior failure evidence cleanup is incomplete: {exc}.",
             )
+
+        if continuation_name == "watch" and repaired_fix:
+            # Keep the frozen publication hold until status, accounting and
+            # durable escalation cleanup succeed. A deferred command must be
+            # able to reprove the same repair without losing its old owner.
+            attempt = self.state.publication_attempt
+            if attempt is not None and attempt.pending:
+                attempt.pending = False
+                await self.publish_state()
 
         pr, reset_counters = self._reset_retry_local_counters(pr)
         if self._current_run_record is not None and self._current_run_record.task_id != task.pr_id:

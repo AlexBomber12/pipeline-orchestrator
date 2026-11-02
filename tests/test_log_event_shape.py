@@ -13,8 +13,14 @@ value is constructed elsewhere — typically by wrapping
 from __future__ import annotations
 
 import ast
+import json
 import re
 from pathlib import Path
+from unittest.mock import AsyncMock
+
+import pytest
+from src.daemon.runner import PipelineRunner
+from src.models import RepoState, validate_event_severity
 
 ALLOWED_CATEGORIES = (
     "CODING",
@@ -95,3 +101,60 @@ def test_every_log_event_call_starts_with_known_category() -> None:
         "log_event calls missing a `[CATEGORY] ` prefix:\n"
         + "\n".join(offenders)
     )
+
+
+@pytest.fixture
+def event_runner() -> PipelineRunner:
+    runner = object.__new__(PipelineRunner)
+    runner.name = "owner__repo"
+    runner.state = RepoState(url="https://github.com/owner/repo.git", name=runner.name)
+    runner._pending_event_log_entries = []
+    runner.redis = AsyncMock()
+    return runner
+
+
+@pytest.mark.parametrize("severity", ["error", "warn", "ok", "info", None])
+def test_log_event_severity(event_runner: PipelineRunner, severity: str | None) -> None:
+    validate_event_severity(severity)
+    event_runner.log_event("message", severity=severity)
+    event_runner.log_event("message", severity=severity)
+    entry = event_runner.state.history[0]
+    assert len(event_runner.state.history) == 1
+    assert entry["count"] == 2
+    assert entry.get("severity") == severity
+    assert ("severity" in entry) == (severity is not None)
+
+
+@pytest.mark.parametrize("severity", ["fatal", "ERROR", "", "unknown"])
+def test_log_event_rejects_invalid_severity(event_runner: PipelineRunner, severity: str) -> None:
+    with pytest.raises(ValueError, match="Unknown event severity"):
+        event_runner.log_event("message", severity=severity)
+    assert event_runner.state.history == []
+    assert event_runner._pending_event_log_entries == []
+
+
+def test_severity_is_part_of_dedup_key(event_runner: PipelineRunner) -> None:
+    for severity in (None, "error", "warn", "ok", "info", None):
+        event_runner.log_event("message", severity=severity)
+    assert len(event_runner.state.history) == 6
+    assert all(entry["count"] == 1 for entry in event_runner.state.history)
+
+
+async def test_severity_in_published_event_and_disk(
+    event_runner: PipelineRunner, isolate_events_dir: Path,
+) -> None:
+    event_runner.log_event("message", severity="error")
+    event_runner.log_event("message", severity="error")
+    await event_runner._publish_pending_event_log_entries()
+    messages = [json.loads(call.args[1]) for call in event_runner.redis.publish.call_args_list]
+    assert [message["type"] for message in messages] == ["event_log_append"] * 2
+    assert [message["data"]["entry"]["severity"] for message in messages] == ["error"] * 2
+    assert [message["data"]["entry"]["count"] for message in messages] == [1, 2]
+    records = [
+        json.loads(line)
+        for path in (isolate_events_dir / event_runner.name).glob("*.jsonl")
+        for line in path.read_text().splitlines()
+    ]
+    assert [record["severity"] for record in records] == ["error"] * 2
+    assert [record["payload"] for record in records] == [message["data"] for message in messages]
+    assert event_runner._pending_event_log_entries == []

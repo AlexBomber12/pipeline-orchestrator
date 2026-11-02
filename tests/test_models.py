@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
+import pytest
 from src.inhibitor import InhibitorType, WorkInhibitor
 from src.models import (
     CIStatus,
@@ -361,3 +362,18 @@ def test_repo_state_clearing_current_pr_does_not_clear_current_task() -> None:
 
     assert state.current_task == task
     assert state.error_message == "active failure"
+
+
+@pytest.mark.parametrize("severity", ["error", "warn", "ok", "info", None])
+def test_history_severity_survives_state_restart(severity: str | None) -> None:
+    entry = {"time": "2026-11-01T00:00:00+00:00", "state": "IDLE", "event": "message"}
+    if severity is not None:
+        entry["severity"] = severity
+    state = RepoState.model_validate({
+        "url": "https://github.com/example/repo.git", "name": "repo", "history": [entry],
+    })
+    assert state.model_dump()["history"] == [entry]
+    # publish_state persists model_dump_json; startup validates that JSON again.
+    restored = RepoState.model_validate_json(state.model_dump_json())
+    assert restored.history == [entry]
+    assert restored.model_dump()["history"] == [entry]

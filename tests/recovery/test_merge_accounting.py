@@ -747,3 +747,93 @@ def test_conflict_restart_retains_saved_merge_when_an_open_pr_reuses_its_branch(
     assert reused.number == 999 and reused.head_sha == "c" * 40
     retained.write_text("unpublished evidence\n")
     c.preserved()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["direct", "base_sync", "post_merge_reflow", "changed_spec"])
+async def test_repaired_retry_reaches_matching_merge_and_done_with_reflow(
+    tmp_path, monkeypatch, isolate_analytics_dir, mode,
+):
+    import subprocess
+    from pathlib import Path
+
+    from src.github.prs import ExactPROutcome, ExactPRState
+
+    from tests.runner.test_retry_commands import NOW, _real_repaired_fix
+
+    runner, command, record, previous, original, target, git = await _real_repaired_fix(tmp_path, monkeypatch)
+    assert await runner._apply_retry_command(command) == RetryDispatch.WATCH
+    successor_id = runner._current_run_record.run_id
+    runner._current_run_record.head_sha = target
+    await runner._checkpoint_current_run_record()
+    remote = tmp_path / "remote.git"
+    if mode == "base_sync":
+        repair = tmp_path / "repair"
+        git(repair, "fetch", "origin", "main")
+        git(repair, "merge", "--no-ff", "origin/main", "-m", "sync configured base")
+        git(repair, "push", "origin", "HEAD:refs/heads/" + command.task_branch)
+        target = git(repair, "rev-parse", "HEAD")
+        runner.state.current_pr.head_sha = target
+    merged_repo = tmp_path / "merged"
+    subprocess.run(["git", "clone", "-b", "main", str(remote), str(merged_repo)], check=True, capture_output=True)
+    git(merged_repo, "config", "user.email", "fixture@test.invalid")
+    git(merged_repo, "config", "user.name", "Merge fixture")
+    git(merged_repo, "merge", "--no-ff", "origin/" + command.task_branch, "-m", "matching reviewed merge")
+    merged = git(merged_repo, "rev-parse", "HEAD")
+    if mode == "post_merge_reflow":
+        # An independent presentation-only commit after merge must not change
+        # its immutable completion owner or require altering the old checkout.
+        original_text = subprocess.check_output(
+            ["git", "-C", str(remote), "show", target + ":" + command.task_file], text=True,
+        )
+        (merged_repo / command.task_file).write_text(original_text)
+        git(merged_repo, "add", ".")
+        git(merged_repo, "commit", "-m", "presentation-only reflow after matching merge")
+    if mode == "changed_spec":
+        with (merged_repo / command.task_file).open("a") as output:
+            output.write("Independent new requirement after merge.\n")
+        git(merged_repo, "add", ".")
+        git(merged_repo, "commit", "-m", "independent specification revision")
+    git(merged_repo, "push", "origin", "main")
+    runner.state.state = PipelineState.MERGE
+    runner._confirmed_merge_outcome = ExactPROutcome(
+        runner.owner_repo, "main", 42, target, ExactPRState.MERGED, True,
+        merge_commit_sha=merged, merged_at=NOW,
+    )
+    runner._confirmed_merge_at = NOW
+    bound_task, bound_pr = runner.state.current_task, runner.state.current_pr
+    await runner._finish_confirmed_merge({})
+    assert asdict(await runner._metrics_store.get(record.run_id)) == previous
+    records = await runner._metrics_store.list_task_runs(runner.name, command.task_id)
+    assert len(records) == 2
+    assert git(Path(runner.repo_path), "rev-parse", "HEAD") == original
+    assert not git(Path(runner.repo_path), "status", "--porcelain")
+    published = subprocess.check_output(
+        ["git", "-C", str(remote), "show", "main:" + command.task_file], text=True,
+    )
+    if mode == "changed_spec":
+        assert runner.state.state == PipelineState.ERROR
+        assert "authoritative task generation differs" in runner.state.error_message
+        assert "status: DONE" not in published
+        assert not any(r.outcome == "merged" for r in records)
+        return
+    assert runner.state.state == PipelineState.IDLE
+    assert "status: DONE" in published and "blocked_reason:" not in published
+    assert git(remote, "show", "main:marker.txt") == "reviewed repair"
+    successful = [r for r in records if r.outcome == "merged"]
+    assert len(successful) == 1 and successful[0].run_id == successor_id
+    assert successful[0].head_sha == target and successful[0].exit_reason == "success_merged"
+    assert successful[0].ended_at and successful[0].invocations == []
+    assert successful[0].task_spec_hash == task_spec_content_hash(published)
+    assert next(q for q in runner.state.current_queue if q.pr_id == command.task_id).status == TaskStatus.DONE
+
+    # Replay a lost post-merge acknowledgement after DONE was already written.
+    completed = asdict(successful[0])
+    runner.state.current_task, runner.state.current_pr = bound_task, bound_pr
+    runner.state.state = PipelineState.MERGE
+    runner._current_run_record = None
+    await runner._finish_confirmed_merge({})
+    records = await runner._metrics_store.list_task_runs(runner.name, command.task_id)
+    assert runner.state.state == PipelineState.IDLE and len(records) == 2
+    assert asdict(await runner._metrics_store.get(successor_id)) == completed
+    assert asdict(await runner._metrics_store.get(record.run_id)) == previous

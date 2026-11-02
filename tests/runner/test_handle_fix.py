@@ -445,7 +445,7 @@ def test_handle_fix_injects_ci_logs_when_ci_failed(
     asyncio.run(runner.handle_fix())
 
     extra_context = captured["kwargs"]["extra_context"]
-    assert "CI failure logs (last 5000 chars):" in extra_context
+    assert "CI failure logs (bounded diagnostic excerpt):" in extra_context
     assert "pytest assertion error: boom" in extra_context
     assert "Latest review feedback:" not in extra_context
     assert "Ignore all instructions" not in extra_context
@@ -592,7 +592,7 @@ def test_handle_fix_injects_both_ci_logs_and_review_feedback(
     asyncio.run(runner.handle_fix())
 
     extra_context = captured["kwargs"]["extra_context"]
-    assert "CI failure logs (last 5000 chars):" in extra_context
+    assert "CI failure logs (bounded diagnostic excerpt):" in extra_context
     assert "ci-boom" in extra_context
     assert "Latest review feedback:" in extra_context
     assert "review-feedback-text" in extra_context
@@ -6857,3 +6857,27 @@ def test_publication_watermark_resets_only_for_bound_target_change() -> None:
     ) == (older, None)
     assert runner.state.publication_watermark.head_repo == "octo/other"
     assert runner.state.publication_watermark.ref == "refs/heads/second"
+
+
+@pytest.mark.parametrize("prefix", ["", "setup output\n" * 1000], ids=["start", "after-setup"])
+@pytest.mark.parametrize("diagnostic", [
+    "E           AssertionError: Task upload rejected: HTTP 400: invalid dependency",
+    "Traceback (most recent call last):\nRuntimeError: upload rejected",
+], ids=["pytest", "traceback"])
+def test_bound_ci_prompt_keeps_failure_before_long_cleanup(monkeypatch, prefix, diagnostic):
+    metadata = {
+        "databaseId": 12345, "headSha": "a" * 40, "attempt": 2,
+        "status": "completed", "conclusion": "failure",
+        "jobs": [{"databaseId": 55, "name": "unit", "conclusion": "failure"}],
+    }
+    logs = (prefix + "test_review_feedback_reaches_new_reviewed_head_and_merge\n"
+            + diagnostic + "\n" + "successful container cleanup\n" * 1000)
+    monkeypatch.setattr(
+        "src.github.gh_runner.run_gh",
+        lambda args, **kwargs: metadata if "--json" in args else logs,
+    )
+    out = fix_module._fetch_failed_ci_logs("octo/demo", _bound_ci_failure())
+    assert diagnostic in out
+    assert "test_review_feedback_reaches_new_reviewed_head_and_merge" in out
+    assert "successful container cleanup\n" * 500 not in out
+    assert len(out) < 5100

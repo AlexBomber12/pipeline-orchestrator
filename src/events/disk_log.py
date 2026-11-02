@@ -53,6 +53,7 @@ def append_event_to_disk(
         "payload": payload,
         "tier": payload.get("tier") or entry.get("tier"),
         "kind": payload.get("kind") or entry.get("kind"),
+        "severity": entry.get("severity") or payload.get("severity"),
     }
     try:
         line = json.dumps(record, separators=(",", ":"), default=str) + "\n"

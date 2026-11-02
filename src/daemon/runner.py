@@ -148,6 +148,7 @@ from src.models import (
     PublicationWatermark,
     RepoState,
     TaskStatus,
+    validate_event_severity,
 )
 from src.process_supervisor import SupervisedProcess
 from src.queue_parser import (
@@ -167,6 +168,7 @@ from src.subsource_registry import (
 from src.suppression.redis_store import RedisSuppressionStore
 from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
+from src.web.services.upload_validation import task_spec_replay_matches
 
 logger = logging.getLogger(__name__)
 
@@ -1887,17 +1889,26 @@ class PipelineRunner(
                 git_ops._git(self.repo_path, "fetch", "--no-tags", "origin", ref, timeout=120)
             hashes.append(self._merge_task_generation_at_ref(task, ref))
         if len(set(hashes)) != 1:
-            raise MergeIdentityConflict("authoritative task generation differs from merged PR")
+            texts = [self._merge_task_text_at_ref(task, ref)
+                     for ref in (pr.head_sha, outcome.merge_commit_sha, base_sha)]
+            if not all(task_spec_replay_matches(texts[-1], text) for text in texts[:-1]):
+                raise MergeIdentityConflict("authoritative task generation differs from merged PR")
         ancestry = git_ops._git(self.repo_path, "merge-base", "--is-ancestor",
                                 outcome.merge_commit_sha, base_sha, check=False).returncode
         if ancestry == 1:
             raise MergeIdentityConflict("merged commit absent from authoritative base")
         if ancestry != 0:
             raise RuntimeError("merged commit ancestry unavailable")
-        return hashes[0]
+        # The merge commit is immutable; later status-writer YAML reflow on
+        # the base must not manufacture a different completion identity.
+        return hashes[1]
 
     def _merge_task_generation_at_ref(self, task: Any, ref: str) -> str:
-        """Read a bounded task identity from a known Git commit, without checkout."""
+        """Read a bounded task fingerprint without changing the checkout."""
+        return task_spec_content_hash(self._merge_task_text_at_ref(task, ref))
+
+    def _merge_task_text_at_ref(self, task: Any, ref: str) -> str:
+        """Read and validate the exact task identity in a proved Git revision."""
         path = task.task_file
         entry = git_ops._git(self.repo_path, "ls-tree", ref, "--", path).stdout
         if not entry.startswith(("100644 blob ", "100755 blob ")):
@@ -1909,7 +1920,7 @@ class PipelineRunner(
             raise MergeIdentityConflict("invalid task in proved Git revision") from exc
         if header.pr_id != task.pr_id or header.branch != task.branch:
             raise MergeIdentityConflict("task identity differs in proved Git revision")
-        return task_spec_content_hash(content)
+        return content
 
     def _merge_record_compatible(
         self, record: RunRecord, generation: str, *, task: Any = None, pr: Any = None,
@@ -1937,7 +1948,11 @@ class PipelineRunner(
             if result.returncode != 0:
                 return False
             try:
-                if self._merge_task_generation_at_ref(task, record.head_sha) != generation:
+                if (self._merge_task_generation_at_ref(task, record.head_sha) != generation
+                    and not task_spec_replay_matches(
+                        self._merge_task_text_at_ref(task, record.head_sha),
+                        self._merge_task_text_at_ref(task, pr.head_sha),
+                    )):
                     return False
             except MergeIdentityConflict:
                 return False
@@ -2814,7 +2829,21 @@ class PipelineRunner(
                     task_bytes = isolated_task.read_bytes()
                     task_text = task_bytes.decode("utf-8")
                     if task_spec_content_hash(task_text) != admitted_hash:
-                        raise ValueError("remote task differs from admitted generation")
+                        try:
+                            retained_text = (repo_root / task_path).read_text(encoding="utf-8")
+                        except (OSError, UnicodeError):
+                            retained_text = None
+                        if (status == "DONE" and (retained_text is None
+                            or task_spec_content_hash(retained_text) != admitted_hash)):
+                            outcome, pr = getattr(self, "_confirmed_merge_outcome", None), self.state.current_pr
+                            if (outcome is not None and pr is not None
+                                and outcome.state == gh_prs.ExactPRState.MERGED and outcome.merge_commit_sha
+                                and (outcome.repo, outcome.base_branch, outcome.number, outcome.head_sha)
+                                == (self.owner_repo, base, pr.number, pr.head_sha)):
+                                retained_text = self._merge_task_text_at_ref(current_task, outcome.merge_commit_sha)
+                        if (retained_text is None or task_spec_content_hash(retained_text) != admitted_hash
+                                or not task_spec_replay_matches(retained_text, task_text)):
+                            raise ValueError("remote task differs from admitted generation")
                     if (expected_task_sha256 is not None
                             and hashlib.sha256(task_bytes).hexdigest()
                             != expected_task_sha256):
@@ -3591,6 +3620,7 @@ class PipelineRunner(
         *,
         tier: str | None = None,
         kind: str | None = None,
+        severity: str | None = None,
     ) -> None:
         """Append an event to ``state.history`` (capped) and log it.
 
@@ -3601,6 +3631,7 @@ class PipelineRunner(
         values stay visible, and ``last_seen_at`` is refreshed.
         """
         validate_event_tier(tier)
+        validate_event_severity(severity)
         if (tier is not None or kind is not None) and os.environ.get(
             "DEBUG_EVENT_LOG_BRACKETS"
         ):
@@ -3615,6 +3646,7 @@ class PipelineRunner(
             and last_entry.get("state") == state
             and last_entry.get("tier") == tier
             and last_entry.get("kind") == kind
+            and last_entry.get("severity") == severity
             and _normalize_for_dedup(last_entry.get("event", ""))
             == _normalize_for_dedup(event)
         ):
@@ -3634,6 +3666,8 @@ class PipelineRunner(
                 "count": 1,
                 "last_seen_at": now,
             }
+            if severity is not None:
+                entry["severity"] = severity
             self.state.history.append(entry)
             self._pending_event_log_entries.append(dict(entry))
         if len(self.state.history) > _HISTORY_LIMIT:
