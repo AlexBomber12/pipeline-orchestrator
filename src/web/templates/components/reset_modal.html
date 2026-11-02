@@ -8,11 +8,11 @@
    ``TemplateResponse``. #}
 {% macro reset_modal(diagnostic, orphan_pr) %}
 <div class="modal-backdrop fixed inset-0 bg-black/60 z-50 flex items-center justify-center"
-     data-reset-modal>
+     data-reset-modal role="dialog" aria-modal="true" aria-label="Reset task">
     <div class="modal bg-surface-2 rounded-lg p-6 max-w-md w-full border border-fail/30">
         <h3 class="text-lg font-semibold mb-2 text-fail">Reset task - destructive</h3>
         <p class="text-sm text-gray-300 mb-4">
-            This is the escape hatch when Retry is blocked (cap reached, orphan PR, fingerprint unchanged).
+            Reset clears the failure and retry history so this task can run again.
             Type the repository name <span class="font-mono">{{ diagnostic.repo_slug }}</span>
             to confirm.
         </p>
@@ -20,15 +20,12 @@
         <details class="mb-3 text-xs text-gray-400">
             <summary class="cursor-pointer">What will happen</summary>
             <ul class="mt-2 space-y-1 list-disc list-inside">
-                <li>Delete cancellation_cause record</li>
-                <li>Delete retry_count (currently {{ diagnostic.retry_count }})</li>
-                <li>Delete retry_fingerprint</li>
-                <li>Delete current_run_started_at</li>
-                <li>ZREM from cancellation_index</li>
+                <li>Clear the recorded failure and reset the retry allowance ({{ diagnostic.retry_count }} used).</li>
+                <li>Discard the retained run timing and retry comparison state.</li>
                 {% if orphan_pr %}
                 <li class="text-warn">Close orphan PR #{{ orphan_pr.number }} on GitHub</li>
                 {% endif %}
-                <li>Rewrite frontmatter status to TODO and commit+push</li>
+                <li>Mark the task TODO and publish the change so it can be dispatched again</li>
             </ul>
         </details>
 
@@ -38,39 +35,97 @@
                data-reset-confirm-input
                class="w-full px-3 py-2 rounded border bg-surface-3 text-white font-mono">
 
+        <p role="alert" data-reset-error class="text-sm text-fail mt-3" hidden></p>
         <div class="flex gap-2 mt-4">
             <button hx-post="/api/reset-task/{{ diagnostic.repo_slug }}/{{ diagnostic.task_id }}{% if orphan_pr %}?close_orphan_pr=true{% endif %}"
-                    hx-target="closest [data-repo-card]"
-                    hx-swap="outerHTML"
+                    hx-swap="none"
+                    data-own-error
                     hx-trigger="click[this.closest('[data-reset-modal]').querySelector('[data-reset-confirm-input]').value === '{{ diagnostic.repo_slug }}']"
                     data-reset-submit
                     class="px-4 py-2 rounded bg-fail/20 text-fail border border-fail/50 hover:bg-fail/30"
                     disabled>
                 Reset task
             </button>
-            <button onclick="this.closest('[data-reset-modal]').remove()"
+            <button type="button"
                     data-reset-cancel
                     class="px-4 py-2 rounded bg-surface-3 text-gray-300 border border-white/10">
                 Cancel
             </button>
         </div>
     </div>
-    {# Inline gating script lives inside ``[data-reset-modal]`` so it can
-       scope its DOM lookups to *this* modal via ``document.currentScript``.
-       A global ``document.querySelector`` would always bind the first
-       modal on the page; when rapid clicks insert a second reset-confirm
-       fragment before the first is dismissed, the older modal's input
-       would stop controlling its own submit and Cancel could remove the
-       wrong instance. #}
+    {# Keep interaction state scoped to this fragment. #}
     <script>
     (function() {
         const modal = document.currentScript.closest('[data-reset-modal]');
         const input = modal.querySelector('[data-reset-confirm-input]');
         const submit = modal.querySelector('[data-reset-submit]');
         const target = "{{ diagnostic.repo_slug }}";
-        input.addEventListener('input', () => {
-            submit.disabled = (input.value !== target);
+        const cancel = modal.querySelector('[data-reset-cancel]');
+        const alert = modal.querySelector('[data-reset-error]');
+        const opener = document.activeElement;
+        let busy = false, reconciled = true;
+        const gate = () => { submit.disabled = busy || !reconciled || input.value !== target; };
+        const close = () => {
+            if (busy) return;
+            modal.remove();
+            if (opener && opener.isConnected) opener.focus();
+        };
+        const refresh = () => {
+            htmx.trigger(document.body, 'repo:history_updated');
+            htmx.trigger(document.body, 'repo:state_change');
+        };
+        input.addEventListener('input', gate);
+        cancel.addEventListener('click', close);
+        modal.addEventListener('keydown', event => {
+            if (event.key === 'Escape') { event.preventDefault(); close(); }
+            if (event.key !== 'Tab') return;
+            const controls = [...modal.querySelectorAll('summary, input, button')].filter(el => !el.disabled);
+            const first = controls[0], last = controls[controls.length - 1];
+            if (event.shiftKey && document.activeElement === first) {
+                event.preventDefault(); last.focus();
+            } else if (!event.shiftKey && document.activeElement === last) {
+                event.preventDefault(); first.focus();
+            }
         });
+        modal.addEventListener('htmx:beforeRequest', event => {
+            if (event.detail.elt !== submit) return;
+            if (busy || !reconciled || input.value !== target) { event.preventDefault(); return; }
+            busy = true;
+            cancel.disabled = true;
+            gate();
+            alert.hidden = true;
+        });
+        modal.addEventListener('htmx:beforeSwap', event => { event.detail.shouldSwap = false; });
+        modal.addEventListener('htmx:afterRequest', async event => {
+            if (event.detail.elt !== submit) return;
+            const xhr = event.detail.xhr;
+            let result = {};
+            try { result = JSON.parse(xhr.responseText); } catch (_) {}
+            busy = false;
+            cancel.disabled = false;
+            const success = xhr.status >= 200 && xhr.status < 300 &&
+                result && result.frontmatter_pushed === true && !result.partial_reset && !result.error;
+            refresh();
+            if (success) { close(); return; }
+            reconciled = false;
+            gate();
+            alert.hidden = false;
+            const reason = result && result.error || xhr.responseText ||
+                (xhr.status === 0 ? 'network error' : 'unconfirmed acknowledgement');
+            alert.textContent = (result && result.partial_reset ? 'Reset partly applied: ' : 'Reset not confirmed: ') + reason;
+            // Re-read the confirmation and its consequences before permitting another POST.
+            // Changed consequences require opening a new dialog and confirming them again.
+            try {
+                const response = await fetch('/repos/{{ diagnostic.repo_slug }}/tasks/{{ diagnostic.task_id }}/reset-confirm');
+                if (!response.ok) throw new Error('reconciliation failed');
+                const current = new DOMParser().parseFromString(await response.text(), 'text/html');
+                reconciled = current.querySelector('[data-reset-submit]')?.getAttribute('hx-post') === submit.getAttribute('hx-post') &&
+                    current.querySelector('details')?.textContent === modal.querySelector('details').textContent;
+            } catch (_) { reconciled = false; }
+            if (!reconciled) alert.textContent += ' Close and reopen Reset to review current state before trying again.';
+            gate();
+        });
+        input.focus();
     })();
     </script>
 </div>
