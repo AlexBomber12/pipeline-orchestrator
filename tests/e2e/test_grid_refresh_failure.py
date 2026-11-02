@@ -6,7 +6,7 @@ import pytest
 from playwright.sync_api import expect
 
 
-@pytest.mark.parametrize("failure", ["http", "transport"])
+@pytest.mark.parametrize("failure", [400, 404, 409, 422, 500, 503, "transport"])
 def test_grid_refresh_failure(page, dashboard_url, failure):
     page.route("**/api/repos/*/events", lambda route: route.abort())
     page.goto(dashboard_url, wait_until="load")
@@ -21,7 +21,7 @@ def test_grid_refresh_failure(page, dashboard_url, failure):
             if failure == "transport":
                 route.abort("failed")
             else:
-                route.fulfill(status=503, body="Unavailable")
+                route.fulfill(status=failure, body="Unavailable")
             return
         route.fulfill(status=200, content_type="text/html",
                       headers={"X-Observation-Available": "false" if mode == "redis" else "true",
@@ -44,6 +44,8 @@ def test_grid_refresh_failure(page, dashboard_url, failure):
     expect(warning).to_be_visible()
     expect(warning).to_have_text(re.compile(r"Data from \d{2}:\d{2}; refresh unavailable. Will be retried\."))
     message = warning.inner_text()
+    assert page.evaluate("window.retainedCard === document.querySelector('[data-repo-card]')")
+    expect(grid).to_have_attribute("data-observed-at", "2026-11-02T12:34:00+00:00")
     page.evaluate("""document.querySelector('#repo-grid').addEventListener('htmx:beforeSwap', event => {
         if (event.detail.xhr.getResponseHeader('X-Observation-Available') === 'false') {
             window.unavailableSeen = true;

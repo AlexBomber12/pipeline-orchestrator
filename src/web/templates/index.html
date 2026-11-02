@@ -58,8 +58,12 @@
             grid.addEventListener(name, showRetainedData);
         });
         grid.addEventListener('htmx:beforeSwap', function (event) {
-            if (event.target === grid &&
-                event.detail.xhr.getResponseHeader('X-Observation-Available') === 'false') {
+            if (event.target !== grid) return;
+            const xhr = event.detail.xhr;
+            if (xhr.status >= 400 ||
+                xhr.getResponseHeader('X-Observation-Available') === 'false') {
+                // Cancel HTMX's swap even if a bubbling handler enables error fragments.
+                event.preventDefault();
                 event.detail.shouldSwap = false;
                 showRetainedData(event);
             }

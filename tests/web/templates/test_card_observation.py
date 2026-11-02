@@ -62,22 +62,30 @@ def test_missing_and_synthetic_timestamps_are_unavailable():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("endpoint", [dashboard.index, dashboard.partial_repo_list])
-@pytest.mark.parametrize("mode", ["fresh", "no_client", "warning", "synthetic"])
+@pytest.mark.parametrize("mode", ["fresh", "no_client", "warning", "missing", "decode"])
 async def test_grid_availability_evidence(monkeypatch, tmp_path, endpoint, mode):
     config = tmp_path / "config.yml"
     config.write_text("repositories: []\n")
     monkeypatch.setattr(web_app, "CONFIG_PATH", str(config))
     repo = _repo()
-    if mode == "synthetic":
-        repo.error_message = "Redis unavailable — state unknown"
+    if mode == "missing":
+        repo.error_message = "Waiting for daemon to initialize"
+    elif mode == "decode":
+        repo.error_message = "State decode failed"
+    healthy = _repo(name="healthy__repo", state=PipelineState.CODING)
     warning = "Redis connection lost" if mode == "warning" else None
-    monkeypatch.setattr(web_app, "get_all_repo_states", AsyncMock(return_value=([repo], warning)))
+    monkeypatch.setattr(web_app, "get_all_repo_states", AsyncMock(return_value=([repo, healthy], warning)))
     redis = None if mode == "no_client" else SimpleNamespace(get=AsyncMock(return_value=None))
     request = Request({"type": "http", "app": SimpleNamespace(state=SimpleNamespace(redis=redis)),
                        "headers": [], "method": "GET", "path": "/"})
     response = await endpoint(request)
-    assert response.context["observation_available"] == (mode == "fresh")
+    available = mode not in ("no_client", "warning")
+    assert response.context["observation_available"] == available
+    assert "healthy__repo" in response.body.decode()
+    if mode in ("missing", "decode"):
+        assert "Report time unavailable" in response.body.decode()
+        assert repo.error_message in response.body.decode()
     assert response.context["observation_now"].tzinfo is not None
     if endpoint == dashboard.partial_repo_list:
-        assert response.headers["X-Observation-Available"] == str(mode == "fresh").lower()
+        assert response.headers["X-Observation-Available"] == str(available).lower()
         assert datetime.fromisoformat(response.headers["X-Observation-Time"]).tzinfo is not None
