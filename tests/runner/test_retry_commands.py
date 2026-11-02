@@ -2392,7 +2392,23 @@ async def _real_repaired_fix(tmp_path, monkeypatch, mode="success"):
     target = git(repair, "rev-parse", "HEAD")
     git(repair, "push", "origin", "HEAD:refs/heads/" + task.branch, "--force-with-lease")
     pr = PRInfo(number=42, branch=task.branch, pr_id=task.pr_id, head_sha=original)
+    pr.is_escalated = True
     runner.state.current_pr = pr
+    labels = {"escalated"}
+    runner._fixture_pr_labels = labels
+    original_gh = retry_module.gh_runner.run_gh
+    cleanup_attempts = []
+
+    def github(args, **kwargs):
+        if args == ["pr", "edit", "42", "--remove-label", "escalated"]:
+            cleanup_attempts.append(args)
+            if mode == "label_cleanup_failure" and len(cleanup_attempts) == 1:
+                raise RuntimeError("controlled GitHub label cleanup failure")
+            labels.discard("escalated")
+            return None
+        return original_gh(args, **kwargs)
+
+    monkeypatch.setattr(retry_module.gh_runner, "run_gh", github)
     runner._start_current_run_record("codex", "")
     record = runner._current_run_record
     record.task_spec_hash = task_spec_content_hash(text)
@@ -2483,6 +2499,7 @@ async def test_operator_retry_preserves_reflowed_generation_and_published_repair
     assert runner.state.current_pr.number == 42 and runner.state.current_pr.head_sha == target
     assert runner.state.current_pr.ci_status == CIStatus.PENDING
     assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+    assert not runner.state.current_pr.is_escalated and not runner._fixture_pr_labels
     assert runner.state.publication_attempt.expected_head_sha == original
     assert not runner.state.publication_attempt.pending
     assert asdict(await runner._metrics_store.get(record.run_id)) == previous
@@ -2569,3 +2586,34 @@ async def test_status_reflow_requires_retained_admitted_bytes(tmp_path, monkeypa
     assert not await write(runner.state.current_task, "TODO", "operator Retry", **expected)
     assert asdict(await runner._metrics_store.get(record.run_id)) == previous
     assert "status: ERROR" in git(tmp_path / "remote.git", "show", "main:tasks/PR-42.md")
+
+
+@pytest.mark.asyncio
+async def test_repaired_fix_retry_retries_durable_label_cleanup_without_duplicate_attempt(tmp_path, monkeypatch):
+    runner, command, record, previous, original, target, _git = await _real_repaired_fix(
+        tmp_path, monkeypatch, "label_cleanup_failure",
+    )
+    assert await runner._apply_retry_command(command) == RetryDispatch.HANDLED
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.publication_attempt.pending
+    assert runner.state.publication_attempt.expected_head_sha == original
+    assert runner._fixture_pr_labels == {"escalated"}
+    assert asdict(await runner._metrics_store.get(record.run_id)) == previous
+    assert runner._current_run_record.run_id == record.run_id
+    receipt = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert receipt.status != RetryCommandStatus.APPLIED and receipt.retry_count == 1
+    await runner.publish_state()
+    runner._current_run_record = None
+    runner.state = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    await runner._restore_current_run_record()
+    assert runner._current_run_record.run_id == record.run_id
+    assert await runner._apply_retry_command(receipt) == RetryDispatch.WATCH
+    assert runner._current_run_record.run_id != record.run_id
+    assert len(await runner._metrics_store.list_task_runs(runner.name, command.task_id)) == 2
+    assert runner._current_run_record.invocations == []
+    assert not runner._fixture_pr_labels and not runner.state.current_pr.is_escalated
+    assert not runner.state.publication_attempt.pending
+    assert runner.state.current_pr.head_sha == target
+    receipt = await load_retry_command(runner.redis, runner.name, command.command_id)
+    assert receipt.status == RetryCommandStatus.APPLIED and receipt.retry_count == 1
+    assert asdict(await runner._metrics_store.get(record.run_id)) == previous

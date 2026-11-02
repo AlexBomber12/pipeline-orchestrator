@@ -22,6 +22,7 @@ from src.config import normalize_repo_url
 from src.daemon import git_ops, publication
 from src.daemon.recovery import MergeIdentityConflict
 from src.daemon.selector import CoderPurpose, resolve_active_coder
+from src.github import gh_runner
 from src.github import prs as gh_prs
 from src.inhibitor import InhibitorType, derive_active_inhibitors
 from src.models import CIStatus, PipelineState, PRInfo, QueueTask, ReviewStatus, TaskStatus
@@ -1121,6 +1122,7 @@ class RetryCommandMixin:
             and command.selected_continuation == "provider_fix"):
             return await self._resume_provider_retry(command)
 
+        repaired_fix = self._repaired_fix_retry_binding(command)
         continuation = await self._select_retry_continuation(command)
         if isinstance(continuation, RetryDispatch):
             return continuation
@@ -1183,10 +1185,9 @@ class RetryCommandMixin:
             except Exception as exc:
                 return await self._defer_retry_command(command, f"Merge accounting Retry handoff deferred: {exc}.")
 
-        if continuation_name == "watch":
-            # Only transfer ownership after reservation succeeds: a cap failure
-            # removes the command from the queue, so the attempt must still hold
-            # the publication against normal ERROR diagnosis in that case.
+        if continuation_name == "watch" and not repaired_fix:
+            # Retain the established handoff timing for ordinary publication
+            # recovery. Descendant repairs additionally own label cleanup.
             attempt = self.state.publication_attempt
             if attempt is not None and attempt.pending:
                 attempt.pending = False
@@ -1217,6 +1218,24 @@ class RetryCommandMixin:
 
         if continuation_name == "provider_fix":
             return await self._resume_provider_retry(command)
+
+        # Clear the durable marker before creating successor accounting. A
+        # GitHub failure then remains replayable across daemon restart too.
+        try:
+            if (continuation_name == "watch" and pr is not None
+                and command.failure_subsource == "coder_escalate"
+                and (pr.is_escalated or self.state.current_pr is not None
+                     and self.state.current_pr.is_escalated)):
+                await asyncio.to_thread(
+                    gh_runner.run_gh,
+                    ["pr", "edit", str(pr.number), "--remove-label", "escalated"],
+                    repo=self.owner_repo,
+                )
+                pr = pr.model_copy(update={"is_escalated": False})
+        except Exception as exc:
+            return await self._defer_retry_command(
+                command, f"Retry escalation label cleanup is incomplete: {exc}.",
+            )
 
         if continuation_name == "watch":
             if (
@@ -1273,6 +1292,15 @@ class RetryCommandMixin:
                 command,
                 f"Status is queued, but prior failure evidence cleanup is incomplete: {exc}.",
             )
+
+        if continuation_name == "watch" and repaired_fix:
+            # Keep the frozen publication hold until status, accounting and
+            # durable escalation cleanup succeed. A deferred command must be
+            # able to reprove the same repair without losing its old owner.
+            attempt = self.state.publication_attempt
+            if attempt is not None and attempt.pending:
+                attempt.pending = False
+                await self.publish_state()
 
         pr, reset_counters = self._reset_retry_local_counters(pr)
         if self._current_run_record is not None and self._current_run_record.task_id != task.pr_id:
