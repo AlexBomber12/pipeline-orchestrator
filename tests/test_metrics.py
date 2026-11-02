@@ -645,3 +645,58 @@ def test_legacy_fix_cumulative_counter_is_unknown_without_dispatch_evidence() ->
     assert totals["telemetry"]["fix_iterations"] == {
         "known_runs": 1, "total_runs": 3, "status": "partial",
     }
+
+
+async def test_merge_only_recovery_counts_no_inherited_fix_work() -> None:
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    records = [
+        _record(f"coding-{i}", attempt_index=i, exit_reason="coding_complete",
+                invocations=[InvocationSnapshot(
+                    plugin_id="codex", model_override=None, reasoning_effort_override=None,
+                    run_id=f"coding-{i}", attempt_index=i, phase="coding",
+                )]) for i in (1, 2)
+    ] + [
+        _record("fix", run_phase="fix", attempt_index=2, fix_iterations=1,
+                exit_reason="error", invocations=[_fix_snapshot("fix", 1)] * 2),
+        _record("merge", run_phase="merge", attempt_index=2, fix_iterations=1,
+                fix_recovery_baseline=1, operator_intervention=True),
+    ]
+    for record in records + records:  # repeated persisted checkpoints
+        await store.save(record)
+    payloads = dict(redis.store)
+    stored = await store.list_task_runs(records[0].repo_name, records[0].task_id)
+    assert {r.run_id: r for r in stored} == {r.run_id: r for r in records}
+    totals = task_attempt_totals(stored + stored)
+    assert totals["attempt_count"] == 4
+    assert totals["fix_iterations"] == 1
+    assert totals["telemetry"]["fix_iterations"] == {
+        "known_runs": 4, "total_runs": 4, "status": "complete",
+    }
+    assert totals["duration_ms"] == 1200000
+    assert totals["operator_interventions"] == 1
+    assert redis.store == payloads
+
+
+@pytest.mark.parametrize("counter", [0, 1, 2])
+def test_merge_zero_is_known_but_captured_fix_evidence_takes_precedence(counter) -> None:
+    record = _record("merge", run_phase="merge", fix_iterations=counter,
+                     fix_recovery_baseline=counter)
+    totals = task_attempt_totals([record])
+    assert totals["fix_iterations"] == 0
+    assert totals["telemetry"]["fix_iterations"]["status"] == "complete"
+    record.invocations = [_fix_snapshot("merge", 1)] * 2
+    assert task_attempt_totals([record])["fix_iterations"] == 1
+
+
+def test_merge_zero_does_not_make_legacy_history_complete() -> None:
+    records = [
+        _record("merge", run_phase="merge", fix_iterations=1, fix_recovery_baseline=1),
+        _record("legacy-coding"),
+        _record("legacy-fix", run_phase="fix", fix_iterations=1),
+    ]
+    totals = task_attempt_totals(records)
+    assert totals["fix_iterations"] == 0
+    assert totals["telemetry"]["fix_iterations"] == {
+        "known_runs": 1, "total_runs": 3, "status": "partial",
+    }

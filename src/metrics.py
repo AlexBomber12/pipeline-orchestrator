@@ -134,7 +134,8 @@ def task_attempt_totals(records: list[RunRecord]) -> dict[str, object]:
             if (value := (_run_fix_dispatches(record) if name == "fix_iterations"
                           else getattr(record, name))) is not None
             and value >= 0 and (value > 0 or record.telemetry_sources.get(name)
-                                or (name == "fix_iterations" and record.invocations))
+                                or (name == "fix_iterations" and
+                                    (record.invocations or record.run_phase == "merge")))
         ]
         totals[name] = sum(values) if values else None
         completeness[name] = {
@@ -158,6 +159,9 @@ def _run_fix_dispatches(record: RunRecord) -> int | None:
         # and Retry chains may legitimately reuse the same iteration numbers.
         return len({snapshot.fix_iteration for snapshot in record.invocations
                     if snapshot.phase == "fix"})
+    if record.run_phase == "merge":
+        # Merge-only recovery retains allowance counters but dispatches no coder.
+        return 0
     if record.run_phase == "fix":
         return None
     # Older coding records retained their FIX work in place, before separate

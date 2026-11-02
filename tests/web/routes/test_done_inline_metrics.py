@@ -261,3 +261,56 @@ async def test_writer_zero_provenance_reaches_view(measured):
     assert ("output tokens unknown" in rendered) is not measured
     assert ("0 output tokens" in rendered) is measured
     assert "API price unavailable" in rendered
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+async def test_merge_recovery_renders_confirmed_fix_count_without_mutating_history(legacy):
+    from tests.test_metrics import _FakeRedis
+
+    redis = _FakeRedis()
+    store = MetricsStore(redis)
+    records = [
+        _record(run_id=f"coding-{i}", attempt_index=i, fix_iterations=0,
+                exit_reason="coding_complete", outcome="superseded", invocations=[
+                    InvocationSnapshot(
+                        plugin_id="codex", model_override=None, reasoning_effort_override=None,
+                        run_id=f"coding-{i}", attempt_index=i, phase="coding",
+                    ),
+                ]) for i in (1, 2)
+    ] + [
+        _record(run_id="fix", run_phase="fix", attempt_index=2, fix_iterations=1,
+                exit_reason="error", outcome="failed", cause="CRASH", invocations=[
+                    InvocationSnapshot(
+                        plugin_id="codex", model_override=None, reasoning_effort_override=None,
+                        run_id="fix", attempt_index=2, phase="fix", fix_iteration=1,
+                    ),
+                ]),
+        _record(run_id="merge", run_phase="merge", attempt_index=2, fix_iterations=1,
+                fix_recovery_baseline=1, operator_intervention=True,
+                ended_at="2026-05-04T10:00:00+00:00"),
+    ]
+    if legacy:
+        records[0].invocations = []
+    for record in records + records:
+        await store.save(record)
+    payloads = dict(redis.store)
+    context = await _panel([_task("PR-001", TaskStatus.DONE)], redis)
+    view = _views(context, "done")[0]
+    assert view["pr_id"] == "PR-001"
+    totals = view["metrics"]
+    assert totals["attempt_count"] == 4
+    assert totals["fix_iterations"] == 1
+    assert totals["telemetry"]["fix_iterations"] == {
+        "known_runs": 3 if legacy else 4, "total_runs": 4,
+        "status": "partial" if legacy else "complete",
+    }
+    assert totals["exit_reason"] == "success_merged"
+    rendered = web_app.templates.get_template("components/tasks_panel.html").render(**context)
+    for text in ("4 runs", "1 fix", "input tokens unknown", "output tokens unknown",
+                 "1 runs with operator intervention"):
+        assert text in rendered
+    assert bool(re.search(r"1 fix\s+\(partial; 3/4 runs known\)", rendered)) is legacy
+    assert "2 fix" not in rendered
+    stored = await store.list_task_runs("example__alpha", "PR-001")
+    assert {r.run_id: r for r in stored} == {r.run_id: r for r in records}
+    assert redis.store == payloads
