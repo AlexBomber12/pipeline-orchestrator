@@ -149,6 +149,34 @@ def _maybe_wrap_sandbox(
     )
 
 
+def _codex_event_output(stdout: str, stderr: str) -> tuple[str, str]:
+    """Separate the final answer from typed CLI history and native diagnostics.
+
+    A tool's quoted error is nested inside item.completed, never a top-level
+    error/turn.failed event. Keep the JSONL stream intact in stderr for the
+    existing diagnostic reader; final-answer consumers still receive plain
+    agent text, not tool output containing old PR URLs or ESCALATE examples.
+    """
+    structured = False
+    final_message = None
+    for line in stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or not isinstance(event.get("type"), str):
+            continue
+        structured = True
+        item = event.get("item")
+        if (event.get("type") == "item.completed" and isinstance(item, dict)
+            and item.get("type") == "agent_message" and isinstance(item.get("text"), str)):
+            final_message = item["text"]
+    if structured:
+        stderr = stdout + ("\n" if stdout and not stdout.endswith("\n") else "") + stderr
+        stdout = final_message or ""
+    return stdout, stderr
+
+
 async def run_codex_async(
     prompt: str,
     cwd: str,
@@ -171,6 +199,7 @@ async def run_codex_async(
         "exec",
         "--sandbox",
         "danger-full-access",
+        "--json",
     ]
     if model:
         cmd.extend(["--model", model])
@@ -234,6 +263,7 @@ async def run_codex_async(
     # Codex echoes the supplied user prompt to stderr, including quoted provider
     # errors in task text. That known echo is not diagnostic evidence.
     stderr = stderr.replace(f"user\n{prompt}\n", "user\n[echoed prompt omitted]\n")
+    stdout, stderr = _codex_event_output(stdout, stderr)
     code = result.returncode
     logger.info("[codex] codex exec exited with code %s", code)
     return (code, stdout, stderr)

@@ -1074,12 +1074,17 @@ async def test_held_failure_queue_projection_is_bound(lifecycle, case):
 
 @pytest.mark.parametrize('published', [False, True])
 @pytest.mark.parametrize('dirty', [False, True])
-@pytest.mark.parametrize('diagnostic', ['capacity', 'rate_limit'])
+@pytest.mark.parametrize('diagnostic', ['capacity', 'rate_limit', 'structured_capacity', 'structured_rate_limit'])
 @pytest.mark.parametrize('feedback_source', ['review', 'ci', 'both'])
 @pytest.mark.parametrize('interrupted_before_work', [False, True])
 async def test_provider_interrupted_fix_preserves_work_and_eventually_progresses(
     lifecycle, monkeypatch, published, dirty, diagnostic, feedback_source, interrupted_before_work,
 ):
+    import json
+
+    from src.codex_cli import _codex_event_output
+    structured = diagnostic.startswith("structured_")
+    diagnostic = diagnostic.removeprefix("structured_")
     runner, provider, repo, old, expected, configure = lifecycle
     remote = git(repo, 'remote', 'get-url', 'origin')
     git(remote, 'update-ref', 'refs/heads/pr-001', old)
@@ -1138,6 +1143,13 @@ async def test_provider_interrupted_fix_preserves_work_and_eventually_progresses
                        'ERROR: Selected model is at capacity. Please try a different model.\n'
                        'ERROR: rollout recording failed: missing thread'
                        if diagnostic == 'capacity' else 'ERROR: HTTP 429 Too Many Requests. Try again in 2 hours.')
+            if structured:
+                stream = json.dumps({"type": "item.started", "item": {
+                    "type": "command_execution", "command": "pytest --full-gate"}})
+                stream += "\n" + json.dumps({"type": "item.updated", "item": {
+                    "type": "command_execution", "aggregated_output": "quoted: Error: HTTP 429 Too Many Requests"}})
+                stdout, stderr = _codex_event_output(stream, message)
+                return 1, stdout, stderr
             return 1, '', 'Task: PR-429\n' + message
         assert kwargs['model'] == calls[0]['model'] == 'gpt-5.4'
         assert kwargs['reasoning_effort'] == calls[0]['reasoning_effort'] == 'high'
