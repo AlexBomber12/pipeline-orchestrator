@@ -168,6 +168,7 @@ from src.subsource_registry import (
 from src.suppression.redis_store import RedisSuppressionStore
 from src.usage import UsageProvider
 from src.utils import repo_slug_from_url
+from src.web.services.upload_validation import task_spec_replay_matches
 
 logger = logging.getLogger(__name__)
 
@@ -2815,7 +2816,13 @@ class PipelineRunner(
                     task_bytes = isolated_task.read_bytes()
                     task_text = task_bytes.decode("utf-8")
                     if task_spec_content_hash(task_text) != admitted_hash:
-                        raise ValueError("remote task differs from admitted generation")
+                        try:
+                            retained_text = (repo_root / task_path).read_text(encoding="utf-8")
+                        except (OSError, UnicodeError) as exc:
+                            raise ValueError("remote task differs from admitted generation") from exc
+                        if (task_spec_content_hash(retained_text) != admitted_hash
+                                or not task_spec_replay_matches(retained_text, task_text)):
+                            raise ValueError("remote task differs from admitted generation")
                     if (expected_task_sha256 is not None
                             and hashlib.sha256(task_bytes).hexdigest()
                             != expected_task_sha256):

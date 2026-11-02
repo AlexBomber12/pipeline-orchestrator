@@ -2431,7 +2431,26 @@ async def _real_repaired_fix(tmp_path, monkeypatch, mode="success"):
     if mode == "fetch_failure":
         remote.rename(tmp_path / "offline.git")
 
+    canonical = "https://github.com/octo/demo"
+    git(repo, "remote", "set-url", "origin", canonical)
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "url." + remote.as_uri() + ".insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", canonical)
+    runner.repo_config = runner.repo_config.model_copy(update={"url": canonical})
+    real_status_write = runner._commit_task_status_change
+
     async def status_write(*args, **kwargs):
+        if not await real_status_write(*args, **kwargs):
+            return False
+        git(repo, "fetch", "origin", "main")
+        if mode != "accounting_generation_changed":
+            if mode == "accounting_snapshot_missing":
+                monkeypatch.setattr(runner, "_origin_retry_task_text", lambda command: None)
+            if mode == "accounting_local_unreadable":
+                def unreadable(**kwargs):
+                    raise OSError("controlled read failure")
+                monkeypatch.setattr(runner, "_retry_task_path", lambda command: SimpleNamespace(read_text=unreadable))
+            return True
         status = tmp_path / "status"
         subprocess.run(["git", "clone", "-b", "main", str(remote), str(status)], check=True, capture_output=True)
         git(status, "config", "user.email", "fixture@test.invalid")
@@ -2474,6 +2493,8 @@ async def test_operator_retry_preserves_reflowed_generation_and_published_repair
     assert successor.task_spec_hash != record.task_spec_hash
     assert git(Path(runner.repo_path), "rev-parse", "HEAD") == original
     assert not git(Path(runner.repo_path), "status", "--porcelain")
+    published_task = git(Path(runner.repo_path).parent / "remote.git", "show", "main:tasks/PR-42.md")
+    assert "status: TODO" in published_task and "blocked_reason:" not in published_task
     receipt = await load_retry_command(runner.redis, runner.name, command.command_id)
     assert receipt.status == RetryCommandStatus.APPLIED and receipt.retry_count == 1
     await runner.publish_state()
@@ -2515,3 +2536,36 @@ async def test_repair_retry_binding_requires_available_current_head(tmp_path, mo
         runner.redis, runner.name, task, Path(runner.repo_path) / task.task_file,
         task.task_file, retry_count=0, state=runner.state,
     ) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["missing", "local_changed", "remote_changed", "byte_pin"])
+async def test_status_reflow_requires_retained_admitted_bytes(tmp_path, monkeypatch, mode):
+    from types import MethodType
+
+    from src.daemon.runner import PipelineRunner
+    runner, _command_record, record, previous, _old, _new, git = await _real_repaired_fix(tmp_path, monkeypatch)
+    local = Path(runner.repo_path) / runner.state.current_task.task_file
+    expected = {}
+    if mode == "missing":
+        local.unlink()
+    elif mode == "local_changed":
+        local.write_text(local.read_text() + "Unadmitted local generation.\n")
+    elif mode == "remote_changed":
+        revised = tmp_path / "revised"
+        subprocess.run(["git", "clone", "-b", "main", str(tmp_path / "remote.git"), str(revised)],
+                       check=True, capture_output=True)
+        git(revised, "config", "user.email", "fixture@test.invalid")
+        git(revised, "config", "user.name", "Revision fixture")
+        with (revised / runner.state.current_task.task_file).open("a") as output:
+            output.write("Unadmitted remote generation.\n")
+        git(revised, "add", ".")
+        git(revised, "commit", "-m", "changed task generation")
+        git(revised, "push", "origin", "main")
+    else:
+        import hashlib
+        expected["expected_task_sha256"] = hashlib.sha256(local.read_bytes()).hexdigest()
+    write = MethodType(PipelineRunner._commit_task_status_change, runner)
+    assert not await write(runner.state.current_task, "TODO", "operator Retry", **expected)
+    assert asdict(await runner._metrics_store.get(record.run_id)) == previous
+    assert "status: ERROR" in git(tmp_path / "remote.git", "show", "main:tasks/PR-42.md")
