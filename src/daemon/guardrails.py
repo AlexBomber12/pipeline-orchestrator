@@ -10,6 +10,7 @@ surrounded by negating words.
 
 from __future__ import annotations
 
+import json
 import re
 import shlex
 from dataclasses import dataclass
@@ -1553,8 +1554,49 @@ def _scan_branch_delete_main(coder_stdout: str) -> list[GuardrailViolation]:
     return violations
 
 
+def _structured_command_evidence(coder_stdout: str) -> str:
+    """Decode only executed-command fields, never quoted tool output.
+
+    Keep legacy text scanning unchanged. JSONL item updates repeat the same
+    command, so retain one copy per item identity. Native shell wrappers are
+    transport: their -c/-lc payload is the command the existing catalog scans.
+    """
+    commands = []
+    seen = set()
+    for line in coder_stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(event, dict) or event.get("type") not in {
+            "item.started", "item.updated", "item.completed",
+        }:
+            continue
+        item = event.get("item")
+        if not isinstance(item, dict) or item.get("type") != "command_execution":
+            continue
+        command = item.get("command")
+        if not isinstance(command, str) or not command:
+            continue
+        item_id = item.get("id")
+        identity = (item_id if isinstance(item_id, str) else None, command)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        commands.append(command)
+        try:
+            argv = shlex.split(command)
+        except ValueError:
+            continue
+        if (len(argv) >= 3 and argv[0].rsplit("/", 1)[-1] in {"sh", "bash", "dash", "zsh"}
+            and argv[1] in {"-c", "-lc"}):
+            commands.append(argv[2])
+    return coder_stdout + "\n" + "\n".join(commands)
+
+
 def scan_stdout(coder_stdout: str) -> list[GuardrailViolation]:
     """Return guardrail violations found in captured coder stdout."""
+    coder_stdout = _structured_command_evidence(coder_stdout)
     violations: list[GuardrailViolation] = _scan_branch_delete_main(coder_stdout)
     for category in sorted(_TIER1_PATTERNS):
         pattern = _TIER1_PATTERNS[category]

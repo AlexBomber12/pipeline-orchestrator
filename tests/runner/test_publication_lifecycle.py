@@ -2831,3 +2831,20 @@ async def test_repeated_coding_publication_retains_each_owned_head(
     for record in before:
         assert await runner._metrics_store.get(record.run_id) == record
     assert await runner._metrics_store.get(original.run_id) == original
+
+
+async def test_structured_forbidden_command_is_not_retried_as_capacity(lifecycle):
+    import json
+
+    from src.codex_cli import _codex_event_output
+    from src.daemon.guardrails import scan_stdout
+
+    runner, _provider, _repo, _old, _expected, _configure = lifecycle
+    raw = json.dumps({"type": "item.started", "item": {"id": "exec-1", "type": "command_execution",
+                     "command": "gh repo delete octo/demo --yes"}})
+    stdout, stderr = _codex_event_output(raw, "ERROR: Selected model is at capacity")
+    assert scan_stdout(stdout + "\n" + stderr)
+    await publication.record_exit(runner, 1, stdout, stderr)
+    assert runner.state.publication_attempt.exit_classification == "failure"
+    assert runner.state.publication_attempt.provider_error is None
+    assert runner.state.state != PipelineState.PAUSED
