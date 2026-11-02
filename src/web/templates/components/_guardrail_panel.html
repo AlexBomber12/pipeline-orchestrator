@@ -1,17 +1,9 @@
-{# Durable approval results remain visible after the cancellation is cleared. #}
-{% if guardrail_pending %}
-<section class="guardrail-panel mb-6 rounded-lg border border-warn/30 bg-warn/10 p-4"
-         data-guardrail-panel
-         id="guardrail-panel-{{ repo.name }}">
-    <header class="mb-3 flex items-center gap-2">
-        <h3 class="text-sm font-semibold text-warn">Guardrail decisions</h3>
-        <span class="rounded border border-warn/30 bg-warn/10 px-2 py-0.5 font-mono text-[11px] text-warn">{{ guardrail_pending | length }}</span>
-    </header>
-    <ul class="space-y-2">
-        {% for entry in guardrail_pending %}
-        <li class="guardrail-row flex flex-col gap-2 rounded border border-warn/20 bg-surface-2 px-3 py-2 sm:flex-row sm:items-center"
+{# All records use the same binding-aware classification as dashboard attention. #}
+{% macro guardrail_row(entry) %}
+        <li class="guardrail-row flex flex-col gap-2 rounded border {% if entry.group == 'action' %}border-warn/30 bg-warn/10{% elif entry.group == 'failed' %}border-fail/30 bg-fail/10{% else %}border-gray-700 bg-surface-2{% endif %} px-3 py-2 sm:flex-row sm:items-center"
             data-guardrail-row
-            data-pr-id="{{ entry.pr_id }}">
+            data-pr-id="{{ entry.pr_id }}" data-guardrail-group="{{ entry.group }}"
+            data-approval-binding="{{ entry.approval.binding if entry.approval else entry.approval_binding | default('') }}">
             <div class="flex flex-col gap-1 sm:flex-1">
                 <div class="flex flex-wrap items-baseline gap-2">
                     {% if entry.pr_url %}
@@ -20,21 +12,29 @@
                     {% else %}
                     <span class="font-mono text-sm text-gray-200">{{ entry.pr_id }}</span>
                     {% endif %}
-                    <span class="font-mono text-[11px] text-warn">{{ entry.rule }}</span>
+                    <span class="font-mono text-[11px] text-gray-400">{{ entry.rule }}</span>
                     <time class="ml-auto font-mono text-[11px] text-gray-400"
                           data-ts-unix="{{ entry.recorded_at }}">{{ entry.recorded_at_text }}</time>
                 </div>
                 <p class="break-words text-xs text-gray-300">{{ entry.excerpt }}</p>
+                {% if entry.group == "applying" %}
+                <p class="text-xs text-gray-200">Approved, being applied</p>
+                {% elif entry.group == "failed" %}
+                <p class="text-xs text-fail">Approval could not be applied. This acknowledgement cannot be retried; inspect the reason or reject the PR.</p>
+                {% elif entry.group == "unknown" %}
+                <p class="text-xs text-gray-400">Current decision unavailable; refresh when its context can be verified.</p>
+                {% endif %}
                 {% if entry.approval %}
                 <p class="text-xs text-gray-200" data-approval-status="{{ entry.approval.status }}">
                     Approval {{ entry.approval.status }}: {{ entry.approval.reason }}
                 </p>
-                {% elif entry.approval_unavailable %}
-                <p class="text-xs text-fail">Approval status unavailable; refresh when Redis recovers.</p>
+                {% endif %}
+                {% if entry.approval_unavailable %}
+                <p class="text-xs text-gray-400">Approval status unavailable; refresh when Redis recovers.</p>
                 {% endif %}
             </div>
             <div class="flex items-center justify-end gap-2">
-                {% if entry.is_active and entry.approval_binding and (not entry.approval or entry.approval.binding != entry.approval_binding) %}
+                {% if entry.group == "action" %}
                 <button type="button"
                         class="approve-btn rounded border border-ok/40 bg-ok/15 px-3 py-1 text-xs font-semibold text-ok hover:bg-ok/25"
                         hx-post="/repos/{{ repo.name }}/guardrail/{{ entry.pr_id }}/decision"
@@ -42,10 +42,10 @@
                         hx-confirm="Approve guardrail violation for {{ entry.pr_id }}? The daemon will apply it when safe. CI and review remain required."
                         hx-target="this"
                         hx-swap="outerHTML">
-                    Approve
+                    Approve current PR
                 </button>
                 {% endif %}
-                {% if not entry.approval or entry.approval.status != "applied" or (entry.approval_binding and entry.approval.binding != entry.approval_binding) %}
+                {% if entry.group in ["action", "applying", "failed"] %}
                 <button type="button"
                         class="reject-btn rounded border border-fail/40 bg-fail/15 px-3 py-1 text-xs font-semibold text-fail hover:bg-fail/25"
                         hx-post="/repos/{{ repo.name }}/guardrail/{{ entry.pr_id }}/decision"
@@ -59,7 +59,28 @@
                 {% endif %}
             </div>
         </li>
-        {% endfor %}
+{% endmacro %}
+{% if guardrail_pending %}
+<section class="guardrail-panel mb-6 rounded-lg border border-gray-700 p-4"
+         data-guardrail-panel id="guardrail-panel-{{ repo.name }}">
+    {% set current = guardrail_pending | rejectattr("group", "equalto", "history") | list %}
+    {% set history = guardrail_pending | selectattr("group", "equalto", "history") | list %}
+    {% if current %}
+    <h3 class="mb-3 text-sm font-semibold text-gray-200">Guardrail decisions</h3>
+    <ul class="space-y-2">
+        {% for entry in current %}{{ guardrail_row(entry) }}{% endfor %}
     </ul>
+    {% endif %}
+    {% if history %}
+    <details class="mt-2 text-gray-400" data-guardrail-history>
+        <summary class="cursor-pointer text-sm">Guardrail history ({{ history | length }})</summary>
+        <p class="my-2 text-xs">Retained results within the recent history window; older results may be omitted.
+            <a class="secondary-interactive text-accent" href="/repo/{{ repo.name }}/rejects">Rejection records</a>
+        </p>
+        <ul class="space-y-2">
+            {% for entry in history %}{{ guardrail_row(entry) }}{% endfor %}
+        </ul>
+    </details>
+    {% endif %}
 </section>
 {% endif %}

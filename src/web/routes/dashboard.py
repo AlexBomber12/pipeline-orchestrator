@@ -22,7 +22,7 @@ import redis.asyncio as aioredis
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 
-from src.approval_commands import build_approval, list_approvals
+from src.approval_commands import build_approval, list_approvals, load_approval
 from src.cancellation import (
     classify_cancellation_subsource,
     list_recent_cancellations,
@@ -413,6 +413,26 @@ def _serialize_guardrail_pending(
     }
 
 
+def _guardrail_group(view: dict[str, Any]) -> str:
+    """Classify only verified current decisions as actionable or applying."""
+    if view.get("approval_unavailable"):
+        return "unknown"
+    if not view["is_active"]:
+        return "history"
+    binding = view.get("approval_binding")
+    if not binding:
+        return "unknown"
+    approval = view.get("approval")
+    if not approval or approval["binding"] != binding:
+        return "action"
+    if approval.get("superseded"):
+        return "history"
+    return {
+        "pending": "applying", "deferred": "applying", "failed": "failed",
+        "applied": "history",
+    }[approval["status"]]
+
+
 async def _build_guardrail_pending_view(
     redis_client: aioredis.Redis | None,
     repo_name: str,
@@ -471,20 +491,30 @@ async def _build_guardrail_pending_view(
         commands = await list_approvals(redis_client, repo_name, recent=True)
         commands += await list_approvals(redis_client, repo_name)
         commands = sorted({c.binding: c for c in commands}.values(), key=lambda c: c.requested_at)
+        history_commands = commands[-20:]
+        represented: set[str] = set()
         for view in views:
             if view["is_active"]:
                 raw = await redis_client.get(cause_key(repo_name, view["pr_id"]))
                 try:
                     command = build_approval(repo_name, state, raw, Path(_app.REPOS_DIR) / repo_name)
                     view["approval_binding"] = command.binding
+                    # A current receipt may be older than the recent window.
+                    existing = await load_approval(redis_client, repo_name, command.binding)
+                    if existing and all(c.binding != existing.binding for c in commands):
+                        commands.append(existing)
                 except (ValueError, OSError):
                     view["approval_binding"] = None
             matching = [c for c in commands if c.task.pr_id == view["pr_id"]]
-            if matching:
-                view["approval"] = matching[-1].model_dump(mode="json")
-        visible = {v["pr_id"] for v in views}
-        for command in commands[-20:]:
-            if command.task.pr_id not in visible:
+            current = next((c for c in matching if c.binding == view.get("approval_binding")), None)
+            # Inactive rows can describe the latest receipt, but an old binding
+            # must never supply the state of a current decision.
+            receipt = current or (matching[-1] if matching and not view["is_active"] else None)
+            if receipt:
+                view["approval"] = receipt.model_dump(mode="json")
+                represented.add(receipt.binding)
+        for command in history_commands:
+            if command.binding not in represented:
                 views.append({
                     "pr_id": command.task.pr_id, "rule": "Approval result", "excerpt": "",
                     "recorded_at": int(command.requested_at.timestamp()),
@@ -495,6 +525,8 @@ async def _build_guardrail_pending_view(
     except Exception:
         for view in views:
             view["approval_unavailable"] = True
+    for view in views:
+        view["group"] = _guardrail_group(view)
     return views
 
 
@@ -657,7 +689,7 @@ async def _repo_template_context(
         "repo": state,
         "work_summary": await _work_summary(
             state, redis_client,
-            guardrail_decision=any(entry["is_active"] for entry in guardrail_pending),
+            guardrail_decision=any(entry["group"] == "action" for entry in guardrail_pending),
             stale_after=max(300, (repo_config.poll_interval_sec if repo_config else 60) * 3,
                             config.daemon.idle_extended_poll_interval_sec * 2,
                             config.daemon.watch_slow_poll_interval_sec * 2),
@@ -1008,6 +1040,19 @@ def _alert_reference_time(state: RepoState) -> datetime:
     if transition is not None:
         return transition
     return state.last_updated
+
+
+async def _dashboard_alerts(states: list[RepoState], redis_client: Any) -> list[dict[str, Any]]:
+    """Use panel classification for guardrail attention on every dashboard surface."""
+    attention = []
+    for state in states:
+        if state.state in _ALERT_STATES and state.current_task and state.current_pr:
+            views = await _build_guardrail_pending_view(redis_client, state.name, state)
+            current = [view for view in views if view["is_active"]]
+            if current and not any(view["group"] in {"action", "failed"} for view in current):
+                continue
+        attention.append(state)
+    return _build_alerts(attention)
 
 
 def _build_alerts(states: list[RepoState]) -> list[dict[str, Any]]:
@@ -1551,7 +1596,8 @@ async def index(request: Request) -> HTMLResponse:
     states = await _attach_upload_pending_counts(states, redis_client)
     config = await asyncio.to_thread(load_config, _app.CONFIG_PATH)
     stats = _compute_stats(states)
-    alerts = _build_alerts(states)
+    alerts = await _dashboard_alerts(states, redis_client)
+    stats["alerts"] = len(alerts)
     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
     panic_state = await _read_panic_state_for_banner(redis_client)
     cancellation_subsources = await _build_cancellation_subsources(
@@ -1609,15 +1655,15 @@ async def api_alerts(request: Request) -> JSONResponse:
     Returns ``{"has_alerts": bool, "count": int}``. Sized independently of
     the repo count so the per-poll cost does not grow with deployment size,
     unlike ``/api/states`` which serializes every ``RepoState`` in full.
-    The alert criterion mirrors ``_ALERT_STATES`` (ERROR) so the badge
-    and the dashboard ``alerts`` panel agree on what an alert is.
+    Uses the same binding-aware guardrail classification as the alerts panel;
+    accepted decisions being applied do not request operator attention.
     """
     redis_client = getattr(request.app.state, "redis", None)
     states, _warning = await _app.get_all_repo_states(
         redis_client, _app.CONFIG_PATH
     )
     states = await _attach_upload_pending_counts(states, redis_client)
-    count = sum(1 for s in states if s.state in _ALERT_STATES)
+    count = len(await _dashboard_alerts(states, redis_client))
     return JSONResponse({"has_alerts": count > 0, "count": count})
 
 
@@ -2055,7 +2101,8 @@ async def partial_stats(request: Request) -> HTMLResponse:
         redis_client, _app.CONFIG_PATH
     )
     stats = _compute_stats(states)
-    alerts = _build_alerts(states)
+    alerts = await _dashboard_alerts(states, redis_client)
+    stats["alerts"] = len(alerts)
     latest_alert = min(alerts, key=lambda a: a["duration_seconds"]) if alerts else None
     return _app.templates.TemplateResponse(
         request,
@@ -2084,7 +2131,7 @@ async def partial_alerts(request: Request) -> HTMLResponse:
     states, _warning = await _app.get_all_repo_states(
         redis_client, _app.CONFIG_PATH
     )
-    alerts = _build_alerts(states)
+    alerts = await _dashboard_alerts(states, redis_client)
     return _app.templates.TemplateResponse(
         request,
         "components/alerts_panel.html",

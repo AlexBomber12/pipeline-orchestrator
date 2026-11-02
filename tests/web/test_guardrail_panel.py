@@ -549,6 +549,7 @@ def _view(
         "pr_url": pr_url,
         "is_active": is_active,
         "approval_binding": "bound-decision",
+        "group": "action" if is_active else "history",
     }
 
 
@@ -670,9 +671,8 @@ def test_repo_detail_route_passes_guardrail_pending_to_template(
     assert "guardrail-panel" in resp.text
     assert "PR-296" in resp.text
     assert "PR-LATER" in resp.text
-    assert (
-        "/repos/example__alpha/guardrail/PR-296/decision" in resp.text
-    )
+    assert 'data-guardrail-group="unknown"' in resp.text
+    assert "/repos/example__alpha/guardrail/PR-296/decision" not in resp.text
 
 
 def test_repo_detail_route_omits_panel_when_no_pending(
@@ -773,14 +773,13 @@ def test_panel_hides_approve_button_for_inactive_entry() -> None:
     html = _render_panel(guardrail_pending=[_view("PR-OTHER", is_active=False)])
     assert "approve-btn" not in html
     assert "Approve guardrail violation" not in html
-    # Reject remains because the reject endpoint accepts non-current PRs.
-    assert "reject-btn" in html
-    assert "Reject guardrail violation for PR-OTHER" in html
+    assert "reject-btn" not in html
+    assert "Guardrail history" in html
 
 
 def test_panel_shows_approve_only_on_active_row_in_mixed_list() -> None:
     """When the panel lists both active and historical entries, only the
-    active row gets an Approve button — Reject still renders for both."""
+    active row gets decision controls; history has none."""
     html = _render_panel(
         guardrail_pending=[
             _view("PR-CURRENT", is_active=True),
@@ -790,6 +789,6 @@ def test_panel_shows_approve_only_on_active_row_in_mixed_list() -> None:
     assert html.count("approve-btn") == 1
     assert "Approve guardrail violation for PR-CURRENT" in html
     assert "Approve guardrail violation for PR-OTHER" not in html
-    assert html.count("reject-btn") == 2
+    assert html.count("reject-btn") == 1
     assert "Reject guardrail violation for PR-CURRENT" in html
-    assert "Reject guardrail violation for PR-OTHER" in html
+    assert "Reject guardrail violation for PR-OTHER" not in html
