@@ -405,6 +405,13 @@ class RetryCommandMixin:
                 pr.number, target, expected_branch=command.task_branch,
             )
             if not outcome.discovery_complete:
+                if outcome.reason in {
+                    "head mismatch", "identity mismatch", "invalid identity",
+                    "head repository or branch mismatch",
+                }:
+                    return await self._fail_retry_command(
+                        command, "Repaired PR identity or HEAD changed; refresh Retry.",
+                    )
                 return await self._defer_retry_command(command, "Repaired PR publication evidence unavailable.")
             if outcome.state != gh_prs.ExactPRState.OPEN:
                 return await self._fail_retry_command(

@@ -2439,6 +2439,7 @@ async def _real_repaired_fix(tmp_path, monkeypatch, mode="success"):
     monkeypatch.setattr(retry_module.gh_prs, "get_exact_pr_outcome", lambda *a, **k: SimpleNamespace(
         discovery_complete=mode != "unknown",
         state=ExactPRState.CLOSED if mode == "changed_head" else ExactPRState.OPEN,
+        reason="transport unavailable" if mode == "unknown" else None,
     ))
     if mode == "local_work":
         (repo / "local.txt").write_text("unpublished work\n")
@@ -2536,6 +2537,41 @@ async def test_repaired_fix_retry_retains_work_when_evidence_conflicts(tmp_path,
     assert runner.state.publication_attempt.expected_head_sha == original
     assert runner._current_run_record.run_id == record.run_id
     assert len(runner._current_run_record.invocations) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", [
+    "head mismatch", "identity mismatch", "invalid identity", "head repository or branch mismatch",
+    "stale cache", "malformed response", "transport unavailable",
+])
+async def test_repaired_fix_retry_rejects_definitive_mismatches(tmp_path, monkeypatch, reason):
+    from src.github.prs import ExactPROutcome, ExactPRState
+    from src.retry_commands import list_pending_retry_commands
+
+    runner, command, record, previous, original, target, git = await _real_repaired_fix(tmp_path, monkeypatch)
+    outcome = ExactPROutcome(
+        runner.owner_repo, runner.repo_config.branch, command.bound_pr_number, target,
+        ExactPRState.UNKNOWN, False, reason=reason,
+        observed_head_sha="f" * 40 if reason == "head mismatch" else None,
+    )
+    monkeypatch.setattr(retry_module.gh_prs, "get_exact_pr_outcome", lambda *a, **k: outcome)
+    assert await runner._apply_retry_command(command) == RetryDispatch.HANDLED
+    receipt = await load_retry_command(runner.redis, runner.name, command.command_id)
+    transient = reason in {"stale cache", "malformed response", "transport unavailable"}
+    assert receipt.status == (RetryCommandStatus.DEFERRED if transient else RetryCommandStatus.FAILED)
+    pending = await list_pending_retry_commands(runner.redis, runner.name)
+    assert [item.command_id for item in pending] == ([command.command_id] if transient else [])
+    if not transient:
+        assert receipt.execution_state == RetryExecutionState.FAILED
+        assert "refresh Retry" in receipt.outcome_reason
+        assert await runner._consume_retry_command() == RetryDispatch.NONE
+    assert runner.state.state == PipelineState.ERROR
+    assert runner.state.current_pr.head_sha == original
+    assert runner.state.publication_attempt.pending
+    assert runner.state.publication_attempt.expected_head_sha == original
+    assert runner._current_run_record.run_id == record.run_id
+    assert asdict(await runner._metrics_store.get(record.run_id)) == previous
+    assert git(Path(runner.repo_path), "rev-parse", "HEAD") == original
 
 
 @pytest.mark.asyncio
