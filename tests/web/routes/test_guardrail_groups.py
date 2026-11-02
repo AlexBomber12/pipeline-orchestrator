@@ -3,6 +3,7 @@ from datetime import timedelta
 from unittest.mock import AsyncMock
 
 import pytest
+from fastapi.testclient import TestClient
 from src.approval_commands import build_approval
 from src.cancellation.storage import CancellationCause, GuardrailPending
 from src.models import PipelineState, PRInfo, QueueTask, RepoState
@@ -153,3 +154,30 @@ async def test_alerts_share_guardrail_classification(context, monkeypatch, group
         dict(is_active=False, group='history'),
     ]))
     assert len(await dashboard._dashboard_alerts([state], redis)) == 1
+
+
+@pytest.mark.parametrize(('status', 'expected'), [
+    ('pending', 1), ('deferred', 1), ('failed', 2), (None, 2),
+])
+def test_stats_api_uses_binding_aware_alert_count(context, monkeypatch, status, expected):
+    state, command, redis = context
+    state.state = PipelineState.ERROR
+    if status:
+        command.status = status
+    receipt = command if status else None
+    monkeypatch.setattr(dashboard, 'list_approvals', AsyncMock(return_value=[receipt] if receipt else []))
+    monkeypatch.setattr(dashboard, 'load_approval', AsyncMock(return_value=receipt))
+    unrelated = RepoState(name='example__other', url='https://github.com/example/other',
+                          state=PipelineState.ERROR)
+    active = RepoState(name='example__active', url='https://github.com/example/active',
+                       state=PipelineState.CODING)
+    monkeypatch.setattr(web_app.app.state, 'redis', redis, raising=False)
+    monkeypatch.setattr(web_app, 'get_all_repo_states', AsyncMock(return_value=([state, unrelated, active], None)))
+    monkeypatch.setattr(dashboard, 'get_upload_pending_count', AsyncMock(return_value=0))
+    client = TestClient(web_app.app)
+    stats = client.get('/api/stats')
+    alerts = client.get('/api/alerts')
+    assert stats.status_code == alerts.status_code == 200
+    assert stats.json()['alerts'] == alerts.json()['count'] == expected
+    assert stats.json()['repos'] == 3
+    assert stats.json()['active'] == 1

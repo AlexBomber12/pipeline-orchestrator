@@ -1645,7 +1645,9 @@ async def api_stats(request: Request) -> JSONResponse:
         redis_client, _app.CONFIG_PATH
     )
     states = await _attach_upload_pending_counts(states, redis_client)
-    return JSONResponse(_compute_stats(states))
+    stats = _compute_stats(states)
+    stats["alerts"] = len(await _dashboard_alerts(states, redis_client))
+    return JSONResponse(stats)
 
 
 @router.get("/api/alerts")
