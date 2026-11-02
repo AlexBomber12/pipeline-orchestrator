@@ -18,7 +18,10 @@
    fallback covers repos beyond MAX_STREAMS (the SSE manager below only
    subscribes to the first slice), and also catches the case where SSE
    itself is unreachable. #}
-<div hx-get="/partials/repo-list"
+<div id="grid-refresh-warning" role="status" class="mb-3 text-sm text-warn"
+     {% if observation_available %}hidden{% endif %}>Report unavailable; retrying.</div>
+<div data-observed-at="{{ observation_now.isoformat() if observation_available else '' }}"
+     hx-get="/partials/repo-list"
      hx-trigger="repo:state_change from:body, repo:history_updated from:body, every 30s"
      hx-swap="innerHTML"
      id="repo-grid">
@@ -37,6 +40,42 @@
             window.repoProgressSSEManager.scan();
             return;
         }
+
+        const grid = document.getElementById('repo-grid');
+        const warning = document.getElementById('grid-refresh-warning');
+        function showRetainedData(event) {
+            if (event.target !== grid) return;
+            const observed = grid.dataset.observedAt;
+            const time = observed ? new Date(observed).toLocaleTimeString([], {
+                hour: '2-digit', minute: '2-digit', hour12: false
+            }) : null;
+            warning.textContent = time
+                ? 'Data from ' + time + '; refresh unavailable. Will be retried.'
+                : 'Report unavailable. Will be retried.';
+            warning.hidden = false;
+        }
+        ['htmx:responseError', 'htmx:sendError'].forEach(function (name) {
+            grid.addEventListener(name, showRetainedData);
+        });
+        grid.addEventListener('htmx:beforeSwap', function (event) {
+            if (event.target !== grid) return;
+            const xhr = event.detail.xhr;
+            if (xhr.status >= 400 ||
+                xhr.getResponseHeader('X-Observation-Available') === 'false') {
+                // Cancel HTMX's swap even if a bubbling handler enables error fragments.
+                event.preventDefault();
+                event.detail.shouldSwap = false;
+                showRetainedData(event);
+            }
+        });
+        grid.addEventListener('htmx:afterSwap', function (event) {
+            if (event.target !== grid) return;
+            const xhr = event.detail.xhr;
+            if (xhr.getResponseHeader('X-Observation-Available') === 'true') {
+                grid.dataset.observedAt = xhr.getResponseHeader('X-Observation-Time');
+                warning.hidden = true;
+            }
+        });
 
         const MAX_STREAMS = 8;
         const BASE_DELAY_MS = 1000;

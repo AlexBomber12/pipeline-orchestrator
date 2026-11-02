@@ -413,7 +413,12 @@ def test_global_spinner_present_on_dashboard(
         "requestConfig.triggeringEvent"
     )
     assert "requestConfig.triggeringEvent" in response.text
-    assert "htmx:sendError" not in response.text
+    # The spinner relies on afterRequest for cleanup; independent grid error
+    # handlers may also listen for sendError without affecting that contract.
+    spinner_script = response.text.split(
+        "const spinner = document.getElementById('global-spinner');", 1
+    )[1].split("</script>", 1)[0]
+    assert "htmx:sendError" not in spinner_script
     assert "body.htmx-request #global-spinner" in response.text
 
 

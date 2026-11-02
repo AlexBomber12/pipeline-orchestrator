@@ -28,6 +28,13 @@
     {% for repo in repos %}
     {% set is_synthetic = repo.error_message in init_messages %}
     {% set style = repo_state.state_styles.get(repo.state.value, repo_state.state_styles['IDLE']) %}
+    {% set _now = observation_now | default(utcnow()) %}
+    {% set _age = none %}
+    {% if not is_synthetic and repo.last_updated is defined and repo.last_updated.timestamp is defined
+          and repo.last_updated.tzinfo and ('last_updated' in repo.model_fields_set) %}
+    {% set _age = [0, (_now.timestamp() - repo.last_updated.timestamp()) | int] | max %}
+    {% endif %}
+    {% set _stale = _age is not none and _age > (observation_stale_after | default(600)) %}
     {% set is_error = repo.state.value == 'ERROR' and not is_synthetic %}
     {% set upload_target = upload_feedback_target(repo.name) %}
     {% set upload_input_selector = '#upload-' ~ css_escape(repo.name) %}
@@ -50,7 +57,7 @@
                     </span>
                     {% else %}
                     <span class="text-xs font-medium px-2 py-0.5 rounded border {{ style.badge }} {% if style.pulse %}pulse-badge{% endif %}" data-state-label>
-                        {% if style.glyph %}<span aria-hidden="true">{{ style.glyph }}</span> {% endif %}{{ repo.state.value }}
+                        {% if (_stale or _age is none) and repo.state.value not in ('PAUSED', 'IDLE') %}Last known: {% endif %}{% if style.glyph %}<span aria-hidden="true">{{ style.glyph }}</span> {% endif %}{{ repo.state.value }}
                     </span>
                     {# PR-352: sub-phase subtitle under MERGE badge so the operator
                        can distinguish pre_merge_sync / ready_to_merge / merging /
@@ -203,6 +210,11 @@
             {%- endif %}
         </div>
         {% endif %}
+        <div class="mt-3 text-xs {{ 'text-warn' if _stale or _age is none else 'text-gray-500' }}" data-observation-age>
+            {% if _age is none %}Report time unavailable
+            {% elif _stale %}No report for {{ (_age / 60) | int }} min
+            {% else %}Reported {{ _age }}s ago{% endif %}
+        </div>
         <div id="upload-feedback-{{ repo.name }}"></div>
     </div>
     {% endfor %}
