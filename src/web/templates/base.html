@@ -764,7 +764,8 @@
 
             function showRequestError(event) {
                 const detail = event.detail || {};
-                if (isRead(detail) || (detail.elt && detail.elt.closest('[data-own-error]'))) return;
+                const source = (detail.requestConfig && detail.requestConfig.elt) || detail.elt;
+                if (isRead(detail) || (source && source.closest('[data-own-error]'))) return;
                 const xhr = detail.xhr;
                 let reason = (xhr && xhr.responseText || '').trim();
                 try {
@@ -778,7 +779,12 @@
                     '. Outcome not confirmed; refresh state before deciding whether to send another command.';
                 errorAlert.hidden = false;
             }
-            ['htmx:responseError', 'htmx:sendError', 'htmx:timeout'].forEach(type => {
+            // The fragment-swap hook clears isError for some failed statuses,
+            // suppressing responseError. Inspect status before the swap instead.
+            document.body.addEventListener('htmx:beforeSwap', event => {
+                if (event.detail.xhr && event.detail.xhr.status >= 400) showRequestError(event);
+            });
+            ['htmx:sendError', 'htmx:timeout'].forEach(type => {
                 document.body.addEventListener(type, showRequestError);
             });
             const pollingElements = new WeakSet();
