@@ -184,7 +184,9 @@ def test_pending_upload_survives_missed_wake_restart_and_pause(
         with coder_shim("success"):
             compose("start", "daemon-test")
             stopped = False
-            deadline = time.monotonic() + 300
+            # Include startup/dispatch, the test stack's 120s publication
+            # budget, and WATCH/merge bookkeeping after the missed wake.
+            deadline = time.monotonic() + 450
             matched_pr = None
             while time.monotonic() < deadline:
                 result = subprocess.run(

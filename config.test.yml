@@ -26,7 +26,9 @@ daemon:
   fix_no_push_cap: 3
   fix_poll_interval_sec: 5
   coder_terminate_grace_sec: 5
-  planned_pr_timeout_sec: 60
+  # Success shims perform real GitHub/git publication round trips. A 60s
+  # budget can kill them before publication on a slow integration runner.
+  planned_pr_timeout_sec: 120
   coder_priority:
     codex: 81
     claude: 76
