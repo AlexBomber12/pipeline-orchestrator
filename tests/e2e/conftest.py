@@ -338,8 +338,9 @@ def _wait_for_runner_apply(applies_before: int) -> None:
     raise AssertionError("runner did not apply restored integration config after resume")
 
 
-# 30 seconds proved insufficient on the shared testbed where dispatch was observed at ~39 seconds.
-def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 150) -> None:
+# Allow the 120s coder budget and remote publication reconciliation to yield
+# before requiring a pause acknowledgement; this does not prove process cleanup.
+def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 300) -> None:
     response = requests.post(f"{TEST_DASHBOARD_URL}/repos/{slug}/stop", timeout=10)
     if response.status_code not in (200, 204):
         raise RuntimeError(f"failed to stop daemon for {slug}: status_code={response.status_code}")

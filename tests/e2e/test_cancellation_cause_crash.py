@@ -30,6 +30,9 @@ from tests.e2e.lib.coder_shim import coder_shim
 # Upload consumption can follow an in-flight empty IDLE scan. Allow that
 # scan plus the next GitHub-backed dispatch cycle, as other lifecycle tests do.
 CANCELLATION_DEADLINE_SEC = 240
+# ERROR reconciliation reads/writes the remote base and proves cleanup before
+# releasing. CI observed diagnosis itself more than 80s after the cause.
+RELEASE_DEADLINE_SEC = 300
 
 
 def _fetch_cancellations(dashboard_url: str, slug: str) -> list[dict]:
@@ -153,7 +156,7 @@ def test_coder_crash_records_cancellation_cause_and_propagates(
         # SKIP must retain a durable failed outcome before releasing execution.
         # The clean branch supplied by this shim is preserved on the remote base.
         release_marker = "[RECOVERY] Failed attempt retained; independent work released."
-        deadline = time.monotonic() + 90
+        deadline = time.monotonic() + RELEASE_DEADLINE_SEC
         last_state = None
         last_events: list[str] = []
         released = False
@@ -171,7 +174,7 @@ def test_coder_crash_records_cancellation_cause_and_propagates(
                     break
             time.sleep(1)
         assert released, (
-            f"clean failed attempt {pr_a_id} did not release within 90s; "
+            f"clean failed attempt {pr_a_id} did not release within {RELEASE_DEADLINE_SEC}s; "
             f"last_state={last_state!r}, recent events={last_events[-10:]!r}"
         )
         # IDLE alone is insufficient: verify A's terminal ERROR and C's TODO
