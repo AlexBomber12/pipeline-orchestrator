@@ -5,7 +5,16 @@ prove the browser emits the marker only on input, including after DOM swaps.
 The serialized GHA executor records the checkout SHA in its existing evidence.
 """
 
+from pathlib import Path
+
+
 def test_background_refresh_and_explicit_input(page, dashboard_url):
+    # Use the real pinned runtime already retained by the e2e harness, so a
+    # first-page CDN failure cannot prevent the presence assertions from running.
+    script = Path(__file__).parent / 'assets' / 'htmx-2.0.4.min.js'
+    page.route('https://unpkg.com/htmx.org@2.0.4', lambda route: route.fulfill(
+        path=script, content_type='application/javascript',
+    ))
     # Accelerate only the existing refresh delays; leave input/actionability
     # timers on the native browser clock.
     page.add_init_script("""(() => {
