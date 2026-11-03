@@ -7,6 +7,8 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from tests.e2e import conftest as evidence
 
 
@@ -274,3 +276,63 @@ def test_upload_rejection_retains_http_reason_in_failure_evidence(tmp_path, monk
     }
     assert "HTTP 400" in capsys.readouterr().out
     assert "do-not-retain" not in json.dumps(record)
+
+
+@pytest.mark.parametrize("outcome", ["success", "exhausted", "unrelated", "unmarked", "invalid", "transport"])
+def test_upload_retries_only_confirmed_snapshot_rejection(tmp_path, monkeypatch, outcome):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+    from threading import Thread
+
+    reason = "Repository task snapshot is changing; retry the upload after checkout settles."
+    rejected = (503, f'<div data-upload-feedback-card><p>{reason}</p></div>')
+    responses = {
+        "success": [rejected, rejected, (201, "accepted")],
+        "exhausted": [rejected] * 5,
+        "unrelated": [(503, '<div data-upload-feedback-card><p>Redis unavailable</p></div>')],
+        "unmarked": [(503, f"<p>{reason}</p>")],
+        "invalid": [(400, rejected[1])],
+        "transport": [],
+    }[outcome]
+    received, sleeps = [], []
+    archive_bytes = b"complete controlled ZIP payload"
+
+    class UploadHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            received.append(self.rfile.read(int(self.headers["Content-Length"])))
+            status, body = responses[len(received) - 1]
+            self.send_response(status)
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, *_args):
+            pass
+
+    server = HTTPServer(("127.0.0.1", 0), UploadHandler)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setattr(evidence, "TEST_DASHBOARD_URL", f"http://127.0.0.1:{server.server_port}")
+    monkeypatch.setattr(evidence.time, "sleep", sleeps.append)
+    node = SimpleNamespace()
+    upload = evidence.upload_zip.__wrapped__(SimpleNamespace(node=node))
+    archive = tmp_path / "PR-900.zip"
+    archive.write_bytes(archive_bytes)
+    try:
+        if outcome == "transport":
+            def unavailable(*args, **kwargs):
+                raise evidence.requests.ConnectionError("outcome unknown")
+            monkeypatch.setattr(evidence.requests, "post", unavailable)
+            with pytest.raises(evidence.requests.ConnectionError, match="outcome unknown"):
+                upload(archive)
+        else:
+            assert upload(archive) == responses[-1][0]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+    assert len(received) == len(responses)
+    assert all(body.count(archive_bytes) == 1 for body in received)
+    assert sleeps == [1] * max(0, len(responses) - 1)
+    if outcome == "success":
+        assert not hasattr(node, "_evidence_upload_error")
+    elif responses:
+        assert node._evidence_upload_error["status_code"] == responses[-1][0]
