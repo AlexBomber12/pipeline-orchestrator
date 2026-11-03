@@ -78,7 +78,7 @@ def test_real_rejected_url_keeps_edit_for_correction(settings_page: Page) -> Non
     with page.expect_response(lambda response: response.url.endswith(f"/settings/config/{name}")) as save:
         _edit_and_blur(page, name, rejected)
     assert save.value.status == 400
-    expect(_message(page, name)).to_have_text("Not saved")
+    expect(_message(page, name)).to_contain_text("Not saved:")
     expect(_field(page, name)).to_have_value(rejected)
     expect(_retry(page, name)).to_be_visible()
 
@@ -212,3 +212,60 @@ def test_mocked_webhook_test_is_separate_from_field_save(settings_page: Page) ->
     expect(page.locator("#webhook-test-status")).to_have_text("Synthetic test response")
     expect(_status(page, "guardrail_notification_webhook_url")).to_be_hidden()
     assert ordinary_saves == []
+    expect(page.get_by_role("button", name="Test webhook")).not_to_have_attribute("data-own-error", "")
+
+
+def test_replaced_threshold_has_one_owned_inline_error(settings_page: Page) -> None:
+    page = settings_page
+    name = "spend_ceiling_warning_percent"
+    # Model the server's reset fragment, which has no client-created feedback.
+    fragment = page.locator("#settings-usage-limits").evaluate("""section => {
+        const clone = section.cloneNode(true);
+        clone.querySelectorAll('[name] + [role="status"]').forEach(node => node.remove());
+        clone.querySelectorAll('[data-own-error]').forEach(node => node.removeAttribute('data-own-error'));
+        return clone.outerHTML;
+    }""")
+    page.route(
+        "**/settings/config/reset/spend_ceiling",
+        lambda route: route.fulfill(status=200, content_type="text/html", body=fragment),
+    )
+    original_section = page.locator("#settings-usage-limits").element_handle()
+    page.locator("#settings-usage-limits").get_by_role("button", name="Reset to defaults").click()
+    page.wait_for_function("section => !section.isConnected", arg=original_section)
+    expect(_field(page, name)).to_have_attribute("data-own-error", "")
+    expect(_status(page, name)).to_have_count(1)
+    expect(_status(page, name)).to_have_attribute("aria-live", "polite")
+    attempts = 0
+
+    def save(route: Route) -> None:
+        nonlocal attempts
+        attempts += 1
+        route.fulfill(
+            status=200 if attempts == 1 else 422,
+            content_type="text/plain",
+            body="Updated" if attempts == 1 else "Threshold rejected",
+        )
+
+    page.route(f"**/settings/config/{name}", save)
+    _edit_and_blur(page, name, "71")
+    expect(_message(page, name)).to_have_text("Saved")
+    _edit_and_blur(page, name, "72")
+    expect(_message(page, name)).to_have_text("Not saved: Threshold rejected")
+    expect(_field(page, name)).to_have_value("72")
+    expect(_status(page, name)).to_have_count(1)
+    expect(page.get_by_role("alert")).to_have_count(0)
+
+
+def test_notification_copy_and_status(settings_page: Page) -> None:
+    page = settings_page
+    expect(_field(page, "dashboard_base_url")).to_have_attribute(
+        "placeholder", "https://orchestrator.example.com",
+    )
+    expect(_field(page, "guardrail_notification_webhook_url")).to_have_attribute(
+        "placeholder", "https://example.com/webhook",
+    )
+    expect(page.locator("#webhook-test-spinner")).to_have_text("Sending...")
+    expect(page.locator("#webhook-test-status")).to_have_attribute("aria-live", "polite")
+    expect(_field(page, "guardrail_notification_min_tier").locator("option")).to_have_text(
+        ["Tier 1", "Tier 2"],
+    )

@@ -14,7 +14,7 @@
                        hx-post="/settings/config/guardrail_notification_webhook_url"
                        hx-trigger="change"
                        hx-swap="none"
-                       placeholder="https://hooks.slack.com/services/..."
+                       placeholder="https://example.com/webhook"
                        class="primary-interactive w-full bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
                 <button hx-post="/settings/webhook/test"
                         hx-target="#webhook-test-status"
@@ -27,8 +27,8 @@
                 </button>
             </div>
             <span class="flex min-h-5 items-center gap-2">
-                <span id="webhook-test-spinner" class="htmx-indicator text-xs text-warn">⏳ sending...</span>
-                <span id="webhook-test-status" class="text-xs"></span>
+                <span id="webhook-test-spinner" class="htmx-indicator text-xs text-warn">Sending...</span>
+                <span id="webhook-test-status" class="text-xs" role="status" aria-live="polite"></span>
             </span>
         </label>
 
@@ -40,7 +40,7 @@
                     hx-swap="none"
                     class="primary-interactive w-32 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
                 {% for tier in [1, 2] %}
-                <option value="{{ tier }}" {% if daemon.guardrail_notification_min_tier == tier %}selected{% endif %}>P{{ tier }}</option>
+                <option value="{{ tier }}" {% if daemon.guardrail_notification_min_tier == tier %}selected{% endif %}>Tier {{ tier }}</option>
                 {% endfor %}
             </select>
         </label>
@@ -64,7 +64,7 @@
                    hx-post="/settings/config/dashboard_base_url"
                    hx-trigger="change"
                    hx-swap="none"
-                   placeholder="https://orchestrator.alexbomber.com"
+                   placeholder="https://orchestrator.example.com"
                    class="primary-interactive w-full bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 focus:border-accent focus:outline-none font-mono">
         </label>
     </div>

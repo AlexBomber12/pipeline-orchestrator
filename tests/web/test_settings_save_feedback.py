@@ -104,10 +104,14 @@ assert.deepEqual(Object.fromEntries(Object.entries(body.listeners).map(
     ([name, entries]) => [name, entries.length])), initialListeners);
 for (const elt of [webhook, tier, session, backup, ...remaining]) {
     assert.equal(elt.getAttribute('hx-request'), '{"timeout":10000}');
+    assert.equal(elt.getAttribute('data-own-error'), '');
     assert.equal(elt.feedback.getAttribute('role'), 'status');
     assert.equal(elt.feedback.getAttribute('aria-live'), 'polite');
 }
-for (const elt of [excluded, reset, otherPage]) assert.equal(elt.feedback, undefined);
+for (const elt of [excluded, reset, otherPage]) {
+    assert.equal(elt.feedback, undefined);
+    assert.equal(elt.getAttribute('data-own-error'), null);
+}
 const message = elt => elt.feedback.children[0].textContent;
 const retry = elt => elt.feedback.children[1];
 const start = (elt, xhr) => body.fire('htmx:beforeRequest', { elt, xhr });
@@ -134,6 +138,19 @@ for (const status of [400, 422, 503]) {
     done(tier, xhr);
     assert.equal(message(tier), 'Not saved');
     assert.equal(retry(tier).classList.contains('hidden'), false);
+}
+
+for (const [responseText, expected] of [
+    ['Threshold must be at most 100', 'Not saved: Threshold must be at most 100'],
+    ['{"detail":"Invalid threshold"}', 'Not saved: Invalid threshold'],
+    ['{"detail":[{"msg":"Must be a number"}]}', 'Not saved: Must be a number'],
+    ['<html>Gateway failure</html>', 'Not saved'],
+]) {
+    edit(session, '71');
+    const xhr = { status: 422, responseText };
+    start(session, xhr); done(session, xhr);
+    assert.equal(message(session), expected);
+    assert.equal(session.value, '71');
 }
 
 for (const event of ['htmx:timeout', 'htmx:sendError']) {
@@ -189,6 +206,7 @@ const swapped = config('settings-sandbox-backup', 'git_bundle_backup_daily_reten
 controls.push(swapped);
 body.fire('htmx:afterSwap');
 assert.equal(swapped.getAttribute('hx-request'), '{"timeout":10000}');
+assert.equal(swapped.getAttribute('data-own-error'), '');
 assert(swapped.feedback);
 const ignored = { status: 200 };
 start(excluded, ignored); done(excluded, ignored);
