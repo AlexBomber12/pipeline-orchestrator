@@ -16,80 +16,12 @@
     </header>
     <ul class="space-y-2">
         {% for alert in alerts %}
-        {% if alert.kind == 'ERROR' %}
-        <li class="rounded-md border-l-4 border-fail bg-fail/10 p-3">
-            <div class="flex items-start justify-between gap-3">
-                <div class="min-w-0 flex-1">
-                    <div class="flex items-center gap-2 mb-1">
-                        <span class="text-[10px] font-semibold uppercase tracking-wide text-fail font-mono">
-                            Error
-                        </span>
-                        <a href="{{ alert.repo_url }}"
-                           class="text-sm font-semibold text-gray-100 hover:text-accent truncate">
-                            {{ alert.repo_name }}
-                        </a>
-                    </div>
-                    <p class="text-xs text-gray-300 font-mono truncate"
-                       title="{{ alert.error_message }}">
-                        {{ alert.error_message or 'Unknown error' }}
-                    </p>
-                </div>
-                <div class="shrink-0 text-right">
-                    <div class="text-xs text-gray-400 font-mono">
-                        {{ alert.duration_text }}
-                    </div>
-                    <div class="text-[10px] text-gray-500"
-                         title="{{ alert.since_iso }}">
-                        Since
-                    </div>
-                </div>
-            </div>
+        <li data-alert-row class="grid grid-cols-1 sm:grid-cols-[1fr_auto_2fr_auto] items-center gap-3 rounded-md border-l-4 p-3 {% if alert.tone == 'fail' %}border-fail bg-fail/10{% else %}border-warn bg-warn/10{% endif %}">
+            <a href="{{ alert.repo_url }}" class="text-sm font-semibold text-gray-100 hover:text-accent truncate">{{ alert.repo_name }}</a>
+            <span class="text-xs font-semibold {% if alert.tone == 'fail' %}text-fail{% else %}text-warn{% endif %}">{{ 'Error' if alert.kind == 'ERROR' else 'Decision needed' }}</span>
+            <p class="text-xs text-gray-300 break-words" title="{{ alert.reason }}">{{ alert.reason }}</p>
+            <a href="{{ alert.action_url }}" class="secondary-interactive text-xs text-accent">{{ alert.action_text }}</a>
         </li>
-        {% else %}
-        <li class="rounded-md border-l-4 border-hung bg-hung/10 p-3">
-            <div class="flex items-start justify-between gap-3">
-                <div class="min-w-0 flex-1">
-                    <div class="flex items-center gap-2 mb-1">
-                        <span class="text-[10px] font-semibold uppercase tracking-wide text-hung font-mono">
-                            Hung
-                        </span>
-                        <a href="{{ alert.repo_url }}"
-                           class="text-sm font-semibold text-gray-100 hover:text-accent truncate">
-                            {{ alert.repo_name }}
-                        </a>
-                        {% if alert.pr_number %}
-                        {% if alert.pr_url %}
-                        <a href="{{ alert.pr_url }}"
-                           target="_blank"
-                           rel="noopener"
-                           class="text-xs font-mono text-hung hover:text-accent">
-                            #{{ alert.pr_number }}
-                        </a>
-                        {% else %}
-                        <span class="text-xs font-mono text-hung">
-                            #{{ alert.pr_number }}
-                        </span>
-                        {% endif %}
-                        {% endif %}
-                    </div>
-                    {% if alert.review_status %}
-                    <p class="text-xs text-gray-300 font-mono">
-                        Review: {{ alert.review_status }}
-                    </p>
-                    {% endif %}
-                </div>
-                <div class="shrink-0 text-right">
-                    <div class="text-xs text-gray-400 font-mono">
-                        Hung for {{ alert.duration_text }}
-                    </div>
-                    <div class="text-[10px] text-gray-500"
-                         title="{{ alert.since_iso }}">
-                        Since last activity
-                    </div>
-                </div>
-            </div>
-        </li>
-        {% endif %}
         {% endfor %}
     </ul>
 </section>

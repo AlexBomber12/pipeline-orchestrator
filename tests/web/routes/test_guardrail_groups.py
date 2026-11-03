@@ -146,7 +146,8 @@ async def test_alerts_share_guardrail_classification(context, monkeypatch, group
     state, _, redis = context
     state.state = PipelineState.ERROR
     monkeypatch.setattr(dashboard, '_build_guardrail_pending_view', AsyncMock(return_value=[
-        dict(is_active=True, group=group), dict(is_active=False, group='history'),
+        dict(is_active=True, group=group, approval_binding='binding', excerpt='reason',
+             approval={'reason': 'failed reason'}), dict(is_active=False, group='history'),
     ]))
     assert len(await dashboard._dashboard_alerts([state], redis)) == expected
     # Unrelated errors still require attention even with retained history.
