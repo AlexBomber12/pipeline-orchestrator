@@ -1,6 +1,7 @@
 """Chromium verifies retained cards across HTTP, transport and Redis failures."""
 
 import re
+from pathlib import Path
 
 import pytest
 from playwright.sync_api import expect
@@ -8,6 +9,11 @@ from playwright.sync_api import expect
 
 @pytest.mark.parametrize("failure", [400, 404, 409, 422, 500, 503, "transport"])
 def test_grid_refresh_failure(page, dashboard_url, failure):
+    # Use the real pinned runtime so CDN availability cannot block the assertions.
+    script = Path(__file__).parent / "assets" / "htmx-2.0.4.min.js"
+    page.route("https://unpkg.com/htmx.org@2.0.4", lambda route: route.fulfill(
+        path=script, content_type="application/javascript",
+    ))
     page.route("**/api/repos/*/events", lambda route: route.abort())
     page.goto(dashboard_url, wait_until="load")
     page.wait_for_function("typeof htmx !== 'undefined'")
