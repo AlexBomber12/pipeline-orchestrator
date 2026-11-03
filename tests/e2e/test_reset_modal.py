@@ -1,6 +1,7 @@
 """Reset interaction with mocked reads/writes; never invokes reset controls."""
 
 import json
+import re
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -55,6 +56,10 @@ def reset_dialog(page: Page, dashboard_url: str, testbed_slug: str):
     opener.evaluate("button => { button.id = 'reset-opener'; }")
     opener.click()
     expect(page.locator('[data-reset-confirm-input]')).to_be_focused()
+    # The inline script focuses the input during insertion, before HTMX's
+    # settle tasks bind the submit handler. Synthetic clicks do not wait for
+    # that initialization and can otherwise silently send no POST.
+    expect(page.locator('#repo-reset-dialog')).not_to_have_class(re.compile(r'\bhtmx-settling\b'))
     return page, slug, posts, outcome, reads
 
 

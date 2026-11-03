@@ -1,4 +1,4 @@
-{# Dashboard "Attention Required" panel. Self-contained so the outer
+{# Dashboard "Needs your action" panel. Self-contained so the outer
    HTMX poll container can swap innerHTML back to an empty shell
    cleanly when everything is healthy, without leaving stale markup
    behind. #}
@@ -7,7 +7,7 @@
     <header class="flex items-center justify-between mb-4">
         <div class="flex items-center gap-2">
             <h2 class="text-sm font-semibold text-gray-200 uppercase tracking-wide">
-                Attention Required
+                Needs your action
             </h2>
             <span class="rounded-full bg-fail text-white text-xs font-mono font-semibold px-2 py-0.5">
                 {{ alerts|length }}

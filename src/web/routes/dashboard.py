@@ -1130,6 +1130,8 @@ def _compute_stats(states: list[RepoState]) -> dict[str, Any]:
 
     * ``repos`` - number of configured repositories.
     * ``active`` - repos currently in CODING/WATCH/FIX.
+    * ``paused`` - repos paused by the operator or in PAUSED state.
+    * ``idle`` - IDLE repos that are not operator-paused.
     * ``alerts`` - repos currently in ERROR.
     * ``done_today`` / ``done_week`` - count of ``Merged PR`` events in the
       merged history whose timestamp falls inside the window. Entries
@@ -1189,6 +1191,8 @@ def _compute_stats(states: list[RepoState]) -> dict[str, Any]:
     return {
         "repos": repos_count,
         "active": active_count,
+        "paused": sum(s.user_paused or s.state == PipelineState.PAUSED for s in states),
+        "idle": sum(s.state == PipelineState.IDLE and not s.user_paused for s in states),
         "alerts": alerts_count,
         "done_today": merges_today,
         "done_week": merges_week,
@@ -1646,6 +1650,7 @@ async def index(request: Request) -> HTMLResponse:
             "repos": states,
             "stats": stats,
             "latest_alert": latest_alert,
+            "alerts": alerts,
             "redis_warning": redis_warning,
                 "page_rendered_at": page_rendered_at,
             "panic_state": panic_state,

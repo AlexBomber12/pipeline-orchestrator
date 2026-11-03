@@ -4,12 +4,25 @@
 
 {% block content %}
 {% include "components/cascade_panic_banner.html" %}
-<div class="flex items-center justify-end mb-3"
-     hx-get="/partials/sandbox-badge"
-     hx-trigger="every 30s"
+<div class="flex flex-col sm:flex-row sm:items-center gap-3 mb-4">
+    <div hx-get="/partials/stats"
+         hx-trigger="repo:state_change from:body, every 30s"
+         hx-swap="innerHTML"
+         id="status-bar" class="flex-1 min-w-0">
+        {% include "components/status_bar.html" %}
+    </div>
+    <div hx-get="/partials/sandbox-badge"
+         hx-trigger="every 30s"
+         hx-swap="innerHTML"
+         id="sandbox-badge-wrapper">
+        {% include "components/sandbox_badge.html" %}
+    </div>
+</div>
+<div hx-get="/partials/alerts"
+     hx-trigger="repo:state_change from:body, every 30s"
      hx-swap="innerHTML"
-     id="sandbox-badge-wrapper">
-    {% include "components/sandbox_badge.html" %}
+     id="alerts-panel">
+    {% include "components/alerts_panel.html" %}
 </div>
 {# Cards refresh on state_change AND history_updated: pause/resume/stop
    mutate repo.user_paused (which controls play/pause/stop visibility) and
@@ -26,13 +39,6 @@
      hx-swap="innerHTML"
      id="repo-grid">
     {% include "components/repo_cards.html" %}
-</div>
-<div hx-get="/partials/stats"
-     hx-trigger="repo:state_change from:body, every 30s"
-     hx-swap="innerHTML"
-     id="status-bar"
-     style="margin-top: 14px;">
-    {% include "components/status_bar.html" %}
 </div>
 <script>
     (function () {

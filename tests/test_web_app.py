@@ -1437,10 +1437,10 @@ def test_partial_stats_renders_status_bar(
 
     assert response.status_code == 200
     body = response.text
-    assert "Repos" in body
-    assert "Done today" in body
-    assert "Active" in body
-    assert "Alerts" in body
+    assert "Working" in body
+    assert "Needs your action" in body
+    assert "Paused" in body
+    assert "Idle" in body
 
 
 def test_partial_redis_banner_handles_missing_and_failing_redis(

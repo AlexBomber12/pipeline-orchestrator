@@ -283,7 +283,7 @@ def test_partial_alerts_empty_when_all_healthy(alerts_config: Path) -> None:
 
     assert response.status_code == 200
     body = response.text
-    assert "Attention Required" not in body
+    assert "Needs your action" not in body
     assert "border-l-4" not in body
     # fragment body is effectively empty (only whitespace / comments)
     assert body.strip() == "" or "<section" not in body
@@ -305,7 +305,7 @@ def test_partial_alerts_renders_error_card(alerts_config: Path) -> None:
 
     assert response.status_code == 200
     body = response.text
-    assert "Attention Required" in body
+    assert "Needs your action" in body
     assert "claude CLI exited 1" in body
     # link to repo detail page is present on the card
     assert 'href="/repo/example__alpha"' in body
@@ -336,11 +336,12 @@ def test_alert_repo_link_points_to_repo_detail(alerts_config: Path) -> None:
 
 
 def test_index_mounts_alerts_partial(alerts_config: Path) -> None:
-    """Dashboard index wires the status bar (with inline alerts) to the SSE state_change trigger."""
+    """Dashboard index wires both attention and stats to the SSE state_change trigger."""
     with TestClient(app) as client:
         response = client.get("/")
 
     assert response.status_code == 200
     body = response.text
     assert 'hx-get="/partials/stats"' in body
+    assert 'hx-get="/partials/alerts"' in body
     assert 'hx-trigger="repo:state_change from:body, every 30s"' in body
