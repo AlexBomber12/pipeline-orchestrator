@@ -53,6 +53,7 @@
         retry.textContent = 'Retry save';
         feedback.append(message, retry);
         elt.insertAdjacentElement('afterend', feedback);
+        elt.setAttribute('data-own-error', '');
         state = { feedback, message, retry, version: 0, active: null };
         states.set(elt, state);
         retry.addEventListener('click', function (event) {
@@ -99,7 +100,15 @@
         } else if (status >= 200 && status < 300) {
             display(state, 'Saved', 'text-ok', false);
         } else {
-            display(state, 'Not saved', 'text-fail', true);
+            let error = (event.detail.xhr.responseText || '').trim();
+            try {
+                const body = JSON.parse(error);
+                error = typeof body.detail === 'string' ? body.detail :
+                    Array.isArray(body.detail) ? body.detail.map(item => item.msg).join('; ') : '';
+            } catch (_) {}
+            // Render errors as text; a full HTML error page is not field feedback.
+            if (error.startsWith('<')) error = '';
+            display(state, 'Not saved' + (error ? ': ' + error.slice(0, 300) : ''), 'text-fail', true);
         }
     }
 
