@@ -53,7 +53,7 @@ from src.keyspace import (
     pipeline_state,
 )
 from src.metrics import MetricsStore, RunRecord, task_attempt_totals
-from src.models import PipelineState, QueueTask, RepoState, TaskStatus
+from src.models import PipelineState, QueueTask, RepoState, TaskStatus, validate_event_severity
 from src.publication_migration import MigrationChanged
 from src.publication_migration import enqueue as enqueue_publication_migration
 from src.queue_parser import (
@@ -1179,8 +1179,10 @@ def _append_history_entry(
     *,
     tier: str | None = None,
     kind: str | None = None,
+    severity: str | None = None,
 ) -> None:
     """Mirror ``Runner.log_event`` for web control-plane history entries."""
+    validate_event_severity(severity)
     now = datetime.now(timezone.utc).isoformat()
     current_state = state.state.value
     last_entry = state.history[-1] if state.history else None
@@ -1190,6 +1192,7 @@ def _append_history_entry(
         and last_entry.get("event") == event
         and last_entry.get("tier") == tier
         and last_entry.get("kind") == kind
+        and last_entry.get("severity") == severity
     ):
         last_entry["count"] = int(last_entry.get("count", 1)) + 1
         last_entry["last_seen_at"] = now
@@ -1206,6 +1209,8 @@ def _append_history_entry(
             "last_seen_at": now,
         }
     )
+    if severity is not None:
+        state.history[-1]["severity"] = severity
     if len(state.history) > _HISTORY_LIMIT:
         state.history = state.history[-_HISTORY_LIMIT:]
 
@@ -1218,6 +1223,7 @@ async def _publish_history_entry_event(
     *,
     tier: str | None = None,
     kind: str | None = None,
+    severity: str | None = None,
 ) -> None:
     """Publish a live history update for repo-detail subscribers."""
     try:
@@ -1225,6 +1231,8 @@ async def _publish_history_entry_event(
             "state": state.state.value,
             "event": event_message,
         }
+        if severity is not None:
+            payload["severity"] = severity
         if tier is not None:
             payload["tier"] = tier
         if kind is not None:
@@ -1285,7 +1293,7 @@ async def _update_repo_pause_state(
             state.user_paused = user_paused
             if event_message is not None:
                 message = event_message(state) if callable(event_message) else event_message
-                _append_history_entry(state, message)
+                _append_history_entry(state, message, severity="info")
 
             pipe.multi()
             pipe.set(state_key, state.model_dump_json())
@@ -1312,6 +1320,7 @@ async def _update_repo_pause_state(
             state,
             message,
             redis_client,
+            severity="info",
         )
 
     return state
@@ -1474,6 +1483,7 @@ async def release_quarantine(
             event_message,
             tier="operator",
             kind="quarantine_release",
+            severity="info",
         )
         pipe.multi()
         pipe.set(state_key, current.model_dump_json())
@@ -1507,6 +1517,7 @@ async def release_quarantine(
             redis_client,
             tier="operator",
             kind="quarantine_release",
+            severity="info",
         )
     return JSONResponse({"status": "released", "pr": pr_number})
 
@@ -2113,6 +2124,7 @@ async def accept_guardrail_park_once(
             event_message,
             tier="operator",
             kind="guardrail_accept_once",
+            severity="ok",
         )
         pipe.multi()
         pipe.set(state_key, current.model_dump_json())
@@ -2148,6 +2160,7 @@ async def accept_guardrail_park_once(
             redis_client,
             tier="operator",
             kind="guardrail_accept_once",
+            severity="ok",
         )
     except Exception:
         pass
@@ -2321,6 +2334,7 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
             event_message,
             tier="operator",
             kind="reset",
+            severity="ok",
         )
         pipe.multi()
         pipe.set(state_key, current.model_dump_json())
@@ -2348,6 +2362,7 @@ async def reset_repo_to_idle(request: Request, name: str) -> JSONResponse:
             redis_client,
             tier="operator",
             kind="reset",
+            severity="ok",
         )
     except Exception:
         pass
