@@ -414,7 +414,7 @@ def test_partial_stats_returns_html_with_four_values(
     assert response.status_code == 200
     body = response.text
     # 4 cards with their labels
-    for label in ("Repos", "Done today", "Active", "Alerts"):
+    for label in ("Working", "Needs your action", "Paused", "Idle"):
         assert label in body
 
 
@@ -479,7 +479,7 @@ def test_index_route_shows_stats_and_activity_blocks(
     body = response.text
     assert 'hx-get="/partials/stats"' in body
     assert 'hx-get="/partials/repo-list"' in body
-    assert "Done today" in body
+    assert "Needs your action" in body
 
 
 def test_partial_repo_detail_returns_summary_only(
