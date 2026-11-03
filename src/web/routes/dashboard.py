@@ -1045,18 +1045,22 @@ def _alert_reference_time(state: RepoState) -> datetime:
 async def _dashboard_alerts(states: list[RepoState], redis_client: Any) -> list[dict[str, Any]]:
     """Use panel classification for guardrail attention on every dashboard surface."""
     attention = []
+    decisions = {}
     for state in states:
-        if state.state in _ALERT_STATES and state.current_task and state.current_pr:
+        if state.current_task and state.current_pr:
             views = await _build_guardrail_pending_view(redis_client, state.name, state)
+            decisions[state.name] = views
             current = [view for view in views if view["is_active"]]
             if current and not any(view["group"] in {"action", "failed"} for view in current):
                 continue
         attention.append(state)
-    return _build_alerts(attention)
+    return _build_alerts(attention, decisions)
 
 
-def _build_alerts(states: list[RepoState]) -> list[dict[str, Any]]:
-    """Collect alert cards for every repo currently in ERROR.
+def _build_alerts(
+    states: list[RepoState], decisions: dict[str, list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Collect ERROR and actionable decision rows, deduplicated by identity.
 
     Each alert dict is self-contained so the template does not need to
     reach back into ``RepoState``. Sort by duration descending so the
@@ -1065,10 +1069,15 @@ def _build_alerts(states: list[RepoState]) -> list[dict[str, Any]]:
     now = datetime.now(timezone.utc)
     alerts: list[dict[str, Any]] = []
 
+    seen: set[tuple[str, str]] = set()
     for state in states:
-        if state.state not in _ALERT_STATES:
+        actionable = [
+            view for view in (decisions or {}).get(state.name, [])
+            if view["group"] in {"action", "failed"}
+        ]
+        if state.state not in _ALERT_STATES and not actionable:
             continue
-        kind = state.state.value
+        kind = "DECISION" if actionable else "ERROR"
         since = _alert_reference_time(state)
         if since.tzinfo is None:
             since = since.replace(tzinfo=timezone.utc)
@@ -1082,7 +1091,28 @@ def _build_alerts(states: list[RepoState]) -> list[dict[str, Any]]:
             "since_iso": since.astimezone(timezone.utc).isoformat(),
         }
         alert["error_message"] = state.error_message or ""
-        alerts.append(alert)
+        alert.update(
+            reason=state.error_message or "Unknown error",
+            action_url=alert["repo_url"], action_text="Open", tone="fail",
+        )
+        # The current decision explains the same repo failure; do not also
+        # emit a generic ERROR row for it. Failed receipts cannot be approved again.
+        for view in actionable or [None]:
+            identity = (state.name, view["approval_binding"] if view else "ERROR")
+            if identity in seen:
+                continue
+            seen.add(identity)
+            row = dict(alert)
+            if view:
+                failed = view["group"] == "failed"
+                row.update(
+                    reason=view["approval"]["reason"] if failed else view["excerpt"] or view["rule"],
+                    action_url=f"{alert['repo_url']}#guardrail-panel-{state.name}",
+                    action_text="View explanation" if failed else "Open decision",
+                    tone="fail" if failed else "warn",
+                )
+                row["error_message"] = row["reason"]
+            alerts.append(row)
 
     alerts.sort(
         key=lambda a: (
