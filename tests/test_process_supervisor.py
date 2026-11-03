@@ -3916,6 +3916,12 @@ async def test_supervised_pty_eof_is_not_leader_success(
         "os.close(0); os.close(1); os.close(2); signal.pause()"
     )
     try:
+        # Start the short supervision deadline only after child startup;
+        # readiness leaves the output buffered for the supervisor to collect.
+        readable, _, _ = await asyncio.to_thread(
+            select.select, [channel.fileno()], [], [], 4,
+        )
+        assert readable
         result = await asyncio.wait_for(run_supervised_process(
             managed, timeout=0.2, pty_channel=channel,
         ), 4)

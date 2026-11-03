@@ -778,6 +778,7 @@ def test_pause_resume_stop_endpoints_update_repo_state(
             "history_updated",
             {
                 "state": "IDLE",
+                "severity": "info",
                 "event": (
                     "Pause requested. Finishing current PR cycle "
                     "(may take several iterations)."
@@ -790,6 +791,7 @@ def test_pause_resume_stop_endpoints_update_repo_state(
             "history_updated",
             {
                 "state": "IDLE",
+                "severity": "info",
                 "event": "Stop requested. Aborting run; working tree may be left dirty.",
             },
             fake,
@@ -799,6 +801,7 @@ def test_pause_resume_stop_endpoints_update_repo_state(
             "history_updated",
             {
                 "state": "IDLE",
+                "severity": "info",
                 "event": "Resumed. Taking next task from queue.",
             },
             fake,
