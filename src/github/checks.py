@@ -7,12 +7,14 @@ WATCH gate's CI status read. Reuses ``cache._etag_get`` and
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Iterable
 from datetime import datetime
 from typing import Any, NamedTuple
 
 from src.github import cache, gh_runner
+from src.github.actions import actions_job_identity, matching_failed_job, read_actions_run
 from src.github.ci_evidence import CIEvidence, _latest, _status_producer, evaluate_ci_evidence
 from src.models import CIStatus
 from src.retry import retry_transient
@@ -133,7 +135,42 @@ _INFRA_ANNOTATION_KEYWORDS = (
 _ANNOTATION_HYDRATION_PER_PAGE = 50
 
 
-def _is_infra_failure(check_run: dict) -> bool:
+def _structured_infra_failure(check: dict, annotations: list) -> bool | None:
+    """A complete job verdict is useful only for its exact current Actions attempt."""
+    app = check.get("app")
+    if not isinstance(app, dict) or app.get("id") != 15368:
+        return False
+    verdicts = [ann for ann in annotations if isinstance(ann, dict)
+                and ann.get("title") == "pipeline-ci-outcome:v1"]
+    if len(verdicts) != 1:
+        return False
+    try:
+        message = verdicts[0].get("message")
+        if not isinstance(message, str) or len(message) > 2048:
+            return False
+        verdict = json.loads(message)
+        if not isinstance(verdict, dict):
+            return False
+        repo, sha = verdict.get("repo"), verdict.get("sha")
+        identity = actions_job_identity(repo, check)
+        failed, infra, attempt = (verdict.get(key) for key in ("failed", "infra", "attempt"))
+        if (identity is None or type(verdict.get("run_id")) is not int or verdict["run_id"] != identity[0]
+            or sha != check.get("head_sha") or not isinstance(sha, str) or len(sha) != 40
+            or any(type(value) is not int or value < 1 for value in (failed, infra, attempt))
+            or failed != infra):
+            return False
+        run = read_actions_run(repo, sha, identity[0])
+        if (run is None or run["attempt"] != attempt
+            or not matching_failed_job(run, identity[1], check.get("name"))):
+            # A newer/incomplete workflow observation can coexist with an old
+            # failed check. It must not send the old outage to code repair.
+            return None
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
+def _is_infra_failure(check_run: dict) -> bool | None:
     """Return ``True`` iff a failing check-run's signals look infra-class.
 
     PR-251 (OBS-BC). Caller already filtered ``check_run`` down to runs
@@ -149,9 +186,16 @@ def _is_infra_failure(check_run: dict) -> bool:
     conclusion = (check_run.get("conclusion") or "").upper()
     if conclusion in _INFRA_CONCLUSION_STATES:
         return True
+    if check_run.get("annotations_unavailable"):
+        return None
     annotations = check_run.get("annotations") or []
     if not isinstance(annotations, list):
         return False
+    # A structured complete-job verdict takes precedence over keyword hints.
+    # Invalid, mixed or stale evidence must never fall back to a loose match.
+    if any(isinstance(ann, dict) and ann.get("title") == "pipeline-ci-outcome:v1"
+           for ann in annotations):
+        return _structured_infra_failure(check_run, annotations)
     for ann in annotations:
         if not isinstance(ann, dict):
             continue
@@ -181,17 +225,10 @@ def _maybe_hydrate_annotations(repo: str, check_run: dict) -> None:
       passing runs are not consulted by the classifier),
     - skip when ``annotations_count`` is missing or zero.
 
-    Only the first ``_ANNOTATION_HYDRATION_PER_PAGE`` annotations are
-    fetched (a single non-paginated REST call) instead of walking every
-    page. ``_is_infra_failure`` only needs to detect that *any*
-    annotation matches an infra keyword; for a large lint/test run
-    with hundreds of annotations, paginating every cycle would
-    multiply REST traffic by the number of failing runs and exhaust
-    the budget for unrelated WATCH cycles.
-
-    Failures of the annotation fetch are swallowed: leaving the field
-    empty causes ``_is_infra_failure`` to return ``False``, which
-    surfaces the run as logic FAILURE — the safe default.
+    Read the first page for supported legacy diagnostics and, when different,
+    the last page for the final complete-job verdict. Never walk every page:
+    at most two bounded pages are read regardless of annotation count.
+    An unavailable selected page is observation uncertainty, not code feedback.
     """
     if "annotations" in check_run:
         return
@@ -210,15 +247,24 @@ def _maybe_hydrate_annotations(repo: str, check_run: dict) -> None:
         f"repos/{repo}/check-runs/{check_run_id}/annotations"
         f"?per_page={_ANNOTATION_HYDRATION_PER_PAGE}"
     )
-    try:
-        raw = retry_transient(
-            lambda: gh_runner.run_gh(["api", path]),
-            operation_name=f"gh api {path}",
-        )
-    except RuntimeError:
-        return
-    if isinstance(raw, list):
-        check_run["annotations"] = [a for a in raw if isinstance(a, dict)]
+    paths = [path]
+    if count > _ANNOTATION_HYDRATION_PER_PAGE:
+        paths.append(path + f"&page={(count - 1) // _ANNOTATION_HYDRATION_PER_PAGE + 1}")
+    annotations = []
+    for selected in paths:
+        try:
+            raw = retry_transient(
+                lambda: gh_runner.run_gh(["api", selected]),
+                operation_name=f"gh api {selected}",
+            )
+        except RuntimeError:
+            check_run["annotations_unavailable"] = True
+            return
+        if not isinstance(raw, list):
+            check_run["annotations_unavailable"] = True
+            return
+        annotations.extend(a for a in raw if isinstance(a, dict))
+    check_run["annotations"] = annotations
 
 
 def clear_ci_status_cache() -> None:
@@ -591,8 +637,11 @@ def _classify_ci_retrieval(
             if len(matches) != 1:
                 return CIStatus.FAILURE
             current_runs.append(matches[0])
-        if current_runs and all(_is_infra_failure(run) for run in current_runs):
+        classifications = [_is_infra_failure(run) for run in current_runs]
+        if classifications and all(value is True for value in classifications):
             return CIStatus.INFRA_FAILURE
+        if classifications and False not in classifications:
+            return CIStatus.PENDING
         return CIStatus.FAILURE
 
     return evidence.policy_result

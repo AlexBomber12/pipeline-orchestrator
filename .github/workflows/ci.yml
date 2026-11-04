@@ -101,6 +101,10 @@ jobs:
         if: ${{ !cancelled() && steps.build-test-stack.outcome == 'success' }}
         run: python -m tests.e2e.lib.pytest_batches
 
+      - name: Classify complete integration outcome
+        if: ${{ !cancelled() && steps.build-test-stack.outcome == 'success' }}
+        run: python -m tests.e2e.lib.ci_outcome
+
       - name: Upload evidence artifact
         if: always()
         uses: actions/upload-artifact@v4

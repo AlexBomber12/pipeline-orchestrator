@@ -20,6 +20,7 @@ from tests.e2e.conftest import (
     _tested_sha,
     _wait_for_fresh_idle,
 )
+from tests.e2e.lib.ci_outcome import LifecycleTimeout
 from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
 from tests.e2e.lib.testbed_reset import clear_testbed_redis_state, reset_testbed_full
 from tests.e2e.test_cancellation_cause_crash import _entry_for, _fetch_cancellations
@@ -37,7 +38,7 @@ def _until(predicate, *, seconds=180):
         if last:
             return last
         time.sleep(1)
-    raise AssertionError(f"predicate {predicate.__name__} did not succeed in {seconds}s; last={last!r}")
+    raise LifecycleTimeout(f"predicate {predicate.__name__} did not succeed in {seconds}s; last={last!r}")
 
 
 def _gh(path):

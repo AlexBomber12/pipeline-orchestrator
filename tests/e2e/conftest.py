@@ -16,6 +16,7 @@ import pytest
 import requests
 from src.config import load_config, update_daemon_config, update_repository
 
+from tests.e2e.lib.ci_outcome import LifecycleTimeout, classify_failure, source_identity
 from tests.e2e.lib.pytest_batches import pytest_addoption as pytest_addoption
 from tests.e2e.lib.pytest_batches import pytest_collection_modifyitems as pytest_collection_modifyitems
 from tests.e2e.lib.review_api import ReviewApi
@@ -141,6 +142,20 @@ def _watch_browser_errors(request):
     request.node._evidence_preteardown = candidate
 
 
+def pytest_sessionstart(session):
+    session.config._ci_outcome = {"completed": [], "failures": [], "collection_failed": False, "skipped": False}
+
+
+def pytest_sessionfinish(session, exitstatus):
+    batch = session.config.getoption("--e2e-batch", default=None)
+    if batch is None or os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    report = session.config._ci_outcome
+    report.update(identity=source_identity(), batch=batch, exitstatus=int(exitstatus))
+    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    (EVIDENCE_DIR / f"batch-{batch}-outcome.json").write_text(json.dumps(report, sort_keys=True) + "\n")
+
+
 def pytest_collectreport(report):
     if report.failed:
         try:
@@ -153,6 +168,15 @@ def pytest_collectreport(report):
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
+    ci = getattr(item.config, "_ci_outcome", None)
+    if ci is not None:
+        if report.when == "teardown":
+            ci["completed"].append(item.nodeid)
+        if report.skipped:
+            ci["skipped"] = True
+        if report.failed:
+            classification = classify_failure(call.excinfo.value) if call.excinfo is not None else {"kind": "failure"}
+            ci["failures"].append({"test_id": item.nodeid, "phase": report.when, "classification": classification})
     if report.failed:
         try:
             _write_failure_evidence(item, report.when)
@@ -432,7 +456,9 @@ def _wait_for_fresh_idle(slug: str, *, after: datetime, timeout_sec: int = 180) 
                     and entry.get("current_pr") is None):
                     return
         time.sleep(0.5)
-    raise RuntimeError(f"timed out waiting for fresh IDLE from restarted daemon for {slug}; last seen={last_seen!r}")
+    raise LifecycleTimeout(
+        f"timed out waiting for fresh IDLE from restarted daemon for {slug}; last seen={last_seen!r}"
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)

@@ -1316,3 +1316,34 @@ dispatch, so the UI warning identifies that queue blocker even while state is ID
 Rejected bytes are retained in staging; replacement generations use the existing
 abandoned-staging retention policy. Redis rejection updates are compare-and-set,
 so a late verdict cannot overwrite a newer uploaded generation.
+
+
+## Infrastructure CI recovery
+
+Integration retains failed pytest reports and the original nonzero exit. At the
+actual GitHub/Git boundary, positively identified 500/502/503/504 responses and
+external-command timeouts produce typed failure evidence. Explicit cross-service
+waits remain assertions; only a fresh GitHub 5xx probe at their deadline can make
+their result infrastructure-blocked. Ordinary assertions, browser failures,
+authentication/quota errors and unavailable probes remain failures. Diagnostic
+text, echoed examples and arbitrary numbers do not authorize recovery.
+
+The final job verdict requires all three disjoint collections, complete terminal
+reports and matching pytest XML. Every failed stage must have infrastructure
+evidence. A mixed job stays FAILURE. The verdict is bound to source PR HEAD,
+repository, workflow run and attempt; the source SHA remains distinct from the
+synthetic merge checkout. The reader additionally proves the GitHub Actions App,
+exact job URL/ID and current completed attempt. Missing provenance stays pending,
+while a separately known code failure retains priority.
+
+WATCH reuses its existing durable one-rerun-per-HEAD admission, intent receipt,
+lost-response reconciliation and operator-pause gates. It reruns only failed
+jobs, never starts CODING/FIX for a pure infrastructure incident, and retains the
+task, PR, commits, review and invocation history. A persistent new infrastructure
+failure parks once for operator Retry; a real failure on the new attempt uses
+normal FIX. An accepted, independently observed successor attempt may outlive the
+CI evidence-observation window, but has a hard six-hour incident allowance from
+the original persisted clock. Polls, restart and acknowledgement progress cannot
+replenish either allowance. Unknown old failures are not retrospectively turned
+into successful invocations. Review, successful current-head CI and exact merge
+proof remain required before DONE.
