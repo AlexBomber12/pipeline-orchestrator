@@ -72,6 +72,11 @@
                 event.preventDefault();
                 event.detail.shouldSwap = false;
                 showRetainedData(event);
+            } else if (grid.querySelector('[data-card-menu][open]')) {
+                // Keep the actual controls and focus while the operator uses a menu.
+                // The next event or 30s poll refreshes the cards after it closes.
+                event.preventDefault();
+                event.detail.shouldSwap = false;
             }
         });
         grid.addEventListener('htmx:afterSwap', function (event) {
