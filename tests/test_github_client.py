@@ -8235,3 +8235,38 @@ def test_repeated_request_summary_does_not_replace_completed_verdict(receipt_651
     expected = {"approved": ReviewStatus.APPROVED, "later_finding": ReviewStatus.CHANGES_REQUESTED,
                 "summary_only": ReviewStatus.PENDING}[result]
     assert _receipt_status(receipt_651) == expected
+
+
+def test_native_nested_annotations_flow_through_real_rest_retrieval(monkeypatch):
+    """GitHub returns annotation count under output, not at check-run top level."""
+    import json
+    repo, sha = "owner/name", "a" * 40
+    verdict = {"repo": repo, "sha": sha, "run_id": 123, "attempt": 1, "failed": 2, "infra": 2}
+    check = {"id": 456, "name": "integration", "head_sha": sha,
+             "status": "completed", "conclusion": "failure", "app": {"id": 15368},
+             "details_url": "https://github.com/owner/name/actions/runs/123/job/456",
+             "output": {"annotations_count": 4,
+                        "annotations_url": "https://api.github.com/repos/owner/name/check-runs/456/annotations"}}
+    calls = []
+    def transport(args, **kwargs):
+        calls.append(args)
+        if args[:2] == ["run", "view"]:
+            return {"databaseId": 123, "headSha": sha, "attempt": 1, "status": "completed",
+                    "conclusion": "failure", "jobs": [{"databaseId": 456, "name": "integration",
+                                                         "conclusion": "failure"}]}
+        path = args[1]
+        if "/annotations?" in path:
+            return [{"title": "pipeline-ci-outcome:v1", "message": json.dumps(verdict)}]
+        if "/check-runs?" in path:
+            return {"total_count": 1, "check_runs": [check]}
+        assert "/status?" in path
+        return {"sha": sha, "state": "success", "statuses": [], "total_count": 0}
+    monkeypatch.setattr("src.github.gh_runner.run_gh", transport)
+    checks.clear_ci_status_cache()
+    from src.github import cache
+    cache.clear_etag_cache()
+    retrieval = checks._retrieve_ci_status_evidence(repo, sha, fresh=True)
+    assert retrieval.evidence.sources_complete
+    assert checks._classify_ci_retrieval(retrieval) == CIStatus.INFRA_FAILURE
+    assert any("/check-runs/456/annotations?per_page=50" in call for args in calls for call in args)
+    assert retrieval.check_runs[0]["output"] == check["output"]

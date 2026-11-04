@@ -15,6 +15,8 @@ from typing import Any
 
 import pytest
 
+from tests.e2e.lib.ci_outcome import require_external_response
+
 TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 
 pytestmark = pytest.mark.skipif(
@@ -40,6 +42,7 @@ def _gh_json(path: str, *, jq: str | None = None, paginate: bool = False) -> Any
         timeout=30,
     )
     if result.returncode != 0:
+        require_external_response(result, "github_ci_evidence")
         stderr = result.stderr.strip()
         permission_hint = ""
         if "Resource not accessible by integration" in stderr or "HTTP 403" in stderr:

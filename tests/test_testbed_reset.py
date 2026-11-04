@@ -734,8 +734,16 @@ def test_fresh_idle_wait_rejects_control_snapshot_and_unready_runner() -> None:
     after = datetime(2026, 1, 1, tzinfo=timezone.utc)
     fresh = {"name": "slug", "state": "IDLE", "user_paused": False,
              "current_task": None, "current_pr": None,
-             "last_updated": (after + timedelta(seconds=1)).isoformat()}
+             "last_updated": (after + timedelta(seconds=1)).isoformat(),
+             "history": [{"event": "[INFRA] No tasks available.", "state": "IDLE",
+                          "time": (after + timedelta(seconds=1)).isoformat()}]}
     snapshots = [
+        {**fresh, "history": []},
+        {**fresh, "history": [{"event": "[INFRA] No tasks available.", "state": "IDLE", "time": after.isoformat()}]},
+        {**fresh, "history": [{"event": "[INFRA] No tasks available.", "state": "IDLE", "time": "invalid"}]},
+        {**fresh, "history": [{"event": "[INFRA] No tasks available.", "state": "IDLE", "time": "2026-01-01T00:00:01"}]},
+        {**fresh, "history": [{"event": "[INFRA] No tasks available.", "state": "CODING", "time": (after + timedelta(seconds=1)).isoformat()}]},
+        {**fresh, "history": [{"event": "startup recovered IDLE", "state": "IDLE", "time": (after + timedelta(seconds=1)).isoformat()}]},
         {**fresh, "last_updated": after.isoformat()},
         {**fresh, "last_updated": (after - timedelta(seconds=1)).isoformat()},
         {**fresh, "state": "CODING"},
@@ -786,13 +794,28 @@ def test_fresh_idle_wait_allows_slow_scan_but_requires_new_publication(publicati
 
     def response(*args, **kwargs):
         observations.append(elapsed)
-        # A valid-looking IDLE stub must remain insufficient throughout
-        # the slow scan; only the runner's new publication permits return.
-        updated = after + timedelta(seconds=1) if elapsed >= publication_delay else after
+        # Reproduce run 41830690201: startup already published fresh IDLE,
+        # but its cold history scan is still running. Use the production event
+        # writer (including dedup timestamps) for the completed scan evidence.
+        from src.daemon.runner import PipelineRunner
+        from src.models import RepoState
+
+        runtime = types.SimpleNamespace(
+            state=RepoState(name="slug", url="https://example.invalid/repo"), name="slug",
+            _pending_event_log_entries=[],
+        )
+        if elapsed >= publication_delay:
+            with patch("src.daemon.runner.datetime") as clock:
+                clock.now.return_value = after - timedelta(seconds=1)
+                PipelineRunner.log_event(runtime, "[INFRA] No tasks available.")
+                clock.now.return_value = after + timedelta(seconds=publication_delay)
+                PipelineRunner.log_event(runtime, "[INFRA] No tasks available.")
+            assert runtime.state.history[0]["count"] == 2
+        updated = after + timedelta(seconds=1)
         payload = {"states": [{
             "name": "slug", "state": "IDLE", "user_paused": False,
             "current_task": None, "current_pr": None,
-            "last_updated": updated.isoformat(),
+            "last_updated": updated.isoformat(), "history": runtime.state.history,
         }]}
         import json
         result = MagicMock()

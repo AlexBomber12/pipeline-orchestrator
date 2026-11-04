@@ -22,6 +22,14 @@ class GhNotStartedError(RuntimeError):
     """The CLI process was not created; no remote request could be submitted."""
 
 
+class GhCommandError(RuntimeError):
+    """Preserve native response fields without reconstructing them from a transcript."""
+
+    def __init__(self, args: list[str], returncode: int, stderr: str):
+        self.cmd, self.returncode, self.stderr = ["gh", *args], returncode, stderr
+        super().__init__(f"gh {' '.join(args)} failed (exit {returncode}): {stderr.strip()}")
+
+
 def run_gh(
     args: list[str],
     repo: str | None = None,
@@ -55,10 +63,7 @@ def run_gh(
             process.kill()
             raise
     if process.returncode != 0:
-        raise RuntimeError(
-            f"gh {' '.join(args)} failed (exit {process.returncode}): "
-            f"{stderr.strip()}"
-        )
+        raise GhCommandError(args, process.returncode, stderr)
 
     stdout = stdout.strip()
     if not stdout:
