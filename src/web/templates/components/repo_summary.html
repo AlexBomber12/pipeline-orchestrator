@@ -17,12 +17,19 @@
 {% set style = repo_state.state_styles.get(repo.state.value, repo_state.state_styles['IDLE']) %}
 
 <section data-repo-summary>
-<header class="mb-6 flex flex-col items-start gap-3 sm:flex-row sm:flex-wrap sm:items-center">
+<header class="mb-6 space-y-3" data-repo-header>
+    <div class="flex min-w-0 flex-wrap items-center gap-3" data-header-identity>
     <h2 class="max-w-full truncate font-mono text-xl text-gray-100 sm:text-2xl">{{ repo.name }}</h2>
     <span class="inline-flex items-center gap-2">
         <span class="inline-flex items-center gap-2 text-xs font-medium px-2 py-0.5 rounded border {{ style.badge }} {% if style.detail_pulse %}pulse-badge{% endif %}" data-state-label>
             {% if style.glyph %}<span aria-hidden="true">{{ style.glyph }}</span> {% endif %}{{ repo.state.value }}
         </span>
+    </span>
+    <span class="text-xs text-gray-300" data-header-task>
+        {{ repo.current_task.pr_id if repo.current_task else 'No active task' }}
+        {% if repo.current_pr %}
+        · {% if repo.current_pr.url %}<a class="secondary-interactive text-accent" href="{{ repo.current_pr.url }}" target="_blank" rel="noopener">#{{ repo.current_pr.number }}</a>{% else %}#{{ repo.current_pr.number }}{% endif %}
+        {% endif %}
     </span>
     {% set display_coder_id = active_invocation.plugin_id if active_invocation else effective_coder %}
     {% set display_plugin = coders | selectattr('name', 'equalto', display_coder_id) | first | default(none) %}
@@ -31,17 +38,31 @@
     {% set display_effort = active_invocation.reasoning_effort_override if active_invocation else (daemon.coder_settings.get(display_coder_id, {}).get('reasoning_effort') if daemon is defined else none) %}
     <div data-coder-display class="flex w-full flex-wrap items-center gap-x-4 gap-y-1 rounded border border-white/10 bg-surface-3 px-2 py-1 text-xs sm:w-auto"
          title="Requested parameters; provider execution is unconfirmed.">
+        <span class="rounded border border-white/10 px-1 text-gray-400">requested</span>
         <span class="min-w-0 max-w-full"><span class="font-mono text-gray-400">Coder</span> <span class="font-mono text-gray-300 break-all">{{ display_coder }}</span></span>
         <span class="min-w-0 max-w-full"><span class="font-mono text-gray-400">Model</span> <span class="font-mono text-gray-300 break-all">{{ display_model or ('Not specified' if not display_plugin and not active_invocation else 'Default') }}</span></span>
         <span class="min-w-0 max-w-full"><span class="font-mono text-gray-400">Effort</span> <span class="font-mono text-gray-300 break-all">{{ display_effort or 'Not specified' }}</span></span>
     </div>
-    {{ repo_controls(repo, 'w-full justify-start sm:w-auto') }}
-    <span class="font-mono text-xs text-gray-500 sm:ml-auto">
-        updated <span data-ts="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">{{ repo.last_updated.strftime('%Y-%m-%d %H:%M:%S') }}</span>
-    </span>
+    </div>
+    <div class="flex min-w-0 flex-wrap items-center gap-3" data-header-status>
+        <div class="min-w-0 w-full break-words text-xs text-gray-400 sm:w-auto sm:flex-1" data-header-sentence>
+            {% set usage_notice_detail = true %}
+            {% include "components/usage_inhibitors.html" %}
+            {% if repo.state.value == 'WATCH' %}
+            {{ vocabulary.watch(repo) }}
+            {% elif work_summary is defined %}
+            <p>{{ work_summary.next_step }}</p>
+            {% else %}
+            <p>Last reported state: {{ repo.state.value }}.</p>
+            {% endif %}
+        </div>
+        {{ repo_controls(repo, labelled=true) }}
+        <span class="font-mono text-xs text-gray-500" data-report-age>
+            updated <span data-ts="{{ repo.last_updated.isoformat() if repo.last_updated else '' }}">{{ repo.last_updated.strftime('%Y-%m-%d %H:%M:%S') }}</span>
+        </span>
+    </div>
 </header>
 {{ vocabulary.queue(repo) }}
-{{ vocabulary.watch(repo) }}
 
 {% if coder_update_message %}
 <div class="mb-4 rounded-lg border border-accent/30 bg-accent/10 px-4 py-3 text-sm text-accent">
@@ -79,9 +100,6 @@
     {% include "components/_publication_migration_panel.html" %}
 </details>
 {% endif %}
-
-{% set usage_notice_detail = true %}
-{% include "components/usage_inhibitors.html" %}
 
 <div class="mb-6 grid grid-cols-1 gap-4 lg:grid-cols-2">
     <section class="rounded-lg border border-white/5 bg-surface-2 p-5">
