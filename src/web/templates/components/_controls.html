@@ -23,7 +23,8 @@
 </svg>
 {%- endmacro %}
 
-{% macro repo_controls(repo, extra_classes='', suppress_paused_resume=false) -%}
+{% macro repo_controls(repo, extra_classes='', suppress_paused_resume=false, labelled=false) -%}
+{% set button_size = 'h-11 sm:h-8 px-2 gap-1 text-xs shrink-0' if labelled else "h-8 w-8 md:h-7 md:w-7 before:absolute before:-inset-1.5 before:content-[''] md:before:content-none" %}
 {% set active_states = ['CODING', 'WATCH', 'FIX', 'MERGE'] %}
 {% set _active_inhibitors = repo.active_inhibitors | default([]) %}
 {% set suppress_play_for_paused_inhibitors = suppress_paused_resume and repo.state.value == 'PAUSED' and _active_inhibitors %}
@@ -37,50 +38,50 @@
     <button type="button"
             aria-label="Resume daemon"
             title="Resume"
-            class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-white hover:bg-white/5 transition-colors before:absolute before:-inset-1.5 before:content-[''] md:before:content-none"
+            class="relative inline-flex items-center justify-center {{ button_size }} rounded-md text-gray-400 hover:text-white hover:bg-white/5 transition-colors"
             hx-post="/repos/{{ repo.name }}/resume"
             hx-swap="none"
             onclick="event.stopPropagation()">
-        {{ play_icon() }}
+        {{ play_icon() }}{% if labelled %}<span>Resume</span>{% endif %}
     </button>
     {% endif %}
     {% if show_pause %}
     <button type="button"
             aria-label="Pause daemon"
             title="Pause"
-            class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-white hover:bg-white/5 transition-colors before:absolute before:-inset-1.5 before:content-[''] md:before:content-none"
+            class="relative inline-flex items-center justify-center {{ button_size }} rounded-md text-gray-400 hover:text-white hover:bg-white/5 transition-colors"
             hx-post="/repos/{{ repo.name }}/pause"
             hx-swap="none"
             onclick="event.stopPropagation()">
-        {{ pause_icon() }}
+        {{ pause_icon() }}{% if labelled %}<span>Pause</span>{% endif %}
     </button>
     {% endif %}
     {% if show_stop %}
     <button type="button"
             aria-label="Stop current run"
             title="Stop"
-            class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-fail hover:bg-fail/10 transition-colors before:absolute before:-inset-1.5 before:content-[''] md:before:content-none"
+            class="relative inline-flex items-center justify-center {{ button_size }} rounded-md text-gray-400 hover:text-fail hover:bg-fail/10 transition-colors"
             hx-post="/repos/{{ repo.name }}/stop"
             data-confirm="Requests cancellation of the owned running coder; retained work may be dirty and unresolved cleanup is reported."
             data-confirm-title="Stop"
             data-confirm-danger
             hx-swap="none"
             onclick="event.stopPropagation()">
-        {{ stop_icon() }}
+        {{ stop_icon() }}{% if labelled %}<span>Stop</span>{% endif %}
     </button>
     {% endif %}
     {% if show_reset %}
     <button type="button"
             aria-label="Reset repo to IDLE"
             title="Reset to IDLE"
-            class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-warn hover:bg-warn/10 transition-colors before:absolute before:-inset-1.5 before:content-[''] md:before:content-none"
+            class="relative inline-flex items-center justify-center {{ button_size }} rounded-md text-gray-400 hover:text-warn hover:bg-warn/10 transition-colors"
             hx-post="/repos/{{ repo.name }}/reset-to-idle"
             data-confirm="The current task returns to TODO."
             data-confirm-title="Reset to IDLE"
             data-confirm-danger
             hx-swap="none"
             onclick="event.stopPropagation()">
-        {{ reset_icon() }}
+        {{ reset_icon() }}{% if labelled %}<span>Reset to IDLE</span>{% endif %}
     </button>
     {% endif %}
 </div>
