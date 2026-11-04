@@ -1167,8 +1167,8 @@ class RecoveryMixin:
                 or (saved_error := getattr(self, "_persisted_merge_error_recovery", None)) is not None
                 and saved_error.error_message.startswith("Merge accounting conflict:")):
             return True
-        # A historical DONE replay must not replace an active publication
-        # owner (and its branch-bound safety floor). Revisit deferred history
+        # Inferred header replay must not replace a checkpointed publication
+        # owner (and its branch-bound safety floor). Revisit deferred bookkeeping
         # through ordinary recovery once that work releases the runner.
         saved_owner = getattr(self, "_persisted_fix_recovery", None)
         floor = self.state.publication_watermark
@@ -1202,7 +1202,7 @@ class RecoveryMixin:
                 if (record is not None and record.exit_reason != "success_merged"
                         or header.frontmatter_status in {"todo", "doing"}
                         or not has_merged_outcome(task.pr_id, self.name)):
-                    if header.frontmatter_status == "done" and has_open_work:
+                    if has_open_work:
                         self._deferred_header_merge_recovery = True
                         continue
                     # A historical DONE task may lack analytics after a log

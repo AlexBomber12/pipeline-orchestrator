@@ -3540,10 +3540,10 @@ def test_recovery_retains_canonical_successful_comment_verdict(monkeypatch, tmp_
     "no_checkpoint", "no_floor", "foreign_checkpoint", "wrong_saved_pr",
 ])
 @pytest.mark.parametrize("header_status", ["done", "todo"])
-def test_open_work_defers_only_historical_bookkeeping(
+def test_open_owner_defers_only_unbound_bookkeeping(
     monkeypatch, isolate_analytics_dir, match, header_status,
 ):
-    """Only a matching DOING/open pair defers DONE, never a pending merge."""
+    """Only a checkpointed publication owner defers inferred merge replay."""
     runner = h._make_runner()
     historical = QueueTask(pr_id="PR-401", title="History", branch="pr-401",
                            task_file="tasks/PR-401.md", status=TaskStatus.DONE)
@@ -3592,7 +3592,7 @@ def test_open_work_defers_only_historical_bookkeeping(
     assert asyncio.run(runner._recover_header_merge_attempt(
         [historical, active], [] if match == "absent" else [live],
     ))
-    deferred = match == "bound" and header_status == "done"
+    deferred = match == "bound"
     assert runner._deferred_header_merge_recovery is deferred
     saved = getattr(runner, "_persisted_merge_recovery", None)
     if deferred:

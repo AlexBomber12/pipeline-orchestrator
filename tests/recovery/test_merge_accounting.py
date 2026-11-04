@@ -839,8 +839,9 @@ async def test_repaired_retry_reaches_matching_merge_and_done_with_reflow(
     assert asdict(await runner._metrics_store.get(record.run_id)) == previous
 
 
+@pytest.mark.parametrize("historical_header", ["DONE", "TODO"])
 def test_active_publication_survives_restart_and_deferred_history_finishes(
-    incident, monkeypatch, tmp_path, isolate_analytics_dir,
+    incident, monkeypatch, tmp_path, isolate_analytics_dir, historical_header,
 ):
     """Real Git, status writer, review reader and metrics reach both DONE outcomes."""
     from datetime import datetime, timezone
@@ -854,9 +855,10 @@ def test_active_publication_survives_restart_and_deferred_history_finishes(
     git(tmp_path, "clone", "-b", "main", str(c.remote), str(writer))
     git(writer, "config", "user.name", "Recovery Test")
     git(writer, "config", "user.email", "recovery@example.test")
-    write_frontmatter_status(writer / c.task_file, "DONE")
-    git(writer, "commit", "-am", "historical terminal header")
-    git(writer, "push", "origin", "main")
+    if historical_header == "DONE":
+        write_frontmatter_status(writer / c.task_file, "DONE")
+        git(writer, "commit", "-am", "historical terminal header")
+        git(writer, "push", "origin", "main")
     git(writer, "checkout", "-b", c.pending.branch)
     (writer / "active_marker.txt").write_text("retained active implementation\n")
     git(writer, "add", ".")

@@ -7076,9 +7076,10 @@ def test_legacy_infra_deadline_without_workflow_binding_never_grants_execution_b
 
 
 @pytest.mark.parametrize("unknown_before_save", [False, True])
+@pytest.mark.parametrize("historical_header", ["done", "todo"])
 def test_historical_bookkeeping_cannot_preempt_published_watch(
     monkeypatch: pytest.MonkeyPatch, isolate_analytics_dir: Path,
-    unknown_before_save: bool,
+    unknown_before_save: bool, historical_header: str,
 ) -> None:
     """Restart must reach the next real review/publication gate, not just WATCH."""
     from src.daemon import recovery as recovery_module
@@ -7105,7 +7106,7 @@ def test_historical_bookkeeping_cannot_preempt_published_watch(
     def parse(runner):
         runner._recovery_task_headers = {
             active.pr_id: types.SimpleNamespace(frontmatter_status="doing"),
-            historical.pr_id: types.SimpleNamespace(frontmatter_status="done"),
+            historical.pr_id: types.SimpleNamespace(frontmatter_status=historical_header),
         }
         return [historical, active]
 
