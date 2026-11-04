@@ -106,3 +106,51 @@ def test_repo_menu_action_completion(page, dashboard_url, status):
     else:
         expect(menu).to_have_attribute('open', '')
         expect(menu.get_by_role('button', name='Pause daemon', exact=True)).to_be_visible()
+
+
+def test_successful_upload_keeps_feedback(page, dashboard_url):
+    from tests.web.templates.test_state_styles_canonical import templates
+
+    script = Path(__file__).parent / 'assets' / 'htmx-2.0.4.min.js'
+    page.route('https://unpkg.com/htmx.org@2.0.4', lambda route: route.fulfill(
+        path=script, content_type='application/javascript',
+    ))
+    page.route('**/api/repos/*/events', lambda route: route.abort())
+    page.clock.install()
+    page.goto(dashboard_url, wait_until='load')
+    page.wait_for_function("typeof htmx !== 'undefined'")
+    grid = page.locator('#repo-grid')
+    repo = RepoState(name='example__menu', url='https://github.com/example/menu', state=PipelineState.CODING)
+    grid.evaluate('''(node, html) => {
+        node.innerHTML = html;
+        node.querySelector('form').setAttribute('hx-target', '#upload-feedback-test');
+        node.insertAdjacentHTML('beforeend', '<div id="upload-feedback-test"></div>');
+        htmx.process(node);
+    }''', _render_repo_cards(repo))
+    refreshes = []
+
+    def refresh(route):
+        refreshes.append(route.request.url)
+        route.fulfill(status=200, content_type='text/html', body=_render_repo_cards(repo))
+
+    page.route('**/partials/repo-list', refresh)
+    feedback_html = templates.get_template('components/upload_success.html').render(
+        message_lines=['Tasks accepted.'], uploaded_files=['PR-495.md'],
+        commit_subject='Accept PR-495 tasks',
+    )
+    page.route('**/repos/example__menu/upload-tasks', lambda route: route.fulfill(
+        status=200, content_type='text/html', body=feedback_html,
+    ))
+    menu = grid.locator('[data-card-menu]')
+    menu.locator('summary').press('Enter')
+    with page.expect_response('**/repos/example__menu/upload-tasks'):
+        menu.locator('input[type=file]').set_input_files({
+            'name': 'PR-495.md', 'mimeType': 'text/markdown', 'buffer': b'Task fixture',
+        })
+    expect(menu).not_to_have_attribute('open', '')
+    feedback = grid.locator('[data-upload-feedback-card]')
+    expect(feedback).to_contain_text('Batch files: PR-495.md.')
+    expect(feedback).to_contain_text('Commit subject: Accept PR-495 tasks')
+    page.clock.fast_forward(1_000)
+    expect(feedback).to_be_visible()
+    assert refreshes == []

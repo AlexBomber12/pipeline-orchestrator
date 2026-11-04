@@ -68,7 +68,9 @@
                 menu.open = false;
                 // hx-swap="none" actions still need updated Pause/Resume controls,
                 // including when their SSE update arrived before completion.
-                htmx.trigger(document.body, 'repo:history_updated');
+                if (event.target.getAttribute('hx-swap') === 'none') {
+                    htmx.trigger(document.body, 'repo:history_updated');
+                }
             }
         });
         function showRetainedData(event) {
