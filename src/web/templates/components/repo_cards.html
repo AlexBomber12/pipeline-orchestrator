@@ -23,7 +23,7 @@
 </div>
 {% else %}
 {% if not _card_only %}
-<div class="grid gap-4 md:grid-cols-2">
+<div class="grid grid-cols-1 gap-4 md:grid-cols-2">
 {% endif %}
     {% for repo in repos %}
     {% set is_synthetic = repo.error_message in init_messages %}

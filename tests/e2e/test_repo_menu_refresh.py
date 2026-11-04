@@ -101,8 +101,13 @@ def test_repo_menu_action_completion(page, dashboard_url, status):
         menu.get_by_role('button', name='Pause daemon', exact=True).click()
     if status == 204:
         expect(menu).not_to_have_attribute('open', '')
-        expect(grid.get_by_role('button', name='Resume daemon', exact=True)).to_have_count(1)
-        expect(grid.get_by_role('button', name='Pause daemon', exact=True)).to_have_count(0)
+        # Closed native details hide their controls from default role queries.
+        # Wait for the replacement before reopening so the open-menu guard
+        # cannot defer the refresh this assertion is intended to verify.
+        expect(grid.get_by_role('button', name='Resume daemon', exact=True, include_hidden=True)).to_have_count(1)
+        expect(grid.get_by_role('button', name='Pause daemon', exact=True, include_hidden=True)).to_have_count(0)
+        menu.locator('summary').press('Enter')
+        expect(menu.get_by_role('button', name='Resume daemon', exact=True)).to_be_visible()
     else:
         expect(menu).to_have_attribute('open', '')
         expect(menu.get_by_role('button', name='Pause daemon', exact=True)).to_be_visible()
