@@ -7043,3 +7043,19 @@ def test_expired_infra_observation_window_requires_verified_successor(monkeypatc
         None if metadata == "unavailable" else {"attempt": 1}))
     asyncio.run(runner.redis.set(key, json.dumps(marker)))
     assert asyncio.run(runner._ci_infra_recovery_expired(pr))
+
+
+def test_confirmed_successor_survives_temporary_metadata_loss_without_renewing_budget(monkeypatch, tmp_path):
+    runner, pr = _lifecycle_watch(monkeypatch, tmp_path, False)
+    ci_attempts.attempt_scope(runner.state, runner.owner_repo, runner.repo_path, pr)
+    runner.state.ci_attempts["9876"] = 2
+    marker = {"at": time.time(), "started_at": time.time() - 3600,
+              "scope": runner.state.ci_attempt_scope, "targets": [9876], "request_attempts": {"9876": 1}}
+    key = ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha)
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    monkeypatch.setattr(watch_module, "read_actions_run", lambda *args: None)
+    assert not asyncio.run(runner._ci_infra_recovery_expired(pr))
+    assert json.loads(asyncio.run(runner.redis.get(key)))["started_at"] == marker["started_at"]
+    marker["started_at"] = time.time() - watch_module._INFRA_EXECUTION_MAX_SECONDS - 1
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    assert asyncio.run(runner._ci_infra_recovery_expired(pr))

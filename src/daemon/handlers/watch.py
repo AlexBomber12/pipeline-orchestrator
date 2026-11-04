@@ -1193,7 +1193,9 @@ class WatchMixin:
             if type(baseline) is not int or baseline < 1:
                 return True
             run = read_actions_run(self.owner_repo, pr.head_sha, run_id, self.state.ci_attempts)
-            if run is None or run["attempt"] <= baseline:
+            observed = self.state.ci_attempts.get(str(run_id), 0)
+            if (run is None and observed <= baseline
+                or run is not None and run["attempt"] <= baseline):
                 return True
         await self.publish_state()
         return False
