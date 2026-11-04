@@ -97,7 +97,8 @@ def test_failure_retains_confirmation(reset_dialog, status, body, abort, message
     page, slug, posts, outcome, reads = reset_dialog
     outcome.update(status=status, body=json.dumps(body), abort=abort)
     _submit(reset_dialog)
-    expect(page.locator('[role="alert"]')).to_contain_text(message)
+    # The page also contains the global request alert; assert the dialog's own error.
+    expect(page.locator('[data-reset-modal] [data-reset-error]')).to_contain_text(message)
     expect(page.locator('[data-reset-confirm-input]')).to_have_value(slug)
     expect(page.locator('[data-reset-submit]')).to_be_enabled()
     expect(page.locator('[data-reset-cancel]')).to_be_enabled()
@@ -150,7 +151,7 @@ def test_changed_consequences_require_new_confirmation(reset_dialog):
     outcome.update(status=503, body='{"partial_reset":true,"error":"git failed"}')
     page.route('**/reset-confirm', lambda route: route.fulfill(body='<p>Changed state</p>'))
     _submit(reset_dialog)
-    expect(page.locator('[role="alert"]')).to_contain_text('Close and reopen Reset')
+    expect(page.locator('[data-reset-modal] [data-reset-error]')).to_contain_text('Close and reopen Reset')
     expect(page.locator('[data-reset-submit]')).to_be_disabled()
     expect(page.locator('[data-reset-cancel]')).to_be_enabled()
     assert len(posts) == 1

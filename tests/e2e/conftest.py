@@ -338,8 +338,9 @@ def _wait_for_runner_apply(applies_before: int) -> None:
     raise AssertionError("runner did not apply restored integration config after resume")
 
 
-# 30 seconds proved insufficient on the shared testbed where dispatch was observed at ~39 seconds.
-def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 150) -> None:
+# Allow the 120s coder budget and remote publication reconciliation to yield
+# before requiring a pause acknowledgement; this does not prove process cleanup.
+def _stop_daemon_and_wait_paused(slug: str, timeout_sec: int = 300) -> None:
     response = requests.post(f"{TEST_DASHBOARD_URL}/repos/{slug}/stop", timeout=10)
     if response.status_code not in (200, 204):
         raise RuntimeError(f"failed to stop daemon for {slug}: status_code={response.status_code}")
@@ -661,12 +662,27 @@ def make_task_zip_multi(tmp_path):
 def upload_zip(request):
     def _upload_zip(zip_path: Path, slug: str = TESTBED_SLUG) -> int:
         url = f"{TEST_DASHBOARD_URL}/repos/{slug}/upload-tasks"
-        with open(zip_path, "rb") as fh:
-            response = requests.post(
-                url,
-                files={"files": (zip_path.name, fh, "application/zip")},
-                timeout=30,
-            )
+        snapshot_rejection = (
+            "Repository task snapshot is changing; retry the upload after checkout settles."
+        )
+        for attempt in range(5):
+            # Reopen the ZIP so every attempt sends the complete archive. This
+            # specific 503 is returned before staging/enqueueing any mutation.
+            with open(zip_path, "rb") as fh:
+                response = requests.post(
+                    url,
+                    files={"files": (zip_path.name, fh, "application/zip")},
+                    timeout=30,
+                )
+            if not (
+                response.status_code == 503
+                and "data-upload-feedback-card" in response.text
+                and f"<p>{snapshot_rejection}</p>" in response.text
+                and attempt < 4
+            ):
+                break
+            print(f"Task snapshot changing; retrying upload ({attempt + 1}/4).")
+            time.sleep(1)
         if response.status_code not in (200, 201):
             # Only retain text from the known upload-error fragment, never a
             # complete page, headers, forms, redirects or credential payloads.

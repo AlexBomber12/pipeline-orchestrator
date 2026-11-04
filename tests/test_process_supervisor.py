@@ -3834,6 +3834,12 @@ async def test_supervised_pty_timeout_and_cancellation_settle_reader(
     managed, channel = await process_pool.launch_pty(
         "import os, signal; os.write(1, b'ready'); signal.pause()"
     )
+    # Start the short supervision deadline after child startup, as in the
+    # PTY EOF test below; interpreter startup can exceed 0.2s under CI load.
+    readable, _, _ = await asyncio.to_thread(
+        select.select, [channel.fileno()], [], [], 4,
+    )
+    assert readable
     ready = asyncio.Event()
     run = asyncio.create_task(run_supervised_process(
         managed, timeout=None if cancel else 0.2, pty_channel=channel,

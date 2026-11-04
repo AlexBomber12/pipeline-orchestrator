@@ -99,7 +99,8 @@ def test_stop_during_coding_then_resume_picks_next_task(
             f"expected pr_id={second_expected_pr_id!r}"
         )
 
-        watch_entry = wait_for_state(["WATCH"], timeout_sec=90)
+        # Allow the 120s coder budget plus bounded publication observation.
+        watch_entry = wait_for_state(["WATCH"], timeout_sec=240)
         watch_pr = watch_entry.get("current_pr") or {}
         assert watch_pr.get("branch") == coding_task["branch"]
         wait_for_state(["IDLE"], timeout_sec=180)
@@ -184,7 +185,9 @@ def test_pending_upload_survives_missed_wake_restart_and_pause(
         with coder_shim("success"):
             compose("start", "daemon-test")
             stopped = False
-            deadline = time.monotonic() + 300
+            # Include startup/dispatch, the test stack's 120s publication
+            # budget, and WATCH/merge bookkeeping after the missed wake.
+            deadline = time.monotonic() + 450
             matched_pr = None
             while time.monotonic() < deadline:
                 result = subprocess.run(

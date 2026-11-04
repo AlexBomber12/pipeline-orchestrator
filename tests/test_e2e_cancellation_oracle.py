@@ -11,6 +11,7 @@ from tests.e2e import test_cancellation_cause_crash as scenario
 @pytest.mark.parametrize("outcome", [
     "released", "missing", "wrong_task", "wrong_category", "wrong_subsource",
     "missing_terminal", "missing_dependent", "missing_retained_cause",
+    "delayed_release", "never_released", "idle_without_release",
 ])
 def test_cancellation_after_inflight_empty_scan(monkeypatch, outcome):
     elapsed = 0
@@ -22,12 +23,15 @@ def test_cancellation_after_inflight_empty_scan(monkeypatch, outcome):
 
     def get_state():
         nonlocal released
-        released = elapsed >= 136
+        released = (elapsed >= (336 if outcome == "delayed_release" else 136)
+                    and outcome != "never_released")
         return {
-            "state": "IDLE", "current_task": None,
+            "state": "IDLE" if released else "ERROR",
+            "current_task": None if released else {"pr_id": "PR-1"},
             "history": [{"event": (
                 "[RECOVERY] Failed attempt retained; independent work released."
-                if released else "[INFRA] No tasks available."
+                if released and outcome != "idle_without_release"
+                else "[INFRA] No tasks available."
             )}],
         }
 
@@ -71,11 +75,13 @@ def test_cancellation_after_inflight_empty_scan(monkeypatch, outcome):
             lambda path: 201, lambda *a, **kw: "unused.zip", None,
         )
 
-    if outcome == "released":
+    if outcome in {"released", "delayed_release"}:
         exercise()
-        assert elapsed == 136
+        assert elapsed == (336 if outcome == "delayed_release" else 136)
     else:
         with pytest.raises(AssertionError):
             exercise()
+        if outcome in {"never_released", "idle_without_release"}:
+            assert elapsed == 136 + scenario.RELEASE_DEADLINE_SEC
         if outcome in {"missing", "wrong_task"}:
             assert elapsed == scenario.CANCELLATION_DEADLINE_SEC

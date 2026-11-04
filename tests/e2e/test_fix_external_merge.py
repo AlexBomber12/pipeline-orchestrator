@@ -32,6 +32,7 @@ WATCH_GATE_CONTEXT = "e2e/watch-merge-gate"
 FIX_POLL_INTERVAL_SEC = 5
 EXTERNAL_MERGE_DETECTION_MARGIN_SEC = 10
 STATUS_PROPAGATION_TIMEOUT_SEC = 10
+FIX_TRANSITION_TIMEOUT_SEC = 90
 
 
 def _post_failed_status(head_sha: str) -> None:
@@ -191,7 +192,10 @@ def test_external_merge_during_fix_returns_to_idle(
         )
         _wait_for_watch_gate_state(head_sha, "failure")
 
-        deadline = time.monotonic() + 30
+        # WATCH evidence reads and FIX preparation both use real GitHub/git
+        # round trips. Match the adjacent review-driven FIX test's entry
+        # budget; the external-merge detection deadline below stays separate.
+        deadline = time.monotonic() + FIX_TRANSITION_TIMEOUT_SEC
         fix_entry = None
         last_entry = None
         while time.monotonic() < deadline:
@@ -219,7 +223,8 @@ def test_external_merge_during_fix_returns_to_idle(
             time.sleep(0.5)
         assert fix_entry is not None, (
             f"FIX coder cycle was not active for {expected_pr_id} / "
-            f"PR #{pr_number} within 30s; last_entry={last_entry!r}"
+            f"PR #{pr_number} within {FIX_TRANSITION_TIMEOUT_SEC}s; "
+            f"last_entry={last_entry!r}"
         )
 
         _merge_pr(pr_number)

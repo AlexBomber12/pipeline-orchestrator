@@ -75,7 +75,8 @@ def test_full_happy_path_via_shim_succeeds(
             f"expected {expected_branch!r}"
         )
 
-        watch_entry = wait_for_state(["WATCH"], timeout_sec=90)
+        # Allow the 120s coder budget plus bounded publication observation.
+        watch_entry = wait_for_state(["WATCH"], timeout_sec=240)
         watch_pr = watch_entry.get("current_pr") or {}
         assert watch_pr.get("branch") == expected_branch, (
             f"WATCH current_pr.branch={watch_pr.get('branch')!r}, "

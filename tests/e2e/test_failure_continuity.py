@@ -184,7 +184,9 @@ def test_failed_a_independent_b(
                     assert len(matches) <= 1, matches
                     return matches[0] if matches else None
 
-                merged = _until(matching_merged_pr, seconds=300)
+                # Include remote failure finalization/release, a fresh dispatch,
+                # the 120s coder allowance, publication observation and merge.
+                merged = _until(matching_merged_pr, seconds=600)
                 exact = _gh(f"repos/{TESTBED}/pulls/{merged['number']}")
                 assert exact["merged"] is True and exact["merge_commit_sha"], exact
                 assert exact["base"]["ref"] == "main" and exact["head"]["ref"] == branches[1], exact

@@ -337,10 +337,6 @@
         }
 
         .global-spinner {
-            position: fixed;
-            top: 88px;
-            right: 16px;
-            z-index: 50;
             display: inline-flex;
             align-items: center;
             gap: 7px;
@@ -666,6 +662,7 @@
                     Settings
                 </a>
                 {% include "components/global_modals.html" %}
+                {% include "components/_global_spinner.html" %}
                 <button
                     id="availability-chip"
                     type="button"
@@ -682,7 +679,11 @@
         </div>
     </nav>
 
-    {% include "components/_global_spinner.html" %}
+    <div id="request-error" role="alert" hidden class="mx-4 my-3 p-3 border border-fail rounded text-fail">
+        <span id="request-error-message"></span>
+        <button type="button" id="request-error-refresh" class="underline ml-2">Refresh state</button>
+        <button type="button" id="request-error-dismiss" class="underline ml-2">Dismiss</button>
+    </div>
 
     <div hx-get="/partials/redis-banner"
          hx-trigger="every 30s"
@@ -749,14 +750,52 @@
                 return;
             }
 
-            let activeRequests = 0;
-            const countedRequests = new WeakSet();
+            const countedRequests = new Map();
+            const errorAlert = document.getElementById('request-error');
+            document.getElementById('request-error-dismiss').addEventListener('click', () => {
+                errorAlert.hidden = true;
+            });
+            document.getElementById('request-error-refresh').addEventListener('click', () => location.reload());
+
+            function isRead(detail) {
+                return ['get', 'head', 'options'].includes(
+                    String(detail.requestConfig && detail.requestConfig.verb).toLowerCase());
+            }
+
+            function showRequestError(event) {
+                const detail = event.detail || {};
+                const source = (detail.requestConfig && detail.requestConfig.elt) || detail.elt;
+                if (isRead(detail) || (source && source.closest('[data-own-error]'))) return;
+                const xhr = detail.xhr;
+                let reason = (xhr && xhr.responseText || '').trim();
+                try {
+                    const body = JSON.parse(reason);
+                    reason = body.detail || body.message || body.error || reason;
+                    if (typeof reason !== 'string') reason = JSON.stringify(reason);
+                } catch (_) {}
+                const status = xhr && xhr.status ? 'HTTP ' + xhr.status : 'Transport error';
+                document.getElementById('request-error-message').textContent =
+                    status + (reason ? ': ' + reason.slice(0, 1000) : '') +
+                    '. Outcome not confirmed; refresh state before deciding whether to send another command.';
+                errorAlert.hidden = false;
+            }
+            // The fragment-swap hook clears isError for some failed statuses,
+            // suppressing responseError. Inspect status before the swap instead.
+            document.body.addEventListener('htmx:beforeSwap', event => {
+                if (event.detail.xhr && event.detail.xhr.status >= 400) showRequestError(event);
+            });
+            ['htmx:sendError', 'htmx:timeout'].forEach(type => {
+                document.body.addEventListener(type, showRequestError);
+            });
             const pollingElements = new WeakSet();
             const triggeredElements = new WeakSet();
 
             function syncSpinner() {
-                spinner.classList.toggle('is-active', activeRequests > 0);
-                document.body.classList.toggle('htmx-request', activeRequests > 0);
+                const active = countedRequests.size > 0;
+                spinner.classList.toggle('is-active', active);
+                document.body.classList.toggle('htmx-request', active);
+                document.getElementById('global-spinner-label').textContent =
+                    [...countedRequests.values()].some(mutating => mutating) ? 'Saving…' : 'Loading…';
             }
 
             document.body.addEventListener('htmx:trigger', function (event) {
@@ -806,10 +845,9 @@
                 }
 
                 if (event.detail && event.detail.xhr) {
-                    countedRequests.add(event.detail.xhr);
+                    countedRequests.set(event.detail.xhr, !isRead(event.detail));
                 }
 
-                activeRequests += 1;
                 syncSpinner();
             });
 
@@ -823,7 +861,6 @@
                     return;
                 }
 
-                activeRequests = Math.max(0, activeRequests - 1);
                 syncSpinner();
             });
 
