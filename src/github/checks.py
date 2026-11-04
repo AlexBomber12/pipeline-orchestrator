@@ -237,7 +237,9 @@ def _maybe_hydrate_annotations(repo: str, check_run: dict) -> None:
         return
     if conclusion not in _REST_CI_FAILURE_STATES:
         return
-    count = check_run.get("annotations_count")
+    output = check_run.get("output")
+    count = (output.get("annotations_count", check_run.get("annotations_count"))
+             if isinstance(output, dict) else check_run.get("annotations_count"))
     if not isinstance(count, int) or count <= 0:
         return
     check_run_id = check_run.get("id")
