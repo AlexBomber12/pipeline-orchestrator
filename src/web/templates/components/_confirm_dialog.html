@@ -54,11 +54,11 @@
             const request = dismiss();
             if (!request || !request.trigger.isConnected || inFlight.has(request.key)) return;
             inFlight.add(request.key);
+            // Listen on the trigger itself: a refresh may detach it and its ancestors.
+            request.trigger.addEventListener('htmx:afterRequest', () => {
+                inFlight.delete(request.key);
+            }, {once: true});
             request.issueRequest(true);
-        });
-        document.body.addEventListener('htmx:afterRequest', event => {
-            const config = event.detail.requestConfig;
-            if (config) inFlight.delete(config.verb + ':' + config.path);
         });
     })();
 </script>
