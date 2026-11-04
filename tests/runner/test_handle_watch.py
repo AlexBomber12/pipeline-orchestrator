@@ -7059,3 +7059,17 @@ def test_confirmed_successor_survives_temporary_metadata_loss_without_renewing_b
     marker["started_at"] = time.time() - watch_module._INFRA_EXECUTION_MAX_SECONDS - 1
     asyncio.run(runner.redis.set(key, json.dumps(marker)))
     assert asyncio.run(runner._ci_infra_recovery_expired(pr))
+
+
+@pytest.mark.parametrize("missing", ["targets", "requests"])
+def test_legacy_infra_deadline_without_workflow_binding_never_grants_execution_budget(monkeypatch, tmp_path, missing):
+    runner, pr = _lifecycle_watch(monkeypatch, tmp_path, False)
+    ci_attempts.attempt_scope(runner.state, runner.owner_repo, runner.repo_path, pr)
+    marker = {"at": time.time(), "started_at": time.time() - 3600,
+              "scope": runner.state.ci_attempt_scope, "targets": [9876], "request_attempts": {"9876": 1}}
+    marker["targets" if missing == "targets" else "request_attempts"] = []
+    key = ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha)
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    monkeypatch.setattr(watch_module, "read_actions_run", lambda *args: pytest.fail("unbound marker must not query workflow"))
+    assert asyncio.run(runner._ci_infra_recovery_expired(pr))
+    assert runner.state.ci_attempts == {}
