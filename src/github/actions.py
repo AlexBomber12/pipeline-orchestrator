@@ -57,5 +57,3 @@ def matching_failed_job(run: dict, job_id: int, name: str) -> bool:
             for job in jobs
         )
     )
-
-

@@ -1342,8 +1342,9 @@ jobs, never starts CODING/FIX for a pure infrastructure incident, and retains th
 task, PR, commits, review and invocation history. A persistent new infrastructure
 failure parks once for operator Retry; a real failure on the new attempt uses
 normal FIX. An accepted, independently observed successor attempt may outlive the
-CI evidence-observation window, but has a hard six-hour incident allowance from
-the original persisted clock. Polls, restart and acknowledgement progress cannot
+CI evidence-observation window, but has a finite incident allowance of six hours
+or the configured observation window if longer, from the original persisted
+clock. Polls, restart and acknowledgement progress cannot
 replenish either allowance. Unknown old failures are not retrospectively turned
 into successful invocations. Review, successful current-head CI and exact merge
 proof remain required before DONE.
