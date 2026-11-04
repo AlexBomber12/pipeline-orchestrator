@@ -1167,6 +1167,27 @@ class RecoveryMixin:
                 or (saved_error := getattr(self, "_persisted_merge_error_recovery", None)) is not None
                 and saved_error.error_message.startswith("Merge accounting conflict:")):
             return True
+        # A historical DONE replay must not replace an active publication
+        # owner (and its branch-bound safety floor). Revisit deferred history
+        # through ordinary recovery once that work releases the runner.
+        saved_owner = getattr(self, "_persisted_fix_recovery", None)
+        floor = self.state.publication_watermark
+        has_open_work = bool(
+            saved_owner is not None
+            and saved_owner.name == self.name and saved_owner.url == self.repo_config.url
+            and saved_owner.current_task is not None and saved_owner.current_pr is not None
+            and floor is not None and floor.pr_number == saved_owner.current_pr.number
+            and floor.ref == f"refs/heads/{saved_owner.current_pr.branch}"
+            and any(
+                task.status == TaskStatus.DOING
+                and task.pr_id == saved_owner.current_task.pr_id
+                and task.branch == saved_owner.current_task.branch == saved_owner.current_pr.branch
+                and (live := find_matching_open_pr(task.pr_id, task.branch, open_prs)) is not None
+                and live.number == saved_owner.current_pr.number
+                for task in tasks
+            )
+        )
+        self._deferred_header_merge_recovery = False
         candidates = []
         try:
             for task in tasks:
@@ -1181,6 +1202,9 @@ class RecoveryMixin:
                 if (record is not None and record.exit_reason != "success_merged"
                         or header.frontmatter_status in {"todo", "doing"}
                         or not has_merged_outcome(task.pr_id, self.name)):
+                    if header.frontmatter_status == "done" and has_open_work:
+                        self._deferred_header_merge_recovery = True
+                        continue
                     # A historical DONE task may lack analytics after a log
                     # failure. Never let it hide an interrupted current merge.
                     priority = (0 if header.frontmatter_status in {"todo", "doing"}

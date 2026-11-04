@@ -370,6 +370,10 @@ class WatchMixin:
                 found.head_sha if published_at is not None else None
             )
             self._push_provenance_reason = reason
+            if published_at is None and reason:
+                self.log_event(
+                    f"[WATCH] PR #{found.number} publication evidence pending: {reason}."
+                )
         elif (
             self._last_push_at is None
             or self._last_push_at_pr_number != found.number

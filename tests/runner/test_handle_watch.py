@@ -7073,3 +7073,88 @@ def test_legacy_infra_deadline_without_workflow_binding_never_grants_execution_b
     monkeypatch.setattr(watch_module, "read_actions_run", lambda *args: pytest.fail("unbound marker must not query workflow"))
     assert asyncio.run(runner._ci_infra_recovery_expired(pr))
     assert runner.state.ci_attempts == {}
+
+
+@pytest.mark.parametrize("unknown_before_save", [False, True])
+def test_historical_bookkeeping_cannot_preempt_published_watch(
+    monkeypatch: pytest.MonkeyPatch, isolate_analytics_dir: Path,
+    unknown_before_save: bool,
+) -> None:
+    """Restart must reach the next real review/publication gate, not just WATCH."""
+    from src.daemon import recovery as recovery_module
+    from src.metrics import MetricsStore
+
+    original, mode, reaction_at, floor, _merged, no_work, _head, branch = (
+        _publication_safety_boundary(monkeypatch)
+    )
+    active = QueueTask(pr_id="PR-459", title="Active", branch=branch,
+                       task_file="tasks/PR-459.md", status=TaskStatus.DOING)
+    historical = QueueTask(pr_id="PR-401", title="Historical", branch="pr-401",
+                           task_file="tasks/PR-401.md", status=TaskStatus.DONE)
+    old_pr = PRInfo(number=629, pr_id=historical.pr_id, branch=historical.branch,
+                    head_sha="b" * 40)
+    original.state.current_task = active
+    asyncio.run(original.handle_watch())
+    assert original.state.publication_watermark.published_at == floor
+    if unknown_before_save:
+        mode["value"] = "unavailable"
+        asyncio.run(original.handle_watch())
+        assert original.state.current_pr.publication_at is None
+    asyncio.run(original.publish_state())
+
+    def parse(runner):
+        runner._recovery_task_headers = {
+            active.pr_id: types.SimpleNamespace(frontmatter_status="doing"),
+            historical.pr_id: types.SimpleNamespace(frontmatter_status="done"),
+        }
+        return [historical, active]
+
+    monkeypatch.setattr(recovery_module.gh_prs, "get_merged_prs_discovery", lambda *a:
+                        recovery_module.gh_prs.PRDiscovery("octo/demo", "main", [old_pr], True))
+    # Retain actual transport/classification, durable state round-trips, metrics
+    # lookup and recovery ownership. Only external merge execution is observed.
+    merges = []
+    async def merge(**_kwargs):
+        merges.append(620)
+
+    mode["value"] = "new"
+    reaction_at["value"] = "2026-10-17T21:11:00Z"
+    redis = original.redis
+    for _ in range(2):
+        runner = h._make_runner(auto_merge=True)
+        runner.redis = redis
+        runner._metrics_store = MetricsStore(redis)
+        monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: parse(runner))
+        monkeypatch.setattr(runner, "_scan_pr_diff_once", no_work)
+        monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_work)
+        monkeypatch.setattr(runner, "handle_merge", merge)
+        assert asyncio.run(runner.recover_state()) is True
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_task.pr_id == active.pr_id
+        assert runner.state.current_pr.number == 620
+        assert runner.state.publication_watermark.published_at == floor
+        assert runner._last_push_at == floor
+        # A restart must not turn a saved floor into a fresh observation.
+        mode["value"] = "old"
+        asyncio.run(runner.handle_watch())
+        assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+        assert merges == []
+        assert any("publication evidence pending" in event["event"]
+                   for event in runner.state.history)
+        mode["value"] = "new"
+        asyncio.run(runner.handle_watch())
+        assert runner.state.current_pr.review_status == ReviewStatus.APPROVED
+        assert merges == [620]
+        assert runner.state.current_pr.publication_at == floor
+        assert runner.state.active_invocation is None
+        assert asyncio.run(runner._metrics_store.list_task_runs(runner.name, active.pr_id)) == []
+        merges.clear()
+        asyncio.run(runner.publish_state())
+
+    # The historical task remains eligible after the current owner completes;
+    # deferral must not mark it accounted or discard its identity/evidence.
+    active.status = TaskStatus.DONE
+    parse(runner)
+    assert asyncio.run(runner._recover_header_merge_attempt([historical, active], []))
+    assert runner._persisted_merge_recovery.current_task.pr_id == historical.pr_id
+    assert runner._persisted_merge_recovery.current_pr.number == 629
