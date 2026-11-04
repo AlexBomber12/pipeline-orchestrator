@@ -61,7 +61,9 @@
             title="Stop"
             class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-fail hover:bg-fail/10 transition-colors before:absolute before:-inset-1.5 before:content-[''] md:before:content-none"
             hx-post="/repos/{{ repo.name }}/stop"
-            hx-confirm="Stop the current run? The working tree may be left dirty."
+            data-confirm="Requests cancellation of the owned running coder; retained work may be dirty and unresolved cleanup is reported."
+            data-confirm-title="Stop"
+            data-confirm-danger
             hx-swap="none"
             onclick="event.stopPropagation()">
         {{ stop_icon() }}
@@ -73,7 +75,9 @@
             title="Reset to IDLE"
             class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-warn hover:bg-warn/10 transition-colors before:absolute before:-inset-1.5 before:content-[''] md:before:content-none"
             hx-post="/repos/{{ repo.name }}/reset-to-idle"
-            hx-confirm="Reset this repo to IDLE? The current task returns to TODO."
+            data-confirm="The current task returns to TODO."
+            data-confirm-title="Reset to IDLE"
+            data-confirm-danger
             hx-swap="none"
             onclick="event.stopPropagation()">
         {{ reset_icon() }}

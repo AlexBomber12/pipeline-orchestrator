@@ -1,0 +1,64 @@
+<style>
+    #confirm-dialog { width: min(28rem, calc(100% - 2rem)); padding: 1.5rem;
+        border: 1px solid var(--border-strong); border-radius: .75rem;
+        background: var(--bg-1); color: var(--text-1); }
+    #confirm-dialog::backdrop { background: rgb(0 0 0 / .65); }
+    #confirm-dialog button { padding: .5rem 1rem; border-radius: .375rem; }
+    #confirm-dialog [data-confirm-accept] { background: var(--accent); color: rgb(var(--c-on-primary)); }
+    #confirm-dialog [data-confirm-accept].danger { background: var(--fail); color: rgb(var(--c-on-fail)); }
+</style>
+<dialog id="confirm-dialog" aria-labelledby="confirm-dialog-title" aria-describedby="confirm-dialog-description">
+    <h2 id="confirm-dialog-title" class="text-lg font-semibold text-white"></h2>
+    <p id="confirm-dialog-description" class="mt-3 text-sm"></p>
+    <div class="mt-6 flex justify-end gap-3">
+        <button type="button" data-confirm-cancel autofocus>Cancel</button>
+        <button type="button" data-confirm-accept></button>
+    </div>
+</dialog>
+<script>
+    (() => {
+        const dialog = document.getElementById('confirm-dialog');
+        const cancel = dialog.querySelector('[data-confirm-cancel]');
+        const accept = dialog.querySelector('[data-confirm-accept]');
+        const inFlight = new Set();
+        let pending = null;
+        function dismiss() {
+            const previous = pending;
+            pending = null;
+            dialog.close();
+            if (previous && previous.trigger.isConnected) previous.trigger.focus();
+            return previous;
+        }
+        document.body.addEventListener('htmx:confirm', event => {
+            const trigger = event.detail.elt;
+            if (!trigger.hasAttribute('data-confirm')) return;
+            event.preventDefault();
+            const key = event.detail.verb + ':' + event.detail.path;
+            if (pending || inFlight.has(key)) return;
+            pending = {trigger, key, issueRequest: event.detail.issueRequest};
+            document.getElementById('confirm-dialog-title').textContent = trigger.dataset.confirmTitle;
+            document.getElementById('confirm-dialog-description').textContent = trigger.dataset.confirm;
+            accept.textContent = trigger.dataset.confirmTitle;
+            accept.classList.toggle('danger', trigger.hasAttribute('data-confirm-danger'));
+            dialog.showModal();
+            cancel.focus();
+        });
+        cancel.addEventListener('click', dismiss);
+        dialog.addEventListener('cancel', event => { event.preventDefault(); dismiss(); });
+        dialog.addEventListener('keydown', event => {
+            if (event.key !== 'Tab') return;
+            event.preventDefault();
+            (document.activeElement === cancel ? accept : cancel).focus();
+        });
+        accept.addEventListener('click', () => {
+            const request = dismiss();
+            if (!request || !request.trigger.isConnected || inFlight.has(request.key)) return;
+            inFlight.add(request.key);
+            request.issueRequest(true);
+        });
+        document.body.addEventListener('htmx:afterRequest', event => {
+            const config = event.detail.requestConfig;
+            if (config) inFlight.delete(config.verb + ':' + config.path);
+        });
+    })();
+</script>

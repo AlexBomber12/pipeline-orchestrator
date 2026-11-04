@@ -2634,7 +2634,13 @@ def test_repo_card_renders_pause_and_stop_controls_for_active_repo(
     assert 'hx-post="/repos/example__alpha/resume"' not in body
     assert 'aria-label="Pause daemon"' in body
     assert 'aria-label="Stop current run"' in body
-    assert 'hx-confirm="Stop the current run? The working tree may be left dirty."' in body
+    assert 'data-confirm-title="Stop"' in body
+    assert 'data-confirm-danger' in body
+    assert (
+        'data-confirm="Requests cancellation of the owned running coder; retained work may be dirty '
+        'and unresolved cleanup is reported."'
+    ) in body
+    assert 'hx-confirm=' not in body
     assert 'onclick="event.stopPropagation()"' in body
     assert 'h-8 w-8 md:h-7 md:w-7' in body
 
