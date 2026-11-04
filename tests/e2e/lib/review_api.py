@@ -157,6 +157,7 @@ class ReviewApi:
                 capture_output=True, text=True, check=False, timeout=30,
             )
             if result.returncode != 0:
+                require_external_response(result, "github_clock")
                 raise ReviewApiError(
                     f"GitHub clock read failed for PR #{pr_number}: {_error_details(result)}"
                 )

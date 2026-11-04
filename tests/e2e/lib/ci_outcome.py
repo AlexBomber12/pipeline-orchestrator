@@ -5,8 +5,11 @@ import json
 import os
 import re
 import subprocess
+import urllib.error
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import urlparse
+
 
 from tests.e2e.lib.pytest_batches import BATCH_COUNT, verify_batch_coverage
 
@@ -44,16 +47,42 @@ def require_external_response(result, operation):
         raise ExternalDependencyError(operation, reason)
 
 
+def external_command(command):
+    if not isinstance(command, list) or len(command) < 2:
+        return False
+    if command[0] == "gh":
+        return command[1] == "api" or len(command) > 2 and (
+            command[1] in {"pr", "run"}
+            and command[2] in {"view", "list", "checks", "merge", "create", "edit", "close", "rerun"})
+    if command[0] == "git":
+        index = 3 if command[1] == "-C" else 1
+        return len(command) > index and command[index] in {"clone", "fetch", "push", "ls-remote"}
+    return False
+
+
 def classify_failure(exc):
+    from src.github.gh_runner import GhCommandError
+    from src.retry import TransientRetryExhausted
+
+    if isinstance(exc, TransientRetryExhausted):
+        exc = exc.last_error
     if isinstance(exc, ExternalDependencyError):
         return {"kind": "infra", "operation": exc.operation, "reason": exc.reason}
-    if isinstance(exc, subprocess.TimeoutExpired):
-        command = exc.cmd
-        if isinstance(command, list) and command and (
-            command[:2] == ["gh", "api"]
-            or command[0] == "git" and "push" in command and "origin" in command
-        ):
-            return {"kind": "infra", "operation": "external_subprocess", "reason": "transport_timeout"}
+    if isinstance(exc, (GhCommandError, subprocess.CalledProcessError)) and external_command(exc.cmd):
+        reason = response_reason(exc.stderr)
+        if reason:
+            return {"kind": "infra", "operation": "github_subprocess", "reason": reason}
+    if isinstance(exc, subprocess.TimeoutExpired) and external_command(exc.cmd):
+        return {"kind": "infra", "operation": "external_subprocess", "reason": "transport_timeout"}
+    # Imported only by the host reporter; reset helpers remain stdlib-only.
+    from requests import HTTPError
+
+    if isinstance(exc, (HTTPError, urllib.error.HTTPError)):
+        response = getattr(exc, "response", None)
+        url = exc.url if isinstance(exc, urllib.error.HTTPError) else getattr(response, "url", "")
+        status = exc.code if isinstance(exc, urllib.error.HTTPError) else getattr(response, "status_code", None)
+        if urlparse(url or "").hostname == "api.github.com" and status in {500, 502, 503, 504}:
+            return {"kind": "infra", "operation": "github_http", "reason": f"github_http_{status}"}
     if isinstance(exc, LifecycleTimeout) and os.environ.get("GITHUB_ACTIONS") == "true":
         # Only explicitly identified lifecycle waits can be inconclusive when a
         # *fresh real* dependency probe fails. Ordinary assertion/DOM timeouts

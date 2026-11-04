@@ -447,3 +447,49 @@ def test_real_pytest_report_preserves_failure_type_and_original_exit(tmp_path, f
     assert len(report["failures"]) == 1
     assert report["failures"][0]["classification"]["kind"] == ("infra" if failure == "external" else "failure")
     assert TITLE not in result.stdout  # Only whole-job aggregation can emit a verdict.
+
+
+@pytest.mark.parametrize("command,expected", [
+    (["gh", "api", "repos/octo/demo"], True), (["gh", "pr", "view", "1"], True),
+    (["git", "-C", "/tmp/test", "push", "origin", "main"], True), (["git", "clone", "url"], True),
+    (["git", "show", "origin", "push"], False), (["bash", "-c", "gh api repos/octo/demo"], False),
+    ("gh api repos/octo/demo", False), (["gh", "auth", "login"], False), (["pytest"], False),
+])
+def test_native_command_timeout_requires_an_actual_network_operation(command, expected):
+    from tests.e2e.lib.ci_outcome import classify_failure
+    assert (classify_failure(subprocess.TimeoutExpired(command, 30))["kind"] == "infra") == expected
+
+
+def test_native_gh_failure_and_retry_wrapper_reach_report_without_parsing_prose(monkeypatch):
+    from unittest.mock import MagicMock
+    from src.github.gh_runner import GhCommandError, run_gh
+    from src.retry import TransientRetryExhausted, retry_transient
+    from tests.e2e.lib.ci_outcome import classify_failure
+    child = MagicMock(returncode=1)
+    child.communicate.return_value = ("", "gh: Internal Server Error (HTTP 500)")
+    child.__enter__.return_value = child
+    monkeypatch.setattr("src.github.gh_runner.subprocess.Popen", lambda *a, **kw: child)
+    with pytest.raises(TransientRetryExhausted) as failed:
+        retry_transient(lambda: run_gh(["api", "repos/octo/demo"]), attempts=1, operation_name="gh api")
+    native = failed.value.last_error
+    assert isinstance(native, GhCommandError) and native.returncode == 1
+    assert native.cmd == ["gh", "api", "repos/octo/demo"]
+    assert classify_failure(failed.value) == {
+        "kind": "infra", "operation": "github_subprocess", "reason": "github_http_500"}
+    # An assertion wrapping the same cause is still a real failure.
+    assertion = AssertionError("application failed")
+    assertion.__cause__ = native
+    assert classify_failure(assertion) == {"kind": "failure"}
+
+
+@pytest.mark.parametrize("url,status,expected", [
+    ("https://api.github.com/repos/octo/demo", 500, True),
+    ("https://api.github.com/repos/octo/demo", 503, True),
+    ("http://localhost:18800/", 500, False),
+    ("https://api.github.com/", 403, False), ("https://api.github.com/", 429, False),
+])
+def test_native_http_response_requires_github_host_and_transient_status(url, status, expected):
+    import urllib.error
+    from tests.e2e.lib.ci_outcome import classify_failure
+    error = urllib.error.HTTPError(url, status, "native response", None, None)
+    assert (classify_failure(error)["kind"] == "infra") == expected

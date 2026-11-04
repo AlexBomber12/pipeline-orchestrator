@@ -65,6 +65,14 @@ def is_transient_error(exc: Exception) -> bool:
     return False
 
 
+class TransientRetryExhausted(RuntimeError):
+    """The bounded operation exhausted retries; retain its typed original cause."""
+
+    def __init__(self, operation_name: str, attempts: int, last_error: Exception):
+        self.last_error = last_error
+        super().__init__(f"{operation_name} failed after {attempts} attempts: {last_error}")
+
+
 def retry_transient(
     operation: Callable[[], T],
     attempts: int = 3,
@@ -97,6 +105,4 @@ def retry_transient(
                 exc,
             )
             time.sleep(backoff)
-    raise RuntimeError(
-        f"{operation_name} failed after {attempts} attempts: {last_exc}"
-    ) from last_exc
+    raise TransientRetryExhausted(operation_name, attempts, last_exc) from last_exc

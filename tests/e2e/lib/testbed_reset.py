@@ -73,6 +73,7 @@ def close_all_open_prs() -> int:
         env=_gh_env(),
     )
     if listing.returncode != 0:
+        require_external_response(listing, "github_reset_listing")
         # Surface listing failures (typically gh auth/API errors) instead of
         # silently treating them as "no PRs to close" — otherwise stale PRs
         # would survive the session-start reset.
@@ -148,6 +149,7 @@ def delete_non_main_branches() -> int:
         env=_gh_env(),
     )
     if listing.returncode != 0:
+        require_external_response(listing, "github_reset_listing")
         # Surface listing failures so we never silently treat an auth/API
         # error as "no non-main branches present" and leave stale refs.
         raise RuntimeError(
