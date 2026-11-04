@@ -43,9 +43,11 @@ def test_stop_during_coding_then_resume_picks_next_task(
         page.wait_for_function("Boolean(window.htmx)")
         summary = page.locator('[data-repo-summary]')
         expect(summary).to_contain_text(f"PR-{first_pr_id_int}")
-        page.once("dialog", lambda dialog: dialog.accept())
         with page.expect_response(f"**/repos/{testbed_slug}/stop") as response:
             summary.get_by_role("button", name="Stop current run", exact=True).click()
+            page.get_by_role("dialog", name="Stop", exact=True).get_by_role(
+                "button", name="Stop", exact=True,
+            ).click()
         assert response.value.status == 200
         assert response.value.request.headers.get("hx-request") == "true"
 

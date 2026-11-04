@@ -736,7 +736,10 @@ def test_reset_confirm_present() -> None:
         )
     )
 
-    assert 'hx-confirm="Reset this repo to IDLE? The current task returns to TODO."' in rendered
+    assert 'data-confirm="The current task returns to TODO."' in rendered
+    assert 'data-confirm-title="Reset to IDLE"' in rendered
+    assert "data-confirm-danger" in rendered
+    assert "hx-confirm" not in rendered
 
 
 def test_reset_owns_legacy_clearing_not_retry_enqueue() -> None:
