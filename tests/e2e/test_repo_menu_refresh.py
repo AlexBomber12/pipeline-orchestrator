@@ -10,7 +10,8 @@ from tests.web.templates.test_state_styles_canonical import _render_repo_cards
 
 @pytest.mark.parametrize('trigger', ['repo:state_change', 'repo:history_updated', 'poll'])
 @pytest.mark.parametrize('action', ['summary', 'a', 'button', 'input[type=file]'])
-def test_open_repo_menu_defers_refresh(page, dashboard_url, trigger, action):
+@pytest.mark.parametrize('dismiss', ['summary', 'outside', 'focus'])
+def test_open_repo_menu_defers_refresh(page, dashboard_url, trigger, action, dismiss):
     script = Path(__file__).parent / 'assets' / 'htmx-2.0.4.min.js'
     page.route('https://unpkg.com/htmx.org@2.0.4', lambda route: route.fulfill(
         path=script, content_type='application/javascript',
@@ -62,8 +63,46 @@ def test_open_repo_menu_defers_refresh(page, dashboard_url, trigger, action):
     assert page.evaluate('''() => window.retainedMenu.isConnected &&
         window.retainedAction === document.activeElement''')
     expect(grid.locator('[data-refresh-marker]')).to_have_count(0)
-    menu.locator('summary').press('Enter')
+    if dismiss == 'summary':
+        menu.locator('summary').press('Enter')
+    elif dismiss == 'outside':
+        page.locator('h1').first.click()
+    else:
+        card.locator('[data-card-name]').focus()
     expect(menu).not_to_have_attribute('open', '')
     refresh()
     expect(grid.locator('[data-refresh-marker]')).to_have_text('Updated repository data')
     assert page.evaluate('!window.retainedMenu.isConnected')
+
+
+@pytest.mark.parametrize('status', [204, 500])
+def test_repo_menu_action_completion(page, dashboard_url, status):
+    script = Path(__file__).parent / 'assets' / 'htmx-2.0.4.min.js'
+    page.route('https://unpkg.com/htmx.org@2.0.4', lambda route: route.fulfill(
+        path=script, content_type='application/javascript',
+    ))
+    page.route('**/api/repos/*/events', lambda route: route.abort())
+    page.clock.install()
+    page.goto(dashboard_url, wait_until='load')
+    page.wait_for_function("typeof htmx !== 'undefined'")
+    grid = page.locator('#repo-grid')
+    repo = RepoState(name='example__menu', url='https://github.com/example/menu', state=PipelineState.CODING)
+    grid.evaluate('(node, html) => { node.innerHTML = html; htmx.process(node); }', _render_repo_cards(repo))
+    menu = grid.locator('[data-card-menu]')
+    menu.locator('summary').press('Enter')
+    repo.user_paused = True
+    page.route('**/partials/repo-list', lambda route: route.fulfill(
+        status=200, content_type='text/html', body=_render_repo_cards(repo),
+        headers={'X-Observation-Available': 'true'},
+    ))
+    page.route('**/repos/example__menu/pause', lambda route: route.fulfill(status=status))
+    # A pending SSE refresh must not be needed to replace Pause with Resume.
+    with page.expect_response('**/repos/example__menu/pause'):
+        menu.get_by_role('button', name='Pause daemon', exact=True).click()
+    if status == 204:
+        expect(menu).not_to_have_attribute('open', '')
+        expect(grid.get_by_role('button', name='Resume daemon', exact=True)).to_have_count(1)
+        expect(grid.get_by_role('button', name='Pause daemon', exact=True)).to_have_count(0)
+    else:
+        expect(menu).to_have_attribute('open', '')
+        expect(menu.get_by_role('button', name='Pause daemon', exact=True)).to_be_visible()

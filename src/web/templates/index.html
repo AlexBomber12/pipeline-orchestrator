@@ -49,6 +49,28 @@
 
         const grid = document.getElementById('repo-grid');
         const warning = document.getElementById('grid-refresh-warning');
+        // Delegate so replacement cards receive the same dismissal behavior.
+        document.addEventListener('click', function (event) {
+            grid.querySelectorAll('[data-card-menu][open]').forEach(function (menu) {
+                if (!menu.contains(event.target)) menu.open = false;
+            });
+        }, true);
+        grid.addEventListener('focusout', function (event) {
+            const menu = event.target.closest('[data-card-menu]');
+            // A native file chooser can temporarily clear document focus.
+            if (menu && event.relatedTarget && !menu.contains(event.relatedTarget)) {
+                menu.open = false;
+            }
+        });
+        grid.addEventListener('htmx:afterRequest', function (event) {
+            const menu = event.target.closest('[data-card-menu]');
+            if (menu && event.detail.successful) {
+                menu.open = false;
+                // hx-swap="none" actions still need updated Pause/Resume controls,
+                // including when their SSE update arrived before completion.
+                htmx.trigger(document.body, 'repo:history_updated');
+            }
+        });
         function showRetainedData(event) {
             if (event.target !== grid) return;
             const observed = grid.dataset.observedAt;
