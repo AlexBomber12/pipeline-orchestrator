@@ -426,6 +426,7 @@ class PipelineRunner(
             last_updated=datetime.now(timezone.utc),
         )
         self._recovered = False
+        self._deferred_header_merge_recovery = False
         self._scaffolded = _repo_looks_scaffolded(self.repo_path)
         self._consecutive_dirty_cycles = 0
         self._error_diagnose_count = 0
@@ -4148,6 +4149,14 @@ class PipelineRunner(
             await self.publish_state()
             return
 
+        if (
+            self._deferred_header_merge_recovery
+            and self.state.state == PipelineState.IDLE
+            and self.state.current_task is None
+        ):
+            # Reuse startup's canonical discovery/proof after the active owner
+            # finishes; do not abandon historical accounting until a restart.
+            self._recovered = False
         if not self._recovered:
             recovery_complete = await self.recover_state()
             if not recovery_complete:

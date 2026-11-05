@@ -443,6 +443,22 @@ rewriting TODO. Both ERROR dispatchers retain the park until operator action.
 The existing HTTP Retry action admits a bound accounting conflict while retaining
 its header and normal task validation. Recovery preserves the saved merged PR
 identity even if an open PR reuses that task branch.
+Inferred header bookkeeping does not preempt a checkpointed DOING task with a
+matching open PR and a validated saved publication floor. The active task retains
+its publication safety floor, invocation and review context through restart.
+This ownership rule is independent of the older merged task's header status;
+that task may still be TODO while its final accounting is unfinished. Once active
+work releases the runner to IDLE, the existing recovery path revisits deferred
+bookkeeping without requiring another restart or dispatching a coder. Explicit
+retained MERGE ownership keeps its existing recovery priority. Without a bound
+publication owner, header discovery retains its pending-merge ordering.
+
+WATCH records the specific publication hold reason in its event history. A
+retained floor remains a veto against backward observations, never a replacement
+for fresh current-head evidence. Missing/damaged floors retain existing explicit
+confirmation or fresh-publication requirements; CI/review reruns alone cannot
+supply that proof.
+
 Operator pause and Stop controls still apply. Resolving a conflict requires
 reviewing the exact PR and current task generation before using existing Retry
 or task-upload controls; this source change does not deploy or resume a daemon.

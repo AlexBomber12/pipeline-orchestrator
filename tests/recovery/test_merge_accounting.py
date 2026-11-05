@@ -837,3 +837,175 @@ async def test_repaired_retry_reaches_matching_merge_and_done_with_reflow(
     assert runner.state.state == PipelineState.IDLE and len(records) == 2
     assert asdict(await runner._metrics_store.get(successor_id)) == completed
     assert asdict(await runner._metrics_store.get(record.run_id)) == previous
+
+
+@pytest.mark.parametrize("historical_header", ["DONE", "TODO"])
+def test_active_publication_survives_restart_and_deferred_history_finishes(
+    incident, monkeypatch, tmp_path, isolate_analytics_dir, historical_header,
+):
+    """Real Git, status writer, review reader and metrics reach both DONE outcomes."""
+    from datetime import datetime, timezone
+
+    from src.github import reviews
+    from src.models import CIStatus, ReviewStatus
+    from src.queue_parser import write_frontmatter_status
+
+    c = incident
+    writer = tmp_path / "active-writer"
+    git(tmp_path, "clone", "-b", "main", str(c.remote), str(writer))
+    git(writer, "config", "user.name", "Recovery Test")
+    git(writer, "config", "user.email", "recovery@example.test")
+    if historical_header == "DONE":
+        write_frontmatter_status(writer / c.task_file, "DONE")
+        git(writer, "commit", "-am", "historical terminal header")
+        git(writer, "push", "origin", "main")
+    git(writer, "checkout", "-b", c.pending.branch)
+    (writer / "active_marker.txt").write_text("retained active implementation\n")
+    git(writer, "add", ".")
+    git(writer, "commit", "-m", "active implementation")
+    head = git(writer, "rev-parse", "HEAD")
+    git(writer, "push", "origin", c.pending.branch, "HEAD:refs/pull/636/head")
+    git(c.repo, "fetch", "origin", "main")
+    at = datetime(2026, 10, 21, 12, tzinfo=timezone.utc)
+    live = {"open": True, "merged": None}
+    owner = c.runner.owner_repo
+    actor = {"id": 199175422, "login": "chatgpt-codex-connector[bot]", "type": "Bot"}
+
+    def transport(args, **_kwargs):
+        if args[1] == "rate_limit":
+            bucket = {"limit": 5000, "remaining": 4999,
+                      "reset": int(datetime.now(timezone.utc).timestamp()) + 3600}
+            return {"core": bucket, "graphql": bucket}
+        if args[1] == f"repos/{owner}/pulls/547":
+            return "HTTP/2.0 200 OK\r\n\r\n" + json.dumps(c.payload)
+        if args[1] == f"repos/{owner}/pulls/636":
+            if "--include" not in args:
+                return {"branch": c.pending.branch, "repo": owner, "sha": head}
+            return "HTTP/2.0 200 OK\r\n\r\n" + json.dumps({
+                "number": 636, "base": {"ref": "main", "repo": {"full_name": owner}},
+                "head": {"sha": head}, "state": "open" if live["open"] else "closed",
+                "merged": not live["open"], "merge_commit_sha": live["merged"],
+                "merged_at": None if live["open"] else "2026-10-21T13:00:00Z",
+            })
+        if "/activity?" in args[1]:
+            return [{"activity_type": "push", "before": "a" * 40, "after": head,
+                     "ref": "refs/heads/" + c.pending.branch, "timestamp": at.isoformat()}]
+        raise AssertionError(args)
+
+    def paginated(path):
+        if path.endswith("/issues/636/comments"):
+            return [{"id": 100, "user": actor, "created_at": "2026-10-21T12:01:00Z",
+                     "body": "Codex Review: Didn't find any major issues.\n\n"
+                             f"**Reviewed commit:** `{head}`"}]
+        return []
+
+    def open_prs(_repo, **kwargs):
+        if not live["open"]:
+            return []
+        reviews.clear_review_status_cache()
+        publication = prs.get_pr_head_publication(owner, 636, expected_head_sha=head)
+        review = reviews.get_pr_review_status(owner, 636, "author", head,
+                   policy=kwargs.get("reviewer_policy"), publication_evidence=publication)
+        assert review == ReviewStatus.APPROVED
+        return [PRInfo(number=636, pr_id=c.pending.pr_id, branch=c.pending.branch,
+                       head_sha=head, ci_status=CIStatus.SUCCESS, review_status=review,
+                       diff_scanned_at_sha=head,
+                       publication_observed=True, publication_at=publication.published_at,
+                       publication_reason=publication.unknown_reason,
+                       publication_head_repo=publication.head_repo,
+                       publication_ref=publication.ref, publication_repo=publication.repo,
+                       publication_head_sha=publication.head_sha,
+                       publication_provenance=publication.provenance)]
+
+    monkeypatch.setattr(prs.gh_runner, "run_gh", transport)
+    monkeypatch.setattr(cache, "_gh_api_paginated", paginated)
+    monkeypatch.setattr(prs, "get_open_prs", open_prs)
+    monkeypatch.setattr(prs, "get_pr_state", lambda *a: "OPEN" if live["open"] else "MERGED")
+    original = c.runner
+    original.state.current_task = c.pending
+    original.state.current_pr = open_prs(owner)[0]
+    original.state.state = PipelineState.WATCH
+    original.state.merge_phase = None
+    original.state.active_invocation = None
+    original._current_run_record = None
+    original._start_current_run_record("claude", "opus")
+    original._capture_invocation_snapshot("claude", {"model": "opus"}, phase="coding")
+    active_id = original._current_run_record.run_id
+    original._current_run_record.head_sha = head
+    original._current_run_record.task_spec_hash = task_spec_content_hash(
+        (c.repo / c.pending.task_file).read_text()
+    )
+    asyncio.run(original._checkpoint_current_run_record())
+    original._rehydrate_last_push_at(original.state.current_pr)
+    assert original.state.publication_watermark.published_at == at
+    asyncio.run(original.publish_state())
+
+    runner = c.fresh()
+    runner.repo_config.auto_merge = True
+    c.recover(runner)
+    assert runner.state.state == PipelineState.WATCH
+    assert runner.state.current_pr.number == 636
+    assert runner.state.publication_watermark.published_at == at
+    assert runner._deferred_header_merge_recovery
+    runner._recovered = True
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", AsyncMock())
+    monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", AsyncMock())
+    remote_merges = []
+    actual_handle_merge = runner.handle_merge
+
+    async def github_merge(**_kwargs):
+        remote_merges.append(runner.state.current_pr.number)
+        git(writer, "checkout", "main")
+        git(writer, "merge", "--no-ff", c.pending.branch, "-m", "merge active PR")
+        live["merged"] = git(writer, "rev-parse", "HEAD")
+        git(writer, "push", "origin", "main")
+        live["open"] = False
+        runner.state.state = PipelineState.MERGE
+        runner.state.merge_phase = "post_merge_cleanup"
+        await actual_handle_merge()
+
+    monkeypatch.setattr(runner, "handle_merge", github_merge)
+    monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+    monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+    key = pipeline_state(runner.name)
+    paused = json.loads(asyncio.run(runner.redis.get(key)))
+    paused["user_paused"] = True
+    asyncio.run(runner.redis.set(key, json.dumps(paused)))
+    asyncio.run(runner.run_cycle())
+    assert runner.state.state == PipelineState.WATCH and remote_merges == [], runner.state.history
+    assert runner.state.publication_watermark.published_at == at
+    paused = json.loads(asyncio.run(runner.redis.get(key)))
+    paused["user_paused"] = False
+    asyncio.run(runner.redis.set(key, json.dumps(paused)))
+    asyncio.run(runner.run_cycle())
+    assert remote_merges == [636], runner.state.history
+    assert runner.state.state == PipelineState.IDLE
+    assert runner.state.current_task is None
+    assert "status: DONE" in git(c.remote, "show", "main:tasks/PR-404.md")
+    assert "retained active implementation" in git(c.remote, "show", "main:active_marker.txt")
+    active_records = asyncio.run(runner._metrics_store.list_task_runs(runner.name, c.pending.pr_id))
+    assert len(active_records) == 1 and active_records[0].run_id == active_id
+    assert active_records[0].outcome == "merged" and active_records[0].ended_at
+    assert len(active_records[0].invocations) == 1
+    c.preserved()
+
+    # IDLE reschedules the existing recovery machinery; no restart, retry,
+    # duplicate code invocation or new PR is necessary for historical history.
+    monkeypatch.setattr(runner, "handle_merge", actual_handle_merge)
+    monkeypatch.setattr(runner, "ensure_repo_cloned", AsyncMock())
+    monkeypatch.setattr(runner, "preflight", AsyncMock(return_value=True))
+    asyncio.run(runner.run_cycle())
+    assert runner.state.state == PipelineState.MERGE
+    assert runner.state.current_pr.number == 547
+    assert not runner._deferred_header_merge_recovery
+    asyncio.run(runner.run_cycle())
+    assert runner.state.state == PipelineState.IDLE
+    c.preserved()
+    old_records = asyncio.run(runner._metrics_store.list_task_runs(runner.name, c.task.pr_id))
+    assert len(old_records) == 2
+    recovered = next(r for r in old_records if r.run_id != c.old.run_id)
+    assert recovered.outcome == "merged" and recovered.invocations == []
+    rows = [json.loads(line) for path in isolate_analytics_dir.glob("*.jsonl")
+            for line in path.read_text().splitlines()]
+    assert sorted(r["pr_id"] for r in rows) == sorted([c.task.pr_id, c.pending.pr_id])
+    assert remote_merges == [636]
