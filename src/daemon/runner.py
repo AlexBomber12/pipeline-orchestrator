@@ -2188,7 +2188,10 @@ class PipelineRunner(
             # Save ownership and the original failure before terminal side effects.
             await self.publish_state()
         log_body = message if log_message is None else log_message
-        self.log_event(f"{log_prefix} {log_body}.", severity=log_severity)
+        if log_severity is None:
+            self.log_event(f"{log_prefix} {log_body}.")
+        else:
+            self.log_event(f"{log_prefix} {log_body}.", severity=log_severity)
         if save_run_record_as:
             await self._save_current_run_record(
                 save_run_record_as,
