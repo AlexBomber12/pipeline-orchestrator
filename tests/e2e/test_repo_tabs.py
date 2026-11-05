@@ -25,7 +25,10 @@ def repo_tabs(page, dashboard_url):
     ))
     # Drive the actual EventSource relay without provider or Redis dependencies.
     page.add_init_script('''window.EventSource = class {
-        constructor() { window.repoStream = this; this.listeners = {}; }
+        constructor(url) {
+            this.listeners = {};
+            if (url === '/api/repos/example__tabs/events') window.repoStream = this;
+        }
         addEventListener(name, handler) { this.listeners[name] = handler; }
         close() {}
     };''')
