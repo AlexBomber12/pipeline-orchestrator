@@ -30,24 +30,32 @@
     <script>
         (function () {
             const STORAGE_KEY = 'theme';
-            let theme = 'dark';
-            let storedTheme = null;
-
+            const media = window.matchMedia('(prefers-color-scheme: light)');
+            let mode = 'system';
             try {
-                storedTheme = localStorage.getItem(STORAGE_KEY);
+                const stored = localStorage.getItem(STORAGE_KEY);
+                if (['system', 'light', 'dark'].includes(stored)) mode = stored;
             } catch (_error) {}
 
-            if (storedTheme === 'light' || storedTheme === 'dark') {
-                theme = storedTheme;
-            } else if (
-                window.matchMedia &&
-                window.matchMedia('(prefers-color-scheme: light)').matches
-            ) {
-                theme = 'light';
+            function applyTheme() {
+                const theme = mode === 'system' ? (media.matches ? 'light' : 'dark') : mode;
+                document.documentElement.dataset.theme = theme;
+                document.documentElement.style.colorScheme = theme;
+                document.querySelectorAll('[data-theme-control]').forEach(control => {
+                    control.value = mode;
+                });
             }
-
-            document.documentElement.dataset.theme = theme;
-            document.documentElement.style.colorScheme = theme;
+            applyTheme();
+            media.addEventListener('change', () => {
+                if (mode === 'system') applyTheme();
+            });
+            document.addEventListener('DOMContentLoaded', applyTheme);
+            document.addEventListener('change', event => {
+                if (!event.target.matches('[data-theme-control]')) return;
+                mode = event.target.value;
+                try { localStorage.setItem(STORAGE_KEY, mode); } catch (_error) {}
+                applyTheme();
+            });
         })();
     </script>
 
@@ -295,6 +303,10 @@
                 transition: none !important;
             }
         }
+
+        #automation-menu-toggle { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        #global-control-result:not(:empty) { position: absolute; right: 1rem; top: 100%; z-index: 40; max-width: calc(100vw - 2rem); background: var(--bg-1); }
+        #header-menu > summary::-webkit-details-marker { display: none; }
 
         /* Shared hover treatments for interactive elements. */
         .primary-interactive {
@@ -644,38 +656,37 @@
             document.addEventListener('keydown', recordInteraction, true);
         })();
     </script>
-    <nav class="border-b border-white/5 bg-surface-2">
-        <div class="max-w-7xl mx-auto flex flex-col gap-3 px-4 py-3 sm:flex-row sm:items-center sm:justify-between sm:px-6 sm:py-4">
-            <div class="flex min-w-0 items-center gap-3">
-                <div class="w-9 h-9 rounded-md bg-accent/10 border border-accent/30 flex items-center justify-center">
+    <nav aria-label="Main navigation" class="border-b border-white/5 bg-surface-2 relative">
+        <div class="max-w-7xl mx-auto flex items-center gap-2 px-4 py-3 sm:gap-6 sm:px-6 sm:py-4">
+            <a href="/" class="flex min-w-0 flex-1 items-center gap-3">
+                <div class="hidden sm:flex shrink-0 w-9 h-9 rounded-md bg-accent/10 border border-accent/30 items-center justify-center">
                     <span class="font-mono text-accent text-sm font-semibold">PO</span>
                 </div>
                 <h1 class="min-w-0 truncate text-base font-semibold tracking-tight sm:text-lg">Pipeline Orchestrator</h1>
-            </div>
-            <div class="flex w-full flex-wrap items-center justify-between gap-3 sm:w-auto sm:justify-end sm:gap-6">
-                <a href="/"
-                   class="text-sm font-medium secondary-interactive {% if title == 'Settings' %}text-gray-400{% else %}text-accent{% endif %}">
-                    Dashboard
-                </a>
-                <a href="/settings"
-                   class="text-sm font-medium secondary-interactive {% if title == 'Settings' %}text-accent{% else %}text-gray-400{% endif %}">
-                    Settings
-                </a>
+            </a>
+            <div class="w-28 shrink-0 sm:w-auto">
                 {% include "components/global_modals.html" %}
-                {% include "components/_global_spinner.html" %}
-                <button
-                    id="availability-chip"
-                    type="button"
-                    class="availability-chip"
-                    data-composed="AVAILABLE"
-                    data-manual="AUTO"
-                    title="Click to cycle: AUTO → AVAILABLE → AWAY"
-                    aria-label="Operator availability: AUTO">
-                    <span class="dot" aria-hidden="true"></span>
-                    <span class="label">AUTO</span>
-                </button>
-                <div id="clock" class="font-mono text-sm text-gray-400 sm:text-right">--:--:--</div>
             </div>
+            <details id="header-menu" class="relative shrink-0">
+                <summary aria-label="Header menu" class="list-none cursor-pointer flex h-11 w-11 items-center justify-center rounded border border-white/10">☰</summary>
+                <div class="absolute right-0 z-50 mt-2 w-60 rounded border border-white/10 bg-surface-2 p-4 flex flex-col gap-4">
+                    <a href="/" class="text-sm secondary-interactive">Dashboard</a>
+                    <a href="/settings" class="text-sm secondary-interactive">Settings</a>
+                    <label for="header-theme" class="text-sm">Theme</label>
+                    <select id="header-theme" data-theme-control class="rounded border border-white/10 bg-surface-3 p-2 text-sm">
+                        <option value="system">System</option>
+                        <option value="light">Light</option>
+                        <option value="dark">Dark</option>
+                    </select>
+                    <button id="availability-chip" type="button" class="availability-chip"
+                            data-composed="AVAILABLE" data-manual="AUTO"
+                            title="Click to cycle: AUTO → AVAILABLE → AWAY" aria-label="Operator availability: AUTO">
+                        <span class="dot" aria-hidden="true"></span><span class="label">AUTO</span>
+                    </button>
+                    <div id="clock" class="font-mono text-sm text-gray-400">--:--:--</div>
+                </div>
+            </details>
+            <div class="absolute right-4 top-full z-40">{% include "components/_global_spinner.html" %}</div>
         </div>
     </nav>
 
@@ -698,49 +709,16 @@
     </main>
 
     <script>
-        (function () {
-            const STORAGE_KEY = 'theme';
-
-            function applyTheme(theme, persist) {
-                const button = document.getElementById('theme-toggle');
-                const darkIcon = document.getElementById('theme-icon-dark');
-                const lightIcon = document.getElementById('theme-icon-light');
-
-                document.documentElement.dataset.theme = theme;
-                document.documentElement.style.colorScheme = theme;
-
-                if (persist) {
-                    try {
-                        localStorage.setItem(STORAGE_KEY, theme);
-                    } catch (_error) {}
-                }
-
-                if (button) {
-                    const nextTheme = theme === 'dark' ? 'light' : 'dark';
-                    button.setAttribute('aria-label', `Switch to ${nextTheme} theme`);
-                    button.setAttribute('title', `Switch to ${nextTheme} theme`);
-                }
-
-                if (darkIcon && lightIcon) {
-                    darkIcon.classList.toggle('hidden', theme !== 'dark');
-                    lightIcon.classList.toggle('hidden', theme !== 'light');
-                }
+        const headerMenu = document.getElementById('header-menu');
+        headerMenu.addEventListener('keydown', event => {
+            if (event.key === 'Escape') {
+                headerMenu.open = false;
+                headerMenu.querySelector('summary').focus();
             }
-
-            applyTheme(document.documentElement.dataset.theme || 'dark', false);
-
-            const button = document.getElementById('theme-toggle');
-
-            if (button) {
-                button.addEventListener('click', function () {
-                    const currentTheme = document.documentElement.dataset.theme === 'light'
-                        ? 'light'
-                        : 'dark';
-                    const nextTheme = currentTheme === 'dark' ? 'light' : 'dark';
-                    applyTheme(nextTheme, true);
-                });
-            }
-        })();
+        });
+        document.addEventListener('click', event => {
+            if (!headerMenu.contains(event.target)) headerMenu.open = false;
+        });
     </script>
 
     <script>

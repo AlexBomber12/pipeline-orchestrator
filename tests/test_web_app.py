@@ -340,7 +340,7 @@ def test_index_route_returns_html(
     "path",
     ["/", "/repo/example__alpha"],
 )
-def test_base_template_top_nav_no_theme_toggle(
+def test_base_template_top_nav_has_theme_menu(
     two_repo_config: Path,
     monkeypatch: pytest.MonkeyPatch,
     path: str,
@@ -353,7 +353,8 @@ def test_base_template_top_nav_no_theme_toggle(
     assert response.status_code == 200
     body = response.text
     nav = body[body.index("<nav"):body.index("</nav>")]
-    assert 'id="theme-toggle"' not in nav
+    assert 'id="header-theme" data-theme-control' in nav
+    assert 'id="header-menu"' in nav
     assert 'meta name="color-scheme" content="dark light"' in response.text
 
 
@@ -369,8 +370,9 @@ def test_settings_template_has_theme_toggle(
     assert response.status_code == 200
     assert "Appearance" in response.text
     assert 'id="theme-toggle"' in response.text
-    assert 'id="theme-icon-dark"' in response.text
-    assert 'id="theme-icon-light"' in response.text
+    assert response.text.count('data-theme-control class=') == 2
+    for mode in ('system', 'light', 'dark'):
+        assert response.text.count(f'<option value="{mode}">') == 2
 
 
 def test_base_template_includes_theme_bootstrap_assets(
@@ -383,14 +385,13 @@ def test_base_template_includes_theme_bootstrap_assets(
 
     body = response.text
     assert "html[data-theme=\"light\"]" in body
-    assert "let storedTheme = null;" in body
     assert "localStorage.getItem(STORAGE_KEY)" in body
-    assert "if (storedTheme === 'light' || storedTheme === 'dark')" in body
-    assert "localStorage.setItem(STORAGE_KEY, theme)" in body
+    assert "['system', 'light', 'dark'].includes(stored)" in body
+    assert "localStorage.setItem(STORAGE_KEY, mode)" in body
     assert "prefers-color-scheme: light" in body
     assert "document.documentElement.dataset.theme = theme;" in body
-    assert "theme-icon-dark" in body
-    assert "theme-icon-light" in body
+    assert "media.addEventListener('change'" in body
+    assert "if (mode === 'system') applyTheme();" in body
 
 
 def test_global_spinner_present_on_dashboard(

@@ -84,20 +84,17 @@
     <section id="settings-appearance" class="scroll-mt-6">
         <h2 class="text-xl font-semibold tracking-tight mb-4">Appearance</h2>
 
-        <div class="flex items-center justify-between gap-4 rounded-lg border border-white/5 bg-surface-2 p-5">
+        <div class="flex flex-wrap items-center justify-between gap-4 rounded-lg border border-white/5 bg-surface-2 p-5">
             <div>
                 <h3 class="font-medium text-gray-200">Theme</h3>
                 <p class="mt-1 text-sm text-gray-400">Your selected theme is saved in this browser.</p>
             </div>
-            <button
-                id="theme-toggle"
-                type="button"
-                class="secondary-interactive inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-white/10 bg-surface-3/60 text-gray-300"
-                aria-label="Switch to light theme"
-                title="Toggle theme">
-                <span id="theme-icon-dark" aria-hidden="true">☾</span>
-                <span id="theme-icon-light" class="hidden" aria-hidden="true">☀</span>
-            </button>
+            <label for="theme-toggle" class="sr-only">Theme</label>
+            <select id="theme-toggle" data-theme-control class="shrink-0 rounded-lg border border-white/10 bg-surface-3 p-2 text-sm">
+                <option value="system">System</option>
+                <option value="light">Light</option>
+                <option value="dark">Dark</option>
+            </select>
         </div>
     </section>
     </div>
