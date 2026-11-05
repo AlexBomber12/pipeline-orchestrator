@@ -61,7 +61,8 @@ async def retain_coding_publication(
             attempt.provider_published_head_sha = observed.head_sha
     except Exception as exc:
         runner.log_event(
-            f"[CODING] Intermediate publication proof unavailable: {type(exc).__name__}."
+            f"[CODING] Intermediate publication proof unavailable: {type(exc).__name__}.",
+            severity="warn",
         )
 
 
@@ -187,11 +188,11 @@ async def resolve(runner: PipelineRunner, *, resolve_terminal: bool) -> bool:
                 empty_is_success=runner.repo_config.allow_merge_without_checks,
             )
         except Exception as exc:
-            runner.log_event(f"[INFRA] Publication CI hydration deferred: {exc}")
+            runner.log_event(f"[INFRA] Publication CI hydration deferred: {exc}", severity="warn")
         return True
     except Exception as exc:
         attempt.incident = f"publication observation unavailable: {exc}"
-        runner.log_event(f"[INFRA] {attempt.incident}")
+        runner.log_event(f"[INFRA] {attempt.incident}", severity="warn")
         return False
 
 
@@ -218,7 +219,7 @@ async def _operator_paused(runner: PipelineRunner) -> bool:
             runner._stop_requested = True
             runner.state.user_paused = True
             runner.state.state = PipelineState.PAUSED
-            runner.log_event("[INFRA] Stop latched during publication reconciliation -> PAUSED.")
+            runner.log_event("[INFRA] Stop latched during publication reconciliation -> PAUSED.", severity="info")
     if runner.state.user_paused:
         await runner.publish_state()
         return True
@@ -329,7 +330,7 @@ async def hold(runner: PipelineRunner) -> bool:
     attempt.pending = False
     attempt.incident = None
     runner.state.state = PipelineState.WATCH
-    runner.log_event("[INFRA] Exact intended PR head confirmed -> WATCH.")
+    runner.log_event("[INFRA] Exact intended PR head confirmed -> WATCH.", severity="ok")
     await runner.publish_state()
     return True
 
@@ -337,7 +338,7 @@ async def hold(runner: PipelineRunner) -> bool:
 async def _park(runner: PipelineRunner, message: str) -> bool:
     if runner.state.error_message != message or runner.state.state != PipelineState.ERROR:
         await runner._transition_to_error(
-            message, save_run_record_as=None, publish=True, log_prefix="[INFRA]",
+            message, save_run_record_as=None, publish=True, log_prefix="[INFRA]", log_severity="error",
         )
     return True
 
@@ -354,7 +355,7 @@ async def _exhaust(runner: PipelineRunner) -> bool:
     record = runner._current_run_record
     await runner._transition_to_error(
         message, save_run_record_as="error" if record is not None and record.ended_at is None else None,
-        publish=False, log_prefix="[INFRA]",
+        publish=False, log_prefix="[INFRA]", log_severity="error",
         cancellation_cause=CancellationCause(category="ERROR", payload={
             "subsource": "crash", "reason_text": message,
             "publication_attempt": attempt.model_dump(mode="json"),
@@ -365,7 +366,7 @@ async def _exhaust(runner: PipelineRunner) -> bool:
             runner.state.current_task, "ERROR", message, blocked_reason=SuppressionReason.CRASH,
         )
     except Exception as exc:
-        runner.log_event(f"[INFRA] Terminal status write deferred: {exc}")
+        runner.log_event(f"[INFRA] Terminal status write deferred: {exc}", severity="error")
         written = False
     if not written:
         await runner._mark_status_write_failed_task(
@@ -461,7 +462,7 @@ async def pause_provider_failure(runner: PipelineRunner, stderr: str, coder_name
     runner.state.error_message = None
     runner.state.state = PipelineState.PAUSED
     runner.log_event(f"[INFRA] {attempt.provider_error}: retained {invocation.phase.upper()}; "
-                     f"retry {attempt.provider_retries}/3 scheduled.")
+                     f"retry {attempt.provider_retries}/3 scheduled.", severity="warn")
     await runner.publish_state()
     return True
 

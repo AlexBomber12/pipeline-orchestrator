@@ -123,6 +123,12 @@ async def lifecycle(tmp_path, monkeypatch):
     return runner, provider, repo, old, expected, configure
 
 
+def assert_event_severity(runner, message, severity):
+    events = [event for event in runner.state.history if message in event['event']]
+    assert events, f'Missing event: {message}'
+    assert {event.get('severity') for event in events} == {severity}
+
+
 async def finish(runner):
     await publication.record_exit(runner, 0, 'implemented; PR view still old', '')
     await runner._capture_published_attempt()
@@ -161,6 +167,7 @@ async def test_delayed_head_survives_fresh_runner_and_accounts_once(lifecycle):
     await fresh._run_cycle_body()
     pr = fresh.state.current_pr
     assert fresh.state.state == PipelineState.WATCH
+    assert_event_severity(fresh, "Exact intended PR head confirmed -> WATCH.", "ok")
     assert not fresh.state.publication_attempt.pending
     assert pr.head_sha == expected
     assert pr.fix_iteration_count == 4
@@ -283,6 +290,8 @@ async def test_bounded_uncertainty_preserves_work_and_actionable_evidence(lifecy
         git(repo, 'push', 'origin', '--delete', 'pr-001')
         provider['head'] = expected
     await runner._hold_unresolved_publication()
+    if problem == 'api':
+        assert_event_severity(runner, 'publication observation unavailable:', 'warn')
     assert runner.state.publication_attempt.pending
     fresh = await restart(runner, configure)
     Clock.value = fresh.state.publication_attempt.reconcile_deadline
@@ -293,6 +302,7 @@ async def test_bounded_uncertainty_preserves_work_and_actionable_evidence(lifecy
     assert not fresh.state.publication_attempt.pending
     assert fresh.state.current_task is not None
     assert fresh.state.state == PipelineState.ERROR
+    assert_event_severity(fresh, 'Publication reconciliation exhausted:', 'error')
     assert status.call_args.args[1] == 'ERROR'
     assert 'expected=' + expected in status.call_args.args[2]
     assert 'branch=' in status.call_args.args[2] and 'PR=' in status.call_args.args[2]
@@ -542,6 +552,8 @@ async def test_partial_observations_fail_closed(lifecycle, monkeypatch, problem)
         a.run_id = 'unrelated invocation'
     await runner._hold_unresolved_publication()
     if problem == 'ci_error':
+        assert_event_severity(runner, 'Publication CI hydration deferred:', 'warn')
+        assert_event_severity(runner, 'Exact intended PR head confirmed -> WATCH.', 'ok')
         assert runner.state.state == PipelineState.WATCH
         assert runner.state.current_pr.ci_status == CIStatus.PENDING
     else:
@@ -652,6 +664,7 @@ async def test_global_stop_latches_pause_until_play_across_restart(lifecycle, mo
     await runner._hold_unresolved_publication()
     monkeypatch.setattr(runner, 'publish_state', publish)
     persisted = RepoState.model_validate_json(await runner.redis.get(pipeline_state(runner.name)))
+    assert_event_severity(runner, 'Stop latched during publication reconciliation -> PAUSED.', 'info')
     assert persisted.user_paused
     assert persisted.state == PipelineState.PAUSED
     assert persisted.publication_attempt.pending
@@ -717,7 +730,8 @@ async def test_exhaustion_status_exception_retains_terminal_incident(lifecycle, 
     await runner._hold_unresolved_publication()
     assert runner.state.publication_attempt.pending
     assert runner.state.publication_attempt.exhausted
-    assert 'base unavailable' in str(runner.state.history)
+    assert_event_severity(runner, 'Terminal status write deferred: base unavailable', 'error')
+    assert_event_severity(runner, 'Publication reconciliation exhausted:', 'error')
     assert provider['requests'] == []
 
 
@@ -1072,13 +1086,14 @@ async def test_held_failure_queue_projection_is_bound(lifecycle, case):
     assert await load_current_queue(runner.name, runner.redis) == expected
 
 
+@pytest.mark.parametrize('single_error_exit', [False, True])
 @pytest.mark.parametrize('published', [False, True])
 @pytest.mark.parametrize('dirty', [False, True])
 @pytest.mark.parametrize('diagnostic', ['capacity', 'rate_limit', 'structured_capacity', 'structured_rate_limit'])
 @pytest.mark.parametrize('feedback_source', ['review', 'ci', 'both'])
 @pytest.mark.parametrize('interrupted_before_work', [False, True])
 async def test_provider_interrupted_fix_preserves_work_and_eventually_progresses(
-    lifecycle, monkeypatch, published, dirty, diagnostic, feedback_source, interrupted_before_work,
+    lifecycle, monkeypatch, published, dirty, diagnostic, feedback_source, interrupted_before_work, single_error_exit,
 ):
     import json
 
@@ -1114,6 +1129,7 @@ async def test_provider_interrupted_fix_preserves_work_and_eventually_progresses
 
     def setup(r):
         configure(r)
+        r.repo_config.feature_flags.use_single_error_exit = single_error_exit
         r.repo_config.coder = "codex"
         r.app_config.daemon.coder_settings = {"codex": {"model": "gpt-5.4", "reasoning_effort": "high"}}
         r._refresh_auth_status_cache = AsyncMock()
@@ -1170,6 +1186,7 @@ async def test_provider_interrupted_fix_preserves_work_and_eventually_progresses
     monkeypatch.setattr(type(plugin), 'fix_review', lambda self, *a, **kw: coder(*a, **kw))
     await runner.handle_fix()
     attempt = runner.state.publication_attempt
+    assert_event_severity(runner, f'{diagnostic}: retained FIX; retry 1/3 scheduled.', 'warn')
     assert attempt.provider_error == diagnostic
     assert attempt.exit_classification == 'failure'
     assert (runner.state.rate_limited_until is None) is (diagnostic == 'capacity')
@@ -1264,6 +1281,8 @@ async def test_persistent_capacity_is_bounded_without_spending_fix_allowance(lif
         assert await publication.resume_provider_failure(runner)
         assert runner.state.state == PipelineState.ERROR
     assert len(calls) == 3
+    assert_event_severity(runner, publication.PROVIDER_RECOVERY_EXHAUSTED, 'error')
+    assert_event_severity(runner, 'capacity: retained FIX;', 'warn')
     assert 'exhausted' in runner.state.error_message
     assert git(repo, 'rev-parse', 'HEAD') == expected
     assert git(remote, 'rev-parse', 'refs/heads/pr-001') == old
@@ -1322,6 +1341,7 @@ async def test_provider_recovery_retains_conflicting_or_missing_evidence(lifecyc
     assert runner.state.state == PipelineState.ERROR
     assert runner.state.current_task.pr_id == 'PR-001'
     assert runner.state.publication_attempt.pending
+    assert_event_severity(runner, runner.state.error_message + '.', 'error')
     assert dispatch.await_count == 0
     assert provider['requests'] == []
 
@@ -2091,6 +2111,7 @@ async def test_coding_capacity_recovers_same_work_after_restart(coding_provider,
     assert first.ended_at and first.outcome == 'paused' and first.run_phase == 'coding'
     assert first.attempt_index == 1 and len(first.invocations) == 1
     attempt = runner.state.publication_attempt
+    assert_event_severity(runner, 'capacity: retained CODING; retry 1/3 scheduled.', 'warn')
     assert attempt.pending and attempt.provider_error == 'capacity' and attempt.cleanup_confirmed
     assert attempt.coding_task_body == (repo / 'tasks/PR-001.md').read_text()
     assert runner.state.state == PipelineState.PAUSED
@@ -2148,6 +2169,7 @@ async def test_persistent_coding_capacity_is_bounded_and_stable(coding_provider,
         assert runner.state.state == PipelineState.ERROR
     assert len(provider['calls_to_coder']) == 3
     assert runner.state.error_message == publication.PROVIDER_RECOVERY_EXHAUSTED.replace('FIX', 'CODING')
+    assert_event_severity(runner, runner.state.error_message + '.', 'error')
     assert (repo / 'retained-test.py').read_text() == '# interrupted test\n'
     assert (repo / 'artifacts/ci.log').read_text() == 'pytest 2% -- unfinished'
     assert len([e for e in runner.state.history if e['event'].endswith(runner.state.error_message + '.')]) == 1
@@ -2695,6 +2717,8 @@ async def test_coding_monitor_retains_intermediate_publication(
     attempt = runner.state.publication_attempt
     a, b = provider['intermediate_head'], git(repo, 'rev-parse', 'HEAD')
     assert a != b and git(repo, 'rev-parse', b + '^') == a
+    if recovery == 'capture_unavailable':
+        assert_event_severity(runner, 'Intermediate publication proof unavailable: OSError.', 'warn')
     capture_failed = recovery.startswith('capture_')
     if recovery != 'capture_remote':
         assert git(remote, 'rev-parse', 'refs/heads/pr-001') == a
