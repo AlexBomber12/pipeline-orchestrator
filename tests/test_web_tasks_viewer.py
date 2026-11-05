@@ -595,4 +595,7 @@ def test_repo_detail_page_includes_tasks_panel_lazy_loader(
     assert response.status_code == 200
     body = response.text
     assert 'hx-get="/repos/example__alpha/tasks"' in body
-    assert "Tasks queue" in body
+    assert 'role="tablist"' in body
+    assert 'id="repo-tab-tasks"' in body
+    assert 'aria-controls="repo-panel-tasks"' in body
+    assert '<template data-panel-content>' in body

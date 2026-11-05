@@ -94,9 +94,10 @@ def test_stop_during_coding_then_resume_picks_next_task(
         expect(summary.locator('[data-work-summary]')).to_contain_text("Activity: Unknown")
         # Passive diagnostics remain usable and do not act as Resume.
         with page.expect_response(f"**/partials/repo/{testbed_slug}/cancellations") as diagnostics:
-            page.get_by_text("Recent cancellations", exact=True).click()
+            page.get_by_role("tab", name="Cancellations").click()
         assert diagnostics.value.status == 200
         assert get_state()["user_paused"] is True
+        page.get_by_role("tab", name="Overview").click()
         with page.expect_response(f"**/repos/{testbed_slug}/resume") as response:
             summary.get_by_role("button", name="Resume daemon", exact=True).click()
         assert response.value.status == 200

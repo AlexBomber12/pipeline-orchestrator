@@ -10,6 +10,22 @@
     </a>
 </div>
 
+<style>
+    [data-repo-tab][aria-selected="true"] { border-color: currentColor; color: #e5e7eb; }
+</style>
+<div role="tablist" aria-label="Repository views" class="flex gap-2 overflow-x-auto mb-4">
+    {% for key, label in [('overview', 'Overview'), ('events', 'Events'), ('tasks', 'Tasks'), ('cancellations', 'Cancellations'), ('coder-log', 'Coder log')] %}
+    <button type="button" role="tab" id="repo-tab-{{ key }}" data-repo-tab="{{ key }}"
+            aria-controls="repo-panel-{{ key }}" aria-selected="{{ 'true' if loop.first else 'false' }}"
+            tabindex="{{ 0 if loop.first else -1 }}"
+            class="secondary-interactive shrink-0 border-b-2 border-transparent px-3 py-2 text-sm text-gray-400">
+        <span>{{ label }}</span>
+        <span data-tab-count="{{ key }}" class="font-mono text-xs"
+              title="{{ 'Current event entries' if key == 'events' else 'Count unavailable' }}">{{ events|default([])|length if key == 'events' else '—' }}</span>
+    </button>
+    {% endfor %}
+</div>
+<div id="repo-panel-overview" role="tabpanel" aria-labelledby="repo-tab-overview" tabindex="0">
 {# Summary refreshes on SSE state_change AND history_updated; the latter
    carries pause/resume/stop mutations of repo.user_paused (which the
    play/pause/stop controls depend on) when state.state itself does not
@@ -29,52 +45,92 @@
     {% include "components/repo_summary.html" %}
 </div>
 
-{# Reset must survive summary, queue, and pending-retry polling swaps. #}
+</div>
+{# Reset must survive panel and summary refreshes. #}
 <div id="repo-reset-dialog"></div>
-
-{% include "components/event_log.html" %}
-
-<details class="mt-4">
-    <summary class="secondary-interactive text-sm text-gray-400 cursor-pointer">
-        Tasks queue
-    </summary>
-    <div hx-get="/repos/{{ repo.name }}/tasks"
-         hx-trigger="revealed, repo:history_updated from:body, repo:state_change from:body"
-         hx-swap="innerHTML">
-    </div>
-</details>
-
-<details class="mt-4">
-    <summary class="secondary-interactive text-sm text-gray-400 cursor-pointer">
-        Recent cancellations
-    </summary>
-    {# Operator-review surface (last 7 days, capped at 50). Fetched
-       on every open of the <details> via the toggle event filtered to
-       the opened state, so closing and re-opening the section refetches
-       (htmx `revealed` fires only once per element, which would leave
-       stale cards visible during incident review). No polling. #}
-    <div hx-get="/partials/repo/{{ repo.name }}/cancellations"
-         hx-trigger="toggle[target.open] from:closest details"
-         hx-swap="innerHTML">
-    </div>
-</details>
-
-<details class="mt-4">
-    <summary class="secondary-interactive text-sm text-gray-400 cursor-pointer">
-        Coder log
-    </summary>
-    {# Keep the periodic poll alongside SSE: state_change fires only on
-       transitions, but coder stdout grows continuously during long
-       CODING/WATCH stretches where state.state stays constant, so
-       without `every 30s` the panel can sit stale for many minutes
-       even while the log is actively appending. #}
-    <div hx-get="/partials/repo/{{ repo.name }}/cli-log"
-         hx-trigger="revealed, repo:state_change from:body, every 30s"
-         hx-swap="innerHTML">
-    </div>
-</details>
+{% for key in ['events', 'tasks', 'cancellations', 'coder-log'] %}
+<div id="repo-panel-{{ key }}" role="tabpanel" aria-labelledby="repo-tab-{{ key }}" tabindex="0" hidden>
+    <template data-panel-content>
+        {% if key == 'events' %}
+        {% include "components/event_log.html" %}
+        {% elif key == 'tasks' %}
+        <div hx-get="/repos/{{ repo.name }}/tasks"
+             hx-trigger="load, repo:history_updated from:body, repo:state_change from:body"
+             hx-swap="innerHTML"></div>
+        {% elif key == 'cancellations' %}
+        <div hx-get="/partials/repo/{{ repo.name }}/cancellations"
+             hx-trigger="panel:activate" hx-swap="innerHTML"></div>
+        {% else %}
+        {# Coder output grows between state transitions; retain the periodic poll. #}
+        <div hx-get="/partials/repo/{{ repo.name }}/cli-log"
+             hx-trigger="load, repo:state_change from:body, every 30s"
+             hx-swap="innerHTML"></div>
+        {% endif %}
+    </template>
+</div>
+{% endfor %}
 
 <script>
+    document.addEventListener('DOMContentLoaded', function () {
+        const tabs = Array.from(document.querySelectorAll('[data-repo-tab]'));
+        const eventPanel = document.getElementById('repo-panel-events');
+        let eventScroll = 0;
+        let selected = null;
+        function activate(key, updateHash) {
+            const tab = tabs.find(item => item.dataset.repoTab === key) || tabs[0];
+            key = tab.dataset.repoTab;
+            if (selected === key) return;
+            const log = eventPanel.querySelector('[id^="event-list-wrapper-"]');
+            if (selected === 'events' && log) eventScroll = log.scrollTop;
+            const moveFocus = document.activeElement.closest('[role="tabpanel"]');
+            tabs.forEach(item => {
+                const active = item === tab;
+                item.setAttribute('aria-selected', String(active));
+                item.tabIndex = active ? 0 : -1;
+                document.getElementById(item.getAttribute('aria-controls')).hidden = !active;
+            });
+            const panel = document.getElementById(tab.getAttribute('aria-controls'));
+            const template = panel.querySelector('template[data-panel-content]');
+            if (template) {
+                template.replaceWith(template.content.cloneNode(true));
+                // Fetch current events on first activation, then retain live subscriptions.
+                const events = panel.querySelector('[id^="event-list-wrapper-"]');
+                if (events) events.setAttribute('hx-trigger', 'load, ' + events.getAttribute('hx-trigger'));
+                // Process once; hiding a loaded panel must never unsubscribe it.
+                htmx.process(panel);
+            }
+            if (key === 'events') {
+                const wrapper = eventPanel.querySelector('[id^="event-list-wrapper-"]');
+                if (wrapper) wrapper.scrollTop = eventScroll;
+            }
+            if (key === 'cancellations') htmx.trigger(panel.querySelector('[hx-get]'), 'panel:activate');
+            selected = key;
+            if (moveFocus && moveFocus.hidden) tab.focus({preventScroll: true});
+            if (updateHash || location.hash !== '#' + key) history.replaceState(null, '', '#' + key);
+        }
+        tabs.forEach((tab, index) => {
+            tab.addEventListener('click', () => activate(tab.dataset.repoTab, true));
+            tab.addEventListener('keydown', event => {
+                let next;
+                if (event.key === 'ArrowRight') next = (index + 1) % tabs.length;
+                if (event.key === 'ArrowLeft') next = (index + tabs.length - 1) % tabs.length;
+                if (event.key === 'Home') next = 0;
+                if (event.key === 'End') next = tabs.length - 1;
+                if (next === undefined) return;
+                event.preventDefault();
+                tabs.forEach((item, i) => { item.tabIndex = i === next ? 0 : -1; });
+                tabs[next].focus();
+            });
+        });
+        // The existing OOB event count is authoritative, including while hidden.
+        document.body.addEventListener('htmx:afterSwap', function () {
+            const count = document.getElementById('event-log-count-' + {{ repo.name | tojson }});
+            if (count) document.querySelector('[data-tab-count="events"]').textContent = count.textContent.trim().replace(/ events$/, '');
+        });
+        window.addEventListener('hashchange', () => activate(location.hash.slice(1), false));
+        activate(location.hash.slice(1), false);
+    });
+
     (function () {
         const container = document.getElementById('repo-summary-refresh');
         let diagnosticsOpen = false;
