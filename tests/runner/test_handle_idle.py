@@ -2480,13 +2480,12 @@ def test_resolve_pending_queue_sync_clears_state_when_pr_merged(
     runner = h._make_runner()
     runner.state.pending_queue_sync_branch = "queue-done-pr-001"
     runner.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
-    events: list[str] = []
-    monkeypatch.setattr(runner, "log_event", events.append)
 
     assert asyncio.run(runner._resolve_pending_queue_sync()) is True
     assert runner.state.pending_queue_sync_branch is None
     assert runner.state.pending_queue_sync_started_at is None
-    assert events == ["[MERGE] Queue-sync PR merged (queue-done-pr-001)."]
+    assert runner.state.history[-1]["event"] == "[MERGE] Queue-sync PR merged (queue-done-pr-001)."
+    assert runner.state.history[-1]["severity"] == "ok"
 
 
 def test_resolve_pending_queue_sync_clears_state_when_pr_closed(
@@ -2549,8 +2548,6 @@ def test_resolve_pending_queue_sync_logs_and_escalates_on_view_failure(
 
     runner = h._make_runner()
     runner.state.pending_queue_sync_branch = "queue-done-pr-001"
-    events: list[str] = []
-    monkeypatch.setattr(runner, "log_event", events.append)
 
     async def fake_escalate(branch: str) -> None:
         escalations.append(branch)
@@ -2562,7 +2559,8 @@ def test_resolve_pending_queue_sync_logs_and_escalates_on_view_failure(
     )
 
     assert asyncio.run(runner._resolve_pending_queue_sync()) is False
-    assert events == ["[MERGE] queue-sync PR queue-done-pr-001 view failed: gh unavailable."]
+    assert runner.state.history[-1]["event"] == "[MERGE] queue-sync PR queue-done-pr-001 view failed: gh unavailable."
+    assert runner.state.history[-1]["severity"] == "error"
     assert escalations == ["queue-done-pr-001"]
 
 
