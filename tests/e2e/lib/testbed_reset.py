@@ -237,7 +237,8 @@ def wipe_tasks_dir_on_main() -> bool:
                 f"wipe_tasks_dir_on_main: git commit failed "
                 f"(rc={commit.returncode}): {commit.stderr.strip()}"
             )
-        # Retry the same commit only for GitHub's transient server error. A
+        # Retry the same commit only for known GitHub server errors, including
+        # the commit_refs_rules failure also retried by the test coder shim. A
         # lost successful response is safe: repeating this push is up to date.
         # Auth, policy and non-fast-forward failures must still fail immediately.
         for attempt in range(3):
@@ -249,7 +250,14 @@ def wipe_tasks_dir_on_main() -> bool:
                 timeout=30,
                 env=_git_env(),
             )
-            if push.returncode == 0 or "Internal Server Error" not in push.stderr:
+            retryable = any(
+                line.strip() in {
+                    "remote: Internal Server Error",
+                    "remote: fatal error in commit_refs_rules",
+                }
+                for line in push.stderr.splitlines()
+            )
+            if push.returncode == 0 or not retryable:
                 break
             if attempt < 2:
                 print(f"wipe_tasks_dir_on_main: transient push failure; retry {attempt + 1}/2")
