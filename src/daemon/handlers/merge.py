@@ -178,7 +178,8 @@ class MergeMixin:
             and record.reason == SuppressionReason.GUARDRAIL
         ):
             self.log_event(
-                f"[MERGE] PR #{number} is quarantined; refusing to merge."
+                f"[MERGE] PR #{number} is quarantined; refusing to merge.",
+                severity="error",
             )
             self.state.state = PipelineState.WATCH
             await self.publish_state()
@@ -197,12 +198,15 @@ class MergeMixin:
                             f"refs/pull/{number}/head", timeout=60,
                         )
                     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-                        self.log_event(f"[MERGE] PR #{number} head fetch deferred: {exc}.")
+                        self.log_event(f"[MERGE] PR #{number} head fetch deferred: {exc}.", severity="warn")
                         return
                     # Use the proved SHA, never FETCH_HEAD (the ref may change).
                     stats = self._compute_diff_stats(base, self.state.current_pr.head_sha)
                     if not stats:
-                        self.log_event(f"[MERGE] PR #{number} diff statistics unavailable; retaining ownership.")
+                        self.log_event(
+                            f"[MERGE] PR #{number} diff statistics unavailable; retaining ownership.",
+                            severity="warn",
+                        )
                         return
                 await self._finish_confirmed_merge(stats)
             return
@@ -282,7 +286,8 @@ class MergeMixin:
                                 self.state.state = PipelineState.WATCH
                             return
                         self.log_event(
-                            "[MERGE] Merge conflict with main, resolving..."
+                            "[MERGE] Merge conflict with main, resolving...",
+                            severity="info",
                         )
                         if self._current_run_record is not None:
                             self._current_run_record.had_merge_conflict = True
@@ -314,7 +319,8 @@ class MergeMixin:
                             )
                             self.log_event(
                                 "[MERGE] Conflict resolution deferred while "
-                                "credential login owns its credential location."
+                                "credential login owns its credential location.",
+                                severity="warn",
                             )
                             self.state.state = PipelineState.WATCH
                             return
@@ -362,7 +368,8 @@ class MergeMixin:
                                 self.log_event(
                                     f"[RATE-LIMIT] Rate limit pause "
                                     f"active until "
-                                    f"{self.state.rate_limited_until.isoformat()}."
+                                    f"{self.state.rate_limited_until.isoformat()}.",
+                                    severity="warn",
                                 )
                                 return
                             await self._transition_to_error(
@@ -439,13 +446,15 @@ class MergeMixin:
                     self.log_event(
                         f"[MERGE] Pre-merge sync pushed new commits to PR "
                         f"#{number}; returning to WATCH to re-verify "
-                        f"gates."
+                        f"gates.",
+                        severity="ok",
                     )
                     self.log_event(
                         f"[MERGE] Bypass-requesting fresh @codex review on "
                         f"new head "
                         f"{new_head_sha[:7] or '<unknown>'} after "
-                        f"pre-merge sync."
+                        f"pre-merge sync.",
+                        severity="info",
                     )
                     if not self._post_codex_review(
                         number,
@@ -482,7 +491,7 @@ class MergeMixin:
                 fresh = self._approval_filtered_pr(fresh)
         except Exception as exc:
             fresh = None
-            self.log_event(f"[MERGE] Final gate evidence unavailable for PR #{number}: {exc}.")
+            self.log_event(f"[MERGE] Final gate evidence unavailable for PR #{number}: {exc}.", severity="warn")
         current = self.state.current_pr
         if (
             fresh is None or fresh.head_sha != current.head_sha
@@ -494,7 +503,7 @@ class MergeMixin:
             current.ci_status = CIStatus.PENDING
             self.state.state = PipelineState.WATCH
             gh_cache._invalidate_etag_cache(f"repos/{self.owner_repo}/pulls")
-            self.log_event(f"[MERGE] PR #{number} needs fresh current-HEAD gates; returning to WATCH.")
+            self.log_event(f"[MERGE] PR #{number} needs fresh current-HEAD gates; returning to WATCH.", severity="warn")
             await self.publish_state()
             return
 
@@ -503,6 +512,7 @@ class MergeMixin:
             f"Merging PR #{number}.",
             tier="state",
             kind="transition",
+            severity="info",
         )
         self.state.merge_phase = "ready_to_merge"
         await self.publish_state()
@@ -534,6 +544,7 @@ class MergeMixin:
                 ),
                 tier="merge",
                 kind="head_mismatch",
+                severity="warn",
             )
             logger.info("merge_pr expected-head mismatch: %s", exc)
             await self.publish_state()
@@ -541,7 +552,7 @@ class MergeMixin:
         except Exception as exc:
             self.state.merge_command_failed = True
             await self.publish_state()
-            self.log_event(f"[MERGE] Merge response unavailable for PR #{number}: {exc}.")
+            self.log_event(f"[MERGE] Merge response unavailable for PR #{number}: {exc}.", severity="error")
 
         if await self._confirm_remote_merge():
             await self._finish_confirmed_merge(merged_diff_stats)
@@ -561,20 +572,24 @@ class MergeMixin:
         elif outcome.reason == "head mismatch":
             pr.review_status = ReviewStatus.PENDING
             self.state.state = PipelineState.WATCH
-            self.log_event(f"[MERGE] PR #{pr.number} needs fresh gate evidence; returning to WATCH.")
+            self.log_event(f"[MERGE] PR #{pr.number} needs fresh gate evidence; returning to WATCH.", severity="warn")
             await self.publish_state()
         elif outcome.state == gh_prs.ExactPRState.OPEN:
             if self.state.merge_command_failed:
                 admitted = gh_prs.get_pr_merge_admission(self.owner_repo, pr.number, pr.head_sha)
                 if admitted is False:
                     self.state.state = PipelineState.WATCH
-                    self.log_event(f"[MERGE] PR #{pr.number} command failed without admission; returning to WATCH.")
+                    self.log_event(
+                        f"[MERGE] PR #{pr.number} command failed without admission; returning to WATCH.",
+                        severity="error",
+                    )
                     await self.publish_state()
                     return False
-            self.log_event(f"[MERGE] PR #{pr.number} remains OPEN; retaining issued merge attempt.")
+            self.log_event(f"[MERGE] PR #{pr.number} remains OPEN; retaining issued merge attempt.", severity="info")
         else:
             self.log_event(
-                f"[MERGE] PR #{pr.number} merge outcome UNKNOWN; retaining attempt: {outcome.reason}."
+                f"[MERGE] PR #{pr.number} merge outcome UNKNOWN; retaining attempt: {outcome.reason}.",
+                severity="warn",
             )
         return False
 
@@ -595,7 +610,7 @@ class MergeMixin:
                 )
                 return
             except Exception as exc:
-                self.log_event(f"[MERGE] Accounting proof deferred for PR #{number}: {exc}.")
+                self.log_event(f"[MERGE] Accounting proof deferred for PR #{number}: {exc}.", severity="warn")
                 return
 
         # Persist the validated run and task index before the terminal header.
@@ -604,7 +619,7 @@ class MergeMixin:
         try:
             await self._checkpoint_current_run_record()
         except Exception as exc:
-            self.log_event(f"[MERGE] Run checkpoint deferred for PR #{number}: {exc}.")
+            self.log_event(f"[MERGE] Run checkpoint deferred for PR #{number}: {exc}.", severity="warn")
             return
 
         if current_task is not None and current_task.task_file:
@@ -617,7 +632,8 @@ class MergeMixin:
                 )
                 if not written:
                     self.log_event(
-                        f"[MERGE] Remote merge confirmed but status:DONE was not written to {current_task.task_file}."
+                        f"[MERGE] Remote merge confirmed but status:DONE was not written to {current_task.task_file}.",
+                        severity="error",
                     )
                     return
             except MergeIdentityConflict as exc:
@@ -629,7 +645,8 @@ class MergeMixin:
             except Exception as exc:
                 self.log_event(
                     f"[ERROR] Failed to write status:DONE to "
-                    f"{current_task.task_file}: {exc}"
+                    f"{current_task.task_file}: {exc}",
+                    severity="error",
                 )
                 return
 
@@ -643,14 +660,15 @@ class MergeMixin:
                     base_branch=base,
                 )
         except Exception as exc:
-            self.log_event(f"[MERGE] Confirmed merge bookkeeping deferred for PR #{number}: {exc}.")
+            self.log_event(f"[MERGE] Confirmed merge bookkeeping deferred for PR #{number}: {exc}.", severity="warn")
             return
         merged_at = getattr(self, "_confirmed_merge_at", None) or datetime.now(timezone.utc)
         try:
             log_merged_pr(self._build_outcome_record(merged_at))
         except Exception as exc:
             self.log_event(
-                f"[ANALYTICS] outcome log for PR #{number} failed: {exc}."
+                f"[ANALYTICS] outcome log for PR #{number} failed: {exc}.",
+                severity="error",
             )
         if current_task is not None:
             try:
@@ -661,7 +679,8 @@ class MergeMixin:
             except Exception as exc:
                 self.log_event(
                     f"[MERGE] Failed to clear retry metadata for "
-                    f"{current_task.pr_id}: {exc}."
+                    f"{current_task.pr_id}: {exc}.",
+                    severity="error",
                 )
         self._current_run_record = None
         self.state.current_task = None
@@ -671,6 +690,7 @@ class MergeMixin:
             f"Merged PR #{number} -> IDLE.",
             tier="merge",
             kind="pr_merge",
+            severity="ok",
         )
 
     def _build_outcome_record(self, merged_at: datetime) -> dict:
@@ -814,7 +834,8 @@ class MergeMixin:
             )
         except Exception as exc:
             self.log_event(
-                f"[MERGE] queue-sync PR {branch} view failed: {exc}."
+                f"[MERGE] queue-sync PR {branch} view failed: {exc}.",
+                severity="error",
             )
             await self._escalate_queue_sync_if_expired(branch)
             return False
@@ -828,7 +849,7 @@ class MergeMixin:
         if state == "MERGED" or merged_at:
             self.state.pending_queue_sync_branch = None
             self.state.pending_queue_sync_started_at = None
-            self.log_event(f"[MERGE] Queue-sync PR merged ({branch}).")
+            self.log_event(f"[MERGE] Queue-sync PR merged ({branch}).", severity="ok")
             return True
 
         if state == "CLOSED":

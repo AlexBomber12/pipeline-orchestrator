@@ -138,7 +138,7 @@ class WatchMixin:
             return
         if self.state.current_pr is None:
             self.state.state = PipelineState.IDLE
-            self.log_event("[WATCH] WATCH without current_pr -> IDLE.")
+            self.log_event("[WATCH] WATCH without current_pr -> IDLE.", severity="info")
             return
 
         try:
@@ -195,12 +195,14 @@ class WatchMixin:
             ):
                 self.log_event(
                     f"[WATCH] PR #{current_number} no longer open (state "
-                    "unknown); retaining bound FIX PR in WATCH."
+                    "unknown); retaining bound FIX PR in WATCH.",
+                    severity="warn",
                 )
                 return
             self.log_event(
                 f"[WATCH] PR #{current_number} no longer open (state "
-                f"unknown) -> IDLE."
+                f"unknown) -> IDLE.",
+                severity="warn",
             )
             self._current_run_record = None
             self.state.current_task = None
@@ -270,7 +272,10 @@ class WatchMixin:
                 self._remote_frontmatter_error_status_for_current_task()
             )
             if remote_status is None or revision is None:
-                self.log_event(f"[WATCH] PR #{found.number} legacy completion header unavailable; retrying.")
+                self.log_event(
+                    f"[WATCH] PR #{found.number} legacy completion header unavailable; retrying.",
+                    severity="warn",
+                )
                 return
             if (
                 task is None or completion.task_id != task.pr_id
@@ -298,7 +303,10 @@ class WatchMixin:
                 suppression = await self._suppression_record_for_task(task.pr_id)
                 cause = await self.redis.get(cause_key(self.name, task.pr_id))
             except Exception as exc:
-                self.log_event(f"[WATCH] PR #{found.number} legacy completion validation deferred: {exc}")
+                self.log_event(
+                    f"[WATCH] PR #{found.number} legacy completion validation deferred: {exc}",
+                    severity="warn",
+                )
                 return
             if (
                 task_hash != completion.task_spec_hash or suppression is not None or cause
@@ -323,7 +331,7 @@ class WatchMixin:
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 reason = f"Checkout verification unavailable: {exc}"
             if reason:
-                self.log_event(f"[WATCH] PR #{found.number} legacy completion waiting: {reason}")
+                self.log_event(f"[WATCH] PR #{found.number} legacy completion waiting: {reason}", severity="warn")
                 return
             # The writer checks the admitted task generation and exact remote
             # revision even when TODO is already present. Its no-diff path is
@@ -334,7 +342,7 @@ class WatchMixin:
                     expected_task_sha256=revision,
                 )
             except Exception as exc:
-                self.log_event(f"[WATCH] PR #{found.number} legacy status retry deferred: {exc}")
+                self.log_event(f"[WATCH] PR #{found.number} legacy status retry deferred: {exc}", severity="warn")
                 return
             if not committed:
                 return
@@ -344,7 +352,7 @@ class WatchMixin:
                 for item in (self.state.current_queue or [task])
             ]
             self.state.size_fix_completion = None
-            self.log_event(f"[WATCH] PR #{found.number} legacy completion reconciled.")
+            self.log_event(f"[WATCH] PR #{found.number} legacy completion reconciled.", severity="ok")
             return
         # Retry rehydrate every cycle so a transient commit-time fetch
         # failure during ``recover_state`` doesn't permanently leave
@@ -372,7 +380,8 @@ class WatchMixin:
             self._push_provenance_reason = reason
             if published_at is None and reason:
                 self.log_event(
-                    f"[WATCH] PR #{found.number} publication evidence pending: {reason}."
+                    f"[WATCH] PR #{found.number} publication evidence pending: {reason}.",
+                    severity="warn",
                 )
         elif (
             self._last_push_at is None
@@ -391,7 +400,7 @@ class WatchMixin:
             return
         if current_pr.head_sha and current_pr.head_sha != found.head_sha:
             found.review_status = ReviewStatus.PENDING
-            self.log_event(f"[WATCH] PR #{found.number} HEAD changed; waiting for fresh evidence.")
+            self.log_event(f"[WATCH] PR #{found.number} HEAD changed; waiting for fresh evidence.", severity="warn")
             return
         ci = found.ci_status
         review = found.review_status
@@ -413,7 +422,8 @@ class WatchMixin:
                 self.log_event(
                     f"[WATCH] PR #{found.number} merge held: diff scan "
                     f"did not complete for head {found.head_sha[:7]}; "
-                    f"will retry next cycle."
+                    f"will retry next cycle.",
+                    severity="warn",
                 )
                 return
             if self.repo_config.auto_merge:
@@ -421,7 +431,8 @@ class WatchMixin:
             else:
                 self.log_event(
                     f"[WATCH] PR #{found.number} green but auto_merge "
-                    f"disabled; awaiting manual merge."
+                    f"disabled; awaiting manual merge.",
+                    severity="info",
                 )
             return
         # Fork (cross-repo) PRs can't be fixed locally.
@@ -434,7 +445,8 @@ class WatchMixin:
                 self.log_event(
                     f"[WATCH] PR #{found.number} fork PR cannot be "
                     f"auto-fixed (review={review.value}, ci={ci.value}); "
-                    f"waiting for review timeout."
+                    f"waiting for review timeout.",
+                    severity="warn",
                 )
         elif ci == CIStatus.FAILURE:
             if review == ReviewStatus.CHANGES_REQUESTED:
@@ -442,7 +454,8 @@ class WatchMixin:
                 if result == FeedbackCheckResult.UNKNOWN:
                     self.log_event(
                         f"[WATCH] PR #{found.number} CI FIX continues: "
-                        "review feedback unavailable."
+                        "review feedback unavailable.",
+                        severity="warn",
                     )
                 if result == FeedbackCheckResult.NEW:
                     self._fix_feedback_reviewer_policy = reviewer_policy
@@ -467,7 +480,10 @@ class WatchMixin:
             return
         elif ci == CIStatus.INFRA_FAILURE:
             if attempt_scope(self.state, self.owner_repo, self.repo_path, found) is None:
-                self.log_event(f"[WATCH] PR #{found.number} task generation unavailable; deferring CI retry.")
+                self.log_event(
+                    f"[WATCH] PR #{found.number} task generation unavailable; deferring CI retry.",
+                    severity="warn",
+                )
                 return
             # One rerun per HEAD, with bounded requery for ambiguous evidence.
             marker_exists, grace_elapsed = await self._infra_retry_attempted(
@@ -491,7 +507,8 @@ class WatchMixin:
                     if not targets and marker.get("intent_runs"):
                         self.log_event(
                             f"[WATCH] PR #{found.number} rerun intent lacks workflow "
-                            "provenance; awaiting operator reconciliation."
+                            "provenance; awaiting operator reconciliation.",
+                            severity="error",
                         )
                         return
                     self._infra_retry_baseline = marker.get("checks", [])
@@ -547,7 +564,8 @@ class WatchMixin:
                         )
                         return
                     self.log_event(
-                        f"[WATCH] PR #{found.number} awaiting post-retry terminal CI evidence."
+                        f"[WATCH] PR #{found.number} awaiting post-retry terminal CI evidence.",
+                        severity="warn",
                     )
                     return
                 if review == ReviewStatus.CHANGES_REQUESTED:
@@ -569,12 +587,14 @@ class WatchMixin:
                 self.log_event(
                     f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
                     f"observed within retry grace window; awaiting "
-                    f"fresh post-rerun status."
+                    f"fresh post-rerun status.",
+                    severity="warn",
                 )
                 return
             self.log_event(
                 f"[WATCH] PR #{found.number} CI INFRA_FAILURE "
-                f"detected; retrying workflow once before operator recovery."
+                f"detected; retrying workflow once before operator recovery.",
+                severity="warn",
             )
             self._infra_retry_baseline = None
             self._infra_retry_rerunnable_checks = []
@@ -599,12 +619,14 @@ class WatchMixin:
                 self.log_event(
                     f"[WATCH] PR #{found.number} CHANGES_REQUESTED but "
                     f"feedback check failed; staying in WATCH, will retry "
-                    f"next cycle."
+                    f"next cycle.",
+                    severity="warn",
                 )
                 return
             self.log_event(
                 f"[WATCH] PR #{found.number} CHANGES_REQUESTED but no new "
-                f"Codex feedback since last push; waiting for fresh review."
+                f"Codex feedback since last push; waiting for fresh review.",
+                severity="info",
             )
         # Review reminders are independent of CI progress. An approved
         # current-HEAD verdict already satisfies the review side of WATCH.
@@ -616,7 +638,8 @@ class WatchMixin:
         elif review == ReviewStatus.APPROVED:
             self.log_event(
                 f"[WATCH] PR #{found.number} review approved; waiting for CI "
-                f"({ci.value})."
+                f"({ci.value}).",
+                severity="info",
             )
 
     async def _maybe_remind_review(self, pr: PRInfo) -> None:
@@ -662,7 +685,7 @@ class WatchMixin:
                 self.owner_repo, pr.number, after=publication
             )
         except Exception as exc:
-            self.log_event(f"[WATCH] PR #{pr.number} review request history unavailable: {exc}")
+            self.log_event(f"[WATCH] PR #{pr.number} review request history unavailable: {exc}", severity="warn")
             return
         if external_at is not None and (
             self.state.review_requested_at is None
@@ -713,7 +736,8 @@ class WatchMixin:
                 self.state.review_overdue_reported = True
                 self.log_event(
                     f"[WATCH] PR #{pr.number} review overdue; automatic reminder "
-                    f"budget exhausted ({cap}/{cap}), still observing."
+                    f"budget exhausted ({cap}/{cap}), still observing.",
+                    severity="warn",
                 )
             return
         if self._watch_retrigger_inhibited(self._watch_retrigger_coder()):
@@ -730,18 +754,21 @@ class WatchMixin:
         except Exception as exc:
             success, posted = False, False
             self.log_event(
-                f"[WATCH] PR #{pr.number} review reminder transport failed: {exc}"
+                f"[WATCH] PR #{pr.number} review reminder transport failed: {exc}",
+                severity="error",
             )
         if posted:
             self.state.review_requested_at = now
             self.log_event(
                 f"[WATCH] PR #{pr.number} review reminder "
-                f"{self.state.review_reminder_count}/{cap} posted."
+                f"{self.state.review_reminder_count}/{cap} posted.",
+                severity="ok",
             )
         elif not success:
             self.log_event(
                 f"[WATCH] PR #{pr.number} review reminder outcome unknown; "
-                "reconciling before another attempt."
+                "reconciling before another attempt.",
+                severity="warn",
             )
         await self.publish_state()
 
@@ -804,7 +831,8 @@ class WatchMixin:
         if size_signal:
             self.log_event(
                 f"[WATCH] PR #{current_pr.number} diff size review signal: {size_signal} "
-                f"(head {current_pr.head_sha})"
+                f"(head {current_pr.head_sha})",
+                severity="warn",
             )
         violations = [v for v in violations if not self._approval_allows_violation(current_pr, v)]
         current_pr.diff_scanned_at_sha = current_pr.head_sha
@@ -821,6 +849,7 @@ class WatchMixin:
                 message,
                 tier="guardrail",
                 kind=first.category,
+                severity="error",
             )
             task_id = current_pr.pr_id or (
                 self.state.current_task.pr_id if self.state.current_task else ""
@@ -869,7 +898,8 @@ class WatchMixin:
             if not was_quarantined:
                 self.log_event(
                     f"[WATCH] PR #{pr_number} quarantine rehydrated from "
-                    "GitHub labels; task id unavailable."
+                    "GitHub labels; task id unavailable.",
+                    severity="ok",
                 )
                 await self.publish_state()
             return
@@ -878,7 +908,8 @@ class WatchMixin:
             if not was_quarantined:
                 self.log_event(
                     f"[WATCH] PR #{pr_number} quarantine rehydrated from "
-                    "GitHub labels."
+                    "GitHub labels.",
+                    severity="ok",
                 )
                 await self.publish_state()
             return
@@ -888,7 +919,8 @@ class WatchMixin:
             {"pr_number": pr_number, "source": "github_quarantine_label"},
         )
         self.log_event(
-            f"[WATCH] PR #{pr_number} quarantine rehydrated from GitHub labels."
+            f"[WATCH] PR #{pr_number} quarantine rehydrated from GitHub labels.",
+            severity="ok",
         )
         await self.publish_state()
 
@@ -929,13 +961,15 @@ class WatchMixin:
             )
         except Exception as exc:
             self.log_event(
-                f"[WATCH] PR #{pr_number} quarantine label check failed: {exc}."
+                f"[WATCH] PR #{pr_number} quarantine label check failed: {exc}.",
+                severity="error",
             )
             return
         if not isinstance(result, str):
             self.log_event(
                 f"[WATCH] PR #{pr_number} quarantine label check returned "
-                f"unexpected {type(result).__name__}; keeping quarantine."
+                f"unexpected {type(result).__name__}; keeping quarantine.",
+                severity="error",
             )
             return
         labels = [label.strip() for label in result.splitlines()]
@@ -945,7 +979,8 @@ class WatchMixin:
             await self._clear_task_suppression(task_id)  # pragma: no cover
         self.state.quarantined_prs.discard(pr_number)
         self.log_event(
-            f"[WATCH] PR #{pr_number} quarantine released externally."
+            f"[WATCH] PR #{pr_number} quarantine released externally.",
+            severity="ok",
         )
         await self.publish_state()
 
@@ -991,7 +1026,8 @@ class WatchMixin:
         sha_short = head_sha[:7]
         self.log_event(
             f"[WATCH] PR #{found.number} CI still pending after "
-            f"{age_min}min on sha {sha_short}; awaiting terminal evidence."
+            f"{age_min}min on sha {sha_short}; awaiting terminal evidence.",
+            severity="warn",
         )
 
     def _observe_watch_event_signature(self, found: object) -> None:
@@ -1053,7 +1089,8 @@ class WatchMixin:
                 self, "_push_provenance_reason", None
             ) or "push provenance unavailable"
             self.log_event(
-                f"[WATCH] Review feedback pending: {self._fix_review_limitation}."
+                f"[WATCH] Review feedback pending: {self._fix_review_limitation}.",
+                severity="warn",
             )
             return FeedbackCheckResult.UNKNOWN
         evidence = gh_reviews.cached_review_feedback(
@@ -1073,7 +1110,7 @@ class WatchMixin:
         if evidence is None or evidence.unknown_reason:
             reason = evidence.unknown_reason if evidence else "status-poll evidence unavailable"
             self._fix_review_limitation = reason
-            self.log_event(f"[WATCH] Review feedback pending: {reason}.")
+            self.log_event(f"[WATCH] Review feedback pending: {reason}.", severity="warn")
             return FeedbackCheckResult.UNKNOWN
         if not evidence.findings:
             return FeedbackCheckResult.NONE
@@ -1425,13 +1462,15 @@ class WatchMixin:
                 except Exception as exc:
                     self.log_event(
                         f"[ERROR] Failed to write status:DONE to "
-                        f"{current_task.task_file}: {exc}"
+                        f"{current_task.task_file}: {exc}",
+                        severity="error",
                     )
                     return False
                 if not written:
                     self.log_event(
                         f"[WATCH] Remote merge confirmed but status:DONE was not written to "
-                        f"{current_task.task_file}; retrying."
+                        f"{current_task.task_file}; retrying.",
+                        severity="error",
                     )
                     return False
         try:
@@ -1440,7 +1479,10 @@ class WatchMixin:
                 # Acceptance already removed its bound cause. A later cause
                 # belongs to a newer decision and must survive this retry.
                 if await self.redis.get(cause_key(self.name, task_id)):
-                    self.log_event(f"[WATCH] Newer task suppression defers PR #{pr_number} reconciliation.")
+                    self.log_event(
+                        f"[WATCH] Newer task suppression defers PR #{pr_number} reconciliation.",
+                        severity="warn",
+                    )
                     return False
             if pr_state == "MERGED":
                 self._mark_task_done_in_snapshot()
@@ -1464,12 +1506,13 @@ class WatchMixin:
             # Retain the bound state so the same terminal outcome can retry.
             self.state = prior_state
             self._current_run_record = prior_run_record
-            self.log_event(f"[WATCH] Terminal bookkeeping deferred for PR #{pr_number}: {exc}")
+            self.log_event(f"[WATCH] Terminal bookkeeping deferred for PR #{pr_number}: {exc}", severity="warn")
             return False
         self._reset_runner_local_task_counters()
         self.log_event(
             f"[WATCH] PR #{pr_number} externally resolved as {pr_state}; "
-            f"releasing task and returning to IDLE ({legacy_fragment})."
+            f"releasing task and returning to IDLE ({legacy_fragment}).",
+            severity="ok",
         )
         return True
 
@@ -1576,12 +1619,14 @@ class WatchMixin:
             if not failing_count:
                 self.log_event(
                     f"[WATCH] PR #{pr_number} infra retry skipped — no "
-                    f"failing check-run found for sha {head_sha[:7]}."
+                    f"failing check-run found for sha {head_sha[:7]}.",
+                    severity="info",
                 )
             else:
                 self.log_event(
                     f"[WATCH] PR #{pr_number} infra retry skipped — failing "
-                    f"check-runs on sha {head_sha[:7]} have no Actions workflow run ID in details_url."
+                    f"check-runs on sha {head_sha[:7]} have no Actions workflow run ID in details_url.",
+                    severity="warn",
                 )
             return False
         target_ids = sorted(candidates if only_run_ids is None else only_run_ids)
@@ -1658,13 +1703,15 @@ class WatchMixin:
                 )
                 self.log_event(
                     f"[WATCH] PR #{pr_number} infra retry process did not start "
-                    f"for run {run_id}: {exc}."
+                    f"for run {run_id}: {exc}.",
+                    severity="error",
                 )
                 continue
             except (RuntimeError, subprocess.TimeoutExpired, OSError) as exc:
                 self.log_event(
                     f"[WATCH] PR #{pr_number} infra retry rerun failed (outcome unknown) "
-                    f"for run {run_id}: {exc}."
+                    f"for run {run_id}: {exc}.",
+                    severity="error",
                 )
                 continue
             rerun_count += 1
@@ -1677,7 +1724,8 @@ class WatchMixin:
         if rerun_count:
             self.log_event(
                 f"[WATCH] PR #{pr_number} infra retry: re-ran failed jobs "
-                f"of {rerun_count} workflow run(s) on sha {head_sha[:7]}."
+                f"of {rerun_count} workflow run(s) on sha {head_sha[:7]}.",
+                severity="ok",
             )
         return bool(self._infra_retry_target_run_ids) and set(
             self._infra_retry_target_run_ids
