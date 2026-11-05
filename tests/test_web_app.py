@@ -2557,13 +2557,10 @@ def test_event_log_has_data_ts(
     assert f'data-ts="{entry_ts}"' in body
 
 
-def test_repo_card_has_onclick(
+def test_repo_card_has_stretched_name_link(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Repo cards on the dashboard must navigate to the detail page on
-    click — except when the click originates inside an interactive
-    element (``label``/``input``/``button``/``a``), which keeps the
-    Upload tasks button and nested anchors working as before."""
+    """Native card navigation preserves separate interactive controls."""
     monkeypatch.setattr(web_app, "aioredis", _StubAioredis())
 
     with TestClient(app) as client:
@@ -2571,9 +2568,10 @@ def test_repo_card_has_onclick(
 
     assert response.status_code == 200
     body = response.text
-    assert "window.location='/repo/example__alpha'" in body
-    assert "window.location='/repo/example__beta'" in body
-    assert "event.target.closest('form,label,input,button,a')" in body
+    assert 'href="/repo/example__alpha"' in body
+    assert 'href="/repo/example__beta"' in body
+    assert "after:absolute after:inset-0" in body
+    assert "window.location=" not in body
     assert 'hx-target="#upload-feedback-example__alpha"' in body
     assert 'hx-disabled-elt="#upload-example__alpha"' in body
     assert 'id="upload-feedback-example__alpha"' in body
@@ -2658,29 +2656,18 @@ def _render_repo_list_body(
     return response.text
 
 
-def test_repo_card_buttons_block_positioned_top_right(
+def test_repo_card_header_uses_flow_and_separate_status_row(
     two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     body = _render_repo_list_body(monkeypatch)
-
-    assert 'class="relative rounded-lg border bg-surface-2 p-4' in body
-    assert "mb-3 flex min-h-12 flex-col gap-3 pr-40" in body
-    assert (
-        'class="absolute top-0 right-0 flex flex-nowrap items-center '
-        'justify-end gap-2 p-4"'
-    ) in body
-
-
-def test_repo_card_buttons_single_row_no_wrap(
-    two_repo_config: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    body = _render_repo_list_body(monkeypatch)
-
-    assert (
-        'class="absolute top-0 right-0 flex flex-nowrap items-center '
-        'justify-end gap-2 p-4"'
-    ) in body
-    assert "flex w-full flex-wrap items-center justify-between" not in body
+    assert 'data-card-header' in body
+    assert 'data-card-secondary' in body
+    assert 'pr-40' not in body
+    assert 'absolute top-0 right-0' not in body
+    assert 'data-card-menu' in body
+    assert 'class="sr-only" id="upload-example__alpha"' in body
+    assert 'href="/repo/example__alpha/audit"' in body
+    assert 'href="/repo/example__alpha/rejects"' in body
 
 
 def test_repo_card_upload_uses_per_card_spinner(

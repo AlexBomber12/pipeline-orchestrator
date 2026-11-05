@@ -23,7 +23,7 @@
 </div>
 {% else %}
 {% if not _card_only %}
-<div class="grid gap-4 md:grid-cols-2">
+<div class="grid grid-cols-1 gap-4 md:grid-cols-2">
 {% endif %}
     {% for repo in repos %}
     {% set is_synthetic = repo.error_message in init_messages %}
@@ -39,17 +39,16 @@
     {% set upload_target = upload_feedback_target(repo.name) %}
     {% set upload_input_selector = '#upload-' ~ css_escape(repo.name) %}
     {% set upload_indicator_target = '#upload-indicator-' ~ css_escape(repo.name) %}
-    <div class="relative rounded-lg border bg-surface-2 p-4 cursor-pointer hover:border-white/10 transition-colors {{ 'border-l-2 border-l-fail border-white/5' if is_error else ('border-l-2 border-l-warn border-white/5' if is_synthetic else 'border-white/5') }}"
+    <div class="relative rounded-lg border bg-surface-2 p-4 [overflow-wrap:anywhere] cursor-pointer hover:border-white/10 transition-colors {{ 'border-l-2 border-l-fail border-white/5' if is_error else ('border-l-2 border-l-warn border-white/5' if is_synthetic else 'border-white/5') }}"
          data-repo-card
-         data-repo="{{ repo.name }}"
-         onclick="if(!event.target.closest('form,label,input,button,a')){window.location='/repo/{{ repo.name }}'}">
-        {# Header row #}
-        <div class="mb-3 flex min-h-12 flex-col gap-3 pr-40 sm:flex-row sm:items-center sm:justify-between">
-            <div class="flex min-w-0 items-center gap-2">
-                <a href="/repo/{{ repo.name }}" class="font-mono text-sm text-white truncate hover:text-accent transition-colors">{{ repo.name }}</a>
-                <a href="/repo/{{ repo.name }}/audit" class="text-xs text-gray-400 underline">audit</a>
-                <a href="/repo/{{ repo.name }}/rejects" class="text-xs text-gray-400 underline">rejects</a>
-                <span class="inline-flex items-center gap-2">
+         data-repo="{{ repo.name }}">
+        {# The unpositioned name link stretches to the positioned card. #}
+        <div class="mb-3 flex min-w-0 items-center gap-2" data-card-header>
+            <a href="/repo/{{ repo.name }}" title="{{ repo.name }}" data-card-name
+               class="min-w-0 flex-1 font-mono text-sm text-white hover:text-accent transition-colors after:absolute after:inset-0 after:rounded-lg after:content-['']">
+                <span class="block truncate">{{ repo.name }}</span>
+            </a>
+            <span class="inline-flex shrink-0 items-center gap-2" data-card-state>
                     {% if is_synthetic %}
                     <span class="w-2.5 h-2.5 rounded-full bg-warn pulse-dot shrink-0" data-state-dot></span>
                     <span class="text-xs font-medium px-2 py-0.5 rounded border bg-warn/10 text-warn border-warn/30" data-state-label>
@@ -59,6 +58,38 @@
                     <span class="text-xs font-medium px-2 py-0.5 rounded border {{ style.badge }} {% if style.pulse %}pulse-badge{% endif %}" data-state-label>
                         {% if (_stale or _age is none) and repo.state.value not in ('PAUSED', 'IDLE') %}Last known: {% endif %}{% if style.glyph %}<span aria-hidden="true">{{ style.glyph }}</span> {% endif %}{{ repo.state.value }}
                     </span>
+                    {% endif %}
+            </span>
+            <details class="relative z-20 shrink-0" data-card-menu>
+                <summary aria-label="Repository actions for {{ repo.name }}"
+                         class="flex h-8 w-8 cursor-pointer list-none items-center justify-center rounded-md text-gray-300 hover:bg-white/5 focus-visible:outline focus-visible:outline-accent">⋯</summary>
+                <div class="absolute right-0 top-full z-10 mt-1 flex w-56 max-w-[80vw] flex-col gap-3 rounded-lg border border-white/10 bg-surface-2 p-3 shadow-xl">
+                    <a href="/repo/{{ repo.name }}/audit" class="text-xs text-gray-300 underline">audit</a>
+                    <a href="/repo/{{ repo.name }}/rejects" class="text-xs text-gray-300 underline">rejects</a>
+                {{ repo_controls(repo, '', true) }}
+                <form hx-post="/repos/{{ repo.name }}/upload-tasks"
+                      hx-encoding="multipart/form-data"
+                      hx-indicator="{{ upload_indicator_target }}"
+                      hx-target="{{ upload_target }}"
+                      hx-swap="innerHTML"
+                      hx-disabled-elt="{{ upload_input_selector }}"
+                      class="inline-flex focus-within:outline focus-within:outline-accent">
+                    <input type="file" name="files" multiple accept=".md,.zip,application/zip,application/x-zip-compressed"
+                           onchange="this.form.requestSubmit()"
+                           class="sr-only" id="upload-{{ repo.name }}">
+                    <label for="upload-{{ repo.name }}"
+                           aria-label="Upload tasks"
+                           title="Upload tasks"
+                           class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-white hover:bg-white/5 transition-colors cursor-pointer before:absolute before:-inset-1.5 before:content-[''] md:before:content-none">
+                        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="w-5 h-5">
+                            <path fill-rule="evenodd" d="M11.47 2.47a.75.75 0 0 1 1.06 0l4.5 4.5a.75.75 0 0 1-1.06 1.06l-3.22-3.22V16.5a.75.75 0 0 1-1.5 0V4.81L8.03 8.03a.75.75 0 0 1-1.06-1.06l4.5-4.5ZM3 15.75a.75.75 0 0 1 .75.75v2.25a1.5 1.5 0 0 0 1.5 1.5h13.5a1.5 1.5 0 0 0 1.5-1.5V16.5a.75.75 0 0 1 1.5 0v2.25a3 3 0 0 1-3 3H5.25a3 3 0 0 1-3-3V16.5a.75.75 0 0 1 .75-.75Z" clip-rule="evenodd" />
+                        </svg>
+                    </label>
+                </form>
+                </div>
+            </details>
+        </div>
+        <div class="mb-3 flex min-w-0 flex-wrap items-center gap-2 text-xs [overflow-wrap:anywhere]" data-card-secondary>
                     {# PR-352: sub-phase subtitle under MERGE badge so the operator
                        can distinguish pre_merge_sync / ready_to_merge / merging /
                        post_merge_cleanup at a dashboard glance. #}
@@ -68,7 +99,6 @@
                     {% set _cancellation_subsource = (cancellation_subsources or {}).get(repo.name) %}
                     {% if repo.state.value == 'ERROR' and _cancellation_subsource %}
                     {{ subsource_badge.subsource_badge(_cancellation_subsource, subsource_lookup) }}
-                    {% endif %}
                     {% endif %}
                     {% if repo.upload_pending_count and repo.upload_pending_count > 0 %}
                     <span class="ml-2 inline-flex items-center gap-1 rounded border border-warn/40 bg-warn/10 px-2 py-0.5 text-[11px] text-warn"
@@ -80,29 +110,6 @@
                         Upload pending ({{ repo.upload_pending_count }})
                     </span>
                     {% endif %}
-                </span>
-            </div>
-            <div class="absolute top-0 right-0 flex flex-nowrap items-center justify-end gap-2 p-4">
-                {{ repo_controls(repo, '', true) }}
-                <form hx-post="/repos/{{ repo.name }}/upload-tasks"
-                      hx-encoding="multipart/form-data"
-                      hx-indicator="{{ upload_indicator_target }}"
-                      hx-target="{{ upload_target }}"
-                      hx-swap="innerHTML"
-                      hx-disabled-elt="{{ upload_input_selector }}"
-                      class="inline-flex">
-                    <input type="file" name="files" multiple accept=".md,.zip,application/zip,application/x-zip-compressed"
-                           onchange="this.form.requestSubmit()"
-                           class="hidden" id="upload-{{ repo.name }}">
-                    <label for="upload-{{ repo.name }}"
-                           aria-label="Upload tasks"
-                           title="Upload tasks"
-                           class="relative inline-flex items-center justify-center h-8 w-8 md:h-7 md:w-7 rounded-md text-gray-400 hover:text-white hover:bg-white/5 transition-colors cursor-pointer before:absolute before:-inset-1.5 before:content-[''] md:before:content-none">
-                        <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true" class="w-5 h-5">
-                            <path fill-rule="evenodd" d="M11.47 2.47a.75.75 0 0 1 1.06 0l4.5 4.5a.75.75 0 0 1-1.06 1.06l-3.22-3.22V16.5a.75.75 0 0 1-1.5 0V4.81L8.03 8.03a.75.75 0 0 1-1.06-1.06l4.5-4.5ZM3 15.75a.75.75 0 0 1 .75.75v2.25a1.5 1.5 0 0 0 1.5 1.5h13.5a1.5 1.5 0 0 0 1.5-1.5V16.5a.75.75 0 0 1 1.5 0v2.25a3 3 0 0 1-3 3H5.25a3 3 0 0 1-3-3V16.5a.75.75 0 0 1 .75-.75Z" clip-rule="evenodd" />
-                        </svg>
-                    </label>
-                </form>
                 <div id="upload-indicator-{{ repo.name }}"
                      class="htmx-indicator inline-flex items-center gap-2 text-xs text-gray-400">
                     <svg class="h-3 w-3 animate-spin" viewBox="0 0 24 24" fill="none" aria-hidden="true">
@@ -111,20 +118,19 @@
                     </svg>
                     <span>Uploading...</span>
                 </div>
-            </div>
         </div>
 
         {% include "components/upload_blocked.html" %}
 
         {% if is_synthetic and repo.error_message %}
         {# Synthetic/degraded variant: show warning instead of normal body #}
-        <div class="px-2 py-1.5 rounded bg-warn/10 border border-warn/20 text-warn text-xs truncate"
+        <div class="px-2 py-1.5 rounded bg-warn/10 border border-warn/20 text-warn text-xs [overflow-wrap:anywhere]"
              title="{{ repo.error_message }}">
             {{ repo.error_message }}
         </div>
         {% elif is_error and repo.error_message %}
         {# Error variant: show error instead of normal body #}
-        <div class="px-2 py-1.5 rounded bg-fail/10 border border-fail/20 text-fail text-xs truncate"
+        <div class="px-2 py-1.5 rounded bg-fail/10 border border-fail/20 text-fail text-xs [overflow-wrap:anywhere]"
              title="{{ repo.error_message }}">
             {{ repo.error_message }}
         </div>
@@ -137,7 +143,7 @@
             <div>
                 <div class="text-gray-500 mb-1">Current task</div>
                 {% if repo.current_task %}
-                <div class="font-mono text-gray-300 truncate" title="{{ repo.current_task.title }}">{{ repo.current_task.pr_id }} {{ repo.current_task.title }}</div>
+                <div class="font-mono text-gray-300 [overflow-wrap:anywhere]" title="{{ repo.current_task.title }}">{{ repo.current_task.pr_id }} {{ repo.current_task.title }}</div>
                 {% else %}
                 <div class="text-gray-600 italic">No active task.</div>
                 {% endif %}
@@ -148,7 +154,7 @@
         {% if repo.current_pr %}
         {% set ci = ci_styles.get(repo.current_pr.ci_status.value, ci_styles['PENDING']) %}
         <div class="mt-2 flex flex-wrap items-center gap-2 border-t border-white/5 pt-2 text-xs text-gray-400">
-            <a href="{{ repo.current_pr.url }}" class="secondary-interactive font-mono text-gray-300">#{{ repo.current_pr.number }}</a>
+            <a href="{{ repo.current_pr.url }}" target="_blank" rel="noopener noreferrer" class="relative z-10 secondary-interactive font-mono text-gray-300">#{{ repo.current_pr.number }}</a>
             <span class="w-2 h-2 rounded-full {{ ci.dot }} {% if ci.pulse %}pulse-dot{% endif %}"></span>
             <span>{{ vocabulary.ci_labels.get(repo.current_pr.ci_status.value, vocabulary.ci_labels.PENDING) }}</span>
             <span>{{ vocabulary.review_labels.get(repo.current_pr.review_status.value, vocabulary.review_labels.PENDING) }}</span>
@@ -164,7 +170,7 @@
         {% endif %}
         {% endif %}
         {% set _active_inhibitors = repo.active_inhibitors | default([]) %}
-        {% include "components/usage_inhibitors.html" %}
+        <div class="relative z-10 [overflow-wrap:anywhere]">{% include "components/usage_inhibitors.html" %}</div>
         {% if repo.state.value == 'PAUSED' and _active_inhibitors %}
         {% set _inhibitor_labels = inhibitor_labels | default({}) %}
         <div class="inhibitor-stack mt-2 flex flex-wrap gap-1" data-inhibitor-stack>
@@ -188,7 +194,7 @@
                         hx-swap="outerHTML"
                         aria-label="Clear {{ inhibitor_label }}"
                         title="Clear {{ inhibitor_label }}"
-                        class="ml-1 text-fail hover:text-white"
+                        class="relative z-10 ml-1 text-fail hover:text-white"
                         onclick="event.stopPropagation()">×</button>
                 {% endif %}
             </span>
@@ -215,7 +221,7 @@
             {% elif _stale %}No report for {{ (_age / 60) | int }} min
             {% else %}Reported {{ _age }}s ago{% endif %}
         </div>
-        <div id="upload-feedback-{{ repo.name }}"></div>
+        <div class="relative z-10 [overflow-wrap:anywhere]" id="upload-feedback-{{ repo.name }}"></div>
     </div>
     {% endfor %}
 {% if not _card_only %}

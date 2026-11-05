@@ -69,6 +69,10 @@ def test_focus_and_computed_control_contrast(page: Page, dashboard_url: str, the
 
     # These controls share hover classes; inspect every currently rendered action
     # without invoking endpoints or changing the testbed pipeline state.
+    # Card actions now live in a native disclosure; open it before measuring
+    # the same hover contrast contract for those controls.
+    for toggle in page.locator('[data-card-menu] summary').all():
+        toggle.click()
     controls = page.locator('[aria-label="Resume daemon"], [aria-label="Pause daemon"], [aria-label="Upload tasks"]')
     assert controls.count() > 0
     for control in controls.all():
