@@ -2133,6 +2133,7 @@ class PipelineRunner(
         publish: bool = True,
         log_prefix: str = "[ERROR]",
         log_message: str | None = None,
+        log_severity: str | None = None,
         cancellation_cause: CancellationCause | None = None,
         commit_task_status: bool = False,
     ) -> None:
@@ -2149,6 +2150,9 @@ class PipelineRunner(
         (e.g. ``watch.py``'s ``[WATCH] {exc}.`` vs. its more verbose
         ``error_message``). Defaults to ``message`` so the common case
         keeps a one-line callsite.
+
+        ``log_severity`` optionally supplies explicit event severity without
+        changing error ownership or terminal behavior.
 
         ``cancellation_cause`` (PR-253) overrides the default CRASH cause
         record written to Redis and drives the durable task
@@ -2184,7 +2188,10 @@ class PipelineRunner(
             # Save ownership and the original failure before terminal side effects.
             await self.publish_state()
         log_body = message if log_message is None else log_message
-        self.log_event(f"{log_prefix} {log_body}.")
+        if log_severity is None:
+            self.log_event(f"{log_prefix} {log_body}.")
+        else:
+            self.log_event(f"{log_prefix} {log_body}.", severity=log_severity)
         if save_run_record_as:
             await self._save_current_run_record(
                 save_run_record_as,

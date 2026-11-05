@@ -679,3 +679,44 @@ run_fix_existing_pr PR-42 pr-42-fix true
     assert result.returncode == 1
     assert "base publication activity unavailable" in result.stderr
     assert "unexpected" not in result.stderr
+
+
+@pytest.mark.parametrize(('failure', 'failures', 'expected_calls', 'expected_status'), [
+    ('fatal error in commit_refs_rules', 1, 2, 0),
+    ('fatal error in commit_refs_rules', 3, 3, 7),
+    ('GH013: Repository rule violations found', 1, 1, 7),
+    ('non-fast-forward', 1, 1, 7),
+    ('', 0, 1, 0),
+])
+def test_capacity_push_retries_only_bounded_ref_rules_service_failures(
+    tmp_path, failure, failures, expected_calls, expected_status,
+):
+    result = subprocess.run(
+        ['bash', '-c', '''
+source "$1"
+fixture_failure="$2"
+fixture_failures="$3"
+git() {
+    printf '%s\\n' "$*" >> push-calls
+    if [[ "$(wc -l < push-calls)" -le "$fixture_failures" ]]; then
+        printf '%s\\n' "$fixture_failure" >&2
+        return 7
+    fi
+    printf 'published\\n'
+}
+sleep() { printf '%s\\n' "$*" >> sleeps; }
+push_capacity_branch pr-42-capacity
+printf 'continued\\n'
+''', 'bash', str(SHIM.resolve()), failure, str(failures)],
+        cwd=tmp_path, capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == expected_status, result.stderr
+    assert (tmp_path / 'push-calls').read_text().splitlines() == [
+        'push -u origin pr-42-capacity',
+    ] * expected_calls
+    sleeps = tmp_path / 'sleeps'
+    assert (sleeps.read_text().splitlines() if sleeps.exists() else []) == ['2'] * (expected_calls - 1)
+    assert ('continued' in result.stdout) is (expected_status == 0)
+    assert ('published' in result.stderr) is (expected_status == 0)
+    if failure and failures:
+        assert failure in result.stderr

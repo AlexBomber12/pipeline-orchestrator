@@ -7,12 +7,24 @@ GHA owns Docker execution and records the exact checkout SHA in e2e evidence.
 import json
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
+import pytest
 from playwright.sync_api import Page, expect
 from src.events import build_wake_message
 from src.keyspace import control_stop, pipeline_state
 
 from tests.e2e.conftest import _wait_for_fresh_idle
+
+
+@pytest.fixture(autouse=True)
+def local_htmx(page: Page):
+    # Match the automation-menu tests: use the real pinned runtime even when
+    # the CDN is unavailable. Control requests and DOM swaps still run normally.
+    script = Path(__file__).parent / "assets" / "htmx-2.0.4.min.js"
+    page.route("https://unpkg.com/htmx.org@2.0.4", lambda route: route.fulfill(
+        path=script, content_type="application/javascript",
+    ))
 
 
 def _compose(*args):
