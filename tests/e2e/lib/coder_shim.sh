@@ -233,9 +233,10 @@ run_fix_existing_pr() {
     local pr="$1" branch="$2" pending="${3:-false}"
     git fetch origin
     git checkout -B "${branch}" "origin/${branch}"
+    # Separate server-observed publications, as in the initial success path.
+    # A local sleep alone does not account for delayed GitHub activity.
+    wait_for_base_activity "${branch}"
     sed -i "\|^shim marker for ${pr} at |d" tests/e2e-shim-marker.txt
-    # Make the FIX marker distinct even on a fast second-resolution clock.
-    sleep 2
     write_marker_and_commit "${pr}"
     safe_push_branch "${branch}"
     if [[ "${pending}" == true ]]; then
