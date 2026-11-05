@@ -165,6 +165,27 @@ safe_push_branch() {
     fi
 }
 
+push_capacity_branch() {
+    # GitHub can transiently fail its ref-rules service before this scenario
+    # reaches the intended provider failure. Retry the same ordinary push only;
+    # policy rejections and other git errors must still fail the fixture.
+    local branch="$1" attempt output status
+    for attempt in 1 2 3; do
+        if output="$(git push -u origin "${branch}" 2>&1)"; then
+            printf '%s\n' "${output}" >&2
+            return 0
+        else
+            status=$?
+        fi
+        printf '%s\n' "${output}" >&2
+        if [[ "${output}" != *"fatal error in commit_refs_rules"* || "${attempt}" -eq 3 ]]; then
+            return "${status}"
+        fi
+        printf 'shim: retrying capacity branch push after GitHub ref-rules service failure (%s/3)\n' "${attempt}" >&2
+        sleep 2
+    done
+}
+
 wait_for_base_activity() {
     # GitHub may record activity after git push returns. Sleeping from the
     # local push alone can still put creation and the next push in one server
@@ -458,7 +479,7 @@ PYTHON
                 printf 'retained commit for %s\n' "${pr}" > tests/e2e-capacity-commit.txt
                 git add tests/e2e-capacity-commit.txt
                 git commit -m "${pr}: retain pre-capacity work"
-                git push -u origin "${branch}"
+                push_capacity_branch "${branch}"
                 gh api -X POST "repos/AlexBomber12/pipeline-orchestrator-testbed/statuses/$(git rev-parse HEAD)" \
                     -f state=pending -f context=e2e/watch-merge-gate >/dev/null
                 pr_url="$(ensure_pr_url "${branch}" "${pr}")"
@@ -510,7 +531,7 @@ PY
             git add tests/e2e-capacity-retained.txt
             write_marker_and_commit "${pr}"
             printf 'completed-after-capacity\n' > "${PO_SHIM_SCENARIO_FILE}.capacity-gate"
-            git push -u origin "${branch}"
+            push_capacity_branch "${branch}"
             pr_url="$(ensure_pr_url "${branch}" "${pr}")"
             gh api -X POST "repos/AlexBomber12/pipeline-orchestrator-testbed/statuses/$(git rev-parse HEAD)" \
                 -f state=pending -f context=e2e/watch-merge-gate >/dev/null
