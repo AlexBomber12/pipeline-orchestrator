@@ -98,10 +98,19 @@ def test_lazy_tabs_keyboard_and_hash(page, repo_tabs):
     expect(coder).to_be_focused()
     coder.press('Home')
     expect(overview).to_be_focused()
-    # Reload restores the selected tab and only loads that lazy panel.
+    # Hash navigation reuses the loaded panel within the current document.
     page.goto(url + '#tasks', wait_until='load')
     expect(tasks).to_have_attribute('aria-selected', 'true')
+    expect(page.locator('#repo-panel-tasks')).to_contain_text('tasks read 1')
+    reads_before_reload = reads.copy()
+    # Explicitly reload: goto with only a new hash does not reload the document.
+    with page.expect_response('**/repos/example__tabs/tasks'):
+        page.reload(wait_until='load')
+    expect(tasks).to_have_attribute('aria-selected', 'true')
     expect(page.locator('#repo-panel-tasks')).to_contain_text('tasks read 2')
+    assert reads['tasks'] == reads_before_reload['tasks'] + 1
+    for key in ('events', 'cli-log', 'cancellations'):
+        assert reads[key] == reads_before_reload[key]
     page.evaluate("location.hash = 'events'")
     expect(events).to_have_attribute('aria-selected', 'true')
     expect(page.locator('#repo-event-log')).to_be_visible()
