@@ -14,6 +14,8 @@ import time
 from pathlib import Path
 from urllib.parse import quote
 
+from tests.e2e.lib.ci_outcome import require_external_response
+
 TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 TESTBED_URL = f"https://github.com/{TESTBED_REPO}.git"
 TESTBED_COMPOSE_FILE = "docker-compose.test.yml"
@@ -71,6 +73,7 @@ def close_all_open_prs() -> int:
         env=_gh_env(),
     )
     if listing.returncode != 0:
+        require_external_response(listing, "github_reset_listing")
         # Surface listing failures (typically gh auth/API errors) instead of
         # silently treating them as "no PRs to close" — otherwise stale PRs
         # would survive the session-start reset.
@@ -146,6 +149,7 @@ def delete_non_main_branches() -> int:
         env=_gh_env(),
     )
     if listing.returncode != 0:
+        require_external_response(listing, "github_reset_listing")
         # Surface listing failures so we never silently treat an auth/API
         # error as "no non-main branches present" and leave stale refs.
         raise RuntimeError(
@@ -196,6 +200,7 @@ def wipe_tasks_dir_on_main() -> bool:
             env=_git_env(),
         )
         if clone.returncode != 0:
+            require_external_response(clone, "git_clone")
             raise RuntimeError(
                 f"wipe_tasks_dir_on_main: git clone failed "
                 f"(rc={clone.returncode}): {clone.stderr.strip()}"
@@ -250,6 +255,7 @@ def wipe_tasks_dir_on_main() -> bool:
                 print(f"wipe_tasks_dir_on_main: transient push failure; retry {attempt + 1}/2")
                 time.sleep(attempt + 1)
         if push.returncode != 0:
+            require_external_response(push, "git_push")
             raise RuntimeError(
                 f"wipe_tasks_dir_on_main: git push failed "
                 f"(rc={push.returncode}): {push.stderr.strip()}"

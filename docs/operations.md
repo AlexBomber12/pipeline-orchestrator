@@ -443,6 +443,22 @@ rewriting TODO. Both ERROR dispatchers retain the park until operator action.
 The existing HTTP Retry action admits a bound accounting conflict while retaining
 its header and normal task validation. Recovery preserves the saved merged PR
 identity even if an open PR reuses that task branch.
+Inferred header bookkeeping does not preempt a checkpointed DOING task with a
+matching open PR and a validated saved publication floor. The active task retains
+its publication safety floor, invocation and review context through restart.
+This ownership rule is independent of the older merged task's header status;
+that task may still be TODO while its final accounting is unfinished. Once active
+work releases the runner to IDLE, the existing recovery path revisits deferred
+bookkeeping without requiring another restart or dispatching a coder. Explicit
+retained MERGE ownership keeps its existing recovery priority. Without a bound
+publication owner, header discovery retains its pending-merge ordering.
+
+WATCH records the specific publication hold reason in its event history. A
+retained floor remains a veto against backward observations, never a replacement
+for fresh current-head evidence. Missing/damaged floors retain existing explicit
+confirmation or fresh-publication requirements; CI/review reruns alone cannot
+supply that proof.
+
 Operator pause and Stop controls still apply. Resolving a conflict requires
 reviewing the exact PR and current task generation before using existing Retry
 or task-upload controls; this source change does not deploy or resume a daemon.
@@ -1316,3 +1332,35 @@ dispatch, so the UI warning identifies that queue blocker even while state is ID
 Rejected bytes are retained in staging; replacement generations use the existing
 abandoned-staging retention policy. Redis rejection updates are compare-and-set,
 so a late verdict cannot overwrite a newer uploaded generation.
+
+
+## Infrastructure CI recovery
+
+Integration retains failed pytest reports and the original nonzero exit. At the
+actual GitHub/Git boundary, positively identified 500/502/503/504 responses and
+external-command timeouts produce typed failure evidence. Explicit cross-service
+waits remain assertions; only a fresh GitHub 5xx probe at their deadline can make
+their result infrastructure-blocked. Ordinary assertions, browser failures,
+authentication/quota errors and unavailable probes remain failures. Diagnostic
+text, echoed examples and arbitrary numbers do not authorize recovery.
+
+The final job verdict requires all three disjoint collections, complete terminal
+reports and matching pytest XML. Every failed stage must have infrastructure
+evidence. A mixed job stays FAILURE. The verdict is bound to source PR HEAD,
+repository, workflow run and attempt; the source SHA remains distinct from the
+synthetic merge checkout. The reader additionally proves the GitHub Actions App,
+exact job URL/ID and current completed attempt. Missing provenance stays pending,
+while a separately known code failure retains priority.
+
+WATCH reuses its existing durable one-rerun-per-HEAD admission, intent receipt,
+lost-response reconciliation and operator-pause gates. It reruns only failed
+jobs, never starts CODING/FIX for a pure infrastructure incident, and retains the
+task, PR, commits, review and invocation history. A persistent new infrastructure
+failure parks once for operator Retry; a real failure on the new attempt uses
+normal FIX. An accepted, independently observed successor attempt may outlive the
+CI evidence-observation window, but has a finite incident allowance of six hours
+or the configured observation window if longer, from the original persisted
+clock. Polls, restart and acknowledgement progress cannot
+replenish either allowance. Unknown old failures are not retrospectively turned
+into successful invocations. Review, successful current-head CI and exact merge
+proof remain required before DONE.

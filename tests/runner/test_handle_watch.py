@@ -6892,3 +6892,270 @@ def test_retry_ignores_malformed_check_identity_without_side_effect(monkeypatch)
     assert _run_infra_retry(runner, 11, "a" * 40) is False
     assert runner._infra_retry_target_run_ids == []
     assert runner._infra_retry_unsupported
+
+
+@pytest.mark.parametrize("restart", [False, True])
+def test_verified_accepted_ci_execution_outlives_observation_window_but_is_bounded(monkeypatch, tmp_path, restart):
+    runner, pr = _lifecycle_watch(monkeypatch, tmp_path, False)
+    requests = []
+    def transport(args, **kwargs):
+        if args[:2] == ["run", "rerun"]:
+            requests.append(args)
+            return ""
+        return {"databaseId": 9876, "headSha": pr.head_sha, "attempt": 2 if requests else 1,
+                "status": "in_progress" if requests else "completed",
+                "conclusion": None if requests else "cancelled",
+                "jobs": [] if requests else [{"databaseId": 12345, "name": "unit", "conclusion": "cancelled"}]}
+    monkeypatch.setattr(watch_module.gh_runner, "run_gh", transport)
+    asyncio.run(runner.handle_watch())
+    assert len(requests) == 1
+    marker = _expire_infra_grace(runner, pr)
+    marker["started_at"] = time.time() - 70 * 60
+    key = ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha)
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    if restart:
+        previous = runner
+        runner = h._make_runner()
+        runner.repo_path, runner.redis = previous.repo_path, previous.redis
+        runner.state = RepoState.model_validate_json(previous.state.model_dump_json())
+    assert not asyncio.run(runner._ci_infra_recovery_expired(pr))
+    assert len(requests) == 1
+    assert json.loads(asyncio.run(runner.redis.get(key)))["started_at"] == marker["started_at"]
+    marker["started_at"] = time.time() - watch_module._INFRA_EXECUTION_MAX_SECONDS - 1
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    assert asyncio.run(runner._ci_infra_recovery_expired(pr))
+
+
+@pytest.mark.parametrize("outcome", ["success", "infra", "logic"])
+@pytest.mark.parametrize("restart", [False, True])
+def test_native_external_ci_failure_retries_once_then_progresses_or_stably_stops(monkeypatch, tmp_path, outcome, restart):
+    from src.github import checks as checks_module
+    from tests.e2e.lib.ci_outcome import ExternalDependencyError, classify_failure
+
+    runner, pr = _lifecycle_watch(monkeypatch, tmp_path, False)
+    requests = []
+    phase = 1
+    check = {"id": 12345, "name": "integration", "head_sha": pr.head_sha,
+             "app": {"id": 15368}, "status": "completed", "conclusion": "failure",
+             "details_url": "https://github.com/octo/demo/actions/runs/9876/job/12345"}
+    def verdict():
+        failure = classify_failure(ExternalDependencyError("github_ci_evidence", "github_http_5xx"))
+        assert failure["kind"] == "infra"
+        return {"repo": "octo/demo", "sha": pr.head_sha, "run_id": 9876,
+                "attempt": phase, "failed": 1, "infra": 0 if phase == 3 and outcome == "logic" else 1}
+    def retrieval(repo, sha):
+        running = phase == 2
+        terminal = "success" if phase == 3 and outcome == "success" else "failure"
+        check.update(id=12345 if phase == 1 else 23456, run_attempt=1 if phase == 1 else 2,
+                     status="in_progress" if running else "completed",
+                     conclusion=None if running else terminal,
+                     details_url=f"https://github.com/octo/demo/actions/runs/9876/job/{12345 if phase == 1 else 23456}")
+        check["annotations"] = [] if running or terminal == "success" else [
+            {"title": "pipeline-ci-outcome:v1", "message": json.dumps({**verdict(), "attempt": 1 if phase == 1 else 2})}]
+        return [check.copy()], {"sha": sha, "state": "success", "statuses": []}, True
+    monkeypatch.setattr(checks_module, "_fetch_ci_status_rest", retrieval)
+    def poll(repo, **kwargs):
+        data = checks_module._retrieve_ci_status_evidence(repo, pr.head_sha)
+        pr.ci_status = checks_module._classify_ci_retrieval(data)
+        return [pr]
+    monkeypatch.setattr(watch_module.gh_prs, "get_open_prs", poll)
+    def transport(args, **kwargs):
+        if args[:2] == ["run", "rerun"]:
+            requests.append(args)
+            return ""
+        assert args[:2] == ["run", "view"]
+        running = phase == 2
+        return {"databaseId": 9876, "headSha": pr.head_sha, "attempt": 1 if phase == 1 else 2,
+                "status": "in_progress" if running else "completed",
+                "conclusion": None if running else "success" if phase == 3 and outcome == "success" else "failure",
+                "jobs": [{"databaseId": 12345 if phase == 1 else 23456, "name": "integration",
+                          "conclusion": None if running else "success" if phase == 3 and outcome == "success" else "failure"}]}
+    monkeypatch.setattr(checks_module.gh_runner, "run_gh", transport)
+    fix = AsyncMock()
+    completed_task = runner.state.current_task
+    async def merged(**kwargs):
+        await runner._handle_external_pr_resolution(pr, "MERGED")
+    merge = AsyncMock(side_effect=merged)
+    monkeypatch.setattr(runner, "handle_fix", fix)
+    monkeypatch.setattr(runner, "handle_merge", merge)
+    asyncio.run(runner.handle_watch())
+    assert len(requests) == 1 and pr.ci_status == CIStatus.INFRA_FAILURE
+    original_scope = runner.state.ci_attempt_scope
+    _expire_infra_grace(runner, pr)
+    phase = 2
+    if restart:
+        old = runner
+        runner = h._make_runner(auto_merge=True)
+        runner.repo_path, runner.redis = old.repo_path, old.redis
+        runner.state = RepoState.model_validate_json(old.state.model_dump_json())
+        runner._last_push_at = old._last_push_at
+        runner._last_push_at_pr_number, runner._last_push_at_head_sha = pr.number, pr.head_sha
+        monkeypatch.setattr(runner, "_scan_pr_diff_once", AsyncMock())
+        monkeypatch.setattr(runner, "_commit_task_status_change", AsyncMock(return_value=True))
+        monkeypatch.setattr(runner, "handle_fix", fix)
+        monkeypatch.setattr(runner, "handle_merge", merge)
+    asyncio.run(runner.handle_watch())
+    assert runner.state.state == PipelineState.WATCH and pr.ci_status == CIStatus.PENDING
+    async def scanned():
+        runner.state.current_pr.diff_scanned_at_sha = pr.head_sha
+    monkeypatch.setattr(runner, "_scan_pr_diff_once", scanned)
+    phase = 3
+    pr.review_status = ReviewStatus.APPROVED
+    runner.repo_config = runner.repo_config.model_copy(update={"auto_merge": True})
+    for _ in range(3):
+        asyncio.run(runner.handle_watch())
+        if runner.state.state in {PipelineState.IDLE, PipelineState.ERROR}:
+            break
+    assert len(requests) == 1 and pr.fix_iteration_count == 0
+    assert runner.state.ci_attempt_scope == original_scope
+    assert completed_task.pr_id == "PR-019"
+    if outcome != "success":
+        assert runner.state.current_task.pr_id == "PR-019" and runner.state.current_pr.number == pr.number
+    if outcome == "logic":
+        assert fix.await_count >= 1 and pr.ci_status == CIStatus.FAILURE
+        merge.assert_not_awaited()
+    elif outcome == "infra":
+        assert runner.state.state == PipelineState.ERROR
+        assert "Infrastructure CI failure persisted after retry" in runner.state.error_message
+        fix.assert_not_awaited()
+        merge.assert_not_awaited()
+    else:
+        merge.assert_awaited_once()
+        assert pr.ci_status == CIStatus.SUCCESS and runner.state.state == PipelineState.IDLE
+        assert runner.state.current_task is None and runner.state.current_pr is None
+        runner._commit_task_status_change.assert_awaited_once_with(
+            completed_task, "DONE", "PR merged externally during WATCH")
+        fix.assert_not_awaited()
+
+
+@pytest.mark.parametrize("metadata", ["unavailable", "old", "bad_baseline", "missing_baseline"])
+def test_expired_infra_observation_window_requires_verified_successor(monkeypatch, tmp_path, metadata):
+    runner, pr = _lifecycle_watch(monkeypatch, tmp_path, False)
+    ci_attempts.attempt_scope(runner.state, runner.owner_repo, runner.repo_path, pr)
+    key = ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha)
+    marker = {"at": time.time(), "started_at": time.time() - 3600,
+              "scope": runner.state.ci_attempt_scope, "targets": [9876], "request_attempts": {"9876": 1}}
+    if metadata == "bad_baseline":
+        marker["request_attempts"]["9876"] = True
+    elif metadata == "missing_baseline":
+        marker["request_attempts"] = {}
+    monkeypatch.setattr(watch_module, "read_actions_run", lambda *args: (
+        None if metadata == "unavailable" else {"attempt": 1}))
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    assert asyncio.run(runner._ci_infra_recovery_expired(pr))
+
+
+def test_confirmed_successor_survives_temporary_metadata_loss_without_renewing_budget(monkeypatch, tmp_path):
+    runner, pr = _lifecycle_watch(monkeypatch, tmp_path, False)
+    ci_attempts.attempt_scope(runner.state, runner.owner_repo, runner.repo_path, pr)
+    runner.state.ci_attempts["9876"] = 2
+    marker = {"at": time.time(), "started_at": time.time() - 3600,
+              "scope": runner.state.ci_attempt_scope, "targets": [9876], "request_attempts": {"9876": 1}}
+    key = ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha)
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    monkeypatch.setattr(watch_module, "read_actions_run", lambda *args: None)
+    assert not asyncio.run(runner._ci_infra_recovery_expired(pr))
+    assert json.loads(asyncio.run(runner.redis.get(key)))["started_at"] == marker["started_at"]
+    marker["started_at"] = time.time() - watch_module._INFRA_EXECUTION_MAX_SECONDS - 1
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    assert asyncio.run(runner._ci_infra_recovery_expired(pr))
+
+
+@pytest.mark.parametrize("missing", ["targets", "requests"])
+def test_legacy_infra_deadline_without_workflow_binding_never_grants_execution_budget(monkeypatch, tmp_path, missing):
+    runner, pr = _lifecycle_watch(monkeypatch, tmp_path, False)
+    ci_attempts.attempt_scope(runner.state, runner.owner_repo, runner.repo_path, pr)
+    marker = {"at": time.time(), "started_at": time.time() - 3600,
+              "scope": runner.state.ci_attempt_scope, "targets": [9876], "request_attempts": {"9876": 1}}
+    marker["targets" if missing == "targets" else "request_attempts"] = []
+    key = ci_infra_retried(runner.owner_repo, pr.number, pr.head_sha)
+    asyncio.run(runner.redis.set(key, json.dumps(marker)))
+    monkeypatch.setattr(watch_module, "read_actions_run", lambda *args: pytest.fail("unbound marker must not query workflow"))
+    assert asyncio.run(runner._ci_infra_recovery_expired(pr))
+    assert runner.state.ci_attempts == {}
+
+
+@pytest.mark.parametrize("unknown_before_save", [False, True])
+@pytest.mark.parametrize("historical_header", ["done", "todo"])
+def test_historical_bookkeeping_cannot_preempt_published_watch(
+    monkeypatch: pytest.MonkeyPatch, isolate_analytics_dir: Path,
+    unknown_before_save: bool, historical_header: str,
+) -> None:
+    """Restart must reach the next real review/publication gate, not just WATCH."""
+    from src.daemon import recovery as recovery_module
+    from src.metrics import MetricsStore
+
+    original, mode, reaction_at, floor, _merged, no_work, _head, branch = (
+        _publication_safety_boundary(monkeypatch)
+    )
+    active = QueueTask(pr_id="PR-459", title="Active", branch=branch,
+                       task_file="tasks/PR-459.md", status=TaskStatus.DOING)
+    historical = QueueTask(pr_id="PR-401", title="Historical", branch="pr-401",
+                           task_file="tasks/PR-401.md", status=TaskStatus.DONE)
+    old_pr = PRInfo(number=629, pr_id=historical.pr_id, branch=historical.branch,
+                    head_sha="b" * 40)
+    original.state.current_task = active
+    asyncio.run(original.handle_watch())
+    assert original.state.publication_watermark.published_at == floor
+    if unknown_before_save:
+        mode["value"] = "unavailable"
+        asyncio.run(original.handle_watch())
+        assert original.state.current_pr.publication_at is None
+    asyncio.run(original.publish_state())
+
+    def parse(runner):
+        runner._recovery_task_headers = {
+            active.pr_id: types.SimpleNamespace(frontmatter_status="doing"),
+            historical.pr_id: types.SimpleNamespace(frontmatter_status=historical_header),
+        }
+        return [historical, active]
+
+    monkeypatch.setattr(recovery_module.gh_prs, "get_merged_prs_discovery", lambda *a:
+                        recovery_module.gh_prs.PRDiscovery("octo/demo", "main", [old_pr], True))
+    # Retain actual transport/classification, durable state round-trips, metrics
+    # lookup and recovery ownership. Only external merge execution is observed.
+    merges = []
+    async def merge(**_kwargs):
+        merges.append(620)
+
+    mode["value"] = "new"
+    reaction_at["value"] = "2026-10-17T21:11:00Z"
+    redis = original.redis
+    for _ in range(2):
+        runner = h._make_runner(auto_merge=True)
+        runner.redis = redis
+        runner._metrics_store = MetricsStore(redis)
+        monkeypatch.setattr(runner, "_parse_tasks_from_headers", lambda: parse(runner))
+        monkeypatch.setattr(runner, "_scan_pr_diff_once", no_work)
+        monkeypatch.setattr(runner, "_maybe_reclassify_stuck_pending", no_work)
+        monkeypatch.setattr(runner, "handle_merge", merge)
+        assert asyncio.run(runner.recover_state()) is True
+        assert runner.state.state == PipelineState.WATCH
+        assert runner.state.current_task.pr_id == active.pr_id
+        assert runner.state.current_pr.number == 620
+        assert runner.state.publication_watermark.published_at == floor
+        assert runner._last_push_at == floor
+        # A restart must not turn a saved floor into a fresh observation.
+        mode["value"] = "old"
+        asyncio.run(runner.handle_watch())
+        assert runner.state.current_pr.review_status == ReviewStatus.PENDING
+        assert merges == []
+        assert any("publication evidence pending" in event["event"]
+                   for event in runner.state.history)
+        mode["value"] = "new"
+        asyncio.run(runner.handle_watch())
+        assert runner.state.current_pr.review_status == ReviewStatus.APPROVED
+        assert merges == [620]
+        assert runner.state.current_pr.publication_at == floor
+        assert runner.state.active_invocation is None
+        assert asyncio.run(runner._metrics_store.list_task_runs(runner.name, active.pr_id)) == []
+        merges.clear()
+        asyncio.run(runner.publish_state())
+
+    # The historical task remains eligible after the current owner completes;
+    # deferral must not mark it accounted or discard its identity/evidence.
+    active.status = TaskStatus.DONE
+    parse(runner)
+    assert asyncio.run(runner._recover_header_merge_attempt([historical, active], []))
+    assert runner._persisted_merge_recovery.current_task.pr_id == historical.pr_id
+    assert runner._persisted_merge_recovery.current_pr.number == 629

@@ -15,6 +15,8 @@ from urllib.parse import quote
 
 import yaml
 
+from tests.e2e.lib.ci_outcome import require_external_response
+
 REVIEWER_TOKEN_ENV = "TESTBED_REVIEWER_TOKEN"
 MARKER_PATH = "tests/e2e-shim-marker.txt"
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -130,6 +132,7 @@ class ReviewApi:
             timeout=30,
         )
         if result.returncode != 0:
+            require_external_response(result, "github_review")
             raise ReviewApiError(
                 f"GitHub review API failure: operation={operation}, "
                 f"pr_number={pr_number}, return_code={result.returncode}, "
@@ -154,6 +157,7 @@ class ReviewApi:
                 capture_output=True, text=True, check=False, timeout=30,
             )
             if result.returncode != 0:
+                require_external_response(result, "github_clock")
                 raise ReviewApiError(
                     f"GitHub clock read failed for PR #{pr_number}: {_error_details(result)}"
                 )

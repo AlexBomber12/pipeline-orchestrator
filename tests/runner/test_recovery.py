@@ -3533,3 +3533,71 @@ def test_recovery_retains_canonical_successful_comment_verdict(monkeypatch, tmp_
     assert runner.state.state == PipelineState.WATCH
     assert runner.state.current_pr.number == 651
     assert runner.state.current_pr.review_status == ReviewStatus.APPROVED
+
+
+@pytest.mark.parametrize("match", [
+    "bound", "wrong_task", "wrong_branch", "absent", "not_doing",
+    "no_checkpoint", "no_floor", "foreign_checkpoint", "wrong_saved_pr",
+])
+@pytest.mark.parametrize("header_status", ["done", "todo"])
+def test_open_owner_defers_only_unbound_bookkeeping(
+    monkeypatch, isolate_analytics_dir, match, header_status,
+):
+    """Only a checkpointed publication owner defers inferred merge replay."""
+    runner = h._make_runner()
+    historical = QueueTask(pr_id="PR-401", title="History", branch="pr-401",
+                           task_file="tasks/PR-401.md", status=TaskStatus.DONE)
+    active = QueueTask(pr_id="PR-459", title="Active", branch="pr-459",
+                       status=TaskStatus.TODO if match == "not_doing" else TaskStatus.DOING)
+    runner._recovery_task_headers = {
+        historical.pr_id: types.SimpleNamespace(frontmatter_status=header_status),
+        active.pr_id: types.SimpleNamespace(frontmatter_status="doing"),
+    }
+    owner = RepoState(
+        name=runner.name, url=runner.repo_config.url, state=PipelineState.WATCH,
+        current_task=active,
+        current_pr=PRInfo(number=620, pr_id=active.pr_id, branch=active.branch, head_sha="b" * 40),
+        publication_watermark=PublicationWatermark(
+            repo=runner.owner_repo, pr_number=620, head_repo=runner.owner_repo,
+            ref="refs/heads/" + active.branch, head_sha="b" * 40,
+            published_at=datetime(2026, 10, 21, tzinfo=timezone.utc),
+            provenance="github-activity:push",
+        ),
+    )
+    if match == "no_floor":
+        owner.publication_watermark = None
+    elif match == "foreign_checkpoint":
+        owner.name = "other__repository"
+    elif match == "wrong_saved_pr":
+        owner.current_pr.number = 621
+    runner._persisted_fix_recovery = None if match == "no_checkpoint" else owner
+    runner._restore_publication_watermark(owner)
+    runner.state.current_task = historical
+    runner._start_current_run_record("claude", "opus")
+    record = runner._current_run_record
+    record.exit_reason, record.outcome = "error", "failed"
+    record.ended_at = "2026-10-01T00:00:00Z"
+    asyncio.run(runner._metrics_store.save(record))
+    before = runner.redis.store.copy()
+    runner.state.current_task = None
+    runner._current_run_record = None
+    old_pr = PRInfo(number=629, pr_id=historical.pr_id, branch=historical.branch,
+                    head_sha="a" * 40)
+    monkeypatch.setattr(gh_prs, "get_merged_prs_discovery", lambda *a: gh_prs.PRDiscovery(
+        runner.owner_repo, "main", [old_pr], True,
+    ))
+    live = PRInfo(number=620, pr_id="PR-999" if match == "wrong_task" else active.pr_id,
+                  branch="other" if match == "wrong_branch" else active.branch,
+                  head_sha="b" * 40)
+    assert asyncio.run(runner._recover_header_merge_attempt(
+        [historical, active], [] if match == "absent" else [live],
+    ))
+    deferred = match == "bound"
+    assert runner._deferred_header_merge_recovery is deferred
+    saved = getattr(runner, "_persisted_merge_recovery", None)
+    if deferred:
+        assert saved is None
+    else:
+        assert saved.current_task.pr_id == historical.pr_id
+        assert saved.current_pr.number == old_pr.number
+    assert runner.redis.store == before

@@ -58,6 +58,10 @@ _CI_INFRA_RETRIED_TTL_SECONDS = 7 * 24 * 60 * 60
 # Wait beyond the CI cache TTL before reconciling a workflow rerun.
 # Persistent infrastructure evidence terminates as infrastructure, never FIX.
 _INFRA_RETRY_GRACE_SECONDS = 60.0
+# Finite allowance for a verified accepted Actions execution, anchored to the
+# original incident (never refreshed by polls/restarts). GitHub-hosted jobs have
+# a six-hour execution limit: https://docs.github.com/en/actions/reference/limits
+_INFRA_EXECUTION_MAX_SECONDS = 6 * 60 * 60
 # PR-251 follow-up: regex for extracting the GitHub Actions workflow run
 # ID from a check-run ``details_url``. The canonical format is
 # ``https://github.com/{owner}/{repo}/actions/runs/{run_id}/job/{job_id}``;
@@ -366,6 +370,10 @@ class WatchMixin:
                 found.head_sha if published_at is not None else None
             )
             self._push_provenance_reason = reason
+            if published_at is None and reason:
+                self.log_event(
+                    f"[WATCH] PR #{found.number} publication evidence pending: {reason}."
+                )
         elif (
             self._last_push_at is None
             or self._last_push_at_pr_number != found.number
@@ -1172,9 +1180,29 @@ class WatchMixin:
             started_at = float(marker.get("started_at", marker["at"]))
         except (TypeError, ValueError, KeyError, AttributeError):
             return False
-        return time.time() - started_at >= max(
+        elapsed = time.time() - started_at
+        observation_window = max(
             _INFRA_RETRY_GRACE_SECONDS, self.app_config.daemon.ci_pending_max_min * 60,
         )
+        if elapsed < observation_window:
+            return False
+        if elapsed >= max(observation_window, _INFRA_EXECUTION_MAX_SECONDS):
+            return True
+        targets = marker.get("targets")
+        requests = marker.get("request_attempts")
+        if not targets or not isinstance(requests, dict):
+            return True
+        for run_id in targets:
+            baseline = requests.get(str(run_id))
+            if type(baseline) is not int or baseline < 1:
+                return True
+            run = read_actions_run(self.owner_repo, pr.head_sha, run_id, self.state.ci_attempts)
+            observed = self.state.ci_attempts.get(str(run_id), 0)
+            if (run is None and observed <= baseline
+                or run is not None and run["attempt"] <= baseline):
+                return True
+        await self.publish_state()
+        return False
 
     async def _infra_retry_attempted(
         self, pr_number: int, head_sha: str

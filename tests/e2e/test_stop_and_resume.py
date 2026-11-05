@@ -44,10 +44,18 @@ def test_stop_during_coding_then_resume_picks_next_task(
         summary = page.locator('[data-repo-summary]')
         expect(summary).to_contain_text(f"PR-{first_pr_id_int}")
         with page.expect_response(f"**/repos/{testbed_slug}/stop") as response:
-            summary.get_by_role("button", name="Stop current run", exact=True).click()
-            page.get_by_role("dialog", name="Stop", exact=True).get_by_role(
-                "button", name="Stop", exact=True,
-            ).click()
+            # This positive lifecycle case confirms one current action. Keep
+            # both activations in one event loop so a passive summary swap cannot
+            # invalidate the origin between them. The separate dialog tests
+            # require detached origins to cancel without sending a stale POST.
+            summary.get_by_role("button", name="Stop current run", exact=True).evaluate("""trigger => {
+                trigger.click();
+                const dialog = document.getElementById('confirm-dialog');
+                if (!dialog.open || dialog.querySelector('h2').textContent !== 'Stop') {
+                    throw new Error('Expected current Stop confirmation');
+                }
+                dialog.querySelector('[data-confirm-accept]').click();
+            }""")
         assert response.value.status == 200
         assert response.value.request.headers.get("hx-request") == "true"
 

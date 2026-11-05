@@ -16,6 +16,7 @@ import pytest
 import requests
 from src.config import load_config, update_daemon_config, update_repository
 
+from tests.e2e.lib.ci_outcome import LifecycleTimeout, classify_failure, source_identity
 from tests.e2e.lib.pytest_batches import pytest_addoption as pytest_addoption
 from tests.e2e.lib.pytest_batches import pytest_collection_modifyitems as pytest_collection_modifyitems
 from tests.e2e.lib.review_api import ReviewApi
@@ -141,6 +142,20 @@ def _watch_browser_errors(request):
     request.node._evidence_preteardown = candidate
 
 
+def pytest_sessionstart(session):
+    session.config._ci_outcome = {"completed": [], "failures": [], "collection_failed": False, "skipped": False}
+
+
+def pytest_sessionfinish(session, exitstatus):
+    batch = session.config.getoption("--e2e-batch", default=None)
+    if batch is None or os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    report = session.config._ci_outcome
+    report.update(identity=source_identity(), batch=batch, exitstatus=int(exitstatus))
+    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    (EVIDENCE_DIR / f"batch-{batch}-outcome.json").write_text(json.dumps(report, sort_keys=True) + "\n")
+
+
 def pytest_collectreport(report):
     if report.failed:
         try:
@@ -153,6 +168,15 @@ def pytest_collectreport(report):
 def pytest_runtest_makereport(item, call):
     outcome = yield
     report = outcome.get_result()
+    ci = getattr(item.config, "_ci_outcome", None)
+    if ci is not None:
+        if report.when == "teardown":
+            ci["completed"].append(item.nodeid)
+        if report.skipped:
+            ci["skipped"] = True
+        if report.failed:
+            classification = classify_failure(call.excinfo.value) if call.excinfo is not None else {"kind": "failure"}
+            ci["failures"].append({"test_id": item.nodeid, "phase": report.when, "classification": classification})
     if report.failed:
         try:
             _write_failure_evidence(item, report.when)
@@ -406,8 +430,9 @@ def _resume_daemon(slug: str) -> None:
 def _wait_for_fresh_idle(slug: str, *, after: datetime, timeout_sec: int = 180) -> None:
     """Require a runner publication after resume, beyond the web's IDLE stub.
 
-    A cold IDLE scan includes paginated GitHub history and exceeded 60s in
-    CI. Keep a finite startup bound while allowing that scan to publish.
+    Startup publishes IDLE before its cold paginated GitHub scan finishes.
+    Require the existing end-of-selection event within the same startup bound;
+    otherwise upload/dispatch inherits that unfinished scan's latency.
     """
     deadline = time.monotonic() + timeout_sec
     last_seen = None
@@ -427,12 +452,27 @@ def _wait_for_fresh_idle(slug: str, *, after: datetime, timeout_sec: int = 180) 
                     updated = datetime.fromisoformat(entry.get("last_updated") or "")
                 except (ValueError, TypeError):
                     continue
-                if (updated.tzinfo is not None and updated > after and entry.get("state") == "IDLE"
+                scan_complete = False
+                for event in entry.get("history") or []:
+                    if (not isinstance(event, dict)
+                        or event.get("event") != "[INFRA] No tasks available."
+                        or event.get("state") != "IDLE"):
+                        continue
+                    try:
+                        observed = datetime.fromisoformat(event.get("last_seen_at") or event.get("time") or "")
+                    except (TypeError, ValueError):
+                        continue
+                    if observed.tzinfo is not None and observed > after:
+                        scan_complete = True
+                        break
+                if (scan_complete and updated.tzinfo is not None and updated > after and entry.get("state") == "IDLE"
                     and entry.get("user_paused") is False and entry.get("current_task") is None
                     and entry.get("current_pr") is None):
                     return
         time.sleep(0.5)
-    raise RuntimeError(f"timed out waiting for fresh IDLE from restarted daemon for {slug}; last seen={last_seen!r}")
+    raise LifecycleTimeout(
+        f"timed out waiting for fresh IDLE and completed empty scan from restarted daemon for {slug}; last seen={last_seen!r}"
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -731,7 +771,7 @@ def reset_testbed():
                 raise
             setup_error.add_note(f"resume failed after reset setup error: {exc}")
     # /resume may create an IDLE RepoState before startup migrations finish.
-    # A later daemon timestamp proves that the restarted runtime is serving.
+    # Require its completed empty scan too; early IDLE is not dispatch readiness.
     _wait_for_fresh_idle(TESTBED_SLUG, after=datetime.now(timezone.utc))
     yield
     clear_testbed_redis_state(TESTBED_SLUG)

@@ -45,6 +45,7 @@ import time
 
 import requests
 
+from tests.e2e.lib.ci_outcome import LifecycleTimeout
 from tests.e2e.lib.coder_shim import coder_shim, crash_coder_started
 
 DAEMON_CONTAINER = "pipeline-orchestrator-daemon-test"
@@ -277,7 +278,8 @@ def test_sigkill_during_coding_with_multitask_queue_recovers_and_progresses(
                     recovered = entry
                     break
             time.sleep(1)
-        assert recovered is not None, (
+        if recovered is None:
+            raise LifecycleTimeout(
             f"daemon did not quiesce in IDLE within "
             f"{RECOVERY_DEADLINE_SEC}s after restart; "
             f"last_seen_state={last_seen_state!r}, "

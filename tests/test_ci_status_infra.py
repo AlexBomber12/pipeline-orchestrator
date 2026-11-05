@@ -189,31 +189,118 @@ def test_maybe_hydrate_annotations_skips_when_id_missing(
     assert calls == []
 
 
-def test_maybe_hydrate_annotations_bounds_to_single_page(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """PR-251 follow-up: the annotations endpoint is paginated and a
-    large lint/test run can have many pages. Hydration must not walk
-    every page on every WATCH cycle — a single bounded ``per_page``
-    fetch is enough to detect any infra keyword. This test fails if the
-    helper ever reverts to ``--paginate``/``--slurp``.
-    """
-    calls: list[list[str]] = []
-
-    def fake_run_gh(args: list[str], **kwargs: Any) -> Any:
-        calls.append(list(args))
-        return [{"message": "Runner offline; could not start the job."}]
-
-    monkeypatch.setattr("src.github.gh_runner.run_gh", fake_run_gh)
+def test_maybe_hydrate_annotations_bounds_to_first_and_last_page(monkeypatch):
+    calls = []
+    def fetch(args, **kwargs):
+        calls.append(args)
+        return [] if "&page=" in args[1] else [{"message": "Runner offline; could not start the job."}]
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fetch)
     run = {"id": 99, "conclusion": "failure", "annotations_count": 500}
     _maybe_hydrate_annotations("owner/name", run)
-    assert len(calls) == 1
-    only_call = calls[0]
-    assert "--paginate" not in only_call
-    assert "--slurp" not in only_call
-    # ``per_page=`` is embedded in the path argument so the worst case
-    # is one page regardless of the underlying ``annotations_count``.
-    assert any("per_page=" in arg for arg in only_call)
-    assert run["annotations"] == [
-        {"message": "Runner offline; could not start the job."}
-    ]
+    assert len(calls) == 2
+    assert all("--paginate" not in call and "--slurp" not in call for call in calls)
+    assert calls[1][1].endswith("&page=10")
+    assert len(run["annotations"]) == 1
+
+
+def _structured_check(monkeypatch, **changes):
+    import json
+    from src.github import checks
+
+    verdict = {"repo": "octo/demo", "sha": "a" * 40, "run_id": 123,
+               "attempt": 1, "failed": 3, "infra": 3}
+    verdict.update(changes)
+    check = {"id": 456, "name": "integration", "head_sha": "a" * 40,
+             "app": {"id": 15368}, "conclusion": "failure", "status": "completed",
+             "details_url": "https://github.com/octo/demo/actions/runs/123/job/456",
+             "annotations": [{"title": "pipeline-ci-outcome:v1", "message": json.dumps(verdict)}]}
+    workflow = {"databaseId": 123, "headSha": "a" * 40, "attempt": 1,
+                "status": "completed", "conclusion": "failure",
+                "jobs": [{"databaseId": 456, "name": "integration", "conclusion": "failure"}]}
+    monkeypatch.setattr(checks.gh_runner, "run_gh", lambda *args, **kwargs: workflow)
+    return check, workflow
+
+
+@pytest.mark.parametrize("changes", [
+    {}, {"infra": 2}, {"failed": 0, "infra": 0}, {"attempt": True}, {"failed": "3"},
+    {"attempt": 2}, {"sha": "b" * 40}, {"run_id": 124}, {"repo": "other/repo"},
+])
+def test_structured_job_requires_pure_external_failure_and_exact_attempt(monkeypatch, changes):
+    check, _run = _structured_check(monkeypatch, **changes)
+    expected = None if changes == {"attempt": 2} else not bool(changes)
+    assert _is_infra_failure(check) is expected
+
+
+@pytest.mark.parametrize("boundary", ["untrusted", "bad_json", "not_object", "missing_message",
+                                     "duplicate", "wrong_job", "wrong_name", "running", "unavailable"])
+def test_structured_job_never_uses_invalid_or_unavailable_proof_as_infra(monkeypatch, boundary):
+    from src.github import checks
+    check, run = _structured_check(monkeypatch)
+    if boundary == "untrusted":
+        check["app"] = None
+    elif boundary == "bad_json":
+        check["annotations"][0]["message"] = "infrastructure error HTTP 500"
+    elif boundary == "not_object":
+        check["annotations"][0]["message"] = "[]"
+    elif boundary == "missing_message":
+        check["annotations"][0]["message"] = None
+    elif boundary == "duplicate":
+        check["annotations"] *= 2
+    elif boundary == "wrong_job":
+        run["jobs"][0]["databaseId"] = 457
+    elif boundary == "wrong_name":
+        run["jobs"][0]["name"] = "unit"
+    elif boundary == "running":
+        run["status"] = "in_progress"
+    else:
+        def unavailable(*args, **kwargs):
+            raise RuntimeError("HTTP 503")
+        monkeypatch.setattr(checks.gh_runner, "run_gh", unavailable)
+    assert _is_infra_failure(check) is (None if boundary in {"wrong_job", "wrong_name", "running", "unavailable"}
+                                       else False)
+
+
+@pytest.mark.parametrize("additional_logic", [False, True])
+def test_structured_unknown_provenance_defers_without_hiding_real_failure(monkeypatch, additional_logic):
+    from src.github import checks
+    from src.github.checks import _CiSourceResult, _make_ci_retrieval
+    check, _ = _structured_check(monkeypatch)
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("HTTP 503")
+    monkeypatch.setattr(checks.gh_runner, "run_gh", unavailable)
+    runs = [check]
+    if additional_logic:
+        runs.append({**check, "id": 789, "name": "unit", "annotations": []})
+    source = _CiSourceResult(True, False, None)
+    retrieval = _make_ci_retrieval("octo/demo", "a" * 40, 1.0, runs,
+                                  {"sha": "a" * 40, "state": "success", "statuses": []}, source, source, None)
+    assert checks._classify_ci_retrieval(retrieval) == (CIStatus.FAILURE if additional_logic else CIStatus.PENDING)
+
+
+def test_structured_verdict_is_bounded_and_invalid_does_not_use_keyword_fallback(monkeypatch):
+    check, _ = _structured_check(monkeypatch)
+    check["annotations"][0]["message"] = "operation timed out " * 200
+    assert _is_infra_failure(check) is False
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_final_job_verdict_hydrates_after_many_annotations_and_unknown_does_not_repair_code(monkeypatch, unavailable):
+    check, _ = _structured_check(monkeypatch)
+    summary = check.pop("annotations")
+    check["annotations_count"] = 501
+    calls = []
+    def fetch(args, **kwargs):
+        if args[0] != "api":
+            return {"databaseId": 123, "headSha": "a" * 40, "attempt": 1,
+                    "status": "completed", "conclusion": "failure",
+                    "jobs": [{"databaseId": 456, "name": "integration", "conclusion": "failure"}]}
+        calls.append(args)
+        if "&page=" not in args[1]:
+            return [{"message": "generic error"}] * 50
+        if unavailable:
+            return "malformed transport response"
+        return summary
+    monkeypatch.setattr("src.github.gh_runner.run_gh", fetch)
+    _maybe_hydrate_annotations("octo/demo", check)
+    assert len(calls) == 2 and calls[-1][1].endswith("&page=11")
+    assert _is_infra_failure(check) is (None if unavailable else True)
