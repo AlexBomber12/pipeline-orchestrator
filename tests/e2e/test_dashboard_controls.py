@@ -181,7 +181,7 @@ def test_delayed_stop_resume_and_redis_outage(
         page.goto(f"{dashboard_url}/repo/{testbed_slug}", wait_until="domcontentloaded")
         expect(summary.locator('[data-work-summary]')).to_contain_text("Stage: Unknown")
         expect(summary.locator('[data-work-summary]')).to_contain_text("Activity: Unknown")
-        expect(page.get_by_text("Recent cancellations", exact=True)).to_be_visible()
+        expect(page.get_by_role("tab", name="Cancellations")).to_be_visible()
         _compose("start", "redis-test")
         redis_stopped = False
         assert _redis("GET", state_key) == snapshot, "unavailable Pause must not mutate state"
