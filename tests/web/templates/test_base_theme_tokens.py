@@ -1,6 +1,7 @@
 """Semantic palette and contrast contracts, independent of the browser CDN."""
 
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -54,3 +55,48 @@ def test_aliases_and_no_semantic_overrides():
     assert '--cause-operator: var(--text-2)' in BASE
     assert '--cause-legacy: var(--text-3)' in BASE
     assert '--text-3: #8b929e' in BASE
+
+
+def test_theme_preference_controller():
+    controller = next(part.split('</script>')[0] for part in BASE.split('<script>')
+                      if "const STORAGE_KEY = 'theme'" in part)
+    script = r"""
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+for (const stored of [null, 'invalid', 'system', 'light', 'dark']) {
+    for (const blocked of [false, true]) {
+        const listeners = {}, controls = [{value: ''}, {value: ''}];
+        const root = {dataset: {}, style: {}};
+        const media = {matches: false, addEventListener: (_, fn) => media.change = fn};
+        let saved = stored;
+        const document = {
+            documentElement: root, querySelectorAll: () => controls,
+            addEventListener: (type, fn) => listeners[type] = fn,
+        };
+        const localStorage = {
+            getItem: () => { if (blocked) throw Error('blocked'); return saved; },
+            setItem: (key, value) => { if (blocked) throw Error('blocked'); saved = value; },
+        };
+        vm.runInNewContext(process.argv[1], {document, localStorage, window: {matchMedia: () => media}});
+        listeners.DOMContentLoaded();
+        const mode = !blocked && ['light', 'dark'].includes(stored) ? stored : 'system';
+        assert.deepEqual(controls.map(c => c.value), [mode, mode]);
+        assert.equal(root.dataset.theme, mode === 'light' ? 'light' : 'dark');
+        media.matches = true; media.change();
+        assert.equal(root.dataset.theme, mode === 'dark' ? 'dark' : 'light');
+        for (const [index, choice] of [[0, 'dark'], [1, 'light'], [0, 'system']]) {
+            const target = controls[index]; target.value = choice; target.matches = () => true;
+            listeners.change({target});
+            assert.deepEqual(controls.map(c => c.value), [choice, choice]);
+            if (!blocked) assert.equal(saved, choice);
+            for (const matches of [false, true]) {
+                media.matches = matches; media.change();
+                const expected = choice === 'system' ? (matches ? 'light' : 'dark') : choice;
+                assert.equal(root.dataset.theme, expected);
+                assert.equal(root.style.colorScheme, expected);
+            }
+        }
+    }
+}
+"""
+    subprocess.run(['node', '-e', script, controller], check=True, capture_output=True, text=True)

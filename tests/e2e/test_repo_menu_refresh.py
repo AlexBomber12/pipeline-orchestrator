@@ -66,10 +66,13 @@ def test_open_repo_menu_defers_refresh(page, dashboard_url, trigger, action, dis
     if dismiss == 'summary':
         menu.locator('summary').press('Enter')
     elif dismiss == 'outside':
-        page.locator('h1').first.click()
+        # The header title links to the dashboard. Use main's padding so
+        # dismissal stays on this document and cannot reset the test state.
+        page.locator('main').click(position={'x': 1, 'y': 1})
     else:
         card.locator('[data-card-name]').focus()
     expect(menu).not_to_have_attribute('open', '')
+    assert page.evaluate('window.retainedMenu.isConnected')
     refresh()
     expect(grid.locator('[data-refresh-marker]')).to_have_text('Updated repository data')
     assert page.evaluate('!window.retainedMenu.isConnected')

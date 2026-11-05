@@ -614,6 +614,7 @@ def test_fix_shim_preserves_remote_history_and_replaces_only_owned_marker(tmp_pa
 
     remote, repo = tmp_path / "remote.git", tmp_path / "repo"
     git("init", "--bare", "--initial-branch=main", str(remote))
+    git("config", "core.logAllRefUpdates", "true", cwd=remote)
     git("clone", str(remote), str(repo))
     git("config", "user.name", "Fixture", cwd=repo)
     git("config", "user.email", "fixture@test.invalid", cwd=repo)
@@ -629,12 +630,24 @@ def test_fix_shim_preserves_remote_history_and_replaces_only_owned_marker(tmp_pa
         ["bash", "-c", '''
 source "$1"
 ensure_pr_url() { printf 'https://example.invalid/pull/42'; }
-gh() { printf '%s\n' "$*" >> gh-calls; }
+gh() {
+    printf '%s\n' "$*" >> gh-calls
+    if [[ "$*" == *"/activity"* ]]; then
+        grep -q 'shim marker for PR-42 at old' tests/e2e-shim-marker.txt || exit 8
+        printf 'poll\n' >> activity-polls
+        if [[ "$(wc -l < activity-polls)" -lt 3 ]]; then
+            printf '0\n'
+        else
+            printf '1\n'
+        fi
+    fi
+}
 run_fix_existing_pr PR-42 pr-42-fix true
 ''', "bash", str(SHIM.resolve())],
         cwd=repo, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
+    assert (repo / "activity-polls").read_text().splitlines() == ["poll"] * 3
     head = git("rev-parse", "refs/heads/pr-42-fix", cwd=remote)
     assert head != old
     assert git("rev-parse", f"{head}^", cwd=remote) == old
@@ -644,3 +657,25 @@ run_fix_existing_pr PR-42 pr-42-fix true
     calls = (repo / "gh-calls").read_text()
     assert f"statuses/{head} -f state=pending" in calls
     assert calls.index("state=pending") < calls.index("@codex review")
+    events = (remote / "logs/refs/heads/pr-42-fix").read_text().splitlines()
+    assert len(events) == 2
+    created_at, fixed_at = (int(event.split("\t", 1)[0].rsplit(" ", 2)[1]) for event in events)
+    assert fixed_at > created_at
+
+
+def test_fix_shim_does_not_change_work_without_prior_publication_activity(tmp_path):
+    result = subprocess.run(
+        ["bash", "-c", '''
+source "$1"
+git() { printf '%040d\n' 1; }
+gh() { printf '0\n'; }
+sleep() { :; }
+write_marker_and_commit() { echo 'unexpected implementation' >&2; exit 8; }
+safe_push_branch() { echo 'unexpected push' >&2; exit 9; }
+run_fix_existing_pr PR-42 pr-42-fix true
+''', "bash", str(SHIM.resolve())],
+        cwd=tmp_path, capture_output=True, text=True, timeout=5,
+    )
+    assert result.returncode == 1
+    assert "base publication activity unavailable" in result.stderr
+    assert "unexpected" not in result.stderr

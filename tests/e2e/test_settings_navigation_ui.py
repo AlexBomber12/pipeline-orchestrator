@@ -191,12 +191,12 @@ def test_settings_direct_appearance_hash(page, dashboard_url, take_screenshot, w
 def test_settings_theme_toggle_persists_after_reload(page, dashboard_url):
     errors = _open_settings(page, dashboard_url, width=768, theme="dark")
     toggle = page.locator("#theme-toggle")
-    toggle.click()
+    toggle.select_option("light")
     assert page.locator("html").get_attribute("data-theme") == "light"
     page.reload(wait_until="load")
     assert page.locator("html").get_attribute("data-theme") == "light"
-    assert toggle.get_attribute("aria-label") == "Switch to dark theme"
-    toggle.click()
+    assert toggle.input_value() == "light"
+    toggle.select_option("dark")
     assert page.locator("html").get_attribute("data-theme") == "dark"
     page.reload(wait_until="load")
     assert page.locator("html").get_attribute("data-theme") == "dark"

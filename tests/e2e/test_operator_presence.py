@@ -30,6 +30,8 @@ def test_background_refresh_and_explicit_input(page, dashboard_url):
     page.goto(dashboard_url, wait_until="load")
     page.wait_for_function("typeof htmx !== 'undefined'")
     page.wait_for_function("document.querySelector('#availability-chip').dataset.manual")
+    page.locator('#header-menu summary').click()
+    page.wait_for_timeout(1100)
     requests.clear()
     # Run the real HTMX timers and the unchanged 60-second chip refresh.
     page.wait_for_timeout(650)
