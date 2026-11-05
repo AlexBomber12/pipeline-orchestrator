@@ -2,10 +2,8 @@ import base64
 import json
 import subprocess
 import time
-from pathlib import Path
 
-import yaml
-
+from tests.e2e.conftest import _load_shared_config
 from tests.e2e.lib.coder_shim import SHIM_SCENARIO_PATH, coder_shim
 from tests.e2e.lib.review_api import MergeOutcomeApi, task_released_and_done
 
@@ -48,13 +46,13 @@ def test_full_happy_path_via_shim_succeeds(
     expected_pr_id = f"PR-{pr_id_int}"
     expected_branch = f"pr-{pr_id_int}-e2e-test-upload-merge"
 
-    config = yaml.safe_load((Path(__file__).parent / "data/config.test.yml").read_text())
+    config = _load_shared_config()
     repo = testbed_slug.replace("__", "/", 1)
-    configured = next(item for item in config["repositories"] if repo in item["url"])
+    configured = next(item for item in config.repositories if repo in item.url)
     # Successful-empty checks are an explicit disposable-testbed exemption;
     # this shim route does not establish strict CI policy or real LLM access.
-    assert configured["allow_merge_without_checks"] is True
-    outcome = MergeOutcomeApi(repo, configured["branch"])
+    assert configured.allow_merge_without_checks is True
+    outcome = MergeOutcomeApi(repo, configured.branch)
 
     with coder_shim("success"):
         zip_path = make_task_zip(

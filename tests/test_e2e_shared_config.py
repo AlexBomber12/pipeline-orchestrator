@@ -50,6 +50,47 @@ def test_shared_config_snapshot_propagates_transport_failure(monkeypatch):
         stack._load_shared_config()
 
 
+def test_upload_merge_reads_owner_config_before_lifecycle(monkeypatch):
+    from tests.e2e import test_upload_and_merge as upload
+
+    content = (
+        "repositories:\n"
+        "  - url: https://github.com/octo/demo.git\n"
+        "    branch: fixture\n"
+        "    allow_merge_without_checks: true\n"
+    ).encode()
+    original_open = Path.open
+
+    def host_open(path, *args, **kwargs):
+        if path.name == "config.test.yml":
+            raise PermissionError("container-owned config")
+        return original_open(path, *args, **kwargs)
+
+    def container_read(args, **kwargs):
+        assert args == [
+            "docker", "compose", "-f", "docker-compose.test.yml", "exec", "-T",
+            "web-test", "cat", "/data/config.test.yml",
+        ]
+        assert kwargs["check"] and kwargs["timeout"] == 15
+        return subprocess.CompletedProcess(args, 0, content)
+
+    class ConfigVerified(Exception):
+        pass
+
+    def outcome(repo, branch):
+        assert (repo, branch) == ("octo/demo", "fixture")
+        raise ConfigVerified
+
+    monkeypatch.setattr(Path, "open", host_open)
+    monkeypatch.setattr(subprocess, "run", container_read)
+    monkeypatch.setattr(upload, "MergeOutcomeApi", outcome)
+    with pytest.raises(ConfigVerified):
+        upload.test_full_happy_path_via_shim_succeeds(
+            "unused", "octo__demo", lambda *args, **kwargs: None,
+            None, None, None, None,
+        )
+
+
 @pytest.mark.parametrize("producer", ["trusted-ci", "untrusted-ci"])
 def test_escalation_status_uses_owner_config_and_checks_producer(monkeypatch, producer):
     from tests.e2e import test_fix_coder_escalate as escalation
