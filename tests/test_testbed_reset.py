@@ -646,9 +646,6 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
         calls.append(f"clear:{slug}")
         return 0
 
-    def stop_daemon(slug: str) -> None:
-        calls.append(f"stop:{slug}")
-
     def resume_daemon(slug: str) -> None:
         calls.append(f"resume:{slug}")
 
@@ -665,7 +662,7 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
             e2e_conftest = importlib.import_module(module_name)
 
         with (
-            patch.object(e2e_conftest, "_stop_daemon_and_wait_paused", side_effect=stop_daemon),
+            patch.object(e2e_conftest, "_stop_daemon_and_wait_paused", side_effect=RuntimeError("startup lost pause")),
             patch.object(e2e_conftest, "_resume_daemon", side_effect=resume_daemon),
             patch.object(e2e_conftest, "reset_testbed_full", side_effect=reset_full),
             patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=clear_redis),
@@ -681,7 +678,6 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
         sys.modules.pop(module_name, None)
 
     assert calls == [
-        f"stop:{e2e_conftest.TESTBED_SLUG}",
         "service:stop",
         f"reset:{e2e_conftest.TESTBED_SLUG}",
         f"clear:{e2e_conftest.TESTBED_SLUG}",
@@ -692,12 +688,14 @@ def test_reset_testbed_fixture_resets_before_and_clears_after() -> None:
     ]
 
 
-def test_reset_testbed_fixture_resumes_when_stop_wait_fails() -> None:
+def test_reset_testbed_fixture_resumes_when_service_stop_fails() -> None:
     module_name = "tests.e2e.conftest"
     calls: list[str] = []
 
-    def stop_daemon(slug: str) -> None:
-        calls.append(f"stop:{slug}")
+    def stop_service(cmd, **kwargs) -> None:
+        assert cmd == ["docker", "compose", "-f", "docker-compose.test.yml", "stop", "daemon-test"]
+        assert kwargs["check"] is True
+        calls.append("service:stop")
         raise RuntimeError("stop timed out")
 
     def resume_daemon(slug: str) -> None:
@@ -713,7 +711,8 @@ def test_reset_testbed_fixture_resumes_when_stop_wait_fails() -> None:
             e2e_conftest = importlib.import_module(module_name)
 
         with (
-            patch.object(e2e_conftest, "_stop_daemon_and_wait_paused", side_effect=stop_daemon),
+            patch.object(e2e_conftest.subprocess, "run", side_effect=stop_service),
+            patch.object(e2e_conftest, "_stop_daemon_and_wait_paused", side_effect=unexpected_call),
             patch.object(e2e_conftest, "_resume_daemon", side_effect=resume_daemon),
             patch.object(e2e_conftest, "reset_testbed_full", side_effect=unexpected_call),
             patch.object(e2e_conftest, "clear_testbed_redis_state", side_effect=unexpected_call),
@@ -725,7 +724,7 @@ def test_reset_testbed_fixture_resumes_when_stop_wait_fails() -> None:
         sys.modules.pop(module_name, None)
 
     assert calls == [
-        f"stop:{e2e_conftest.TESTBED_SLUG}",
+        "service:stop",
         f"resume:{e2e_conftest.TESTBED_SLUG}",
     ]
     assert excinfo.value.__notes__ == ["resume failed after reset setup error: resume failed"]
@@ -763,11 +762,11 @@ def test_reset_fixture_does_not_run_with_partial_reset(failure: str) -> None:
     finally:
         sys.modules.pop(module_name, None)
     expected = {
-        "stop": ["paused", "stop", "resume"],
-        "reset": ["paused", "stop", "reset", "start", "resume"],
-        "clear": ["paused", "stop", "reset", "clear", "start", "resume"],
-        "start": ["paused", "stop", "reset", "clear", "start"],
-        "ready": ["paused", "stop", "reset", "clear", "start", "resume", "ready"],
+        "stop": ["stop", "resume"],
+        "reset": ["stop", "reset", "start", "resume"],
+        "clear": ["stop", "reset", "clear", "start", "resume"],
+        "start": ["stop", "reset", "clear", "start"],
+        "ready": ["stop", "reset", "clear", "start", "resume", "ready"],
     }
     assert calls == expected[failure]
 

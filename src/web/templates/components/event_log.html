@@ -30,3 +30,87 @@
         {% include "components/event_list.html" %}
     </div>
 </section>
+<style>
+    #repo-event-log button { min-height: 32px; }
+    #repo-event-log button[aria-pressed="true"] { border-color: currentColor; color: #e5e7eb; }
+    #repo-event-log [hidden] { display: none !important; }
+    #repo-event-log[data-problems="true"] [id^="event-list-wrapper-"] > p:first-child:not(:last-child) { display: none; }
+    @media (max-width: 639px) { #repo-event-log button { min-height: 44px; } }
+</style>
+<script>
+(function () {
+    const section = document.getElementById('repo-event-log');
+    const wrapper = section.querySelector('[id^="event-list-wrapper-"]');
+    const key = 'event-filters:' + {{ repo.name | tojson }};
+    let saved = {};
+    try { saved = JSON.parse(localStorage.getItem(key)) || {}; } catch (_) {}
+    const excluded = new Set(Array.isArray(saved.excluded) ? saved.excluded : []);
+    let problems = saved.problems === true;
+    let showUnknown = saved.showUnknown === true;
+    const controls = document.createElement('div');
+    controls.className = 'flex flex-wrap items-center gap-2 mb-3';
+    controls.setAttribute('role', 'group');
+    controls.setAttribute('aria-label', 'Event filters');
+    const categories = document.createElement('div');
+    categories.className = 'flex flex-wrap gap-2';
+    function button(label, action) {
+        const node = document.createElement('button');
+        node.type = 'button';
+        node.className = 'secondary-interactive rounded border border-white/10 px-3 text-xs text-gray-400';
+        node.textContent = label;
+        node.addEventListener('click', () => {
+            action();
+            apply();
+            try { localStorage.setItem(key, JSON.stringify({excluded: [...excluded], problems, showUnknown})); } catch (_) {}
+        });
+        return node;
+    }
+    const problemButton = button('Problems only', () => { problems = !problems; });
+    controls.append(problemButton, categories);
+    const note = document.createElement('div');
+    note.className = 'mb-3 text-xs text-gray-400';
+    const explanation = document.createElement('span');
+    const unknownButton = button('Show them', () => { showUnknown = !showUnknown; });
+    note.append(explanation, ' ', unknownButton);
+    wrapper.before(controls, note);
+    const chips = new Map();
+    function apply() {
+        const rows = [...wrapper.querySelectorAll('[data-event-severity]')];
+        const category = row => row.querySelector('[data-event-category]').dataset.eventCategory.toUpperCase();
+        const present = new Set(rows.map(category));
+        [...present].sort().forEach(value => {
+            if (chips.has(value)) return;
+            const chip = button(value || 'Event', () => {
+                if (excluded.has(value)) excluded.delete(value); else excluded.add(value);
+            });
+            chip.dataset.eventFilterCategory = value;
+            chips.set(value, chip);
+            categories.append(chip);
+        });
+        chips.forEach((chip, value) => {
+            // Retain focused controls and their DOM position across periodic refreshes.
+            chip.hidden = !present.has(value) && document.activeElement !== chip;
+            chip.setAttribute('aria-pressed', String(!excluded.has(value)));
+        });
+        let unknown = 0;
+        rows.forEach(row => {
+            const included = !excluded.has(category(row));
+            const severity = row.dataset.eventSeverity;
+            if (included && severity === 'unknown') unknown++;
+            const problem = ['error', 'warn'].includes(severity) || (severity === 'unknown' && showUnknown);
+            row.hidden = !included || (problems && !problem);
+        });
+        section.dataset.problems = String(problems);
+        problemButton.setAttribute('aria-pressed', String(problems));
+        note.hidden = !problems || (unknown === 0 && document.activeElement !== unknownButton);
+        explanation.textContent = unknown + ' events without recorded severity ' + (showUnknown ? 'shown.' : 'hidden.');
+        unknownButton.textContent = showUnknown ? 'Hide them' : 'Show them';
+        unknownButton.setAttribute('aria-pressed', String(showUnknown));
+    }
+    wrapper.addEventListener('htmx:afterSwap', () => {
+        apply();
+        wrapper.scrollTop = wrapper._scrollPos || 0;
+    });
+    apply();
+})();
+</script>

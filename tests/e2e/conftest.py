@@ -744,10 +744,10 @@ def reset_testbed():
     setup_error = None
     service_stopped = False
     try:
-        _stop_daemon_and_wait_paused(TESTBED_SLUG)
-        # A retained publication/error attempt deliberately survives Play.
-        # Remove the fixture-owned in-memory runner too, and prevent its
-        # heartbeat from restoring the snapshot while Redis is being cleared.
+        # Like the session reset, stop the fixture-owned service directly.
+        # Startup recovery can still be publishing an earlier task when this
+        # fixture starts, so a dashboard Stop is not a reliable reset barrier.
+        # Require compose stop to succeed before deleting any remote/Redis state.
         subprocess.run(
             ["docker", "compose", "-f", "docker-compose.test.yml", "stop", "daemon-test"],
             cwd=REPO_DIR, check=True, timeout=60,
