@@ -92,13 +92,15 @@ class _Runner(repo_ops.RepoOpsMixin):
         self.redis = _FakeRedis()
         self.name = "demo"
         self.events: list[str] = []
+        self.event_severities: list[str | None] = []
         self._crashed_task_pr_ids: set[str] = set()
         self._status_write_failed_task_pr_ids: set[str] = set()
         self.cleared_status_write_failed_calls = 0
         self.state = SimpleNamespace(current_queue=None)
 
-    def log_event(self, message: str) -> None:
+    def log_event(self, message: str, *, severity: str | None = None) -> None:
         self.events.append(message)
+        self.event_severities.append(severity)
 
     async def _clear_status_write_failed_task_ids(
         self,
@@ -1146,6 +1148,7 @@ def test_process_pending_uploads_handles_failures_and_safe_mode(
     assert git_calls[-1] == (runner.repo_path, "reset", "--hard", "origin/main")
     assert runner.redis.store[key] == manifest
     assert any("Upload push failed: commit exploded" in event for event in runner.events)
+    assert runner.event_severities[-1] == "error"
 
     git_calls.clear()
     runner.redis.store[key] = manifest

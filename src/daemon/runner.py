@@ -602,13 +602,15 @@ class PipelineRunner(
         the PR-210 baseline.
         """
         self.log_event(
-            "[ERROR] max soft-skip retries (3) reached, staying ERROR."
+            "[ERROR] max soft-skip retries (3) reached, staying ERROR.",
+            severity="error",
         )
 
     def _on_error_diagnose_threshold(self) -> None:
         """Log when the diagnose-attempt ceiling fires; stays ERROR."""
         self.log_event(
-            "[ERROR] diagnose_error: max attempts (3) reached, staying ERROR."
+            "[ERROR] diagnose_error: max attempts (3) reached, staying ERROR.",
+            severity="error",
         )
 
     async def _is_diagnose_exhausted(self, task_id: str) -> bool:  # pragma: no cover
@@ -785,7 +787,8 @@ class PipelineRunner(
         )
         self.log_event(
             f"[AUTO-PAUSE] ERROR rate exceeded threshold; manual Resume "
-            f"required ({reason})."
+            f"required ({reason}).",
+            severity="error",
         )
         await self.redis.set(pipeline_state(self.name), self.state.model_dump_json())
         await self.publish_state()
@@ -919,7 +922,7 @@ class PipelineRunner(
                 usage_providers=self._pending_usage_provider_map,
             )
         self.clear_staged_config_reload()
-        self.log_event("[INFRA] Applied staged repo config.")
+        self.log_event("[INFRA] Applied staged repo config.", severity="ok")
 
     def clear_staged_config_reload(self) -> None:
         """Drop any queued config swap once a newer config is in effect."""
@@ -966,7 +969,8 @@ class PipelineRunner(
                 self.clear_staged_config_reload()
                 await self.redis.delete(dirty_key)
                 self.log_event(
-                    "[INFRA] Reloaded repo config from config.yml."
+                    "[INFRA] Reloaded repo config from config.yml.",
+                    severity="ok",
                 )
                 return
         await self.redis.delete(dirty_key)
@@ -1078,7 +1082,8 @@ class PipelineRunner(
                     f"[INFRA] {self.state.state.value}: {context}"
                     f"Configured {preferred_label} unavailable: "
                     f"{explanation}; selected {resolution.plugin.display_name} "
-                    "because automatic fallback is enabled."
+                    "because automatic fallback is enabled.",
+                    severity="warn",
                 )
             return resolution.name, resolution.plugin
         if pin and pin != "any":
@@ -1852,7 +1857,8 @@ class PipelineRunner(
             self._current_run_record = None
             self.log_event(
                 f"[INFRA] restore_current_run_record failed for "
-                f"{task.pr_id}: {exc}."
+                f"{task.pr_id}: {exc}.",
+                severity="error",
             )
             return
         if (
@@ -1998,7 +2004,7 @@ class PipelineRunner(
                     exit_reason="", operator_intervention=False, run_phase="merge",
                     task_spec_hash=generation, head_sha=pr.head_sha,
                 )
-                self.log_event(f"[MERGE] Reconstructed missing accounting for {task.pr_id}.")
+                self.log_event(f"[MERGE] Reconstructed missing accounting for {task.pr_id}.", severity="ok")
         self._current_run_record = record
         self.state.active_invocation = record.invocations[-1] if record.invocations else None
 
@@ -2114,7 +2120,8 @@ class PipelineRunner(
         await self._clear_diagnose_exhausted(task_id)
         self.log_event(
             f"{log_prefix} cleared error_message ({reason}): "
-            f"{previous[:120]}"
+            f"{previous[:120]}",
+            severity="ok",
         )
         if publish:
             await self._publish_state_for_repo()
@@ -2189,7 +2196,7 @@ class PipelineRunner(
             await self.publish_state()
         log_body = message if log_message is None else log_message
         if log_severity is None:
-            self.log_event(f"{log_prefix} {log_body}.")
+            self.log_event(f"{log_prefix} {log_body}.", severity="error")
         else:
             self.log_event(f"{log_prefix} {log_body}.", severity=log_severity)
         if save_run_record_as:
@@ -2220,7 +2227,8 @@ class PipelineRunner(
             except Exception as exc:
                 self.log_event(
                     f"[ERROR] Failed to write status:ERROR to "
-                    f"{getattr(task, 'task_file', None)}: {exc}"
+                    f"{getattr(task, 'task_file', None)}: {exc}",
+                    severity="error",
                 )
                 status_written = False
             if status_written:
@@ -2228,7 +2236,8 @@ class PipelineRunner(
             if not status_written:
                 self.log_event(
                     "[INFRA] Warning: status:ERROR write failed; staying "
-                    "ERROR so the next ERROR cycle retries the coarse write."
+                    "ERROR so the next ERROR cycle retries the coarse write.",
+                    severity="error",
                 )
                 status_write_failed = True
 
@@ -2262,7 +2271,8 @@ class PipelineRunner(
                 except Exception as exc:
                     self.log_event(
                         "[INFRA] Warning: failed to record cancellation "
-                        f"cause for {task.pr_id}: {exc}."
+                        f"cause for {task.pr_id}: {exc}.",
+                        severity="error",
                     )
                 subsource = cause.payload.get("subsource") if cause.payload else None
                 if recorded and isinstance(subsource, str) and subsource:
@@ -2270,6 +2280,7 @@ class PipelineRunner(
                         f"Cancellation cause recorded for {task.pr_id}.",
                         tier="cancel",
                         kind=subsource,
+                        severity="ok",
                     )
                 if status_write_failed:
                     await self._mark_status_write_failed_task(
@@ -2322,11 +2333,13 @@ class PipelineRunner(
                     )
                 except asyncio.TimeoutError:
                     self.log_event(
-                        "[GUARDRAIL] notification webhook timed out"
+                        "[GUARDRAIL] notification webhook timed out",
+                        severity="error",
                     )
                 except Exception as exc:
                     self.log_event(
-                        f"[GUARDRAIL] notification webhook failed: {exc}"
+                        f"[GUARDRAIL] notification webhook failed: {exc}",
+                        severity="error",
                     )
         if publish:
             await self.publish_state()
@@ -2514,7 +2527,7 @@ class PipelineRunner(
                 reviewer_policy=policy,
             )
         except Exception as exc:
-            self.log_event(f"[RECOVERY] Review timeout evidence unavailable: {exc}")
+            self.log_event(f"[RECOVERY] Review timeout evidence unavailable: {exc}", severity="warn")
             return False
         found = next((pr for pr in candidates if pr.number == bound.number), None)
         if (
@@ -2555,7 +2568,8 @@ class PipelineRunner(
         self.state.state = PipelineState.WATCH
         self.log_event(
             f"[RECOVERY] PR #{bound.number} late review admitted for "
-            f"{bound.head_sha[:7]}; resuming WATCH."
+            f"{bound.head_sha[:7]}; resuming WATCH.",
+            severity="ok",
         )
         return True
 
@@ -2577,7 +2591,8 @@ class PipelineRunner(
         label = reason.value if reason is not None else "unknown"
         self.log_event(
             "[ERROR] AI diagnosis disabled for self-healing ERROR "
-            f"({label}) -> IDLE for retry."
+            f"({label}) -> IDLE for retry.",
+            severity="ok",
         )
 
     async def _maybe_resume_obsolete_ci_error(self) -> bool | None:
@@ -2615,14 +2630,14 @@ class PipelineRunner(
                         return True
                     return False
             except Exception as exc:
-                self.log_event(f"[RECOVERY] Obsolete CI observation deferred: {exc}.")
+                self.log_event(f"[RECOVERY] Obsolete CI observation deferred: {exc}.", severity="warn")
                 return False
         return None
 
     async def _handle_single_error_exit(self) -> bool | None:
         """Common ERROR policy; True requests the existing immediate WATCH handoff."""
         if (self.state.error_message or "").startswith("Merge accounting conflict:"):
-            self.log_event("[RECOVERY] Merge accounting conflict remains parked for operator Retry.")
+            self.log_event("[RECOVERY] Merge accounting conflict remains parked for operator Retry.", severity="error")
             return
         obsolete_ci = await self._maybe_resume_obsolete_ci_error()
         if obsolete_ci is not None:
@@ -2631,7 +2646,8 @@ class PipelineRunner(
         if pause is not None and pause.active:
             self.state.state = PipelineState.PAUSED
             self.log_event(
-                "[RATE-LIMIT] Legacy ERROR + rate_limited_until -> PAUSED."
+                "[RATE-LIMIT] Legacy ERROR + rate_limited_until -> PAUSED.",
+                severity="warn",
             )
             return
 
@@ -2677,17 +2693,19 @@ class PipelineRunner(
             self._last_error_park_log_key = None
             self.log_event(
                 "[ESCALATE] operator-cleared ERROR task frontmatter "
-                "-> IDLE."
+                "-> IDLE.",
+                severity="ok",
             )
             return
 
         if task is not None and frontmatter_status is None:
-            self.log_event("[RECOVERY] Remote ERROR task status unavailable; staying ERROR.")
+            self.log_event("[RECOVERY] Remote ERROR task status unavailable; staying ERROR.", severity="warn")
             return
         if merge_sync_error:
             self.log_event(
                 "[RECOVERY] Retained checkout failure remains ERROR until "
-                "operator Retry or a task update."
+                "operator Retry or a task update.",
+                severity="error",
             )
             return
 
@@ -2700,7 +2718,8 @@ class PipelineRunner(
                 self._last_error_park_log_key = key
                 self.log_event(
                     "[ESCALATE] review_timeout operator-clearable ERROR "
-                    "park active; waiting for Retry or reupload."
+                    "park active; waiting for Retry or reupload.",
+                    severity="error",
                 )
             return
 
@@ -2720,7 +2739,8 @@ class PipelineRunner(
                 self._last_error_park_log_key = key
                 self.log_event(
                     f"[ESCALATE] {reason.value} operator-clearable ERROR "
-                    "park active; waiting for Retry or reupload."
+                    "park active; waiting for Retry or reupload.",
+                    severity="error",
                 )
             return
 
@@ -2758,7 +2778,8 @@ class PipelineRunner(
         ):
             self.log_event(
                 f"[INFRA] Warning: refusing to commit unsafe task path "
-                f"{task_file!r}."
+                f"{task_file!r}.",
+                severity="error",
             )
             return False
         repo_root = Path(self.repo_path).resolve()
@@ -2768,7 +2789,8 @@ class PipelineRunner(
         except ValueError:
             self.log_event(
                 f"[INFRA] Warning: refusing to commit task path outside repo "
-                f"{task_file!r}."
+                f"{task_file!r}.",
+                severity="error",
             )
             return False
 
@@ -2800,7 +2822,7 @@ class PipelineRunner(
                     (repo_root / task_path).read_text(encoding="utf-8")
                 )
             except (OSError, UnicodeError):
-                self.log_event("[INFRA] Warning: admitted task spec unavailable.")
+                self.log_event("[INFRA] Warning: admitted task spec unavailable.", severity="error")
                 return False
 
         try:
@@ -2868,7 +2890,8 @@ class PipelineRunner(
                     )
                     if diff.returncode == 0:
                         self.log_event(
-                            f"[MERGE] No task status change to commit for {task_file}."
+                            f"[MERGE] No task status change to commit for {task_file}.",
+                            severity="info",
                         )
                         if status == "ERROR":
                             self._confirmed_error_task_pr_ids.add(pr_id)
@@ -2907,7 +2930,8 @@ class PipelineRunner(
                 raise MergeIdentityConflict(str(exc)) from exc
             self.log_event(
                 f"[INFRA] Warning: failed to commit {status} status for "
-                f"{task_file}: {exc}."
+                f"{task_file}: {exc}.",
+                severity="error",
             )
             return False
 
@@ -2957,7 +2981,8 @@ class PipelineRunner(
             self._status_write_failed_task_pr_ids_persist_failed = True
             self.log_event(
                 f"[INFRA] Warning: failed to persist status-write "
-                f"fallback markers: {exc}."
+                f"fallback markers: {exc}.",
+                severity="error",
             )
 
     async def _hydrate_status_write_failed_task_pr_ids(self) -> None:  # pragma: no cover
@@ -3000,7 +3025,8 @@ class PipelineRunner(
         except Exception as exc:
             self.log_event(
                 f"[INFRA] Warning: failed to clear legacy status-write "
-                f"fallback markers: {exc}."
+                f"fallback markers: {exc}.",
+                severity="error",
             )
 
     async def _mark_status_write_failed_task(
@@ -3027,7 +3053,8 @@ class PipelineRunner(
             )
         self.log_event(
             f"[INFRA] Warning: using in-memory ERROR fallback for "
-            f"{pr_id}; status write will retry on the next ERROR cycle."
+            f"{pr_id}; status write will retry on the next ERROR cycle.",
+            severity="warn",
         )
         await self._persist_status_write_failed_task_pr_ids()
         snapshot = self.state.current_queue
@@ -3384,7 +3411,8 @@ class PipelineRunner(
                 close()
             self.log_event(
                 f"{log_prefix} Coder invocation deferred while credential login "
-                "owns its credential location."
+                "owns its credential location.",
+                severity="warn",
             )
             return None
         self._stop_requested = False
@@ -3431,7 +3459,8 @@ class PipelineRunner(
             self.state.state = PipelineState.PAUSED
             self.log_event(
                 f"{log_prefix} Auxiliary coder stopped by operator; "
-                "repository paused."
+                "repository paused.",
+                severity="info",
             )
             return None
         return result
@@ -3467,7 +3496,8 @@ class PipelineRunner(
                 self.state.user_paused = True
                 self.log_event(
                     "[INFRA] User stop requested; terminating current "
-                    "coder."
+                    "coder.",
+                    severity="info",
                 )
                 await self._terminate_current_coder()
                 cli_task.cancel()
@@ -3620,7 +3650,7 @@ class PipelineRunner(
             logger.warning("Failed to save CLI log for %s", self.name)
         if combined.strip():
             first_lines = combined.strip()[:200]
-            self.log_event(f"[INFRA] {label}: {first_lines}.")
+            self.log_event(f"[INFRA] {label}: {first_lines}.", severity="info")
 
     def log_event(
         self,
@@ -3775,7 +3805,8 @@ class PipelineRunner(
         self.log_event(
             f"[RATE-LIMIT] GitHub API budget critical "
             f"({budget.remaining}/{budget.limit}), pausing until "
-            f"{reset_iso} ({remaining_min} min)."
+            f"{reset_iso} ({remaining_min} min).",
+            severity="warn",
         )
 
     def _enter_github_api_slowdown(self) -> None:
@@ -3788,7 +3819,8 @@ class PipelineRunner(
         self.log_event(
             f"[RATE-LIMIT] GitHub API budget low "
             f"({budget.remaining}/{budget.limit}), slowing polling to "
-            f"{effective_interval}s."
+            f"{effective_interval}s.",
+            severity="warn",
         )
 
     def _is_extended_idle_active(self) -> bool:
@@ -4092,7 +4124,8 @@ class PipelineRunner(
             ):
                 self.log_event(
                     f"[INFRA] ensure_repo_cloned failed: {exc}; "
-                    "retaining unpublished PR checkout and failure."
+                    "retaining unpublished PR checkout and failure.",
+                    severity="error",
                 )
                 if not is_retained_merge_error(self.state.error_message):
                     await self._transition_to_error(
@@ -4206,7 +4239,7 @@ class PipelineRunner(
             )
         ):
             if not self._user_pause_logged:
-                self.log_event("[INFRA] Paused. Press Play to resume.")
+                self.log_event("[INFRA] Paused. Press Play to resume.", severity="info")
                 self._user_pause_logged = True
             await self.publish_state()
             return
@@ -4247,7 +4280,8 @@ class PipelineRunner(
         if self.state.state in _TRANSIENT_STATES:
             self.log_event(
                 f"[INFRA] resetting stale transient state "
-                f"{self.state.state.value} -> IDLE."
+                f"{self.state.state.value} -> IDLE.",
+                severity="ok",
             )
             self.state.state = PipelineState.IDLE
 
@@ -4268,14 +4302,15 @@ class PipelineRunner(
             self.state.skip_ai_error_diagnose = False
             self.log_event(
                 "[ESCALATE] review_timeout park flag cleared "
-                f"(state {self.state.state.value} is not ERROR)."
+                f"(state {self.state.state.value} is not ERROR).",
+                severity="ok",
             )
 
         if self.state.state == PipelineState.IDLE:
             await self._refresh_user_paused_from_redis()
             if self.state.user_paused:
                 if not self._user_pause_logged:
-                    self.log_event("[INFRA] Paused. Press Play to resume.")
+                    self.log_event("[INFRA] Paused. Press Play to resume.", severity="info")
                     self._user_pause_logged = True
                 await self.publish_state()
                 return
