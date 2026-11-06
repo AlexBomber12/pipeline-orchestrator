@@ -605,7 +605,8 @@ class FixMixin(BreachMixin):
         ):
             self.log_event(
                 f"[FIX] Skipping FIX for cross-repo PR "
-                f"#{self.state.current_pr.number}."
+                f"#{self.state.current_pr.number}.",
+                severity="error",
             )
             self.state.state = PipelineState.WATCH
             return
@@ -661,7 +662,7 @@ class FixMixin(BreachMixin):
                 await persist_attempts()
             if ci_failure is None:
                 if not (review_feedback and review_head == current_pr.head_sha):
-                    self.log_event("[FIX] CI failure no longer actionable; returning to WATCH.")
+                    self.log_event("[FIX] CI failure no longer actionable; returning to WATCH.", severity="info")
                     self.state.state = PipelineState.WATCH
                     return
                 current_pr.ci_status = CIStatus.PENDING
@@ -671,7 +672,7 @@ class FixMixin(BreachMixin):
             and current_pr.review_status == ReviewStatus.CHANGES_REQUESTED
             and (not review_feedback or not review_head or review_head != current_pr.head_sha)
         ):
-            self.log_event("[FIX] Current actionable review findings unavailable; returning to WATCH.")
+            self.log_event("[FIX] Current actionable review findings unavailable; returning to WATCH.", severity="info")
             self.state.state = PipelineState.WATCH
             return
         fix_iteration_cap = self.app_config.daemon.fix_iteration_cap
@@ -687,7 +688,7 @@ class FixMixin(BreachMixin):
                 or current_pr.pr_id not in (None, task.pr_id)
                 or (not task.branch and current_pr.pr_id != task.pr_id)
             ):
-                self.log_event("[FIX] Task/PR binding unavailable; deferring dispatch.")
+                self.log_event("[FIX] Task/PR binding unavailable; deferring dispatch.", severity="warn")
                 self.state.state = PipelineState.WATCH
                 return
             if self._current_run_record is None:
@@ -696,7 +697,7 @@ class FixMixin(BreachMixin):
                         task_id=task.pr_id, limit=20, repo_name=self.name
                     )
                 except Exception as exc:
-                    self.log_event(f"[FIX] Run accounting unavailable: {exc}; deferring dispatch.")
+                    self.log_event(f"[FIX] Run accounting unavailable: {exc}; deferring dispatch.", severity="warn")
                     self.state.state = PipelineState.WATCH
                     return
                 self._current_run_record = next(
@@ -707,14 +708,17 @@ class FixMixin(BreachMixin):
                 return
             if record is None:
                 if approval_candidate is not None:
-                    self.log_event("[FIX] Approved guardrail run accounting unavailable; deferring dispatch.")
+                    self.log_event(
+                        "[FIX] Approved guardrail run accounting unavailable; deferring dispatch.",
+                        severity="warn",
+                    )
                     self.state.state = PipelineState.WATCH
                     return
                 if (
                     self.state.active_invocation is not None
                     and self.state.active_invocation.phase == "fix"
                 ):
-                    self.log_event("[FIX] Prior FIX accounting missing; deferring dispatch.")
+                    self.log_event("[FIX] Prior FIX accounting missing; deferring dispatch.", severity="warn")
                     self.state.state = PipelineState.WATCH
                     return
                 self._start_current_run_record(coder_name, "")
@@ -722,7 +726,7 @@ class FixMixin(BreachMixin):
                 assert record is not None
                 record.run_phase = "fix"
             elif record.task_id != task.pr_id:
-                self.log_event("[FIX] Completed or unrelated run record; deferring dispatch.")
+                self.log_event("[FIX] Completed or unrelated run record; deferring dispatch.", severity="warn")
                 self.state.state = PipelineState.WATCH
                 return
             elif record.ended_at is not None:
@@ -730,7 +734,7 @@ class FixMixin(BreachMixin):
                 if record.exit_reason != "coding_complete" and not provider_resume:
                     approval = await self._approved_guardrail_fix_attempt(record, current_pr)
                     if approval is None:
-                        self.log_event("[FIX] Completed or unrelated run record; deferring dispatch.")
+                        self.log_event("[FIX] Completed or unrelated run record; deferring dispatch.", severity="warn")
                         self.state.state = PipelineState.WATCH
                         return
                     approved_continuation = approval
@@ -784,7 +788,7 @@ class FixMixin(BreachMixin):
                 except Exception as exc:
                     self._current_run_record = record
                     self.state.active_invocation = previous_snapshot
-                    self.log_event(f"[FIX] Could not persist active FIX run: {exc}.")
+                    self.log_event(f"[FIX] Could not persist active FIX run: {exc}.", severity="error")
                     self.state.state = PipelineState.WATCH
                     return
                 self.state.active_invocation = previous_snapshot
@@ -805,7 +809,8 @@ class FixMixin(BreachMixin):
             ):
                 self.log_event(
                     "[FIX] Persisted FIX invocation count unavailable; "
-                    "deferring dispatch for operator recovery."
+                    "deferring dispatch for operator recovery.",
+                    severity="error",
                 )
                 self.state.state = PipelineState.WATCH
                 return
@@ -817,7 +822,8 @@ class FixMixin(BreachMixin):
             self.state.state = PipelineState.IDLE
             self.log_event(
                 f"[FIX] FIX blocked for escalated PR #{current_pr.number}, "
-                f"moving to IDLE."
+                f"moving to IDLE.",
+                severity="error",
             )
             await self.publish_state()
             return
@@ -858,14 +864,17 @@ class FixMixin(BreachMixin):
                 if approved_continuation is not None and not await self._approved_fix_checkout_safe(
                     approved_continuation, current_pr, require_fetched_head=True,
                 ):
-                    self.log_event("[FIX] Approved checkout changed before refresh; deferring dispatch.")
+                    self.log_event(
+                        "[FIX] Approved checkout changed before refresh; deferring dispatch.",
+                        severity="warn",
+                    )
                     self.state.state = PipelineState.WATCH
                     return
                 git_ops._git(self.repo_path, "checkout", branch)
                 if approved_continuation is not None and not await self._approved_fix_checkout_safe(
                     approved_continuation, current_pr, require_fetched_head=True,
                 ):
-                    self.log_event("[FIX] Approved checkout changed before reset; deferring dispatch.")
+                    self.log_event("[FIX] Approved checkout changed before reset; deferring dispatch.", severity="warn")
                     self.state.state = PipelineState.WATCH
                     return
                 git_ops._git(self.repo_path, "reset", "--hard", f"origin/{branch}")
@@ -957,7 +966,7 @@ class FixMixin(BreachMixin):
                     or self.state.current_pr is not current_pr
                     or self.state.current_pr.head_sha != review_head
                 ):
-                    self.log_event("[FIX] PR HEAD changed before review dispatch; returning to WATCH.")
+                    self.log_event("[FIX] PR HEAD changed before review dispatch; returning to WATCH.", severity="info")
                     self.state.state = PipelineState.WATCH
                     return
             if ci_failure is not None:
@@ -981,7 +990,10 @@ class FixMixin(BreachMixin):
                             or self.state.current_pr is not current_pr
                             or self.state.current_pr.head_sha != review_head
                         ):
-                            self.log_event("[FIX] PR HEAD changed before review dispatch; returning to WATCH.")
+                            self.log_event(
+                                "[FIX] PR HEAD changed before review dispatch; returning to WATCH.",
+                                severity="info",
+                            )
                             self.state.state = PipelineState.WATCH
                             return
                         ci_failure = None
@@ -995,11 +1007,17 @@ class FixMixin(BreachMixin):
                         if review_context is not None:
                             fix_kwargs["extra_context"] = review_context
                         else:
-                            self.log_event("[FIX] Current actionable review findings unavailable; returning to WATCH.")
+                            self.log_event(
+                                "[FIX] Current actionable review findings unavailable; returning to WATCH.",
+                                severity="info",
+                            )
                             self.state.state = PipelineState.WATCH
                             return
                     else:
-                        self.log_event("[FIX] CI failure changed before coder launch; returning to WATCH.")
+                        self.log_event(
+                            "[FIX] CI failure changed before coder launch; returning to WATCH.",
+                            severity="info",
+                        )
                         self.state.state = PipelineState.WATCH
                         return
         feedback_context = retained.fix_feedback_context if provider_resume else fix_kwargs.get("extra_context")
@@ -1021,7 +1039,7 @@ class FixMixin(BreachMixin):
                     fix_kwargs.get("reasoning_effort")
                 )
             ):
-                self.log_event("[FIX] Checkpointed invocation settings changed; deferring dispatch.")
+                self.log_event("[FIX] Checkpointed invocation settings changed; deferring dispatch.", severity="warn")
                 self.state.state = PipelineState.WATCH
                 return
         if not self._reserve_coder_credentials(
@@ -1030,7 +1048,8 @@ class FixMixin(BreachMixin):
         ):
             self.log_event(
                 "[FIX] Coder invocation deferred while credential login owns "
-                "its credential location."
+                "its credential location.",
+                severity="warn",
             )
             self.state.state = PipelineState.WATCH
             return
@@ -1057,6 +1076,7 @@ class FixMixin(BreachMixin):
                 f"[{coder_name}] entering FIX.",
                 tier="state",
                 kind="transition",
+                severity="info",
             )
             if reused_prelaunch:
                 captured_snapshot = self.state.active_invocation
@@ -1302,12 +1322,14 @@ class FixMixin(BreachMixin):
             if breach_cancelled:
                 self.log_event(
                     f"[FIX] FIX aborted: in-flight rate limit breach, "
-                    f"paused until {self.state.rate_limited_until}."
+                    f"paused until {self.state.rate_limited_until}.",
+                    severity="warn",
                 )
             else:
                 self.log_event(
                     f"[FIX] FIX paused: late in-flight rate limit breach, "
-                    f"paused until {self.state.rate_limited_until}."
+                    f"paused until {self.state.rate_limited_until}.",
+                    severity="warn",
                 )
             return
 
@@ -1328,7 +1350,8 @@ class FixMixin(BreachMixin):
             stop_requested_after_exit = True
             self.log_event(
                 "[FIX] User stop requested after FIX exit; deferring "
-                "pause until FIX bookkeeping completes."
+                "pause until FIX bookkeeping completes.",
+                severity="info",
             )
             return True
 
@@ -1340,7 +1363,7 @@ class FixMixin(BreachMixin):
                 log_prefix="[FIX]",
                 reason="user stop requested after FIX exit",
             )
-            self.log_event("[FIX] FIX aborted: user stop requested.")
+            self.log_event("[FIX] FIX aborted: user stop requested.", severity="info")
             return True
 
         async def read_head_after_fix() -> str | None:
@@ -1391,7 +1414,7 @@ class FixMixin(BreachMixin):
                 self._last_push_at = None
                 iteration = 0
 
-            self.log_event(f"[FIX] Fix pushed, iteration #{iteration}.")
+            self.log_event(f"[FIX] Fix pushed, iteration #{iteration}.", severity="ok")
             if self.state.current_pr is not None:
                 if not await fix_codex_trigger.maybe_post_codex_review_after_push(
                     self,
@@ -1448,6 +1471,7 @@ class FixMixin(BreachMixin):
                     f"{violation.category}: {violation.excerpt}",
                     tier="guardrail",
                     kind=violation.category,
+                    severity="error",
                 )
             if await pause_for_stop_after_bookkeeping():
                 return
@@ -1489,7 +1513,7 @@ class FixMixin(BreachMixin):
                 return
             if self.state.publication_attempt is not None:
                 self.state.publication_attempt.pending = False
-            self.log_event("[FIX] Bound CI-only failure became obsolete; resuming WATCH.")
+            self.log_event("[FIX] Bound CI-only failure became obsolete; resuming WATCH.", severity="info")
             self.state.state = PipelineState.WATCH
             await self.publish_state()
             return
@@ -1577,7 +1601,8 @@ class FixMixin(BreachMixin):
                 self.log_event(
                     "[FIX] FIX stop-cancel left local HEAD outside the "
                     "fetched remote branch; skipping push bookkeeping and "
-                    "@codex review."
+                    "@codex review.",
+                    severity="warn",
                 )
             if await pause_for_stop_after_bookkeeping():
                 return
@@ -1608,7 +1633,8 @@ class FixMixin(BreachMixin):
                 )
                 self.log_event(
                     f"[RATE-LIMIT] Rate limit pause active until "
-                    f"{self.state.rate_limited_until.isoformat()}."
+                    f"{self.state.rate_limited_until.isoformat()}.",
+                    severity="warn",
                 )
                 return
             if await pause_for_stop_after_bookkeeping():
@@ -1670,7 +1696,8 @@ class FixMixin(BreachMixin):
             elif verification is None and verify_branch:
                 self.log_event(
                     "[FIX] FIX push verification unavailable; "
-                    "proceeding optimistically."
+                    "proceeding optimistically.",
+                    severity="warn",
                 )
 
         if local_no_push or remote_no_push:
@@ -1679,7 +1706,7 @@ class FixMixin(BreachMixin):
                     return
                 if self.state.publication_attempt is not None:
                     self.state.publication_attempt.pending = False
-                self.log_event("[FIX] Bound CI-only failure became obsolete; resuming WATCH.")
+                self.log_event("[FIX] Bound CI-only failure became obsolete; resuming WATCH.", severity="info")
                 self.state.state = PipelineState.WATCH
                 await self.publish_state()
                 return
@@ -1692,12 +1719,14 @@ class FixMixin(BreachMixin):
             if local_no_push:
                 self.log_event(
                     "[FIX] FIX FEEDBACK exited 0 but HEAD unchanged; "
-                    "no push, skipping @codex review."
+                    "no push, skipping @codex review.",
+                    severity="error",
                 )
             else:
                 self.log_event(
                     "[FIX] Coder exited cleanly but no push detected; "
-                    "treating as no-push, skipping @codex review."
+                    "treating as no-push, skipping @codex review.",
+                    severity="error",
                 )
             if self.state.current_pr is not None:
                 no_push_policy.increment(self.state.current_pr)

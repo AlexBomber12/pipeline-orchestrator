@@ -184,7 +184,8 @@ class ErrorMixin:
                 or is_retained_merge_error(self.state.error_message)):
                 self.log_event(
                     f"[RECOVERY] Terminal failure {getattr(task, 'pr_id', None)} held: "
-                    "bound cleanup/work proof required."
+                    "bound cleanup/work proof required.",
+                    severity="error",
                 )
                 return
             status, blocked, revision = await asyncio.to_thread(
@@ -284,22 +285,23 @@ class ErrorMixin:
             ))
             if decision != TerminalReleaseDecision.RELEASE:
                 self.log_event(
-                    f"[RECOVERY] Terminal release {decision.value}; re-observing safety evidence next cycle."
+                    f"[RECOVERY] Terminal release {decision.value}; re-observing safety evidence next cycle.",
+                    severity="warn",
                 )
                 return
             await self._suppress_task(task.pr_id, reason, evidence)
             retained = await self._suppression_record_for_task(task.pr_id)
             if retained is None or retained.reason != reason or retained.detail != evidence:
-                self.log_event("[RECOVERY] Terminal failure persistence unconfirmed; staying ERROR.")
+                self.log_event("[RECOVERY] Terminal failure persistence unconfirmed; staying ERROR.", severity="error")
                 return
         except Exception as exc:
-            self.log_event(f"[RECOVERY] Terminal failure reconciliation deferred: {exc}.")
+            self.log_event(f"[RECOVERY] Terminal failure reconciliation deferred: {exc}.", severity="warn")
             return
         self.state.current_task = None
         self._current_run_record = None
         self._reset_runner_local_task_counters()
         self.state.state = PipelineState.IDLE
-        self.log_event("[RECOVERY] Failed attempt retained; independent work released.")
+        self.log_event("[RECOVERY] Failed attempt retained; independent work released.", severity="ok")
 
     async def handle_error(self, error_context: str | None = None) -> None:
         """Ask the selected coder whether to FIX, SKIP, or ESCALATE the error."""
@@ -321,7 +323,7 @@ class ErrorMixin:
             return
 
         if context.startswith("Size FIX outcome unresolved; operator Retry"):
-            self.log_event("[RECOVERY] Size FIX remains parked for operator Retry.")
+            self.log_event("[RECOVERY] Size FIX remains parked for operator Retry.", severity="error")
             return
 
         if "status:ERROR write failed; operator Retry required" in context:
@@ -334,11 +336,11 @@ class ErrorMixin:
                 if not await self._commit_task_status_change(
                     retry_task, "ERROR", context, blocked_reason=reason
                 ):
-                    self.log_event("[RECOVERY] Status write still failing; operator Retry required.")
+                    self.log_event("[RECOVERY] Status write still failing; operator Retry required.", severity="error")
                     return
                 self._status_write_failed_task_pr_ids.discard(retry_task_id)
                 await self._persist_status_write_failed_task_pr_ids()
-            self.log_event("[RECOVERY] Status write failure retained; operator Retry required.")
+            self.log_event("[RECOVERY] Status write failure retained; operator Retry required.", severity="error")
             return
 
         if (
@@ -360,7 +362,8 @@ class ErrorMixin:
             if not status_written:
                 self.log_event(
                     "[INFRA] Warning: retryable status:ERROR write still "
-                    f"failing for {retry_task_id}; staying ERROR."
+                    f"failing for {retry_task_id}; staying ERROR.",
+                    severity="error",
                 )
                 await self.publish_state()
                 return
@@ -368,7 +371,7 @@ class ErrorMixin:
             await self._persist_status_write_failed_task_pr_ids()
             # Repairing storage proves persistence only. The next ERROR tick
             # must still prove cleanup, remote outcome and work preservation.
-            self.log_event("[RECOVERY] Terminal status repaired; safety reconciliation pending.")
+            self.log_event("[RECOVERY] Terminal status repaired; safety reconciliation pending.", severity="warn")
             return
 
         # Repair durable task status before reconciliation can retain the
@@ -379,13 +382,14 @@ class ErrorMixin:
             await self._process_upload_while_publication_held()
             return
         if context.startswith(_UNCERTAIN_FIX_OWNERSHIP_PREFIX):
-            self.log_event("[RECOVERY] Uncertain FIX invocation remains parked for operator Retry.")
+            self.log_event("[RECOVERY] Uncertain FIX invocation remains parked for operator Retry.", severity="error")
             return
 
         if is_retained_merge_error(context):
             self.log_event(
                 "[RECOVERY] Unpublished checkout failure remains parked with its "
-                "original evidence for operator Retry."
+                "original evidence for operator Retry.",
+                severity="error",
             )
             return
 
@@ -405,7 +409,8 @@ class ErrorMixin:
             truncated = context if len(context) <= 200 else context[:197] + "..."
             self.log_event(
                 f"[ERROR] Infra error detected, skipping AI diagnosis and "
-                f"transitioning to IDLE for retry: {truncated}."
+                f"transitioning to IDLE for retry: {truncated}.",
+                severity="warn",
             )
             await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
@@ -423,7 +428,8 @@ class ErrorMixin:
             self._error_skip_active = False
             self.log_event(
                 "[ERROR] Skipping AI diagnosis for rate-limit error, "
-                "transitioning to IDLE for retry."
+                "transitioning to IDLE for retry.",
+                severity="warn",
             )
             await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
@@ -440,7 +446,8 @@ class ErrorMixin:
             self._error_skip_active = False
             self.log_event(
                 "[ERROR] Skipping AI diagnosis for timeout error, "
-                "transitioning to IDLE for retry."
+                "transitioning to IDLE for retry.",
+                severity="warn",
             )
             await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
@@ -455,7 +462,8 @@ class ErrorMixin:
         if selected is None:
             self.log_event(
                 "[ERROR] No eligible coder available for error diagnosis; "
-                "staying ERROR."
+                "staying ERROR.",
+                severity="error",
             )
             return
         coder_name, plugin = selected
@@ -489,7 +497,8 @@ class ErrorMixin:
 
             self.log_event(
                 f"[ERROR] Skipping AI diagnosis: "
-                f"{coder_name.capitalize()} rate limited."
+                f"{coder_name.capitalize()} rate limited.",
+                severity="warn",
             )
             await _clear_cause_for_retry()
             self.state.state = PipelineState.IDLE
@@ -513,7 +522,8 @@ class ErrorMixin:
         ):
             self.log_event(
                 "[ERROR] Diagnosis deferred while credential login owns "
-                "the coder credential location."
+                "the coder credential location.",
+                severity="warn",
             )
             return
         try:
@@ -581,13 +591,15 @@ class ErrorMixin:
             # Preserve error_message so handle_paused resumes to ERROR
             self.log_event(
                 f"[RATE-LIMIT] Rate limit pause active until "
-                f"{self.state.rate_limited_until.isoformat()}."
+                f"{self.state.rate_limited_until.isoformat()}.",
+                severity="warn",
             )
             return
         if code != 0:
             self.log_event(
                 f"[ERROR] diagnose_error CLI failed: "
-                f"{stderr.strip() or f'exit {code}'}."
+                f"{stderr.strip() or f'exit {code}'}.",
+                severity="error",
             )
             return
 
@@ -602,7 +614,8 @@ class ErrorMixin:
             verdict = "ESCALATE"
             self.log_event(
                 "[ERROR] diagnose_error: pre-existing dirty tree blocks "
-                "automatic cleanup/publish."
+                "automatic cleanup/publish.",
+                severity="error",
             )
             dirty = ""
         if dirty and verdict == "FIX":
@@ -639,7 +652,8 @@ class ErrorMixin:
                 verdict = "ESCALATE"
                 self.log_event(
                     "[ERROR] diagnose_error: dirty tree without active "
-                    "PR/task branch."
+                    "PR/task branch.",
+                    severity="error",
                 )
             else:
                 checked_out_branch = ""
@@ -652,7 +666,8 @@ class ErrorMixin:
                         self.log_event(
                             f"[ERROR] diagnose_error: active branch "
                             f"mismatch ({checked_out_branch!r} != "
-                            f"{branch!r})."
+                            f"{branch!r}).",
+                            severity="error",
                         )
                         raise RuntimeError("diagnose_error branch mismatch")
                     git_ops._git(self.repo_path, "add", "-A")
@@ -753,10 +768,10 @@ class ErrorMixin:
                 )
                 self.state.state = PipelineState.IDLE
                 self._error_diagnose_policy.reset(self)
-                self.log_event("[ERROR] diagnose_error: SKIP -> IDLE (no bound task).")
+                self.log_event("[ERROR] diagnose_error: SKIP -> IDLE (no bound task).", severity="info")
             else:
                 await self._mark_diagnose_exhausted(retry_task_id)
-                self.log_event("[ERROR] diagnose_error: SKIP -> terminal failure reconciliation.")
+                self.log_event("[ERROR] diagnose_error: SKIP -> terminal failure reconciliation.", severity="info")
         elif verdict == "FIX":
             await _clear_cause_for_retry()
             await self._clear_error_message_on_recovery(
@@ -770,9 +785,11 @@ class ErrorMixin:
                     retry_task_id, "diagnose_attempts"
                 )
             self.log_event(
-                f"[ERROR] diagnose_error: FIX -> IDLE ({summary[:80]})."
+                f"[ERROR] diagnose_error: FIX -> IDLE ({summary[:80]}).",
+                severity="ok",
             )
         else:  # ESCALATE
             self.log_event(
-                "[ESCALATE] diagnose_error: ESCALATE, keeping ERROR state."
+                "[ESCALATE] diagnose_error: ESCALATE, keeping ERROR state.",
+                severity="error",
             )
