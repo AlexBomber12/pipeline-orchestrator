@@ -23,7 +23,12 @@ def event_filters(page, dashboard_url):
         content_type='application/javascript',
     ))
     page.add_init_script('''window.EventSource = class {
-        constructor() { this.listeners = {}; window.repoStream = this; }
+        constructor(url) {
+            this.url = url;
+            this.listeners = {};
+            // The shared availability stream must not replace the repo stream.
+            if (url === '/api/repos/example__filters/events') window.repoStream = this;
+        }
         addEventListener(name, handler) { this.listeners[name] = handler; }
         close() {}
     };''')
@@ -83,6 +88,7 @@ def test_severity_unknown_and_persistence(page, event_filters):
     merge.press('Space')
     expect(merge).to_have_attribute('aria-pressed', 'false')
     expect(row('status:DONE')).to_be_hidden()
+    assert page.evaluate('window.repoStream.url') == '/api/repos/example__filters/events'
     with page.expect_response('**/partials/repo/example__filters/events'):
         page.evaluate("window.repoStream.listeners.event_log_append({data: '{}'})")
     expect(merge).to_be_focused()
