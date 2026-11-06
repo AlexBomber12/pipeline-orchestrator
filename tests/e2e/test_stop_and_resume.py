@@ -1,6 +1,7 @@
 import json
 import subprocess
 import time
+from pathlib import Path
 
 import requests
 from playwright.sync_api import expect
@@ -25,6 +26,12 @@ def test_stop_during_coding_then_resume_picks_next_task(
             f"test stack did not reach IDLE before test start: {exc}"
         ) from exc
 
+    # Use the existing pinned runtime; lifecycle coverage must not depend on
+    # CDN availability (the control requests still reach the real stack).
+    page.route("https://unpkg.com/htmx.org@2.0.4", lambda route: route.fulfill(
+        path=Path(__file__).parent / "assets" / "htmx-2.0.4.min.js",
+        content_type="application/javascript",
+    ))
     first_pr_id_int = int(time.time())
 
     with coder_shim("slow"):
@@ -44,18 +51,23 @@ def test_stop_during_coding_then_resume_picks_next_task(
         summary = page.locator('[data-repo-summary]')
         expect(summary).to_contain_text(f"PR-{first_pr_id_int}")
         with page.expect_response(f"**/repos/{testbed_slug}/stop") as response:
-            # This positive lifecycle case confirms one current action. Keep
-            # both activations in one event loop so a passive summary swap cannot
-            # invalidate the origin between them. The separate dialog tests
-            # require detached origins to cancel without sending a stale POST.
-            summary.get_by_role("button", name="Stop current run", exact=True).evaluate("""trigger => {
+            # HTMX inserts swapped HTML before its settle phase attaches request
+            # handlers. Wait for settled controls, reselecting the current origin
+            # each frame. Keep both activations synchronous so a passive refresh
+            # cannot detach the origin between opening and accepting the dialog.
+            page.wait_for_function("""() => {
+                const trigger = document.querySelector(
+                    '[data-repo-summary] button[aria-label="Stop current run"]'
+                );
+                if (!trigger || trigger.closest('.htmx-added, .htmx-settling')) return false;
                 trigger.click();
                 const dialog = document.getElementById('confirm-dialog');
                 if (!dialog.open || dialog.querySelector('h2').textContent !== 'Stop') {
                     throw new Error('Expected current Stop confirmation');
                 }
                 dialog.querySelector('[data-confirm-accept]').click();
-            }""")
+                return true;
+            }""", timeout=10_000)
         assert response.value.status == 200
         assert response.value.request.headers.get("hx-request") == "true"
 
