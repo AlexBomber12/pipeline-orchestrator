@@ -365,8 +365,16 @@ def test_wipe_tasks_dir_cleans_workdir_even_on_exception(tmp_path) -> None:
     ("failures", "final_error"),
     [(1, ""), (2, ""), (3, "Internal Server Error"), (1, "permission denied")],
 )
+@pytest.mark.parametrize(
+    "server_error",
+    [
+        "remote: Internal Server Error",
+        "remote: fatal error in commit_refs_rules        \n"
+        " ! [remote rejected] main -> main (fatal error in commit_refs_rules\n)\n",
+    ],
+)
 def test_wipe_tasks_dir_bounds_server_error_push_retries(
-    tmp_path, monkeypatch, failures, final_error
+    tmp_path, monkeypatch, failures, final_error, server_error
 ) -> None:
     monkeypatch.setattr(testbed_reset.tempfile, "mkdtemp", lambda **kwargs: str(tmp_path))
     pushes = []
@@ -379,7 +387,7 @@ def test_wipe_tasks_dir_bounds_server_error_push_retries(
         if "push" in cmd:
             pushes.append((cmd, kwargs))
             if len(pushes) <= failures:
-                return _completed(1, stderr="remote: Internal Server Error")
+                return _completed(1, stderr=server_error)
             if final_error:
                 return _completed(1, stderr=final_error)
             # Also covers a lost response where the first push actually applied.
@@ -389,7 +397,11 @@ def test_wipe_tasks_dir_bounds_server_error_push_retries(
     monkeypatch.setattr(testbed_reset.subprocess, "run", fake_run)
     with patch.object(testbed_reset.time, "sleep") as sleep:
         if final_error:
-            with pytest.raises(RuntimeError, match=final_error):
+            expected_error = (
+                server_error.splitlines()[0].removeprefix("remote: ").strip()
+                if failures == 3 else final_error
+            )
+            with pytest.raises(RuntimeError, match=expected_error):
                 wipe_tasks_dir_on_main()
         else:
             assert wipe_tasks_dir_on_main() is True
@@ -401,6 +413,37 @@ def test_wipe_tasks_dir_bounds_server_error_push_retries(
     assert all(push == pushes[0] for push in pushes)
     assert sum("commit" in cmd for cmd in commands) == 1
     assert not tmp_path.exists()  # Fixture-owned clone is cleaned on every outcome.
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "remote: Permission denied",
+        "remote: error: GH013: Repository rule violations found for refs/heads/main.",
+        " ! [rejected] main -> main (non-fast-forward)",
+        "remote: Repository rule violation: fatal error in commit_refs_rules",
+    ],
+)
+def test_wipe_tasks_dir_does_not_retry_other_push_failures(tmp_path, monkeypatch, error):
+    monkeypatch.setattr(testbed_reset.tempfile, "mkdtemp", lambda **kwargs: str(tmp_path))
+    pushes = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["git", "clone"]:
+            (Path(cmd[-1]) / "tasks").mkdir(parents=True)
+        if "push" in cmd:
+            pushes.append(cmd)
+            return _completed(1, stderr=error)
+        return _completed()
+
+    monkeypatch.setattr(testbed_reset.subprocess, "run", fake_run)
+    with patch.object(testbed_reset.time, "sleep") as sleep:
+        with pytest.raises(RuntimeError, match="git push failed") as exc:
+            wipe_tasks_dir_on_main()
+        assert error.strip() in str(exc.value)
+        sleep.assert_not_called()
+    assert len(pushes) == 1
+    assert not tmp_path.exists()
 
 
 def test_clone_url_returns_plain_url_without_token(monkeypatch) -> None:

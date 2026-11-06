@@ -208,7 +208,10 @@ def test_shim_ignores_status_doing_outside_task_metadata(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize("scenario", ["run_success", "run_success_pending_ci"])
-def test_success_shim_separates_branch_creation_from_head_publication(tmp_path: Path, scenario: str) -> None:
+@pytest.mark.parametrize("activity_after", [3, 45])
+def test_success_shim_separates_branch_creation_from_head_publication(
+    tmp_path: Path, scenario: str, activity_after: int,
+) -> None:
     remote = tmp_path / "remote.git"
     repo = tmp_path / "repo"
 
@@ -229,24 +232,27 @@ def test_success_shim_separates_branch_creation_from_head_publication(tmp_path: 
     result = subprocess.run(
         ["bash", "-c", '''
 source "$1"
+activity_after="$3"
 ensure_pr_url() { printf 'https://example.invalid/pull/42'; }
 gh() {
     if [[ "$*" == *"/activity"* ]]; then
         [[ ! -e tests/e2e-shim-marker.txt ]] || exit 8
         printf 'poll\n' >> activity-polls
-        if [[ "$(wc -l < activity-polls)" -lt 3 ]]; then
+        if [[ "$(wc -l < activity-polls)" -lt "$activity_after" ]]; then
             printf '0\n'
         else
             printf '1\n'
         fi
     fi
 }
+# Skip polling delays, but retain the timestamp separation after observation.
+sleep() { if [[ "$1" == 2 ]]; then command sleep "$1"; fi; }
 $2 PR-42 pr-42-success
-''', "bash", str(SHIM.resolve()), scenario],
+''', "bash", str(SHIM.resolve()), scenario, str(activity_after)],
         cwd=repo, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
-    assert (repo / "activity-polls").read_text().splitlines() == ["poll"] * 3
+    assert (repo / "activity-polls").read_text().splitlines() == ["poll"] * activity_after
     head = git("rev-parse", "refs/heads/pr-42-success", cwd=remote)
     assert head != base
     assert "PR-42" in git("show", f"{head}:tests/e2e-shim-marker.txt", cwd=remote)
@@ -265,7 +271,7 @@ source "$1"
 git_setup_branch() { :; }
 safe_push_branch() { printf 'base push\n'; }
 git() { printf '%040d\n' 1; }
-gh() { printf '0\n'; }
+gh() { printf 'poll\n' >> activity-polls; printf '0\n'; }
 sleep() { :; }
 write_marker_and_commit() { echo 'unexpected implementation' >&2; exit 8; }
 run_success_pending_ci PR-42 pr-42-success
@@ -274,6 +280,7 @@ run_success_pending_ci PR-42 pr-42-success
     )
     assert result.returncode == 1
     assert result.stdout == "base push\n"
+    assert (tmp_path / "activity-polls").read_text().splitlines() == ["poll"] * 120
     assert "base publication activity unavailable for pr-42-success" in result.stderr
     assert "unexpected implementation" not in result.stderr
 
