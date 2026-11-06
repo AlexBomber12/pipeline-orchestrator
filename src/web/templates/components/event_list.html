@@ -7,7 +7,9 @@
 <span id="event-log-count-{{ repo.name }}" hx-swap-oob="true"
       class="font-mono text-xs text-gray-500">{{ events|length }} events</span>
 {% endif %}
+{% from 'components/_event_style.html' import category_style, severity_styles %}
 {% if events %}
+<p class="mb-2 text-xs text-gray-500">Unknown: Severity not recorded. Error (derived from transition): historical transition into ERROR.</p>
 <ul class="divide-y divide-white/5 font-mono text-xs">
     {% for entry in events|reverse %}
     {% set entry_count = entry.get('count', 1) %}
@@ -17,17 +19,37 @@
     {% set tier = entry.get('tier') %}
     {% set kind = entry.get('kind') %}
     {% set legacy_prefix = '' %}
-    {% set legacy_text = event_text %}
-    {% if not tier and event_text.startswith('[') and '] ' in event_text %}
-        {% set legacy_prefix = event_text.split('] ', 1)[0][1:] %}
-        {% set legacy_text = event_text.split('] ', 1)[1] %}
+    {% set message = event_text %}
+    {% if event_text.startswith('[') and '] ' in event_text %}
+        {% set prefix = event_text.split('] ', 1)[0][1:] %}
+        {% if not tier or prefix|upper == tier|upper %}
+            {% set legacy_prefix = prefix %}
+            {% set message = event_text.split('] ', 1)[1] %}
+        {% endif %}
     {% endif %}
     {% set category = tier or legacy_prefix %}
-    <li class="flex flex-col gap-1 px-1 py-2.5 sm:flex-row sm:items-start sm:gap-2 sm:px-0 sm:py-2">
+    {% set coder = entry.get('coder') %}
+    {% if coder and message.startswith('[' ~ coder ~ '] ') %}
+        {% set message = message.split('] ', 1)[1] %}
+    {% endif %}
+    {# Parse only an anchored state-to-state arrow, never state words in prose. #}
+    {% set states = ['IDLE', 'PREFLIGHT', 'CODING', 'WATCH', 'FIX', 'MERGE', 'ERROR', 'PAUSED'] %}
+    {% set arrow_text = message.replace('→', '->') %}
+    {% set source = arrow_text.split('->', 1)[0]|trim %}
+    {% set destination = arrow_text.split('->', 1)[1].split(':', 1)[0]|trim if '->' in arrow_text else '' %}
+    {% set transition = kind == 'transition' and source in states and destination in states %}
+    {% set severity = entry.get('severity') %}
+    {% set provenance = 'recorded' %}
+    {% if severity not in ['error', 'warn', 'ok', 'info'] %}
+        {% set severity = 'error' if not severity and transition and destination == 'ERROR' else 'unknown' %}
+        {% set provenance = 'transition' if severity == 'error' else 'unknown' %}
+    {% endif %}
+    <li data-event-severity="{{ severity }}" data-event-severity-source="{{ provenance }}"
+        class="border-l-2 {{ severity_styles[severity] }} flex flex-col gap-1 px-1 py-2.5 sm:flex-row sm:items-start sm:gap-2 sm:px-0 sm:py-2">
         <div class="flex items-center gap-2 text-xs">
-            <span class="text-[10px] font-medium min-w-[4.5rem] inline-flex max-w-full items-center justify-center rounded border border-gray-500/30 bg-gray-500/10 px-1.5 py-0.5 uppercase tracking-wide text-gray-300 break-words"
+            <span class="text-[10px] font-medium min-w-[4.5rem] inline-flex max-w-full items-center justify-center rounded border {{ category_style(category) }} px-1.5 py-0.5 uppercase tracking-wide break-words"
                   data-event-category="{{ category }}">
-                Event{% if category %} · {{ category | upper }}{% endif %}
+                {{ category | upper if category else 'Event' }}
             </span>
             {% if entry_count > 1 %}
             <span class="w-24 text-gray-500 shrink-0 whitespace-nowrap"
@@ -45,7 +67,17 @@
             {% if kind %}
             <span class="rounded border border-white/10 bg-surface-3 px-1.5 py-0.5 mr-1 text-[10px] text-gray-400">{{ kind }}</span>
             {% endif %}
-            {{ event_text if tier else legacy_text }}
+            {% if transition %}
+            <span aria-hidden="true" class="inline-flex items-center gap-1 mr-1" data-event-transition>
+                <span class="rounded border px-1 {{ category_style(source) }}">{{ source }}</span>
+                → <span class="rounded border px-1 {{ category_style(destination) }}">{{ destination }}</span>
+            </span>
+            {% endif %}
+            <span data-event-message>{{ message }}</span>
+            {% if coder %}
+            <span class="rounded border border-white/10 px-1.5 text-gray-400" data-event-coder>{{ coder }}</span>
+            {% endif %}
+            <span class="text-[10px] text-gray-400" data-event-severity-label>{{ severity | capitalize }}{% if provenance == 'transition' %} (derived from transition){% endif %}</span>
             {% if entry_count > 1 %}
             <span class="event-dedup-badge inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] bg-gray-700/40 text-gray-400 align-middle"
                   title="repeated {{ entry_count }} times"

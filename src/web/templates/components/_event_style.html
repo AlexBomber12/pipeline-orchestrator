@@ -1,0 +1,13 @@
+{# Category hue describes pipeline phase, independently of recorded severity. #}
+{% from 'components/_repo_state_styles.html' import state_styles %}
+{% set neutral_category = 'bg-gray-500/10 text-gray-300 border-gray-500/30' %}
+{% set severity_styles = {
+    'error': 'border-fail',
+    'warn': 'border-warn',
+    'ok': 'border-ok',
+    'info': 'border-gray-500',
+    'unknown': 'border-gray-500 border-dashed',
+} %}
+{% macro category_style(category) -%}
+{{ state_styles[category|upper].badge if category|upper in ['CODING', 'WATCH', 'FIX', 'MERGE'] else neutral_category }}
+{%- endmacro %}
