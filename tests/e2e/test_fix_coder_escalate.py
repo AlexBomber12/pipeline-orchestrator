@@ -25,6 +25,7 @@ TESTBED_REPO = "AlexBomber12/pipeline-orchestrator-testbed"
 WATCH_GATE_CONTEXT = "e2e/watch-merge-gate"
 FIX_TRANSITION_DEADLINE_SEC = 30
 ESCALATE_DETECTION_MARGIN_SEC = 60
+STATUS_PROPAGATION_TIMEOUT_SEC = 10
 
 
 def _post_failed_status(head_sha: str) -> None:
@@ -59,7 +60,7 @@ def _post_failed_status(head_sha: str) -> None:
         f"POST status producer {posted_producer!r} does not match configured {configured!r}"
     )
     observed = None
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + STATUS_PROPAGATION_TIMEOUT_SEC
     while observed is None and time.monotonic() < deadline:
         combined = subprocess.run(
             ["gh", "api", f"repos/{TESTBED_REPO}/commits/{head_sha}/status"],
@@ -74,14 +75,21 @@ def _post_failed_status(head_sha: str) -> None:
     assert observed_producer is None or observed_producer in configured, (
         f"combined status producer {observed_producer!r} is not configured"
     )
-    listed_response = subprocess.run(
-        ["gh", "api", f"repos/{TESTBED_REPO}/commits/{head_sha}/statuses?per_page=100"],
-        capture_output=True, text=True, check=True, timeout=30,
-    )
-    listed = next(
-        (item for item in json.loads(listed_response.stdout)
-         if item.get("id") == payload.get("id")), None,
-    )
+    # The history endpoint can lag behind the combined-status endpoint. Wait
+    # for this exact POST receipt there too before checking its producer.
+    listed = None
+    deadline = time.monotonic() + STATUS_PROPAGATION_TIMEOUT_SEC
+    while listed is None and time.monotonic() < deadline:
+        listed_response = subprocess.run(
+            ["gh", "api", f"repos/{TESTBED_REPO}/commits/{head_sha}/statuses?per_page=100"],
+            capture_output=True, text=True, check=True, timeout=30,
+        )
+        listed = next(
+            (item for item in json.loads(listed_response.stdout)
+             if item.get("id") == payload.get("id")), None,
+        )
+        if listed is None:
+            time.sleep(0.5)
     assert listed is not None, f"posted status {payload.get('id')!r} absent from status history"
     assert _status_producer(listed) in configured, (
         f"status history producer {_status_producer(listed)!r} does not match configured {configured!r}"
@@ -127,6 +135,21 @@ def _watch_gate_state(head_sha: str) -> str:
     gate = next((item for item in statuses if item.get("context") == WATCH_GATE_CONTEXT), None)
     assert gate is not None, f"{WATCH_GATE_CONTEXT!r} missing on {head_sha}"
     return str(gate.get("state"))
+
+
+def _wait_for_failed_watch_gate(head_sha: str) -> None:
+    # This read uses another history query and may have its own stale snapshot.
+    deadline = time.monotonic() + STATUS_PROPAGATION_TIMEOUT_SEC
+    last_state = None
+    while time.monotonic() < deadline:
+        last_state = _watch_gate_state(head_sha)
+        if last_state == "failure":
+            return
+        time.sleep(0.5)
+    raise AssertionError(
+        f"{WATCH_GATE_CONTEXT!r} on {head_sha} remained {last_state!r}; "
+        f"expected 'failure' within {STATUS_PROPAGATION_TIMEOUT_SEC}s"
+    )
 
 
 def _pr_labels(pr_number: int) -> list[str]:
@@ -252,7 +275,7 @@ def test_coder_escalate_marker_parks_pr_in_error(
         assert _get_pr_head_sha(pr_number) == head_sha, (
             f"PR #{pr_number} HEAD changed while publishing the failure"
         )
-        assert _watch_gate_state(head_sha) == "failure"
+        _wait_for_failed_watch_gate(head_sha)
 
         deadline = time.monotonic() + FIX_TRANSITION_DEADLINE_SEC
         fix_entry = None
