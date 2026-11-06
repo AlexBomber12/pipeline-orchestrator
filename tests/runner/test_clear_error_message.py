@@ -11,7 +11,7 @@ def test_clear_error_message_on_recovery_no_op_when_already_none() -> None:
     runner = h._make_runner()
     runner.state.error_message = None
     events: list[str] = []
-    runner.log_event = events.append  # type: ignore[method-assign]
+    runner.log_event = lambda message, **kwargs: events.append(message)  # type: ignore[method-assign]
 
     asyncio.run(
         runner._clear_error_message_on_recovery(
@@ -28,7 +28,7 @@ def test_clear_error_message_on_recovery_clears_and_logs() -> None:
     runner = h._make_runner()
     runner.state.error_message = "something failed"
     events: list[str] = []
-    runner.log_event = events.append  # type: ignore[method-assign]
+    runner.log_event = lambda message, **kwargs: events.append(message)  # type: ignore[method-assign]
 
     asyncio.run(
         runner._clear_error_message_on_recovery(
@@ -48,7 +48,7 @@ def test_clear_error_message_on_recovery_truncates_long_previous() -> None:
     previous = "0123456789" * 20
     runner.state.error_message = previous
     events: list[str] = []
-    runner.log_event = events.append  # type: ignore[method-assign]
+    runner.log_event = lambda message, **kwargs: events.append(message)  # type: ignore[method-assign]
 
     asyncio.run(
         runner._clear_error_message_on_recovery(

@@ -2500,7 +2500,7 @@ def test_resolve_pending_queue_sync_clears_state_when_pr_closed(
     runner.state.pending_queue_sync_branch = "queue-done-pr-001"
     runner.state.pending_queue_sync_started_at = datetime.now(timezone.utc)
     events: list[str] = []
-    monkeypatch.setattr(runner, "log_event", events.append)
+    monkeypatch.setattr(runner, "log_event", lambda message, **kwargs: events.append(message))
 
     assert asyncio.run(runner._resolve_pending_queue_sync()) is False
     assert runner.state.pending_queue_sync_branch is None

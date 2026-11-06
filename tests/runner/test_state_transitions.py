@@ -1481,7 +1481,7 @@ def test_escalate_queue_sync_transitions_to_error_when_expired(
     runner.state.pending_queue_sync_branch = "queue-done-pr-001"
     runner.state.pending_queue_sync_started_at = datetime.now(timezone.utc) - timedelta(hours=2)
     events: list[str] = []
-    monkeypatch.setattr(runner, "log_event", events.append)
+    monkeypatch.setattr(runner, "log_event", lambda message, **kwargs: events.append(message))
 
     asyncio.run(runner._escalate_queue_sync_if_expired("queue-done-pr-001"))
 

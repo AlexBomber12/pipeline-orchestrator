@@ -1506,7 +1506,7 @@ def test_save_cli_log_truncates_and_warns_on_redis_error(
     events: list[str] = []
     runner = h._make_runner()
     runner.redis = _FailingRedis()
-    runner.log_event = events.append  # type: ignore[method-assign]
+    runner.log_event = lambda message, **kwargs: events.append(message)  # type: ignore[method-assign]
     monkeypatch.setattr(
         runner_module.logger,
         "warning",
