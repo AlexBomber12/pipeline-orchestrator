@@ -116,7 +116,7 @@ class RetryCommandMixin:
                 revision = hashlib.sha256(tracked.read_bytes()).hexdigest()
                 return header.frontmatter_status, SuppressionReason(reason) if reason else None, revision
         except Exception as exc:
-            self.log_event(f"[RECOVERY] FIX timeout remote status unavailable: {exc}; staying ERROR.")
+            self.log_event(f"[RECOVERY] FIX timeout remote status unavailable: {exc}; staying ERROR.", severity="warn")
             return None, None, None
 
     async def _admit_fix_idle_timeout(self) -> None:
@@ -130,13 +130,13 @@ class RetryCommandMixin:
                 return
         task, bound = self.state.current_task, self.state.current_pr
         if task is None or bound is None or not task.branch:
-            self.log_event("[RECOVERY] FIX timeout has no bound task/PR; operator Retry required.")
+            self.log_event("[RECOVERY] FIX timeout has no bound task/PR; operator Retry required.", severity="error")
             return
         if task.pr_id in self._status_write_failed_task_pr_ids:
             if not await self._commit_task_status_change(
                 task, "ERROR", "FIX idle timeout", blocked_reason=SuppressionReason.FIX_IDLE_TIMEOUT
             ):
-                self.log_event("[RECOVERY] FIX timeout status:ERROR write still failing.")
+                self.log_event("[RECOVERY] FIX timeout status:ERROR write still failing.", severity="error")
                 return
             self._status_write_failed_task_pr_ids.discard(task.pr_id)
             await self._persist_status_write_failed_task_pr_ids()
@@ -146,22 +146,22 @@ class RetryCommandMixin:
                 self.redis, self.name, task.pr_id, refresh_ttl=False
             )
         except Exception as exc:
-            self.log_event(f"[RECOVERY] FIX timeout evidence unavailable: {exc}; staying ERROR.")
+            self.log_event(f"[RECOVERY] FIX timeout evidence unavailable: {exc}; staying ERROR.", severity="warn")
             return
         if (status == "error" and reason != SuppressionReason.FIX_IDLE_TIMEOUT) or (
             cause is not None
             and cause.payload.get("subsource") != "fix_idle_timeout"
         ) or status not in {"error", "todo"} or revision is None:
-            self.log_event("[RECOVERY] FIX timeout admission changed; operator Retry required.")
+            self.log_event("[RECOVERY] FIX timeout admission changed; operator Retry required.", severity="error")
             return
         if status == "error" and cause is None:
-            self.log_event("[RECOVERY] FIX timeout cause missing; operator Retry required.")
+            self.log_event("[RECOVERY] FIX timeout cause missing; operator Retry required.", severity="error")
             return
         if cause is not None and (
             cause.payload.get("pr_number", bound.number) != bound.number
             or cause.payload.get("branch", bound.branch) != bound.branch
         ):
-            self.log_event("[RECOVERY] FIX timeout PR binding changed; operator Retry required.")
+            self.log_event("[RECOVERY] FIX timeout PR binding changed; operator Retry required.", severity="error")
             return
         if (
             self._current_run_record is None
@@ -177,7 +177,7 @@ class RetryCommandMixin:
             or snapshot.fix_iteration != record.fix_iterations
             or (cause is not None and cause.payload.get("run_id", record.run_id) != record.run_id)
         ):
-            self.log_event("[RECOVERY] FIX invocation evidence incomplete; operator Retry required.")
+            self.log_event("[RECOVERY] FIX invocation evidence incomplete; operator Retry required.", severity="error")
             return
         count = record.fix_iterations - record.fix_recovery_baseline
         cap = self.app_config.daemon.fix_iteration_cap
@@ -187,7 +187,8 @@ class RetryCommandMixin:
                 self._last_error_park_log_key = key
                 self.log_event(
                     f"[RECOVERY] FIX dispatch budget exhausted ({count}/{cap}); "
-                    "staying ERROR. Operator Retry required."
+                    "staying ERROR. Operator Retry required.",
+                    severity="error",
                 )
             return
         if (
@@ -208,7 +209,7 @@ class RetryCommandMixin:
                 or dirty is not False or task_path is None
                 or bound.branch != task.branch or bound.pr_id not in (None, task.pr_id)
             ):
-                self.log_event(f"[RECOVERY] FIX timeout admission deferred ({detail}); staying ERROR.")
+                self.log_event(f"[RECOVERY] FIX timeout admission deferred ({detail}); staying ERROR.", severity="warn")
                 return
             open_prs = await asyncio.to_thread(
                 gh_prs.get_open_prs, self.owner_repo,
@@ -222,21 +223,21 @@ class RetryCommandMixin:
                 if terminal in {"MERGED", "CLOSED"}:
                     await self._handle_external_pr_resolution(bound, terminal)
                 else:
-                    self.log_event("[RECOVERY] Bound PR unavailable; staying ERROR.")
+                    self.log_event("[RECOVERY] Bound PR unavailable; staying ERROR.", severity="warn")
                 return
             if found != find_matching_open_pr(task.pr_id, task.branch, [found]):
-                self.log_event("[RECOVERY] Bound PR identity changed; staying ERROR.")
+                self.log_event("[RECOVERY] Bound PR identity changed; staying ERROR.", severity="error")
                 return
             if not await self._commit_task_status_change(
                 task, "TODO", f"confirmed FIX timeout recovery {count}/{cap}",
                 expected_task_sha256=revision,
             ):
-                self.log_event("[RECOVERY] FIX timeout status:TODO write failed; staying ERROR.")
+                self.log_event("[RECOVERY] FIX timeout status:TODO write failed; staying ERROR.", severity="error")
                 return
             if cause is not None:
                 await delete_cancellation_cause(self.redis, self.name, task.pr_id)
         except Exception as exc:
-            self.log_event(f"[RECOVERY] FIX timeout admission failed: {exc}; staying ERROR.")
+            self.log_event(f"[RECOVERY] FIX timeout admission failed: {exc}; staying ERROR.", severity="error")
             return
         self._set_retry_task_snapshot(task)
         self._crashed_task_pr_ids.discard(task.pr_id)
@@ -253,14 +254,15 @@ class RetryCommandMixin:
         )
         self.log_event(
             f"[RECOVERY] FIX timeout retry admitted for {task.pr_id} PR "
-            f"#{found.number}; dispatched FIX invocations {count}/{cap} -> WATCH."
+            f"#{found.number}; dispatched FIX invocations {count}/{cap} -> WATCH.",
+            severity="ok",
         )
 
     async def _consume_retry_command(self) -> RetryDispatch:
         try:
             commands = await list_pending_retry_commands(self.redis, self.name)
         except Exception as exc:
-            self.log_event(f"[INFRA] Retry command store unavailable: {exc}.")
+            self.log_event(f"[INFRA] Retry command store unavailable: {exc}.", severity="warn")
             return RetryDispatch.NONE
         if not commands:
             self._active_retry_command_id = None
@@ -280,7 +282,8 @@ class RetryCommandMixin:
             )
         except Exception as exc:
             self.log_event(
-                f"[INFRA] Retry command {command.command_id} claim failed: {exc}."
+                f"[INFRA] Retry command {command.command_id} claim failed: {exc}.",
+                severity="error",
             )
             return RetryDispatch.HANDLED
         if claimed is None:
@@ -310,7 +313,8 @@ class RetryCommandMixin:
         if previous != reason:
             self.log_event(
                 f"[RECOVERY] Retry {command.command_id} deferred for {command.task_id}: "
-                f"{reason}"
+                f"{reason}",
+                severity="warn",
             )
         return RetryDispatch.HANDLED
 
@@ -332,7 +336,8 @@ class RetryCommandMixin:
             transition_reason=reason,
         )
         self.log_event(
-            f"[RECOVERY] Retry {command.command_id} failed for {command.task_id}: {reason}"
+            f"[RECOVERY] Retry {command.command_id} failed for {command.task_id}: {reason}",
+            severity="error",
         )
         return RetryDispatch.HANDLED
 
@@ -1045,7 +1050,8 @@ class RetryCommandMixin:
         self.log_event(
             f"[RECOVERY] Applied Retry {command.command_id} for {command.task_id}; "
             f"fingerprint={command.task_fingerprint[:12]}, continuation={continuation}, "
-            f"reset={','.join(reset_counters)}."
+            f"reset={','.join(reset_counters)}.",
+            severity="ok",
         )
         return updated
 
@@ -1504,7 +1510,8 @@ class RetryCommandMixin:
             )
         except Exception as exc:
             self.log_event(
-                f"[RECOVERY] Refusing to start Retry CODING without durable execution marker: {exc}."
+                f"[RECOVERY] Refusing to start Retry CODING without durable execution marker: {exc}.",
+                severity="error",
             )
             return False
         return updated is not None
@@ -1549,7 +1556,8 @@ class RetryCommandMixin:
             )
         except Exception as exc:
             self.log_event(
-                f"[RECOVERY] Retry execution outcome for {command_id} remains recoverable: {exc}."
+                f"[RECOVERY] Retry execution outcome for {command_id} remains recoverable: {exc}.",
+                severity="warn",
             )
 
 
