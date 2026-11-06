@@ -199,7 +199,10 @@ class ApprovalCommandMixin:
                             invocation = persisted.active_invocation
                             blocker = checkout_process_blocker(self.repo_path)
                             if blocker:
-                                self.log_event(f"[FIX] Persisted invocation ownership pending: {blocker}")
+                                self.log_event(
+                                    f"[FIX] Persisted invocation ownership pending: {blocker}",
+                                    severity="warn",
+                                )
                                 return True
                             record = (
                                 await self._metrics_store.get(invocation.run_id)
@@ -220,7 +223,8 @@ class ApprovalCommandMixin:
                             if invalid_record:
                                 self.log_event(
                                     "[FIX] Persisted invocation accounting changed; "
-                                    "parking for operator Retry."
+                                    "parking for operator Retry.",
+                                    severity="error",
                                 )
                             self.state = persisted
                             self._current_run_record = None if invalid_record else record
@@ -292,7 +296,7 @@ class ApprovalCommandMixin:
                         reason = f"Continuation safety could not be verified: {exc}"
                     if reason:
                         await self._approval_result(command, "deferred", reason)
-                        self.log_event(f"[RECOVERY] Approved PR waiting: {reason}")
+                        self.log_event(f"[RECOVERY] Approved PR waiting: {reason}", severity="info")
                         return True
                     if command.size_only or is_size_only_cause(command.failure):
                         if not await self._finish_size_approval(command, pr.quarantine_labels):
@@ -314,7 +318,10 @@ class ApprovalCommandMixin:
                 return await self._apply_approval(command)
             return False
         except Exception as exc:
-            self.log_event(f"[RECOVERY] Approval store/application unavailable; deferring cycle: {exc}.")
+            self.log_event(
+                f"[RECOVERY] Approval store/application unavailable; deferring cycle: {exc}.",
+                severity="warn",
+            )
             return True
 
     async def _enqueue_size_only_recovery(self, commands: list[ApprovalCommand]) -> None:
@@ -336,13 +343,13 @@ class ApprovalCommandMixin:
         ):
             return
         if state.url != self.repo_config.url:
-            self.log_event("[RECOVERY] Size-only decision retained: repository binding changed.")
+            self.log_event("[RECOVERY] Size-only decision retained: repository binding changed.", severity="error")
             return
         try:
             command = build_approval(self.name, state, raw_cause, Path(self.repo_path))
             await enqueue_approval(self.redis, command)
         except Exception as exc:
-            self.log_event(f"[RECOVERY] Size-only decision retained: {exc}")
+            self.log_event(f"[RECOVERY] Size-only decision retained: {exc}", severity="error")
 
     async def _inactive_approval_holds(self, command: ApprovalCommand) -> bool:
         """Retain preservation until a later operator action safely supersedes it.
@@ -644,7 +651,7 @@ class ApprovalCommandMixin:
             if fresh is not None and fresh.head_sha:
                 current.head_sha = fresh.head_sha
         except Exception as exc:
-            self.log_event(f"[RECOVERY] Guardrail PR head refresh deferred: {exc}")
+            self.log_event(f"[RECOVERY] Guardrail PR head refresh deferred: {exc}", severity="warn")
 
     async def _publish_refreshed_guardrail_head(self, command: ApprovalCommand, head_sha: str) -> None:
         """Refresh a stale error snapshot without rebinding the accepted request."""
@@ -751,12 +758,15 @@ class ApprovalCommandMixin:
                 )
                 or await self.redis.get(cause_key(self.name, command.task.pr_id))
             ):
-                self.log_event("[RECOVERY] Size approval binding changed before task status write.")
+                self.log_event("[RECOVERY] Size approval binding changed before task status write.", severity="error")
                 return False
             if not await self._commit_task_status_change(
                 command.task, "TODO", "Size-only approval applied; continuing published PR",
             ):
-                self.log_event("[RECOVERY] Size approval task status write deferred; retaining receipt.")
+                self.log_event(
+                    "[RECOVERY] Size approval task status write deferred; retaining receipt.",
+                    severity="error",
+                )
                 return False
 
             async def transaction(pipe: Any) -> None:
