@@ -192,7 +192,10 @@ wait_for_base_activity() {
     # timestamp. Observe the base activity first, then separate the next push.
     local branch="$1" sha count poll
     sha="${2:-$(git rev-parse HEAD)}"
-    for ((poll=0; poll<30; poll++)); do
+    # Activity indexing can lag branch creation by more than 30 seconds even
+    # after a successful push. Keep a bounded two-minute observation window;
+    # never substitute elapsed time for the required publication evidence.
+    for ((poll=0; poll<120; poll++)); do
         count="$(gh api --method GET repos/AlexBomber12/pipeline-orchestrator-testbed/activity \
             -f "ref=refs/heads/${branch}" -f per_page=100 \
             --jq "[.[] | select(.after == \"${sha}\" and (.activity_type == \"branch_creation\" or .activity_type == \"push\" or .activity_type == \"force_push\"))] | length" \
