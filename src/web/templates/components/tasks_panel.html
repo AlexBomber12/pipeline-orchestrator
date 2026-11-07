@@ -12,26 +12,68 @@
 {% set target_id = 'task-content-' ~ status_key ~ '-' ~ task.pr_id %}
 {% set diagnostic_id = 'diagnostic-' ~ status_key ~ '-' ~ task.pr_id %}
 <li class="rounded border border-white/5 bg-surface-3 px-3 py-2">
-    <button type="button"
-            class="secondary-interactive flex w-full flex-col gap-1 text-left text-xs sm:flex-row sm:items-baseline sm:gap-3"
-            hx-get="/repos/{{ repo_name }}/tasks/{{ task.pr_id }}"
-            hx-target="[id='{{ target_id }}']"
-            hx-swap="innerHTML">
-        <span class="font-mono text-gray-200">{{ task.pr_id }}</span>
-        <span class="break-words text-gray-300 sm:flex-1">
-            {{ task.title }}
-            {% if status_key == 'todo' and task.unresolved_deps %}
-            <span class="ml-0 inline-flex rounded border border-fail/40 bg-fail/10 px-1.5 py-0.5 text-[11px] font-medium text-fail sm:ml-2">
-                Blocked by: {{ task.unresolved_deps | join(', ') }}
+    <div class="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-3" data-task-row>
+        <button type="button"
+                class="secondary-interactive flex min-w-0 w-full flex-col gap-1 text-left text-xs sm:flex-row sm:items-baseline sm:gap-3"
+                hx-get="/repos/{{ repo_name }}/tasks/{{ task.pr_id }}"
+                hx-target="[id='{{ target_id }}']"
+                hx-swap="innerHTML">
+            <span class="break-all font-mono text-gray-200">{{ task.pr_id }}</span>
+            <span class="min-w-0 break-all text-gray-300 sm:flex-1">
+                {{ task.title }}
+                {% if status_key == 'todo' and task.unresolved_deps %}
+                <span class="ml-0 inline-flex rounded border border-fail/40 bg-fail/10 px-1.5 py-0.5 text-[11px] font-medium text-fail sm:ml-2">
+                    Blocked by: {{ task.unresolved_deps | join(', ') }}
+                </span>
+                {% endif %}
             </span>
+            {% if task.branch %}
+            <span class="min-w-0 break-all font-mono text-[11px] text-gray-500">{{ task.branch }}</span>
             {% endif %}
-        </span>
-        {% if task.branch %}
-        <span class="font-mono text-[11px] text-gray-500 sm:text-right">{{ task.branch }}</span>
+        </button>
+        <div class="flex items-center justify-end gap-2 whitespace-nowrap" data-task-actions>
+            <button type="button"
+                    class="secondary-interactive text-[11px] text-gray-400 hover:text-accent"
+                    hx-get="/partials/repo/{{ repo_name }}/tasks/{{ task.pr_id }}/diagnostic"
+                    hx-target="[id='{{ diagnostic_id }}']"
+                    hx-swap="innerHTML"
+                    data-diagnostic-trigger>
+                Diagnostic
+            </button>
+        {% if status_key == 'error' %}
+        {% set next_retry = task.retry_count + 1 %}
+            {% if task.retry_command and task.retry_command.status in ['queued', 'processing', 'deferred', 'applied'] %}
+            <button type="button"
+                    class="cursor-not-allowed rounded border border-white/10 px-2 py-1 text-xs font-medium text-gray-500"
+                    title="Retry command {{ task.retry_command.command_id }} is {{ task.retry_command.status }}."
+                    disabled>
+                Retry {{ task.retry_command.status }}
+            </button>
+            {% elif task.retry_count < retry_cap and task.retry_binding %}
+            <button type="button"
+                    class="secondary-interactive rounded border border-accent/30 px-2 py-1 text-xs font-medium text-accent hover:border-accent/50 hover:bg-accent/10"
+                    title="Retry count {{ task.retry_count }}/{{ retry_cap }}"
+                    hx-post="/repos/{{ repo_name }}/tasks/{{ task.pr_id }}/retry"
+                    hx-vals='{"retry_binding":"{{ task.retry_binding }}"}'
+                    hx-target="#repo-tasks-panel-{{ repo_name }}"
+                    hx-swap="outerHTML"
+                    data-confirm="Retry {{ task.pr_id }}? Attempt {{ next_retry }} of {{ retry_cap }}. Same task content; the failure record stays for history. The daemon selects the safe continuation."
+                    data-confirm-title="Retry">
+                Retry
+            </button>
+            {% else %}
+            <button type="button"
+                    class="cursor-not-allowed rounded border border-white/10 px-2 py-1 text-xs font-medium text-gray-500"
+                    title="Retry count {{ task.retry_count }}/{{ retry_cap }}. Edit task spec or delete to proceed."
+                    disabled>
+                Retry
+            </button>
+            {% endif %}
         {% endif %}
-    </button>
+        </div>
+    </div>
     {% if status_key in ('done', 'error') and task.metrics %}
-    <div class="mt-1 flex flex-wrap gap-3 text-[11px] text-gray-500">
+    <div class="mt-1 flex flex-wrap gap-3 break-all text-[11px] text-gray-500">
         {% if task.metrics.coder %}<span>{{ task.metrics.coder }}</span>{% endif %}
         {% if task.metrics.model %}<span class="font-mono">{{ task.metrics.model }}</span>{% endif %}
         <span>{{ task.metrics.attempt_count }} runs</span>
@@ -51,20 +93,10 @@
         {% if task.metrics.exit_reason %}<span class="text-gray-600">{{ task.metrics.exit_reason }}</span>{% endif %}
     </div>
     {% endif %}
-    <div class="mt-1 flex justify-end">
-        <button type="button"
-                class="secondary-interactive text-[11px] text-gray-400 hover:text-accent"
-                hx-get="/partials/repo/{{ repo_name }}/tasks/{{ task.pr_id }}/diagnostic"
-                hx-target="[id='{{ diagnostic_id }}']"
-                hx-swap="innerHTML"
-                data-diagnostic-trigger>
-            Diagnostic
-        </button>
-    </div>
     <div id="{{ diagnostic_id }}" class="mt-1 empty:hidden"></div>
     {% if task.retry_command %}
     {% set command = task.retry_command %}
-    <div class="mt-2 rounded border border-accent/20 bg-accent/5 px-2 py-1.5 text-[11px] text-gray-300"
+    <div class="mt-2 break-all rounded border border-accent/20 bg-accent/5 px-2 py-1.5 text-[11px] text-gray-300"
          data-retry-command-id="{{ command.command_id }}"
          data-retry-command-status="{{ command.status }}">
         {% if command.status == 'queued' %}
@@ -83,38 +115,6 @@
         {% else %}
         <span class="font-medium text-fail">Retry failed.</span>
         {{ command.outcome_reason }}
-        {% endif %}
-    </div>
-    {% endif %}
-    {% if status_key == 'error' %}
-    {% set next_retry = task.retry_count + 1 %}
-    <div class="mt-2 flex items-center justify-end gap-2">
-        {% if task.retry_command and task.retry_command.status in ['queued', 'processing', 'deferred', 'applied'] %}
-        <button type="button"
-                class="cursor-not-allowed rounded border border-white/10 px-2 py-1 text-xs font-medium text-gray-500"
-                title="Retry command {{ task.retry_command.command_id }} is {{ task.retry_command.status }}."
-                disabled>
-            Retry {{ task.retry_command.status }}
-        </button>
-        {% elif task.retry_count < retry_cap and task.retry_binding %}
-        <button type="button"
-                class="secondary-interactive rounded border border-accent/30 px-2 py-1 text-xs font-medium text-accent hover:border-accent/50 hover:bg-accent/10"
-                title="Retry count {{ task.retry_count }}/{{ retry_cap }}"
-                hx-post="/repos/{{ repo_name }}/tasks/{{ task.pr_id }}/retry"
-                hx-vals='{"retry_binding":"{{ task.retry_binding }}"}'
-                hx-target="#repo-tasks-panel-{{ repo_name }}"
-                hx-swap="outerHTML"
-                data-confirm="Retry {{ task.pr_id }}? Attempt {{ next_retry }} of {{ retry_cap }}. Same task content; the failure record stays for history. The daemon selects the safe continuation."
-                data-confirm-title="Retry">
-            Retry
-        </button>
-        {% else %}
-        <button type="button"
-                class="cursor-not-allowed rounded border border-white/10 px-2 py-1 text-xs font-medium text-gray-500"
-                title="Retry count {{ task.retry_count }}/{{ retry_cap }}. Edit task spec or delete to proceed."
-                disabled>
-            Retry
-        </button>
         {% endif %}
     </div>
     {% endif %}
