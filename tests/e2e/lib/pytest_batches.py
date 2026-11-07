@@ -29,13 +29,17 @@ def pytest_collection_modifyitems(config, items):
     all_ids = [item.nodeid for item in items]
     modules = sorted({nodeid.split("::", 1)[0] for nodeid in all_ids})
     owners = {module: index % BATCH_COUNT + 1 for index, module in enumerate(modules)}
-    # Run 41718511968 exhausted batch 1's 45-minute credential budget:
-    # continuity took ~18 minutes, versus ~9 minutes for FIX restart in batch 2.
-    # Exchange whole modules without excluding any collected or future tests.
-    continuity = "tests/e2e/test_failure_continuity.py"
-    restart = "tests/e2e/test_fix_restart.py"
-    if continuity in owners and restart in owners:
-        owners[continuity], owners[restart] = owners[restart], owners[continuity]
+    # Run 42331838755 exceeded batch 1's 45-minute budget after new
+    # modules shifted the round-robin positions. Keep the two long lifecycle
+    # modules in stable batches rather than exchanging their mutable owners.
+    # Measured totals become ~36/32/21 minutes; every other module, including
+    # future additions, still participates in the complete round-robin split.
+    for module, owner in {
+        "tests/e2e/test_failure_continuity.py": 2,
+        "tests/e2e/test_fix_restart.py": 3,
+    }.items():
+        if module in owners:
+            owners[module] = owner
     owned = {module for module, owner in owners.items() if owner == batch}
     selected = [item for item in items if item.nodeid.split("::", 1)[0] in owned]
     if not selected:
