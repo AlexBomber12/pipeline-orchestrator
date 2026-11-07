@@ -39,7 +39,8 @@ async def maybe_post_codex_review_after_push(
     if runner._should_skip_codex_review_post(pr_number):
         runner.log_event(
             "[FIX] Codex auto-trigger detected, skipping duplicate "
-            "@codex review post."
+            "@codex review post.",
+            severity="info",
         )
         return True
     if runner._post_codex_review(pr_number):

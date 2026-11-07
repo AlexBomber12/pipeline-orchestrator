@@ -54,7 +54,7 @@ def verify_pushes_since(
         subprocess.TimeoutExpired,
         OSError,
     ) as exc:
-        runner.log_event(f"[FIX] fetch {branch} failed {context}: {exc}.")
+        runner.log_event(f"[FIX] fetch {branch} failed {context}: {exc}.", severity="error")
         return None
     try:
         remote_head = git_ops._git(
@@ -68,7 +68,7 @@ def verify_pushes_since(
         OSError,
     ) as exc:
         runner.log_event(
-            f"[FIX] rev-parse origin/{branch} failed {context}: {exc}."
+            f"[FIX] rev-parse origin/{branch} failed {context}: {exc}.", severity="error"
         )
         return None
     if (
@@ -90,7 +90,7 @@ def verify_pushes_since(
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
         runner.log_event(
-            f"[FIX] merge-base ancestry check failed {context}: {exc}."
+            f"[FIX] merge-base ancestry check failed {context}: {exc}.", severity="error"
         )
         return None
     return is_ancestor.returncode == 0
