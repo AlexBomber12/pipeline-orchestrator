@@ -55,7 +55,7 @@ def cleanup_obsolete_size_labels(runner: "PipelineRunner", pr: "PRInfo") -> None
                 repo=runner.owner_repo,
             )
         except Exception as exc:
-            runner.log_event(f"[RECOVERY] Obsolete size label cleanup deferred: {exc}")
+            runner.log_event(f"[RECOVERY] Obsolete size label cleanup deferred: {exc}", severity="warn")
             continue
         pr.quarantine_labels.discard(label)
 
@@ -81,7 +81,7 @@ def apply_quarantine_label_for_violation(
     guardrail suppression record plus the MERGE gate.
     """
     if violation.category == "large_diff_threshold":
-        runner.log_event(f"[GUARDRAIL] Informational diff size: {violation.excerpt}")
+        runner.log_event(f"[GUARDRAIL] Informational diff size: {violation.excerpt}", severity="info")
         return True
     label = quarantine_label_for_category(violation.category)
     try:
@@ -100,7 +100,8 @@ def apply_quarantine_label_for_violation(
     except Exception as exc:
         if not _is_label_already_exists_error(exc):
             runner.log_event(
-                f"[GUARDRAIL] label create failed: {_exception_text(exc)}."
+                f"[GUARDRAIL] label create failed: {_exception_text(exc)}.",
+                severity="error",
             )
     try:
         gh_runner.run_gh(
@@ -109,7 +110,8 @@ def apply_quarantine_label_for_violation(
         )
     except Exception as exc:
         runner.log_event(
-            f"[GUARDRAIL] label apply on PR #{pr_number} failed: {exc}."
+            f"[GUARDRAIL] label apply on PR #{pr_number} failed: {exc}.",
+            severity="error",
         )
         return False
     try:
@@ -128,7 +130,8 @@ def apply_quarantine_label_for_violation(
         )
     except Exception as exc:
         runner.log_event(
-            f"[GUARDRAIL] comment post on PR #{pr_number} failed: {exc}."
+            f"[GUARDRAIL] comment post on PR #{pr_number} failed: {exc}.",
+            severity="error",
         )
     write_operator_action_audit(
         action="quarantine_apply",

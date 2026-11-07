@@ -66,7 +66,8 @@ async def monitor_fix_idle(
             msg = str(exc)
             if "HTTP 304" not in msg:
                 runner.log_event(
-                    f"[FIX] GitHub API poll failed: {exc}, preserving deadline."
+                    f"[FIX] GitHub API poll failed: {exc}, preserving deadline.",
+                    severity="warn",
                 )
             latest_push_at = None
         now = time.monotonic()
@@ -81,7 +82,8 @@ async def monitor_fix_idle(
             idle_flag["deadline"] = deadline
             runner.log_event(
                 f"[FIX] [{runner.state.coder or 'coder'}] pushed, "
-                f"resetting idle timer."
+                f"resetting idle timer.",
+                severity="ok",
             )
         if latest_push_at is not None and (
             last_observed_push is None or latest_push_at > last_observed_push
@@ -91,7 +93,8 @@ async def monitor_fix_idle(
             runner.log_event(
                 f"[FIX] idle timeout ({idle_limit}s since invocation start "
                 f"or last observed push), "
-                f"killing."
+                f"killing.",
+                severity="error",
             )
             idle_flag["timed_out"] = True
             await runner._terminate_current_coder()
@@ -134,13 +137,15 @@ async def poll_github_during_fix(
             )
         except Exception as exc:
             runner.log_event(
-                f"[FIX] GitHub poll for PR #{pr_number} failed: {exc}."
+                f"[FIX] GitHub poll for PR #{pr_number} failed: {exc}.",
+                severity="warn",
             )
             continue
         if state_info is None:
             runner.log_event(
                 f"[FIX] GitHub poll for PR #{pr_number} returned no "
-                f"data."
+                f"data.",
+                severity="warn",
             )
             continue
         state = (state_info.get("state") or "").upper()
@@ -149,7 +154,8 @@ async def poll_github_during_fix(
         terminal_flag["state"] = state
         runner.log_event(
             f"[FIX] PR #{pr_number} reached terminal state {state} "
-            f"during FIX, requesting coder termination."
+            f"during FIX, requesting coder termination.",
+            severity="info",
         )
         await runner._terminate_current_coder()
         target.cancel()
@@ -203,7 +209,8 @@ async def handle_external_terminal_pr_state(
             pr.fix_iteration_count = 0
         runner.log_event(
             f"[FIX] PR {pr_number_str} merged externally during FIX, "
-            f"returning to IDLE."
+            f"returning to IDLE.",
+            severity="ok",
         )
         await runner._save_current_run_record("success_merged")
         runner._current_run_record = None
@@ -216,7 +223,8 @@ async def handle_external_terminal_pr_state(
     # CLOSED
     runner.log_event(
         f"[FIX] PR {pr_number_str} closed externally during FIX, "
-        f"skipping task and returning to IDLE."
+        f"skipping task and returning to IDLE.",
+        severity="error",
     )
     # Finalize the run record before clearing the task so closed PR metrics
     # retain their explicit exit reason.
@@ -248,12 +256,14 @@ async def handle_external_terminal_pr_state(
         except Exception as exc:  # pragma: no cover - defensive status-write logging.
             runner.log_event(
                 f"[ERROR] Failed to write status:ERROR to "
-                f"{current_task.task_file}: {exc}"
+                f"{current_task.task_file}: {exc}",
+                severity="error",
             )
             status_written = False
         if not status_written:
             runner.log_event(
-                "[INFRA] Warning: status:ERROR write failed; staying ERROR for retry."
+                "[INFRA] Warning: status:ERROR write failed; staying ERROR for retry.",
+                severity="error",
             )
             await runner._mark_status_write_failed_task(current_task)
     runner.state.error_message = None

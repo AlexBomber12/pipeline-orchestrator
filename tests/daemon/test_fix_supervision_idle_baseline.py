@@ -25,7 +25,7 @@ class _Runner:
         self.cleanup_calls = 0
         self.state = types.SimpleNamespace(coder="claude")
 
-    def log_event(self, message: str) -> None:
+    def log_event(self, message: str, *, severity: str) -> None:
         self.events.append(message)
 
     async def _terminate_current_coder(self) -> bool:
