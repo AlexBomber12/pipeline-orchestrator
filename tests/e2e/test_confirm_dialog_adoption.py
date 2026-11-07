@@ -1,5 +1,6 @@
 """Shared confirmations retain each control's HTMX request contract."""
 
+import re
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -18,7 +19,7 @@ def test_confirm_dialog_adoption(page, dashboard_url, action, title, danger):
     env = web_app.templates.env
     if action == 'retry':
         template = env.get_template('components/tasks_panel.html')
-        html = template.make_module({'retry_cap': 3}).task_row('confirm-fixture', {
+        html = template.make_module({'retry_cap': 3, 'tasks_total': 0}).task_row('confirm-fixture', {
             'pr_id': 'PR-492', 'title': 'Retry fixture', 'retry_count': 1,
             'retry_binding': 'retained-binding',
         }, 'error')
@@ -52,7 +53,8 @@ def test_confirm_dialog_adoption(page, dashboard_url, action, title, danger):
     page.goto(dashboard_url, wait_until='domcontentloaded')
     page.wait_for_function('Boolean(window.htmx)')
     page.route('**/repos/confirm-fixture/**', lambda route: requests.append(route))
-    page.route('**/settings/repos?**', lambda route: requests.append(route))
+    # The encoded repository URL retains slashes, which a glob's single * cannot match.
+    page.route(re.compile(r'.*/settings/repos\?.*'), lambda route: requests.append(route))
     page.evaluate('''html => {
         const host = document.createElement('div'); host.id = 'adoption-fixture';
         host.innerHTML = html; document.querySelector('main').prepend(host); htmx.process(host);
