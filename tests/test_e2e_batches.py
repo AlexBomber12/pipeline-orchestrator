@@ -69,10 +69,15 @@ def test_real_pytest_batches_execute_every_parameter_once_and_include_new_module
 
 
 @pytest.mark.parametrize("include_restart", [True, False])
-def test_lifecycle_module_exchange_preserves_complete_disjoint_collection(tmp_path, include_restart):
+@pytest.mark.parametrize("insert_new_module", [True, False])
+def test_lifecycle_modules_keep_stable_batches_and_complete_collection(
+    tmp_path, include_restart, insert_new_module,
+):
     directory = tmp_path / "tests/e2e"
     directory.mkdir(parents=True)
-    names = ["test_failure_continuity.py", "test_new.py", "test_zeta.py"]
+    names = ["test_alpha.py", "test_failure_continuity.py", "test_new.py", "test_omega.py", "test_zeta.py"]
+    if insert_new_module:
+        names.append("test_beta.py")
     if include_restart:
         names.append("test_fix_restart.py")
     for name in names:
@@ -90,9 +95,9 @@ def test_lifecycle_module_exchange_preserves_complete_disjoint_collection(tmp_pa
             module = nodeid.split("::", 1)[0]
             assert owners.setdefault(module, batch) == batch
     assert verify_batch_coverage(evidence) == len(names) * 2
-    assert owners["tests/e2e/test_failure_continuity.py"] == (2 if include_restart else 1)
+    assert owners["tests/e2e/test_failure_continuity.py"] == 2
     if include_restart:
-        assert owners["tests/e2e/test_fix_restart.py"] == 1
+        assert owners["tests/e2e/test_fix_restart.py"] == 3
     assert set(owners) == {f"tests/e2e/{name}" for name in names}
 
 

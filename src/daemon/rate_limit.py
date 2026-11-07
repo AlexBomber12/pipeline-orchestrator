@@ -282,13 +282,15 @@ class RateLimitMixin:
             self.log_event(
                 f"[RATE-LIMIT] [SPEND-CEILING] {coder_name} {breach.limit_kind} "
                 f"cap reached ({breach.current_percent}%/{breach.cap_percent}%); "
-                "paused until reset."
+                "paused until reset.",
+                severity="warn",
             )
         else:
             self.log_event(
                 f"[RATE-LIMIT] [{coder_name}] Proactive pause: "
                 f"{breach.limit_kind} usage at {breach.current_percent}%, "
-                f"resumes at {until.isoformat()}."
+                f"resumes at {until.isoformat()}.",
+                severity="warn",
             )
         if breach.source == "spend-ceiling":
             await self.publish_state()
@@ -352,10 +354,12 @@ class RateLimitMixin:
                 except Exception as cleanup_exc:
                     self.log_event(
                         "[RATE-LIMIT] [SPEND-CEILING] warn dedup cleanup failed: "
-                        f"{cleanup_exc}"
+                        f"{cleanup_exc}",
+                        severity="error",
                     )
                 self.log_event(
-                    f"[RATE-LIMIT] [SPEND-CEILING] warn notification failed: {exc}"
+                    f"[RATE-LIMIT] [SPEND-CEILING] warn notification failed: {exc}",
+                    severity="error",
                 )
 
     def _record_rate_limit(
@@ -474,7 +478,8 @@ class RateLimitMixin:
         remaining = (until - now).total_seconds()
         self.log_event(
             f"[RATE-LIMIT] Rate limited, resuming in "
-            f"{int(remaining)}s."
+            f"{int(remaining)}s.",
+            severity="warn",
         )
 
     def _restore_state_after_cross_coder_clear(self) -> None:
@@ -545,7 +550,8 @@ class RateLimitMixin:
                 self.log_event(
                     f"[RATE-LIMIT] [{coder_name}] Usage API degraded "
                     f"(10 consecutive failures), falling back to "
-                    f"reactive rate-limit detection."
+                    f"reactive rate-limit detection.",
+                    severity="warn",
                 )
             return True
         self._usage_degraded_logged = False
@@ -601,7 +607,8 @@ class RateLimitMixin:
                 effective_pause = self._effective_coder_pause(effective_coder, now)
                 self._invalidate_usage_caches()
                 self.log_event(
-                    "[RATE-LIMIT] Rate limit window expired, resuming."
+                    "[RATE-LIMIT] Rate limit window expired, resuming.",
+                    severity="ok",
                 )
                 if effective_pause.until is not None:
                     self._apply_pause_state(
@@ -643,7 +650,8 @@ class RateLimitMixin:
                 self.log_event(
                     f"[RATE-LIMIT] {effective_coder.capitalize()} active "
                     f"while {global_pause.pause_coder} remains rate-limited until "
-                    f"{global_pause.until.isoformat()}."
+                    f"{global_pause.until.isoformat()}.",
+                    severity="ok",
                 )
                 return await self._proactive_usage_check(
                     proactive_coder=proactive_coder, preserve_error_message=preserve_error_message
@@ -795,6 +803,7 @@ class RateLimitMixin:
             self._record_rate_limit(coder_name, until, reactive=True)
             self.log_event(
                 f"[RATE-LIMIT] [{coder_name}] Rate limit detected "
-                f"({limit_type}), pausing for {pause_min} min."
+                f"({limit_type}), pausing for {pause_min} min.",
+                severity="warn",
             )
         return triggered

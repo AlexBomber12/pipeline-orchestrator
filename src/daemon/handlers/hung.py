@@ -226,7 +226,8 @@ class HungMixin:
             self.log_event(
                 f"[INFRA] Warning: failed to load PR metadata for "
                 f"@codex review dedup on PR #{pr_number}: {exc}; "
-                f"posting without PR-author dedup."
+                f"posting without PR-author dedup.",
+                severity="warn",
             )
         if head_sha:
             bound_head_sha = (
@@ -249,7 +250,8 @@ class HungMixin:
         if head_sha is None:
             self.log_event(
                 f"[INFRA] Warning: failed to resolve HEAD for PR "
-                f"#{pr_number}; posting @codex review without dedup."
+                f"#{pr_number}; posting @codex review without dedup.",
+                severity="warn",
             )
         if (
             not bypass_same_head_dedup
@@ -268,7 +270,8 @@ class HungMixin:
             except Exception as exc:
                 self.log_event(
                     f"[INFRA] PR #{pr_number} review request history "
-                    f"unavailable: {exc}"
+                    f"unavailable: {exc}",
+                    severity="warn",
                 )
                 return True, False, None
             if confirmed_at is not None:
@@ -297,7 +300,8 @@ class HungMixin:
             self.log_event(
                 f"[INFRA] Skipping duplicate @codex review for PR "
                 f"#{pr_number}; PR author already requested review for "
-                f"this head."
+                f"this head.",
+                severity="info",
             )
             requested_at = _author_recent_review_requested_at(
                 self.owner_repo,
@@ -316,7 +320,8 @@ class HungMixin:
         ):
             self.log_event(
                 f"[INFRA] Skipping duplicate @codex review for PR "
-                f"#{pr_number}."
+                f"#{pr_number}.",
+                severity="info",
             )
             return True, False, None
 
@@ -351,6 +356,7 @@ class HungMixin:
                 f"Posted @codex review on PR #{pr_number}.",
                 tier="infra",
                 kind=kind,
+                severity="ok",
             )
             return True, True, None
         except Exception as exc:
@@ -359,7 +365,8 @@ class HungMixin:
                 self._last_codex_review_head_sha = None
             self.log_event(
                 f"[INFRA] Warning: failed to post @codex review on PR "
-                f"#{pr_number}: {exc}."
+                f"#{pr_number}: {exc}.",
+                severity="error",
             )
             return False, False, None
 
