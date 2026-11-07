@@ -369,7 +369,7 @@ class CodingMixin:
                         attempt.unverified_head_sha,
                     )
                 except Exception as exc:
-                    self.log_event(f"[INFRA] FIX head verification deferred: {exc}")
+                    self.log_event(f"[INFRA] FIX head verification deferred: {exc}", severity="warn")
                 else:
                     if (candidate_outcome.discovery_complete
                         and candidate_outcome.state in {
@@ -418,7 +418,7 @@ class CodingMixin:
                     )
                 except Exception as exc:
                     current.ci_status = CIStatus.PENDING
-                    self.log_event(f"[INFRA] CODING CI hydration deferred: {exc}")
+                    self.log_event(f"[INFRA] CODING CI hydration deferred: {exc}", severity="warn")
                 attempt.verified = True
                 self.state.current_pr = current
                 # The old remote head proves ownership, but cannot release a
@@ -426,7 +426,7 @@ class CodingMixin:
                 return attempt.unverified_head_sha is None
             return False
         except Exception as exc:
-            self.log_event(f"[INFRA] Reconciliation deferred: {exc}")
+            self.log_event(f"[INFRA] Reconciliation deferred: {exc}", severity="warn")
             return False
 
     async def _release_unpublished_attempt(self, target_branch: str) -> None:
@@ -448,7 +448,7 @@ class CodingMixin:
                         attempt.repo, attempt.base, attempt.branch,
                     )
                 except Exception as exc:
-                    self.log_event(f"[INFRA] Unpublished attempt release deferred: {exc}")
+                    self.log_event(f"[INFRA] Unpublished attempt release deferred: {exc}", severity="warn")
                     return
                 if not any(item.number not in attempt.baseline_numbers for item in publications):
                     # Remote absence does not establish ownership of a local
@@ -457,7 +457,8 @@ class CodingMixin:
                     if attempt.initial_branch_head_sha != "":
                         self.log_event(
                             "[INFRA] Unpublished local branch cleanup deferred: "
-                            "pre-launch branch ownership is unproven"
+                            "pre-launch branch ownership is unproven",
+                            severity="warn",
                         )
                         return
                     # Retry dispatches CODING directly, so AUTO PR must be able
@@ -479,7 +480,7 @@ class CodingMixin:
                             )
                             git_ops._git(self.repo_path, "branch", "-D", "--", target_branch)
                     except Exception as exc:
-                        self.log_event(f"[INFRA] Unpublished local branch cleanup deferred: {exc}")
+                        self.log_event(f"[INFRA] Unpublished local branch cleanup deferred: {exc}", severity="warn")
                         return
                     attempt.pending = False
                     # Checkpoint before callers await terminal bookkeeping:
@@ -530,7 +531,7 @@ class CodingMixin:
             )
             return await self._resolve_published_attempt()
         except Exception as exc:
-            self.log_event(f"[INFRA] Retry PR creation deferred: {exc}")
+            self.log_event(f"[INFRA] Retry PR creation deferred: {exc}", severity="warn")
             return False
 
     async def _hold_unresolved_publication(self) -> bool:
@@ -556,7 +557,7 @@ class CodingMixin:
                 return False
         if self.state.user_paused or self.state.state == PipelineState.PAUSED:
             if self.state.user_paused and not self._user_pause_logged:
-                self.log_event("[INFRA] Paused. Press Play to resume.")
+                self.log_event("[INFRA] Paused. Press Play to resume.", severity="info")
                 self._user_pause_logged = True
             await self.publish_state()
             return True
@@ -568,7 +569,7 @@ class CodingMixin:
                 attempt.pending = False
                 self.state.state = PipelineState.WATCH
                 self._rehydrate_last_push_at(self.state.current_pr)
-                self.log_event("[FIX] Recovered retained PR -> WATCH.")
+                self.log_event("[FIX] Recovered retained PR -> WATCH.", severity="ok")
                 await self.publish_state()
                 return True
             await self._handoff_coding_pr_to_watch(
@@ -769,13 +770,15 @@ class CodingMixin:
                     f"{pr_id}: {exc}; marker invalidation also failed: "
                     f"{delete_exc}. A stale non-crash cause from a prior "
                     f"run may be wrongly classified as belonging to this "
-                    f"run on recovery."
+                    f"run on recovery.",
+                    severity="error",
                 )
             else:
                 self.log_event(
                     f"[CODING] current_run_started_at write failed for "
                     f"{pr_id}: {exc}; stale marker cleared so recovery "
-                    f"falls back to crash-branch on this run."
+                    f"falls back to crash-branch on this run.",
+                    severity="error",
                 )
         if not provider_resume:
             await self._prepare_current_run_record_dispatch_metadata(
@@ -832,7 +835,8 @@ class CodingMixin:
             else:
                 self.log_event(
                     "[INFRA] Preserving expected-branch marker while "
-                    "coder cleanup remains unconfirmed."
+                    "coder cleanup remains unconfirmed.",
+                    severity="warn",
                 )
 
     async def _prepare_coder_invocation(
@@ -854,7 +858,7 @@ class CodingMixin:
         keeps the runner PAUSED instead of falling through to the ERROR
         transition.
         """
-        self.log_event(f"[CODING] [{coder_name}] Starting PLANNED PR.")
+        self.log_event(f"[CODING] [{coder_name}] Starting PLANNED PR.", severity="info")
 
         breach_dir, breach_run_id = self._breach_env()
         self._current_breach_dir = breach_dir
@@ -914,7 +918,8 @@ class CodingMixin:
                 return None
             self.log_event(
                 f"[CODING] Publication baseline unavailable for "
-                f"{target_branch!r}: {exc}; deferring coder invocation."
+                f"{target_branch!r}: {exc}; deferring coder invocation.",
+                severity="warn",
             )
             # No coder has launched. Persist queue eligibility rather than a
             # CODING task that recovery would classify as an interrupted run.
@@ -932,7 +937,8 @@ class CodingMixin:
         ):
             self.log_event(
                 "[CODING] Coder invocation deferred while credential login "
-                "owns its credential location."
+                "owns its credential location.",
+                severity="warn",
             )
             if provider_resume:
                 await self._restore_current_run_record()
@@ -1090,14 +1096,16 @@ class CodingMixin:
                 self.log_event(
                     "[CODING] Publication recheck failed as coder completed "
                     f"under publication observation: {exc}; using ordinary "
-                    "completion handling."
+                    "completion handling.",
+                    severity="warn",
                 )
             else:
                 if publication_observed is not None:
                     await self._retain_observed_publication(publication_observed)
                     self.log_event(
                         "[CODING] Verified publication as coder completed "
-                        "under publication observation."
+                        "under publication observation.",
+                        severity="ok",
                     )
 
         publication_monitor = start_publication_monitor()
@@ -1137,7 +1145,8 @@ class CodingMixin:
                 self.log_event(
                     f"[CODING] Verified publication of PR "
                     f"#{publication_observed.number}; allowing coder "
-                    "natural-exit grace."
+                    "natural-exit grace.",
+                    severity="ok",
                 )
                 completed, _ = await asyncio.wait(
                     {cli_task},
@@ -1151,13 +1160,15 @@ class CodingMixin:
                     publication_observed = None
                     self.log_event(
                         f"[CODING] Publication recheck failed before "
-                        f"cleanup: {exc}; coder will continue."
+                        f"cleanup: {exc}; coder will continue.",
+                        severity="warn",
                     )
                 if publication_observed is not None:
                     self.log_event(
                         f"[CODING] Publication grace elapsed; "
                         f"terminating owned coder group for PR "
-                        f"#{publication_observed.number}."
+                        f"#{publication_observed.number}.",
+                        severity="info",
                     )
                     await self._terminate_current_coder()
                     publication_cancel_requested = cli_task.cancel()
@@ -1165,7 +1176,8 @@ class CodingMixin:
                 self.log_event(
                     "[CODING] Publication no longer matches the local task "
                     "branch after grace; coder will continue under renewed "
-                    "publication observation."
+                    "publication observation.",
+                    severity="warn",
                 )
                 completed, _ = await asyncio.wait(
                     {cli_task},
@@ -1272,7 +1284,7 @@ class CodingMixin:
                 reason="user stop requested during coder run",
             )
             await self._save_current_run_record("error")
-            self.log_event("[CODING] CODING aborted: user stop requested.")
+            self.log_event("[CODING] CODING aborted: user stop requested.", severity="info")
             return None
 
         if interruption == "breach" or breach_flag["breached"]:
@@ -1293,7 +1305,8 @@ class CodingMixin:
             await self._save_current_run_record("rate_limit")
             self.log_event(
                 f"[CODING] CODING aborted: in-flight rate limit breach, "
-                f"paused until {self.state.rate_limited_until}."
+                f"paused until {self.state.rate_limited_until}.",
+                severity="warn",
             )
             return None
 
@@ -1310,7 +1323,8 @@ class CodingMixin:
             await self._save_current_run_record("rate_limit")
             self.log_event(
                 f"[CODING] CODING paused: late in-flight rate limit breach, "
-                f"paused until {self.state.rate_limited_until}."
+                f"paused until {self.state.rate_limited_until}.",
+                severity="warn",
             )
             return None
         if publication_result_missing:
@@ -1401,7 +1415,8 @@ class CodingMixin:
             except Exception as exc:
                 self.log_event(
                     f"[CODING] Publication observation failed for "
-                    f"{target_branch!r}: {exc}."
+                    f"{target_branch!r}: {exc}.",
+                    severity="warn",
                 )
             else:
                 local_head = await asyncio.to_thread(
@@ -1436,7 +1451,8 @@ class CodingMixin:
             return
         if await self._resolve_published_attempt() and self.state.current_pr is not None:
             self.log_event(
-                f"[CODING] Recorded PR #{self.state.current_pr.number} {log_suffix}."
+                f"[CODING] Recorded PR #{self.state.current_pr.number} {log_suffix}.",
+                severity="ok",
             )
 
     def _expected_branch_path(self) -> Path:
@@ -1502,7 +1518,8 @@ class CodingMixin:
         except OSError as exc:
             self.log_event(
                 f"[CODING] expected-branch write failed ({exc}); pre-push "
-                f"hook disabled for this dispatch — continuing."
+                f"hook disabled for this dispatch — continuing.",
+                severity="error",
             )
 
     def _active_pr_runtime_path(self) -> Path:
@@ -1524,7 +1541,8 @@ class CodingMixin:
         except OSError as exc:
             self.log_event(
                 f"[CODING] active-pr-id runtime write failed ({exc}); "
-                "e2e shim task discovery may fall back to task headers."
+                "e2e shim task discovery may fall back to task headers.",
+                severity="error",
             )
 
     def _cleanup_expected_branch(self) -> None:
@@ -1544,7 +1562,8 @@ class CodingMixin:
             self.log_event(
                 f"[CODING] expected-branch cleanup failed ({exc}); "
                 f"manual git operations on this worktree may be gated "
-                f"until the marker is removed."
+                f"until the marker is removed.",
+                severity="error",
             )
 
     async def _post_coder_resolution(
@@ -1578,7 +1597,8 @@ class CodingMixin:
                     self.state.user_paused = True
                     self.log_event(
                         "[CODING] User stop requested after coder exit; "
-                        "honoring persisted stop."
+                        "honoring persisted stop.",
+                        severity="info",
                     )
             if not requested:
                 return False
@@ -1602,7 +1622,7 @@ class CodingMixin:
                 reason="user stop requested after coder exit",
             )
             await self._save_current_run_record("error")
-            self.log_event("[CODING] CODING aborted: user stop requested.")
+            self.log_event("[CODING] CODING aborted: user stop requested.", severity="info")
             return True
 
         await self._save_cli_log(
@@ -1618,6 +1638,7 @@ class CodingMixin:
                     f"{violation.category}: {violation.excerpt}",
                     tier="guardrail",
                     kind=violation.category,
+                    severity="error",
                 )
             protected_pr = self.state.current_pr
             if protected_pr is None and self._publication_attempt_matches_dispatch():
@@ -1653,7 +1674,8 @@ class CodingMixin:
             if self.state.user_paused:
                 self.log_event(
                     "[CODING] User pause persisted during coder exit; "
-                    "finishing current run before honoring pause."
+                    "finishing current run before honoring pause.",
+                    severity="info",
                 )
         if await pause_for_stop_if_requested():
             return
@@ -1698,7 +1720,8 @@ class CodingMixin:
                 await self._save_current_run_record("rate_limit")
                 self.log_event(
                     f"[RATE-LIMIT] Rate limit pause active until "
-                    f"{self.state.rate_limited_until.isoformat()}."
+                    f"{self.state.rate_limited_until.isoformat()}.",
+                    severity="warn",
                 )
                 return
             await self._transition_to_error(
@@ -1769,11 +1792,12 @@ class CodingMixin:
         self.state.state = PipelineState.WATCH
         self._rehydrate_last_push_at(candidate)
         await self._save_current_run_record("coding_complete")
-        self.log_event(message, tier="state", kind="transition")
+        self.log_event(message, tier="state", kind="transition", severity="ok")
         if self._should_skip_codex_review_post(candidate.number):
             self.log_event(
                 "[CODING] Codex auto-trigger detected, skipping duplicate "
-                "@codex review post."
+                "@codex review post.",
+                severity="info",
             )
         else:
             self._post_codex_review(candidate.number)
@@ -1814,7 +1838,8 @@ class CodingMixin:
                 # "no push" verdict.
                 self.log_event(
                     f"[BRANCH] mismatch detected: {ctx.mismatch_reason}; "
-                    f"{ctx.log_summary()}"
+                    f"{ctx.log_summary()}",
+                    severity="error",
                 )
                 message = (
                     f"[{coder_name}] Branch mismatch: "
