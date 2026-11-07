@@ -110,7 +110,8 @@ class PreflightMixin:
             if count >= _DIRTY_CYCLES_BEFORE_AUTO_RESET:
                 self.log_event(
                     f"[INFRA] Dirty tree persisted {count} cycles, "
-                    f"auto-resetting to recover."
+                    f"auto-resetting to recover.",
+                    severity="warn",
                 )
             if await policy.maybe_escalate(self):
                 if self.state.state in (PipelineState.IDLE, PipelineState.WATCH):
@@ -164,7 +165,7 @@ class PreflightMixin:
             subprocess.TimeoutExpired,
             OSError,
         ) as exc:
-            self.log_event(f"[INFRA] Auto-recovery failed: {exc}.")
+            self.log_event(f"[INFRA] Auto-recovery failed: {exc}.", severity="error")
             return
         if self.state.current_pr is not None:
             resumed = PipelineState.WATCH
@@ -174,5 +175,6 @@ class PreflightMixin:
         self.state.error_message = None
         self.log_event(
             f"[INFRA] Auto-recovered from dirty tree -> {resumed.value} "
-            f"({ctx.log_summary()})."
+            f"({ctx.log_summary()}).",
+            severity="ok",
         )

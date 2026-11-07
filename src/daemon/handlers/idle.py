@@ -181,7 +181,7 @@ class IdleMixin:
             return
         self._last_agents_scan_fingerprint = fingerprint
         for event in pending:
-            self.log_event(event)
+            self.log_event(event, severity="warn")
 
     async def _audit_main_commits_if_due(self) -> None:
         self._main_commit_audit_counter = (
@@ -217,7 +217,8 @@ class IdleMixin:
         except Exception as exc:
             self.log_event(
                 f"[AUDIT] [MAIN-COMMIT-AUDIT] Skipping audit for "
-                f"{self.owner_repo}: {exc}"
+                f"{self.owner_repo}: {exc}",
+                severity="warn",
             )
             if getattr(self, "_main_commit_audit_retry_pending", False):
                 self._main_commit_audit_retry_pending = False
@@ -231,7 +232,8 @@ class IdleMixin:
             self.log_event(
                 f"[AUDIT] [MAIN-COMMIT-AUDIT] VIOLATION "
                 f"{finding.violation_category}: {finding.short_sha} "
-                f'"{finding.message_first_line}"'
+                f'"{finding.message_first_line}"',
+                severity="error",
             )
         await record_audit_findings_in_redis(
             self.redis,
@@ -280,15 +282,16 @@ class IdleMixin:
         except Exception as exc:
             # Leave ``last_run`` untouched so the next IDLE cycle retries
             # instead of waiting another full interval.
-            self.log_event(f"[BACKUP] bundle creation crashed: {exc}")
+            self.log_event(f"[BACKUP] bundle creation crashed: {exc}", severity="error")
             return
         if bundle_path is None:
             self.log_event(
-                "[BACKUP] git bundle failed; will retry next cycle"
+                "[BACKUP] git bundle failed; will retry next cycle",
+                severity="error",
             )
             return
         self._git_bundle_backup_last_run_at = now
-        self.log_event(f"[BACKUP] git bundle created: {bundle_path.name}")
+        self.log_event(f"[BACKUP] git bundle created: {bundle_path.name}", severity="ok")
         try:
             removed = await prune_old_bundles(
                 backup_dir=config.git_bundle_backup_dir,
@@ -297,10 +300,10 @@ class IdleMixin:
                 weekly_retention=config.git_bundle_backup_weekly_retention,
             )
         except Exception as exc:
-            self.log_event(f"[BACKUP] prune failed: {exc}")
+            self.log_event(f"[BACKUP] prune failed: {exc}", severity="error")
             return
         if removed > 0:
-            self.log_event(f"[BACKUP] pruned {removed} old bundles")
+            self.log_event(f"[BACKUP] pruned {removed} old bundles", severity="ok")
 
     @staticmethod
     def _validate_task_file_header_match(task_file: Path, header_pr_id: str) -> None:
@@ -383,7 +386,8 @@ class IdleMixin:
             except QueueValidationError as exc:
                 if exc.issues and all(": invalid Coder " in issue for issue in exc.issues):
                     self.log_event(
-                        f"[INFRA] Task {task_file.stem}: admission requires action; {exc}"
+                        f"[INFRA] Task {task_file.stem}: admission requires action; {exc}",
+                        severity="error",
                     )
                     skipped_unstructured_pr_ids.add(task_file.stem)
                     continue
@@ -422,7 +426,8 @@ class IdleMixin:
         ):
             self.log_event(
                 "[INFRA] Operating without gh API done-check; tasks without "
-                "positive merge or open-PR evidence will defer task selection"
+                "positive merge or open-PR evidence will defer task selection",
+                severity="warn",
             )
             self._idle_degraded_done_check_logged = True
         # Match admission's completion evidence before resolving blockers or
@@ -619,7 +624,8 @@ class IdleMixin:
         if not candidates:
             self.log_event(
                 f"[INFRA] Task {pr_id}: coder configuration requires action; "
-                f"load/enable the configured plugin or correct Coder: {pin or 'any'}."
+                f"load/enable the configured plugin or correct Coder: {pin or 'any'}.",
+                severity="error",
             )
             return False
         available = eligible_coders(ctx)
@@ -627,7 +633,8 @@ class IdleMixin:
             return True
         self.log_event(
             f"[INFRA] Task {pr_id} waiting for coder resource "
-            f"{candidates}: {ctx.exclusion_reasons}."
+            f"{candidates}: {ctx.exclusion_reasons}.",
+            severity="warn",
         )
         return False
 
@@ -675,7 +682,7 @@ class IdleMixin:
         try:
             task = await self._select_next_task_from_dag()
         except MergeStatusUnavailable as exc:
-            self.log_event(f"[INFRA] {exc}")
+            self.log_event(f"[INFRA] {exc}", severity="warn")
             return None
         except (
             OSError,
@@ -721,14 +728,15 @@ class IdleMixin:
         self.state.current_queue = list(dag_tasks)
 
         if task is None:
-            self.log_event("[INFRA] No tasks available.")
+            self.log_event("[INFRA] No tasks available.", severity="info")
             self.state.current_task = None
             if not self._idle_resource_wait:
                 self._reset_runner_local_task_counters()
             if prs:
                 self.log_event(
                     f"[INFRA] IDLE: {len(prs)} open PR(s) detected "
-                    f"(manual work)."
+                    f"(manual work).",
+                    severity="info",
                 )
             return None
 
@@ -747,7 +755,8 @@ class IdleMixin:
                 self.log_event(
                     f"[INFRA] Task {task.pr_id} has existing open PR "
                     f"#{existing.number} on {task_branch!r} -> WATCH "
-                    f"(no duplicate CODING)."
+                    f"(no duplicate CODING).",
+                    severity="info",
                 )
                 await self.publish_state()
                 return None
@@ -787,7 +796,7 @@ class IdleMixin:
             # Match the legacy IDLE guard by treating the scalar as the
             # source of truth for manual pause.
             if self.state.user_paused:
-                self.log_event("[INFRA] IDLE inhibited by ['user_pause']")
+                self.log_event("[INFRA] IDLE inhibited by ['user_pause']", severity="info")
                 return
             candidates = [
                 name for name in self._registry.coder_names()
@@ -795,9 +804,10 @@ class IdleMixin:
             ]
             if not candidates:
                 self.log_event(
-                    "[INFRA] IDLE inhibited by no eligible coder"
+                    "[INFRA] IDLE inhibited by no eligible coder",
+                    severity="warn",
                 )
-                self.log_event("[INFRA] Coder configuration requires action: load/enable a plugin.")
+                self.log_event("[INFRA] Coder configuration requires action: load/enable a plugin.", severity="error")
                 return
             # ``GITHUB_BUDGET_SLOWDOWN`` is a polling-cadence throttle
             # enforced by ``_check_github_api_budget`` at the runner-cycle
@@ -820,7 +830,8 @@ class IdleMixin:
                     for inh in blockers
                 })
                 self.log_event(
-                    f"[INFRA] IDLE inhibited by {blocking_types}"
+                    f"[INFRA] IDLE inhibited by {blocking_types}",
+                    severity="warn",
                 )
                 return
         else:
@@ -851,7 +862,8 @@ class IdleMixin:
             if not getattr(self, "_upload_admission_blocked", False):
                 self.log_event(
                     "[INFRA] Pending upload failed; skipping task dispatch "
-                    "to retry next cycle."
+                    "to retry next cycle.",
+                    severity="warn",
                 )
             return
         if upload_result:
@@ -879,7 +891,8 @@ class IdleMixin:
         except Exception as exc:
             self.log_event(
                 f"[INFRA] IDLE: open PR check failed: {exc}; deferring "
-                f"task dispatch."
+                f"task dispatch.",
+                severity="warn",
             )
             self.state.current_task = None
             self._reset_runner_local_task_counters()
@@ -925,12 +938,14 @@ class IdleMixin:
                         f"heuristics.",
                         tier="infra",
                         kind="etag_304",
+                        severity="warn",
                     )
                 merged_prs = []
             else:
                 self.log_event(
                     f"[INFRA] IDLE: merged PR check failed: {exc}; "
-                    f"continuing with local merged-status heuristics."
+                    f"continuing with local merged-status heuristics.",
+                    severity="warn",
                 )
                 merged_prs = []
         else:
@@ -949,7 +964,8 @@ class IdleMixin:
             self._reset_runner_local_task_counters()
             self.log_event(
                 f"[INFRA] Pause requested while preparing {task.pr_id}; "
-                f"deferring CODING."
+                f"deferring CODING.",
+                severity="warn",
             )
             return
 
@@ -960,7 +976,7 @@ class IdleMixin:
             return
 
         self.state.state = PipelineState.CODING
-        self.log_event(f"[INFRA] Picked task {task.pr_id}: {task.title}.")
+        self.log_event(f"[INFRA] Picked task {task.pr_id}: {task.title}.", severity="info")
         await self.publish_state()
         await self.handle_coding()
 
@@ -974,7 +990,7 @@ class IdleMixin:
             if not await self.redis.get(upload_pending(self.name)):
                 return
         except Exception as exc:
-            self.log_event(f"[INFRA] Retained publication upload check deferred: {exc}")
+            self.log_event(f"[INFRA] Retained publication upload check deferred: {exc}", severity="warn")
             return
         if not await self._confirm_current_coder_cleanup("retained publication upload"):
             return
@@ -992,10 +1008,10 @@ class IdleMixin:
             if local != remote:
                 raise ValueError("local base has unpublished commits")
         except (OSError, ValueError, subprocess.SubprocessError) as exc:
-            self.log_event(f"[INFRA] Retained publication upload deferred: {exc}")
+            self.log_event(f"[INFRA] Retained publication upload deferred: {exc}", severity="warn")
             return
         if await self.process_pending_uploads(_safe=True) is None:
-            self.log_event("[INFRA] Retained publication upload failed; retrying later.")
+            self.log_event("[INFRA] Retained publication upload failed; retrying later.", severity="error")
 
     async def handle_paused(self) -> None:
         """Wait for rate limit window to expire, then resume previous flow."""
@@ -1058,7 +1074,8 @@ class IdleMixin:
             if self.state.user_paused:
                 if not getattr(self, "_paused_inhibited_logged", False):
                     self.log_event(
-                        "[INFRA] PAUSED inhibited by ['user_pause']"
+                        "[INFRA] PAUSED inhibited by ['user_pause']",
+                        severity="info",
                     )
                     self._paused_inhibited_logged = True
                 return
@@ -1119,7 +1136,8 @@ class IdleMixin:
                 )
                 if not getattr(self, "_paused_inhibited_logged", False):
                     self.log_event(
-                        f"[INFRA] PAUSED inhibited by {blocking_types}"
+                        f"[INFRA] PAUSED inhibited by {blocking_types}",
+                        severity="warn",
                     )
                     self._paused_inhibited_logged = True
                 return
@@ -1179,7 +1197,8 @@ class IdleMixin:
                 if not getattr(self, "_paused_inhibited_logged", False):
                     self.log_event(
                         "[INFRA] PAUSED: inhibitor snapshot disagrees "
-                        "with live rate-limit scalars, staying paused"
+                        "with live rate-limit scalars, staying paused",
+                        severity="warn",
                     )
                     self._paused_inhibited_logged = True
                 return
@@ -1258,17 +1277,19 @@ class IdleMixin:
             ):
                 self.state.state = PipelineState.WATCH
                 self.log_event(
-                    "[INFRA] PAUSED inhibitors cleared -> WATCH."
+                    "[INFRA] PAUSED inhibitors cleared -> WATCH.",
+                    severity="ok",
                 )
             else:
                 self.state.state = PipelineState.IDLE
                 self.log_event(
-                    "[INFRA] PAUSED inhibitors cleared -> IDLE."
+                    "[INFRA] PAUSED inhibitors cleared -> IDLE.",
+                    severity="ok",
                 )
             return
         if self.state.user_paused:
             if not getattr(self, "_user_pause_logged", False):
-                self.log_event("[INFRA] Paused. Press Play to resume.")
+                self.log_event("[INFRA] Paused. Press Play to resume.", severity="info")
                 self._user_pause_logged = True
             return
         if self.state.rate_limited_until is None:
@@ -1278,7 +1299,8 @@ class IdleMixin:
                 )
                 return
             self.log_event(
-                "[INFRA] PAUSED without rate_limited_until -> IDLE."
+                "[INFRA] PAUSED without rate_limited_until -> IDLE.",
+                severity="ok",
             )
             self.state.state = PipelineState.IDLE
             return
@@ -1328,17 +1350,18 @@ class IdleMixin:
                 and self.state.current_pr.branch == self.state.current_task.branch
             ):
                 self.state.state = PipelineState.WATCH
-                self.log_event(f"[RATE-LIMIT] {label} -> WATCH.")
+                self.log_event(f"[RATE-LIMIT] {label} -> WATCH.", severity="ok")
             else:
                 self.state.state = PipelineState.IDLE
-                self.log_event(f"[RATE-LIMIT] {label} -> IDLE.")
+                self.log_event(f"[RATE-LIMIT] {label} -> IDLE.", severity="ok")
             return
         if datetime.now(timezone.utc) < self.state.rate_limited_until:
             remaining = (
                 self.state.rate_limited_until - datetime.now(timezone.utc)
             ).total_seconds()
             self.log_event(
-                f"[RATE-LIMIT] Paused, resuming in {int(remaining)}s."
+                f"[RATE-LIMIT] Paused, resuming in {int(remaining)}s.",
+                severity="warn",
             )
             return
         # Window expired: resume to appropriate state
@@ -1357,10 +1380,12 @@ class IdleMixin:
         ):
             self.state.state = PipelineState.WATCH
             self.log_event(
-                "[RATE-LIMIT] Rate limit expired, resuming -> WATCH."
+                "[RATE-LIMIT] Rate limit expired, resuming -> WATCH.",
+                severity="ok",
             )
         else:
             self.state.state = PipelineState.IDLE
             self.log_event(
-                "[RATE-LIMIT] Rate limit expired, resuming -> IDLE."
+                "[RATE-LIMIT] Rate limit expired, resuming -> IDLE.",
+                severity="ok",
             )
