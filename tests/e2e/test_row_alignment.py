@@ -5,7 +5,7 @@ from playwright.sync_api import expect
 from src.web.app import templates
 
 
-@pytest.mark.parametrize("width", [360, 1280])
+@pytest.mark.parametrize("width", [360, 640, 1280])
 @pytest.mark.parametrize("retry_state", [None, "queued", "processing", "deferred", "applied", "capped"])
 def test_row_alignment(page, dashboard_url, width, retry_state):
     long_value = "long-unbroken-value-" * 12
