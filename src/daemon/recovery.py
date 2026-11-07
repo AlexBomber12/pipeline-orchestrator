@@ -191,7 +191,7 @@ class RecoveryMixin:
                 ) if cause is not None else None
             )
         except Exception as exc:
-            self.log_event(f"[RECOVERY] Obsolete CI evidence unavailable: {exc}.")
+            self.log_event(f"[RECOVERY] Obsolete CI evidence unavailable: {exc}.", severity="warn")
             return False
         claim = cause.payload.get("obsolete_ci_trigger") if cause is not None else None
         completed_cleanup = (
@@ -270,7 +270,7 @@ class RecoveryMixin:
             elif cause is not None:
                 await delete_cancellation_cause(self.redis, self.name, task.pr_id)
         except Exception as exc:
-            self.log_event(f"[RECOVERY] Obsolete CI cleanup deferred: {exc}.")
+            self.log_event(f"[RECOVERY] Obsolete CI cleanup deferred: {exc}.", severity="warn")
             return False
         resumed = task.model_copy(update={"status": TaskStatus.DOING})
         tasks[tasks.index(task)] = resumed
@@ -287,7 +287,10 @@ class RecoveryMixin:
         self.state.error_message = None
         self._current_run_record = continuation
         self._rehydrate_last_push_at(pr)
-        self.log_event(f"[RECOVERY] Obsolete CI-only condition cleared for PR #{pr.number}; resuming WATCH.")
+        self.log_event(
+            f"[RECOVERY] Obsolete CI-only condition cleared for PR #{pr.number}; resuming WATCH.",
+            severity="ok",
+        )
         return True
 
     async def _consume_publication_migration_command(self) -> bool:
@@ -300,7 +303,10 @@ class RecoveryMixin:
         key = migration_command_key(self.name, binding)
         raw = await self.redis.get(key)
         if not raw:
-            self.log_event("[RECOVERY] Publication migration receipt missing; operator investigation required.")
+            self.log_event(
+                "[RECOVERY] Publication migration receipt missing; operator investigation required.",
+                severity="error",
+            )
             return False
         command = MigrationCommand.model_validate_json(raw)
         if command.status == "applied":
@@ -444,7 +450,7 @@ class RecoveryMixin:
             self.state.publication_watermark = watermark
             self.state.publication_migration = None
         elif outcome == "failed":
-            self.log_event(f"[RECOVERY] Publication migration rejected: {reason or 'state changed'}.")
+            self.log_event(f"[RECOVERY] Publication migration rejected: {reason or 'state changed'}.", severity="error")
         return outcome != "deferred"
 
     def _parse_tasks_from_headers(self) -> list[QueueTask] | None:
@@ -708,7 +714,10 @@ class RecoveryMixin:
         try:
             raw = await self.redis.get(pipeline_state(self.name))
         except Exception as exc:
-            self.log_event(f"[INFRA] Publication snapshot read unavailable: {type(exc).__name__}; retrying recovery.")
+            self.log_event(
+                f"[INFRA] Publication snapshot read unavailable: {type(exc).__name__}; retrying recovery.",
+                severity="warn",
+            )
             return False
         if not raw:
             self._publication_snapshot_absent = True
@@ -1061,7 +1070,7 @@ class RecoveryMixin:
                 )
                 base_refreshed = True
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
-                self.log_event(f"[RECOVERY] Legacy FIX task header refresh deferred: {exc}")
+                self.log_event(f"[RECOVERY] Legacy FIX task header refresh deferred: {exc}", severity="warn")
                 return False
         # PR-266b crash-no-PR fix: the headers helper derives ``DOING``
         # via ``current_task_pr_id`` when no matching open PR exists.
@@ -1107,7 +1116,7 @@ class RecoveryMixin:
                     )
                     tasks = self._parse_tasks_from_headers()
             except MergeStatusUnavailable as exc:
-                self.log_event(f"[INFRA] recover_state deferred: {exc}")
+                self.log_event(f"[INFRA] recover_state deferred: {exc}", severity="warn")
                 return False
             except QueueValidationError as exc:
                 await self._transition_to_error(
@@ -1142,7 +1151,8 @@ class RecoveryMixin:
             self.log_event(
                 "[INFRA] recover_state: no tasks/PR-*.md headers parsed; "
                 "treating as empty queue and deferring to preflight + "
-                "IDLE regeneration."
+                "IDLE regeneration.",
+                severity="warn",
             )
             tasks = []
         if not await self._recover_header_merge_attempt(tasks, prs):
@@ -1217,7 +1227,7 @@ class RecoveryMixin:
             if not discovery.complete:
                 raise RuntimeError(discovery.reason or "incomplete merged discovery")
         except Exception as exc:
-            self.log_event(f"[RECOVERY] Merge bookkeeping discovery deferred: {exc}.")
+            self.log_event(f"[RECOVERY] Merge bookkeeping discovery deferred: {exc}.", severity="warn")
             return False
         for _, task, records in sorted(candidates, key=lambda candidate: candidate[0]):
             matches = [pr for pr in discovery.prs
@@ -1225,7 +1235,7 @@ class RecoveryMixin:
             if not matches:
                 continue
             if len(matches) != 1:
-                self.log_event(f"[RECOVERY] Ambiguous merged identity for {task.pr_id}; retrying.")
+                self.log_event(f"[RECOVERY] Ambiguous merged identity for {task.pr_id}; retrying.", severity="warn")
                 return False
             header = self._recovery_task_headers[task.pr_id]
             if header.frontmatter_status == "done" and (Path(self.repo_path) / ".git").exists():
@@ -1239,7 +1249,7 @@ class RecoveryMixin:
                         ) for r in records):
                             continue
                 except Exception as exc:
-                    self.log_event(f"[RECOVERY] Merge accounting generation read deferred: {exc}.")
+                    self.log_event(f"[RECOVERY] Merge accounting generation read deferred: {exc}.", severity="warn")
                     return False
             self._persisted_merge_recovery = self.state.model_copy(update={
                 "current_task": task, "current_pr": matches[0],
@@ -1281,7 +1291,8 @@ class RecoveryMixin:
             restored_list = ", ".join(f"#{number}" for number in sorted(restored))
             self.log_event(
                 f"[INFRA] Rehydrated quarantine for PR(s) {restored_list} "
-                "from GitHub labels."
+                "from GitHub labels.",
+                severity="ok",
             )
 
     async def _recover_unresolved_error_pr(
@@ -1338,7 +1349,8 @@ class RecoveryMixin:
             ):
                 self.log_event(
                     f"[RECOVERY] ERROR task {task.pr_id} retains PR #{pr.number}; "
-                    "task header does not authorize continuation."
+                    "task header does not authorize continuation.",
+                    severity="error",
                 )
                 return task, pr
         return None
@@ -1479,7 +1491,8 @@ class RecoveryMixin:
             )
             self.log_event(
                 f"[INFRA] Recovered pending queue-sync branch: "
-                f"{pending_sync.branch}."
+                f"{pending_sync.branch}.",
+                severity="ok",
             )
 
         if retained_error is not None:
@@ -1505,7 +1518,8 @@ class RecoveryMixin:
                     await self._restore_current_run_record()
                 self.log_event(
                     f"[RECOVERY] Restored MERGE attempt for {queued.pr_id} "
-                    f"PR #{self.state.current_pr.number} ({self.state.merge_phase})."
+                    f"PR #{self.state.current_pr.number} ({self.state.merge_phase}).",
+                    severity="ok",
                 )
                 return
 
@@ -1548,7 +1562,8 @@ class RecoveryMixin:
                 )
                 self.log_event(
                     f"[RECOVERY] Restored retained merge failure for "
-                    f"{queued.pr_id} PR #{self.state.current_pr.number}."
+                    f"{queued.pr_id} PR #{self.state.current_pr.number}.",
+                    severity="error",
                 )
                 return
 
@@ -1687,7 +1702,8 @@ class RecoveryMixin:
                         return
                 self.log_event(
                     f"[RECOVERY] Restored bound FIX PR #{bound.number} for "
-                    f"{queued.pr_id} in {recovered_state.value}."
+                    f"{queued.pr_id} in {recovered_state.value}.",
+                    severity="ok",
                 )
                 if live_bound is not None:
                     self._rehydrate_last_push_at(live_bound)
@@ -1714,7 +1730,8 @@ class RecoveryMixin:
                 self._rehydrate_last_push_at(matching)
                 self.log_event(
                     f"[INFRA] Recovered: DOING task {doing.pr_id} "
-                    f"-> WATCH PR #{matching.number}."
+                    f"-> WATCH PR #{matching.number}.",
+                    severity="ok",
                 )
                 return
 
@@ -1722,7 +1739,8 @@ class RecoveryMixin:
                 self.log_event(
                     f"[INFRA] recover_state: ignoring stale DOING entry "
                     f"{doing.pr_id} (already merged on "
-                    f"origin/{self.repo_config.branch})."
+                    f"origin/{self.repo_config.branch}).",
+                    severity="ok",
                 )
                 self.state.current_task = None
                 self._reset_runner_local_task_counters()
@@ -1751,7 +1769,8 @@ class RecoveryMixin:
                 self.state.state = PipelineState.IDLE
                 self.log_event(
                     f"[INFRA] Recovered: DOING task {doing.pr_id}, no PR "
-                    f"but user_paused -> defer CODING until resume."
+                    f"but user_paused -> defer CODING until resume.",
+                    severity="warn",
                 )
                 return
 
@@ -1833,7 +1852,8 @@ class RecoveryMixin:
                     await self._persist_status_write_failed_task_pr_ids()
                     self.log_event(
                         f"[INFRA] Warning: failed to persist status:ERROR for "
-                        f"{doing.pr_id}; fallback marker keeps task blocked."
+                        f"{doing.pr_id}; fallback marker keeps task blocked.",
+                        severity="error",
                     )
             # PR-266b crash-no-PR fix: reflect the cancellation in the
             # in-memory tasks list so the headers-mode current_queue
@@ -1853,13 +1873,15 @@ class RecoveryMixin:
                 self.log_event(
                     f"[INFRA] Task {doing.pr_id} crashed, marking ERROR. "
                     f"Manually re-upload to retry. "
-                    f"({ctx.log_summary()})"
+                    f"({ctx.log_summary()})",
+                    severity="error",
                 )
             else:
                 self.log_event(
                     f"[INFRA] Task {doing.pr_id} parked for operator "
                     f"attention, marking ERROR. Manually re-upload to "
-                    f"retry. ({ctx.log_summary()})"
+                    f"retry. ({ctx.log_summary()})",
+                    severity="error",
                 )
             return
 
@@ -1887,7 +1909,8 @@ class RecoveryMixin:
             self._rehydrate_last_push_at(matched_pr)
             self.log_event(
                 f"[INFRA] Recovered: {matched_task.status.value} task "
-                f"{matched_task.pr_id} -> WATCH PR #{matched_pr.number}."
+                f"{matched_task.pr_id} -> WATCH PR #{matched_pr.number}.",
+                severity="ok",
             )
             return
 
@@ -1937,11 +1960,13 @@ class RecoveryMixin:
         if prs:
             self.log_event(
                 f"[INFRA] Recovered: {len(prs)} open PR(s) not matched "
-                f"to any queued task -> IDLE."
+                f"to any queued task -> IDLE.",
+                severity="ok",
             )
         else:
             self.log_event(
-                "[INFRA] Recovered: no DOING tasks, no open PRs -> IDLE."
+                "[INFRA] Recovered: no DOING tasks, no open PRs -> IDLE.",
+                severity="ok",
             )
 
     async def _dispatch_recovery_branch(self, task_pr_id: str) -> str:
@@ -1989,7 +2014,8 @@ class RecoveryMixin:
             self.log_event(
                 f"[INFRA] recover_state: failed to read cancellation "
                 f"cause for {task_pr_id}: {exc}. Falling back to "
-                f"crash-recovery branch."
+                f"crash-recovery branch.",
+                severity="error",
             )
             return "crash"
         if cause is None:
@@ -2001,7 +2027,8 @@ class RecoveryMixin:
             self.log_event(
                 f"[INFRA] recover_state: cancellation cause for "
                 f"{task_pr_id} has empty/unrecognized subsource "
-                f"{subsource!r}; falling back to crash-recovery branch."
+                f"{subsource!r}; falling back to crash-recovery branch.",
+                severity="warn",
             )
             return "crash"
         if not await self._cause_belongs_to_current_run(cause, task_pr_id):
@@ -2046,7 +2073,8 @@ class RecoveryMixin:
             self.log_event(
                 f"[INFRA] recover_state: failed to read current_run "
                 f"start for {task_pr_id}: {exc}. Treating cause as "
-                f"stale and falling back to crash-recovery branch."
+                f"stale and falling back to crash-recovery branch.",
+                severity="error",
             )
             return False
         if started_at is None:
@@ -2054,7 +2082,8 @@ class RecoveryMixin:
                 f"[INFRA] recover_state: no current_run start recorded "
                 f"for {task_pr_id}; cannot prove non-crash cause belongs "
                 f"to the current run, falling back to crash-recovery "
-                f"branch."
+                f"branch.",
+                severity="warn",
             )
             return False
         try:
@@ -2064,7 +2093,8 @@ class RecoveryMixin:
                 f"[INFRA] recover_state: cancellation cause for "
                 f"{task_pr_id} has malformed created_at "
                 f"{cause.created_at!r}; treating as stale and falling "
-                f"back to crash-recovery branch."
+                f"back to crash-recovery branch.",
+                severity="warn",
             )
             return False
         if cause_created_at.tzinfo is None:
@@ -2074,7 +2104,8 @@ class RecoveryMixin:
                 f"[INFRA] recover_state: cancellation cause for "
                 f"{task_pr_id} created at {cause.created_at} predates "
                 f"current run start {started_at.isoformat()}; treating "
-                f"as stale and falling back to crash-recovery branch."
+                f"as stale and falling back to crash-recovery branch.",
+                severity="warn",
             )
             return False
         return True
@@ -2112,7 +2143,8 @@ class RecoveryMixin:
         if branch == self.repo_config.branch:
             self.log_event(
                 f"[INFRA] Refusing to preserve crashed-run commits on "
-                f"base branch {branch!r}."
+                f"base branch {branch!r}.",
+                severity="error",
             )
             return False
 
@@ -2128,7 +2160,8 @@ class RecoveryMixin:
             )
         except (subprocess.TimeoutExpired, OSError) as exc:
             self.log_event(
-                f"[INFRA] Could not probe local branch {branch}: {exc}."
+                f"[INFRA] Could not probe local branch {branch}: {exc}.",
+                severity="error",
             )
             return False
         try:
@@ -2145,13 +2178,13 @@ class RecoveryMixin:
                 diff = git_ops._git(self.repo_path, "stash", "show", "-u", "-p", "--text", timeout=60).stdout
                 key = any(line.startswith("+") and "PRIVATE KEY-----" in line for line in diff.splitlines())
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
-                self.log_event(f"[INFRA] Failed to stash crashed-run work: {exc}.")
+                self.log_event(f"[INFRA] Failed to stash crashed-run work: {exc}.", severity="error")
                 return False
             secrets = {c for c, _ in SECRET_PATTERNS_A + SECRET_PATTERNS_B} | {"generic_high_entropy"}
             unsafe = key or any(v.category in secrets for v in scan_pr_diff(diff)) or not ref
             if unsafe or self._attempt_backup_branch_push(ref, "dirty worktree") is None:
                 return False
-            self.log_event(f"[INFRA] Preserved crashed-run commits on {branch}.")
+            self.log_event(f"[INFRA] Preserved crashed-run commits on {branch}.", severity="ok")
             return True
         if probe.returncode != 0:
             return True
@@ -2172,18 +2205,21 @@ class RecoveryMixin:
                     return True
             self.log_event(
                 f"[INFRA] Failed to preserve unpushed commits on "
-                f"{branch}: {exc}."
+                f"{branch}: {exc}.",
+                severity="error",
             )
             return False
         except (subprocess.TimeoutExpired, OSError) as exc:
             self.log_event(
                 f"[INFRA] Failed to preserve unpushed commits on "
-                f"{branch}: {exc}."
+                f"{branch}: {exc}.",
+                severity="error",
             )
             return False
 
         self.log_event(
-            f"[INFRA] Preserved crashed-run commits on {branch}."
+            f"[INFRA] Preserved crashed-run commits on {branch}.",
+            severity="ok",
         )
         return True
 
@@ -2251,13 +2287,15 @@ class RecoveryMixin:
         ) as exc:
             self.log_event(
                 f"[INFRA] Crash-backup fallback push to "
-                f"{backup_branch} also failed: {exc}."
+                f"{backup_branch} also failed: {exc}.",
+                severity="error",
             )
             return None
         self.log_event(
             f"[INFRA] Primary push rejected ({primary_stderr.strip() or 'rejected'}); "
             f"preserved crashed-run commits on fallback branch "
-            f"{backup_branch}."
+            f"{backup_branch}.",
+            severity="ok",
         )
         self._pending_backup_branch_write = (task_id, backup_branch)
         return backup_branch
@@ -2387,7 +2425,8 @@ class RecoveryMixin:
         except Exception as exc:
             self.log_event(
                 f"[INFRA] Failed to record crash-backup branch for "
-                f"{task_id}: {exc}."
+                f"{task_id}: {exc}.",
+                severity="error",
             )
 
     def _initialize_publication_admission(

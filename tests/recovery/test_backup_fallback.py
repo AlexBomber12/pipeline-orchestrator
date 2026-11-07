@@ -351,8 +351,8 @@ def test_both_pushes_fail_returns_failure(
     primary_stderr = (
         " ! [remote rejected] pr-042-inflight -> pr-042-inflight"
     )
-    events: list[str] = []
-    runner.log_event = lambda msg: events.append(msg)  # type: ignore[method-assign]
+    events: list[tuple[str, str]] = []
+    runner.log_event = lambda msg, *, severity: events.append((msg, severity))  # type: ignore[method-assign]
 
     def handler(cmd: list[str], **kwargs: Any) -> Any:
         if cmd[:4] == ["git", "rev-parse", "--verify", "--quiet"]:
@@ -377,11 +377,12 @@ def test_both_pushes_fail_returns_failure(
     result = runner._preserve_crashed_run_commits("pr-042-inflight")
 
     assert result is False
+    assert all(severity == "error" for _, severity in events)
     assert runner._pending_backup_branch_write is None
-    assert any("Crash-backup fallback push" in m for m in events)
+    assert any("Crash-backup fallback push" in m for m, _ in events)
     assert any(
         "Failed to preserve unpushed commits on pr-042-inflight" in m
-        for m in events
+        for m, _ in events
     )
     asyncio.run(runner._persist_pending_backup_branch_write())
     assert runner.redis.writes == []
@@ -504,13 +505,14 @@ def test_redis_failure_during_persist_does_not_raise() -> None:
         "crash-backup/PR-042/20260519-120000",
     )
 
-    events: list[str] = []
-    runner.log_event = lambda msg: events.append(msg)  # type: ignore[method-assign]
+    events: list[tuple[str, str]] = []
+    runner.log_event = lambda msg, *, severity: events.append((msg, severity))  # type: ignore[method-assign]
 
     asyncio.run(runner._persist_pending_backup_branch_write())
 
     assert runner._pending_backup_branch_write is None
-    assert any("Failed to record crash-backup branch" in m for m in events)
+    assert any("Failed to record crash-backup branch" in m for m, _ in events)
+    assert [severity for _, severity in events] == ["error"]
 
 
 # ---------------------------------------------------------------------------
