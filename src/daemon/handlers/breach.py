@@ -54,7 +54,8 @@ class BreachMixin:
                 pct_val = data.get(pct_key, "?")
                 self.log_event(
                     f"[RATE-LIMIT] In-flight breach: {breach_type} at "
-                    f"{pct_val}%, killing {coder_name} coder."
+                    f"{pct_val}%, killing {coder_name} coder.",
+                    severity="warn",
                 )
                 breach_flag["breached"] = True
                 coder_task.cancel()
@@ -101,7 +102,8 @@ class BreachMixin:
         pct_val = data.get(pct_key, "?")
         self.log_event(
             f"[RATE-LIMIT] Late in-flight breach detected: "
-            f"{breach_type} at {pct_val}%."
+            f"{breach_type} at {pct_val}%.",
+            severity="warn",
         )
         breach_flag["breached"] = True
 
