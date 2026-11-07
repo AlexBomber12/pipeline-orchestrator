@@ -595,7 +595,7 @@
         /* PR-256: Human Availability chip in the dashboard top bar.
            3-state (AUTO/AVAILABLE/AWAY) with the dot color reflecting
            the composed verdict and the label reflecting the manual
-           override. Click cycles through states. */
+           override. The popover exposes explicit choices. */
         .availability-chip {
             display: inline-flex;
             align-items: center;
@@ -613,6 +613,22 @@
             user-select: none;
             transition: border-color 150ms ease, background-color 150ms ease;
         }
+
+        #availability-popover {
+            position: fixed;
+            margin: 0;
+            left: auto;
+            bottom: auto;
+            width: min(260px, calc(100vw - 32px));
+            padding: 12px;
+            border: 1px solid var(--border-strong);
+            border-radius: 8px;
+            background: rgb(var(--bg-2-rgb) / 1);
+            color: var(--text-1);
+        }
+
+        #availability-popover button { display: block; width: 100%; padding: 8px; text-align: left; }
+        #availability-popover button[aria-pressed="true"] { font-weight: bold; background: rgb(var(--c-accent) / 0.15); }
 
         .availability-chip:hover {
             border-color: rgb(var(--c-accent) / 0.5);
@@ -680,9 +696,16 @@
                     </select>
                     <button id="availability-chip" type="button" class="availability-chip"
                             data-composed="AVAILABLE" data-manual="AUTO"
-                            title="Click to cycle: AUTO → AVAILABLE → AWAY" aria-label="Operator availability: AUTO">
+                            popovertarget="availability-popover" aria-expanded="false"
+                            aria-label="Operator availability: AUTO">
                         <span class="dot" aria-hidden="true"></span><span class="label">AUTO</span>
                     </button>
+                    <div id="availability-popover" popover="auto" role="group" aria-label="Operator availability">
+                        <button type="button" data-availability="AUTO" aria-pressed="true">Auto</button>
+                        <button type="button" data-availability="AVAILABLE" aria-pressed="false">Available</button>
+                        <button type="button" data-availability="AWAY" aria-pressed="false">Away</button>
+                        <p id="availability-reason" class="mt-2 text-sm" aria-live="polite">Loading availability…</p>
+                    </div>
                     <div id="clock" class="font-mono text-sm text-gray-400">--:--:--</div>
                 </div>
             </details>
@@ -967,25 +990,34 @@
     </script>
 
     <script>
-        // PR-256: Human Availability chip. 3-state cycle AUTO → AVAILABLE
-        // → AWAY → AUTO; ``data-composed`` drives the dot color (composed
-        // verdict from server-side sources) while ``data-manual`` drives
-        // the label and click-cycle next state so AUTO renders distinctly
-        // from a pinned override that happens to resolve identically.
+        // Explicit availability choices; server composition still controls the dot.
         (function () {
             const chip = document.getElementById('availability-chip');
             if (!chip) return;
-            const cycle = {AUTO: 'AVAILABLE', AVAILABLE: 'AWAY', AWAY: 'AUTO'};
+            const popover = document.getElementById('availability-popover');
+            const choices = popover.querySelectorAll('[data-availability]');
+
+            function applyChoice(manual) {
+                chip.dataset.manual = manual;
+                chip.setAttribute('aria-label', 'Operator availability: ' + manual);
+                chip.querySelector('.label').textContent = manual;
+                choices.forEach(button => {
+                    button.setAttribute('aria-pressed', String(button.dataset.availability === manual));
+                });
+            }
 
             function applyState(data) {
                 if (!data || typeof data !== 'object') return;
                 const composed = data.composed_state || 'AVAILABLE';
                 const manual = data.manual_override || 'AUTO';
                 chip.dataset.composed = composed;
-                chip.dataset.manual = manual;
-                chip.setAttribute('aria-label', 'Operator availability: ' + manual);
-                const label = chip.querySelector('.label');
-                if (label) label.textContent = manual;
+                applyChoice(manual);
+                // The current API exposes no per-source reason; describe only
+                // the known override/composition, without inferring a source.
+                const reason = data.reason || (manual === 'AUTO'
+                    ? 'automatic availability signals' : 'manual override');
+                document.getElementById('availability-reason').textContent =
+                    'Now: ' + composed + ' because ' + reason;
             }
 
             async function refresh() {
@@ -1007,24 +1039,10 @@
             // it always reads the newest server-side value.
             let pendingChain = Promise.resolve();
 
-            async function cycleState() {
-                const current = chip.dataset.manual || 'AUTO';
-                const next = cycle[current] || 'AUTO';
-                // Advance the dataset (and label) optimistically BEFORE the
-                // POST so a second click that lands while the first request
-                // is still in flight sees the updated `current` and
-                // continues the cycle (AUTO → AVAILABLE → AWAY → AUTO).
-                // Without this the click handler would re-read the stale
-                // `data-manual`, recompute the same `next`, and send a
-                // duplicate transition. The dot color (data-composed)
-                // stays at the last server-composed verdict until
-                // ``refresh()`` reconciles; if the POST fails, ``refresh``
-                // pulls the server's actual override back so the local
-                // optimistic update gets reverted.
-                chip.dataset.manual = next;
-                chip.setAttribute('aria-label', 'Operator availability: ' + next);
-                const label = chip.querySelector('.label');
-                if (label) label.textContent = next;
+            function selectState(next) {
+                applyChoice(next);
+                popover.hidePopover();
+                chip.focus();
                 pendingChain = pendingChain.then(async () => {
                     try {
                         await fetch('/api/availability/' + next, {method: 'POST'});
@@ -1033,7 +1051,26 @@
                 });
             }
 
-            chip.addEventListener('click', cycleState);
+            choices.forEach(button => {
+                button.addEventListener('click', () => selectState(button.dataset.availability));
+            });
+            popover.addEventListener('keydown', event => {
+                if (event.key !== 'Escape') return;
+                event.preventDefault();
+                event.stopPropagation();
+                popover.hidePopover();
+                chip.focus();
+            });
+            chip.addEventListener('click', () => {
+                const rect = chip.getBoundingClientRect();
+                popover.style.top = Math.min(rect.bottom + 8, window.innerHeight - 210) + 'px';
+                popover.style.right = Math.max(16, window.innerWidth - rect.right) + 'px';
+            });
+            popover.addEventListener('toggle', event => {
+                const open = event.newState === 'open';
+                chip.setAttribute('aria-expanded', String(open));
+                if (open) popover.querySelector('[aria-pressed="true"]').focus();
+            });
 
             // 60s polling is the safety net: SSE wake fires immediately on
             // operator clicks, but heartbeat expiry and active-hours rollover
