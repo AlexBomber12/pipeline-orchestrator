@@ -129,7 +129,12 @@ def test_renders_retry_button_when_below_cap(
     assert response.status_code == 200
     body = response.text
     assert 'hx-post="/repos/example__alpha/tasks/PR-283/retry"' in body
-    assert 'hx-confirm="Retry PR-283? Counter will increment to 3/3."' in body
+    assert ('data-confirm="Retry PR-283? Attempt 3 of 3. Same task content; '
+            'the failure record stays for history. The daemon selects the safe continuation."') in body
+    assert 'data-confirm-title="Retry"' in body
+    assert 'hx-confirm=' not in body
+    assert 'data-confirm-danger' not in body
+    assert 'text-accent hover:border-accent/50 hover:bg-accent/10' in body
     assert "Retry count 2/3" in body
     assert "disabled" not in body
 

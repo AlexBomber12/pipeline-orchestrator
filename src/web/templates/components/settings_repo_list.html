@@ -105,8 +105,10 @@
                         hx-delete="{{ delete_url }}"
                         hx-target="#settings-repo-list"
                         hx-swap="innerHTML"
-                        hx-confirm="Remove {{ name }}?">
-                    Delete
+                        data-confirm="Remove {{ name }} ({{ repo.url }})?"
+                        data-confirm-title="Remove"
+                        data-confirm-danger>
+                    Remove
                 </button>
             </td>
         </tr>

@@ -577,8 +577,12 @@ def test_panel_buttons_carry_confirm_target_and_swap_attributes() -> None:
     assert "approve-btn" in html and "reject-btn" in html
     assert 'hx-vals=\'{"decision": "approve", "binding": "bound-decision"}\'' in html
     assert 'hx-vals=\'{"decision": "reject"}\'' in html
-    assert "hx-confirm=\"Approve guardrail violation for PR-296" in html
-    assert "hx-confirm=\"Reject guardrail violation for PR-296" in html
+    assert "data-confirm=\"Approve guardrail violation for PR-296" in html
+    assert "data-confirm=\"Reject guardrail violation for PR-296" in html
+    assert 'hx-confirm=' not in html
+    assert 'data-confirm-title="Approve current PR"' in html
+    assert 'data-confirm-title="Reject"' in html
+    assert html.count("data-confirm-danger") == 1
     assert 'hx-target="closest .guardrail-row"' in html
     assert 'hx-swap="outerHTML"' in html
 
