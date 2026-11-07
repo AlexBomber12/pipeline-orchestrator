@@ -1054,6 +1054,13 @@
             choices.forEach(button => {
                 button.addEventListener('click', () => selectState(button.dataset.availability));
             });
+            popover.addEventListener('keydown', event => {
+                if (event.key !== 'Escape') return;
+                event.preventDefault();
+                event.stopPropagation();
+                popover.hidePopover();
+                chip.focus();
+            });
             chip.addEventListener('click', () => {
                 const rect = chip.getBoundingClientRect();
                 popover.style.top = Math.min(rect.bottom + 8, window.innerHeight - 210) + 'px';
