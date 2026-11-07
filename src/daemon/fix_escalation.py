@@ -100,7 +100,8 @@ def ensure_escalated_label(
         if not _is_label_already_exists_error(exc):
             runner.log_event(
                 f"[FIX] {label_create_log_prefix} label create failed: "
-                f"{_exception_text(exc)}."
+                f"{_exception_text(exc)}.",
+                severity="error",
             )
     try:
         gh_runner.run_gh(
@@ -111,7 +112,8 @@ def ensure_escalated_label(
     except Exception as exc:
         runner.log_event(
             f"[FIX] Warning: failed to apply escalated label to PR "
-            f"#{pr_number}: {exc}."
+            f"#{pr_number}: {exc}.",
+            severity="error",
         )
         return False
 
@@ -142,7 +144,8 @@ def apply_canceled_label(runner: "PipelineRunner", pr_number: int) -> None:
         if not _is_label_already_exists_error(exc):
             runner.log_event(
                 "[FIX] FIX no-push canceled label create failed: "
-                f"{_exception_text(exc)}."
+                f"{_exception_text(exc)}.",
+                severity="error",
             )
     try:
         gh_runner.run_gh(
@@ -152,7 +155,8 @@ def apply_canceled_label(runner: "PipelineRunner", pr_number: int) -> None:
     except Exception as exc:
         runner.log_event(
             f"[FIX] Warning: failed to apply canceled label to PR "
-            f"#{pr_number}: {exc}."
+            f"#{pr_number}: {exc}.",
+            severity="error",
         )
 
 
@@ -173,7 +177,8 @@ async def escalate_fix_no_push_deadlock(
     pr_number = current_pr.number
     runner.log_event(
         f"[FIX] PR #{pr_number} no-push deadlock after {attempts} "
-        "attempts; canceling task with cause preserved."
+        "attempts; canceling task with cause preserved.",
+        severity="error",
     )
 
     current_task = runner.state.current_task
@@ -213,12 +218,14 @@ async def escalate_fix_no_push_deadlock(
         except Exception as exc:  # pragma: no cover - defensive status-write logging.
             runner.log_event(
                 f"[ERROR] Failed to write status:ERROR to "
-                f"{current_task.task_file}: {exc}"
+                f"{current_task.task_file}: {exc}",
+                severity="error",
             )
             status_written = False
         if not status_written:
             runner.log_event(
-                "[INFRA] Warning: status:ERROR write failed; staying ERROR for retry."
+                "[INFRA] Warning: status:ERROR write failed; staying ERROR for retry.",
+                severity="error",
             )
             await runner._mark_status_write_failed_task(
                 current_task,
@@ -256,7 +263,8 @@ async def escalate_fix_coder_initiated(
     except Exception as exc:
         runner.log_event(
             f"[FIX] Warning: failed to post FIX coder ESCALATE comment "
-            f"on PR #{pr_number}: {exc}."
+            f"on PR #{pr_number}: {exc}.",
+            severity="error",
         )
     label_applied = ensure_escalated_label(
         runner, pr_number, "FIX coder ESCALATE"
@@ -336,7 +344,8 @@ async def escalate_fix_iteration_cap(
     except Exception as exc:
         if not _is_label_already_exists_error(exc):
             runner.log_event(
-                f"[FIX] FIX cap label create failed: {_exception_text(exc)}."
+                f"[FIX] FIX cap label create failed: {_exception_text(exc)}.",
+                severity="error",
             )
     try:
         gh_runner.run_gh(
