@@ -5549,7 +5549,7 @@ def test_monitor_fix_idle_times_out_without_push_history(
     """_monitor_fix_idle should tolerate missing push history and still time out."""
     runner = h._make_runner()
     events: list[str] = []
-    monkeypatch.setattr(runner, "log_event", events.append)
+    monkeypatch.setattr(runner, "log_event", lambda message, *, severity: events.append(message))
 
     branch_results: list[object] = [
         fix_supervision_module.gh_prs.GitHubPollError("bootstrap failed"),
@@ -5656,7 +5656,7 @@ def test_monitor_fix_idle_resets_timer_on_detected_push(
     runner = h._make_runner()
     runner.state.coder = "codex"
     events: list[str] = []
-    monkeypatch.setattr(runner, "log_event", events.append)
+    monkeypatch.setattr(runner, "log_event", lambda message, *, severity: events.append(message))
 
     class _StopMonitor(Exception):
         pass
@@ -5732,7 +5732,7 @@ def test_monitor_fix_idle_logs_poll_failures_before_timing_out(
     """GitHub poll failures should preserve the deadline and be logged."""
     runner = h._make_runner()
     events: list[str] = []
-    monkeypatch.setattr(runner, "log_event", events.append)
+    monkeypatch.setattr(runner, "log_event", lambda message, *, severity: events.append(message))
 
     def fake_branch_last_push(repo: str, pr_number: int) -> float | None:
         if fake_branch_last_push.calls == 0:
@@ -5809,7 +5809,7 @@ def test_poll_github_during_fix_logs_and_continues_on_exception(
     runner = h._make_runner()
     runner._app_config = h._app_cfg(fix_poll_interval_sec=1)
     events: list[str] = []
-    monkeypatch.setattr(runner, "log_event", events.append)
+    monkeypatch.setattr(runner, "log_event", lambda message, *, severity: events.append(message))
 
     sequence: list[Any] = [RuntimeError("rate-limit"), None]
 
@@ -5911,7 +5911,7 @@ def test_poll_github_during_fix_terminates_coder_on_external_merge(
     runner = h._make_runner()
     runner._app_config = h._app_cfg(fix_poll_interval_sec=1)
     events: list[str] = []
-    monkeypatch.setattr(runner, "log_event", events.append)
+    monkeypatch.setattr(runner, "log_event", lambda message, *, severity: events.append(message))
     terminated = []
 
     async def fake_terminate() -> None:
