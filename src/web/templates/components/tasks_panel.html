@@ -98,13 +98,14 @@
         </button>
         {% elif task.retry_count < retry_cap and task.retry_binding %}
         <button type="button"
-                class="secondary-interactive rounded border border-fail/30 px-2 py-1 text-xs font-medium text-fail hover:border-fail/50 hover:bg-fail/10"
+                class="secondary-interactive rounded border border-accent/30 px-2 py-1 text-xs font-medium text-accent hover:border-accent/50 hover:bg-accent/10"
                 title="Retry count {{ task.retry_count }}/{{ retry_cap }}"
                 hx-post="/repos/{{ repo_name }}/tasks/{{ task.pr_id }}/retry"
                 hx-vals='{"retry_binding":"{{ task.retry_binding }}"}'
                 hx-target="#repo-tasks-panel-{{ repo_name }}"
                 hx-swap="outerHTML"
-                hx-confirm="Retry {{ task.pr_id }}? Counter will increment to {{ next_retry }}/{{ retry_cap }}.">
+                data-confirm="Retry {{ task.pr_id }}? Attempt {{ next_retry }} of {{ retry_cap }}. Same task content; the failure record stays for history. The daemon selects the safe continuation."
+                data-confirm-title="Retry">
             Retry
         </button>
         {% else %}
