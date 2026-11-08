@@ -1,6 +1,7 @@
 """Chromium timestamp formatting on initial render and diagnostic HTMX swaps."""
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 from playwright.sync_api import expect
@@ -13,11 +14,20 @@ def browser_context_args(browser_context_args):
     return {**browser_context_args, "timezone_id": "America/New_York", "locale": "en-US"}
 
 
+@pytest.fixture(autouse=True)
+def local_htmx(page):
+    page.route("https://unpkg.com/htmx.org@2.0.4", lambda route: route.fulfill(
+        path=Path(__file__).parent / "assets/htmx-2.0.4.min.js",
+        content_type="application/javascript",
+    ))
+
+
 @pytest.mark.parametrize("run_started", ["valid", "invalid", None])
 def test_repo_timestamps(page, dashboard_url, run_started):
     now = datetime(2026, 11, 8, 18, 0, tzinfo=timezone.utc)
     timestamp = (now - timedelta(minutes=5)).isoformat()
-    page.clock.install(time=now)
+    # Freeze Date only: HTMX request/swap timers must keep running normally.
+    page.clock.set_fixed_time(now)
     migration = PublicationMigration(
         repo="example/alpha", pr_number=504, head_repo="example/alpha",
         ref="refs/heads/pr-504", head_sha="a" * 40, reason="Inspect publication",
@@ -39,10 +49,14 @@ def test_repo_timestamps(page, dashboard_url, run_started):
         body=diagnostic, content_type="text/html",
     ))
     page.goto(dashboard_url + "/time-format", wait_until="load")
+    # Repo tabs initialize on DOMContentLoaded and replace the URL fragment.
+    # Let that navigation finish before evaluating the diagnostic request.
+    expect(page).to_have_url(dashboard_url + "/time-format#overview")
     publication = page.locator("[data-publication-migration] [data-ts]")
     expect(publication).to_have_text("5 min ago" if run_started else "unavailable")
     page.wait_for_function("Boolean(window.htmx)")
-    page.evaluate("htmx.ajax('GET', '/diagnostic-time', {target: 'main', swap: 'beforeend'})")
+    with page.expect_response(dashboard_url + "/diagnostic-time"):
+        page.evaluate("() => { htmx.ajax('GET', '/diagnostic-time', {target: 'main', swap: 'beforeend'}); }")
     started = page.locator("[data-diagnostic-panel] [data-ts]")
     expect(started).to_have_text("5 min ago" if run_started == "valid" else "unavailable")
     for element in (publication, started):
@@ -63,7 +77,7 @@ def test_formatter_preserves_titles_and_rejects_invalid_unix(page, dashboard_url
         '<span class="unknown" data-ts-unix="{{ value }}">unavailable</span>{% endfor %}'
         '<span class="unknown" data-ts="">unavailable</span>{% endblock %}'
     ).render()
-    page.clock.install(time=datetime(2026, 11, 8, 18, 0, tzinfo=timezone.utc))
+    page.clock.set_fixed_time(datetime(2026, 11, 8, 18, 0, tzinfo=timezone.utc))
     page.route(dashboard_url + "/time-format", lambda route: route.fulfill(body=html, content_type="text/html"))
     page.goto(dashboard_url + "/time-format", wait_until="load")
     expect(page.locator("#existing")).to_have_text("5 min ago")
