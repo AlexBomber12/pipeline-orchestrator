@@ -1,9 +1,10 @@
-<div class="rounded-lg border border-white/5 bg-surface-2 p-5">
+<div>
     <div class="mb-4">
         <h2 class="text-xl font-semibold tracking-tight">Coders</h2>
         <p class="mt-1 text-sm text-gray-400">Choose a preferred default coder. Repositories may override this preference.</p>
     </div>
 
+    <div class="rounded-lg border border-white/5 bg-surface-2 p-5">
     <div class="grid gap-4 lg:grid-cols-2">
                 {% for coder in coders %}
                 {% set auth_entry = coder.auth %}
@@ -114,7 +115,7 @@
                                 </p>
                                 {% if effort.default_reasoning_effort %}
                                 <p class="mt-1 text-xs text-gray-500">
-                                    Catalogue metadata advertises <span class="font-mono text-gray-400">{{ effort.default_reasoning_effort }}</span> as this model's default; this does not confirm the effective CLI setting.
+                                    Catalog metadata advertises <span class="font-mono text-gray-400">{{ effort.default_reasoning_effort }}</span> as this model's default; this does not confirm the effective CLI setting.
                                 </p>
                                 {% endif %}
                                 {% if effort.update_message %}
@@ -218,4 +219,5 @@
     </p>
 
 
+</div>
 </div>

@@ -1,6 +1,7 @@
 """Browser checks for Settings navigation and the coder cards."""
 
 import pytest
+from playwright.sync_api import expect
 
 SECTIONS = (
     ("settings-coders-section", "Coders"),
@@ -9,7 +10,7 @@ SECTIONS = (
     ("settings-automation", "Automation"),
     ("settings-usage", "Usage limits"),
     ("settings-notifications-section", "Notifications"),
-    ("settings-protection-backups", "Sandbox and backup"),
+    ("settings-protection-backups", "Protection & backups"),
     ("settings-appearance", "Appearance"),
 )
 
@@ -159,6 +160,7 @@ def test_settings_navigation_and_coder_cards(
     for section_id, heading in SECTIONS:
         link = page.locator(f'nav[aria-label="Settings sections"] a[href="#{section_id}"]')
         assert link.count() == 1
+        expect(link).to_have_text(heading)
         link.click()
         assert page.evaluate("location.hash") == f"#{section_id}"
         _assert_heading_in_viewport(page, section_id, heading)
@@ -200,4 +202,22 @@ def test_settings_theme_toggle_persists_after_reload(page, dashboard_url):
     assert page.locator("html").get_attribute("data-theme") == "dark"
     page.reload(wait_until="load")
     assert page.locator("html").get_attribute("data-theme") == "dark"
+    assert not errors, errors
+
+
+@pytest.mark.parametrize("width", [390, 1440])
+def test_settings_current_section_follows_scroll(page, dashboard_url, width):
+    errors = _open_settings(page, dashboard_url, width=width, theme="dark")
+    nav = page.locator('nav[aria-label="Settings sections"]')
+    current = nav.locator('[aria-current="location"]')
+    expect(current).to_have_attribute("href", "#settings-coders-section")
+    for section_id in ("settings-notifications-section", "settings-automation", "settings-appearance"):
+        # Scroll without clicking a navigation link; current must reflect the viewport.
+        page.locator(f"#{section_id}").evaluate(
+            "element => window.scrollTo(0, window.scrollY + element.getBoundingClientRect().top - 24)"
+        )
+        expect(current).to_have_count(1)
+        expect(current).to_have_attribute("href", f"#{section_id}")
+    page.evaluate("window.scrollTo(0, 0)")
+    expect(current).to_have_attribute("href", "#settings-coders-section")
     assert not errors, errors

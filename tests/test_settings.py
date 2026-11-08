@@ -1427,7 +1427,7 @@ def test_reasoning_effort_choices_render_from_selected_model_and_match_api(
     assert "CLI default (no application override)" in rendered.text
     assert "quick" in rendered.text
     assert "Short deliberation" in rendered.text
-    assert "Catalogue metadata advertises" in rendered.text
+    assert "Catalog metadata advertises" in rendered.text
     assert "does not confirm the effective CLI setting" in rendered.text
     assert "subsequent coder launches" in rendered.text
     codex_row = next(
