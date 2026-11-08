@@ -1,5 +1,8 @@
 """Repository cards and contained desktop tables on the real Settings page."""
 
+import re
+from urllib.parse import parse_qs, urlsplit
+
 import pytest
 from playwright.sync_api import expect
 from src.config import DaemonConfig, RepoConfig
@@ -20,7 +23,9 @@ def test_settings_repository_layout(page, dashboard_url, width, repo_count):
     page.wait_for_function("Boolean(window.htmx && window.settingsSaveFeedbackInstalled)")
     # Exercise the same fragment replacement used by repository edits, without
     # mutating the shared integration configuration or cloning fixture repos.
-    page.route("**/settings/repos?*", lambda route: route.fulfill(
+    # Repository query values retain URL slashes; Playwright glob `*` does
+    # not match those. Match the entire query so edits cannot reach the server.
+    page.route(re.compile(r"/settings/repos\?.*"), lambda route: route.fulfill(
         status=200, content_type="text/html", body=fragment,
     ))
     # Scope the fixture request to the list and await an explicit completion value.
@@ -55,9 +60,15 @@ def test_settings_repository_layout(page, dashboard_url, width, repo_count):
         remove.hover()
         assert remove.evaluate("el => getComputedStyle(el).backgroundColor") != "rgba(0, 0, 0, 0)"
     if repo_count:
-        with page.expect_response(lambda response: "/settings/repos?" in response.url):
+        with page.expect_response(lambda response: (
+            response.request.method == "PUT"
+            and parse_qs(urlsplit(response.url).query).get("url") == [repos[0].url]
+        )) as edit_response:
             listing.get_by_label("Branch", exact=True).first.fill("layout-check")
             listing.get_by_label("Branch", exact=True).first.blur()
+        assert parse_qs(edit_response.value.request.post_data)["branch"] == ["layout-check"]
+        # The fixture response resets the edited value, proving the swap completed.
+        expect(listing.get_by_label("Branch", exact=True).first).to_have_value(repos[0].branch)
         expect(listing.locator('select[name="coder"]')).to_have_count(repo_count)
         assert page.evaluate(
             "document.documentElement.scrollWidth <= document.documentElement.clientWidth"
