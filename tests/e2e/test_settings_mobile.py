@@ -23,9 +23,10 @@ def test_settings_repository_layout(page, dashboard_url, width, repo_count):
     page.route("**/settings/repos?*", lambda route: route.fulfill(
         status=200, content_type="text/html", body=fragment,
     ))
+    # Scope the fixture request to the list and await an explicit completion value.
     page.evaluate("""() => htmx.ajax('PUT', '/settings/repos?url=layout-fixture', {
-        target: '#settings-repo-list', swap: 'innerHTML'
-    })""")
+        source: '#settings-repo-list', target: '#settings-repo-list', swap: 'innerHTML'
+    }).then(() => true)""")
     listing = page.locator("#settings-repo-list")
     expect(listing.locator('select[name="coder"]')).to_have_count(repo_count)
     page.wait_for_function("""() => {

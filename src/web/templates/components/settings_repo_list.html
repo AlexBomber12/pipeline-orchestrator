@@ -4,7 +4,8 @@
     {%- if last.endswith('.git') -%}{{ last[:-4] }}{%- else -%}{{ last }}{%- endif -%}
 {%- endmacro %}
 
-<div class="max-w-full overflow-x-auto">
+{# Contain absolutely positioned sr-only labels within the table scroller. #}
+<div class="relative max-w-full overflow-x-auto">
 <table class="block w-full text-sm md:table md:min-w-[64rem]">
     <thead class="hidden md:table-header-group bg-surface-3 text-xs uppercase tracking-wide text-gray-500">
         <tr>
@@ -97,9 +98,10 @@
                 </label>
             </td>
             <td class="col-span-2 block min-w-0 px-2 py-2 md:table-cell md:px-4">
-                <label class="block min-w-0">
+                <label for="repo-coder-{{ loop.index }}" class="block min-w-0">
                     <span class="block mb-1 text-xs text-gray-500 md:sr-only">Coder</span>
-                <select name="coder"
+                </label>
+                <select id="repo-coder-{{ loop.index }}" name="coder"
                         class="primary-interactive w-full min-w-0 md:w-56 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 text-xs focus:border-accent focus:outline-none"
                         hx-put="{{ put_url }}"
                         hx-trigger="change"
@@ -113,7 +115,6 @@
                     <option value="{{ repo.coder }}" selected disabled>{{ repo.coder }} (unavailable)</option>
                     {% endif %}
                 </select>
-                </label>
             </td>
             <td class="block px-2 py-2 text-right md:table-cell md:px-4">
                 <button type="button"
