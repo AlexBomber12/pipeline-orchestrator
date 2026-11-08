@@ -98,6 +98,15 @@ def _restart():
     )
 
 
+def _restart_and_wait_for_idle(slug):
+    # A completed scan can be published while restart/resume is returning.
+    # Bind freshness to this restart, before either blocking operation.
+    restarted_after = datetime.now(timezone.utc)
+    _restart()
+    _resume_daemon(slug)
+    _wait_for_fresh_idle(slug, after=restarted_after)
+
+
 @pytest.mark.parametrize("dirty", [False, True], ids=["clean-merged", "dirty-held"])
 def test_failed_a_independent_b(
     dirty, dashboard_url, testbed_slug, get_state, upload_zip,
@@ -212,9 +221,7 @@ def test_failed_a_independent_b(
                 # No active process: the released A and completed B both passed
                 # production cleanup. Restart only this fixture-owned daemon.
                 _stop_daemon_and_wait_paused(testbed_slug)
-                _restart()
-                _resume_daemon(testbed_slug)
-                _wait_for_fresh_idle(testbed_slug, after=datetime.now(timezone.utc))
+                _restart_and_wait_for_idle(testbed_slug)
                 for _ in range(12):
                     assert _calls() == [expected_a, expected_b], _calls()
                     assert _queue(dashboard_url, testbed_slug)[b]["status"] == "DONE"

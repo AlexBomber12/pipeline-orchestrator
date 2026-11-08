@@ -36,7 +36,7 @@
         <dd class="min-w-0 break-all font-mono">{{ "yes" if diagnostic.retry_fingerprint_matches_current_spec else "no" }}</dd>
 
         <dt class="text-gray-400">Current run started</dt>
-        <dd class="min-w-0 break-all font-mono">{{ diagnostic.current_run_started_at or "-" }}</dd>
+        <dd class="min-w-0 break-all font-mono" data-ts="{{ diagnostic.current_run_started_at or '' }}">{{ diagnostic.current_run_started_at or "unavailable" }}</dd>
 
         <dt class="text-gray-400">Attempt count</dt>
         <dd class="min-w-0 break-all font-mono">{{ diagnostic.attempt_count or 0 }}</dd>
