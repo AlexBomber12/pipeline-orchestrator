@@ -4,19 +4,20 @@
     {%- if last.endswith('.git') -%}{{ last[:-4] }}{%- else -%}{{ last }}{%- endif -%}
 {%- endmacro %}
 
-<table class="w-full text-sm">
-    <thead class="bg-surface-3 text-xs uppercase tracking-wide text-gray-500">
+<div class="max-w-full overflow-x-auto">
+<table class="block w-full text-sm md:table md:min-w-[64rem]">
+    <thead class="hidden md:table-header-group bg-surface-3 text-xs uppercase tracking-wide text-gray-500">
         <tr>
             <th class="text-left px-4 py-2 font-medium">Repository</th>
             <th class="text-left px-4 py-2 font-medium">Branch</th>
             <th class="text-left px-4 py-2 font-medium">Auto merge</th>
             <th class="text-left px-4 py-2 font-medium">No CI merge</th>
-            <th class="text-left px-4 py-2 font-medium">Review timeout (min)</th>
+            <th class="text-left px-4 py-2 font-medium">Review reminder (min)</th>
             <th class="text-left px-4 py-2 font-medium">Coder</th>
             <th class="px-4 py-2"></th>
         </tr>
     </thead>
-    <tbody>
+    <tbody class="block md:table-row-group">
         {% if not repos %}
         <tr>
             <td colspan="7" class="px-4 py-6 text-center text-gray-500 italic">
@@ -28,14 +29,16 @@
         {% set name = repo_name(repo.url) %}
         {% set put_url = "/settings/repos?url=" ~ (repo.url | urlencode) %}
         {% set delete_url = "/settings/repos?url=" ~ (repo.url | urlencode) %}
-        <tr class="border-t border-white/5">
-            <td class="px-4 py-2">
-                <div class="font-mono text-gray-200">{{ name }}</div>
-                <div class="font-mono text-xs text-gray-500 truncate max-w-xs" title="{{ repo.url }}">
+        <tr class="grid grid-cols-2 border-t border-white/5 p-2 md:table-row md:p-0">
+            <td class="col-span-2 block min-w-0 px-2 py-2 md:table-cell md:px-4">
+                <div class="font-mono text-gray-200 break-all">{{ name }}</div>
+                <div class="font-mono text-xs text-gray-500 truncate max-w-full md:max-w-xs" title="{{ repo.url }}">
                     {{ repo.url }}
                 </div>
             </td>
-            <td class="px-4 py-2">
+            <td class="block min-w-0 px-2 py-2 md:table-cell md:px-4">
+                <label class="block min-w-0">
+                    <span class="block mb-1 text-xs text-gray-500 md:sr-only">Branch</span>
                 <input type="text"
                        name="branch"
                        value="{{ repo.branch }}"
@@ -44,8 +47,11 @@
                        hx-trigger="change"
                        hx-target="#settings-repo-list"
                        hx-swap="innerHTML">
+                </label>
             </td>
-            <td class="px-4 py-2">
+            <td class="block min-w-0 px-2 py-2 md:table-cell md:px-4">
+                <label class="block min-w-0">
+                    <span class="block mb-1 text-xs text-gray-500 md:sr-only">Auto merge</span>
                 <input type="checkbox"
                        name="auto_merge"
                        value="true"
@@ -56,8 +62,11 @@
                        hx-target="#settings-repo-list"
                        hx-swap="innerHTML"
                        hx-vals='{"auto_merge": "{{ "false" if repo.auto_merge else "true" }}"}'>
+                </label>
             </td>
-            <td class="px-4 py-2">
+            <td class="block min-w-0 px-2 py-2 md:table-cell md:px-4">
+                <label class="block min-w-0">
+                    <span class="block mb-1 text-xs text-gray-500 md:sr-only">No CI merge</span>
                 <input type="checkbox"
                        name="allow_merge_without_checks"
                        value="true"
@@ -69,8 +78,11 @@
                        hx-swap="innerHTML"
                        hx-vals='{"allow_merge_without_checks": "{{ "false" if repo.allow_merge_without_checks else "true" }}"}'
                        title="Only enable for repos intentionally running without CI. Default off.">
+                </label>
             </td>
-            <td class="px-4 py-2">
+            <td class="block min-w-0 px-2 py-2 md:table-cell md:px-4">
+                <label class="block min-w-0">
+                    <span class="block mb-1 text-xs text-gray-500 md:sr-only">Review reminder (min)</span>
                 <input type="number"
                        name="review_timeout_min"
                        value="{{ repo.review_timeout_min if repo.review_timeout_min is not none else '' }}"
@@ -82,10 +94,13 @@
                        hx-target="#settings-repo-list"
                        hx-swap="innerHTML"
                        title="Leave blank to inherit the daemon default ({{ daemon.review_timeout_min if daemon is defined else 10 }} min).">
+                </label>
             </td>
-            <td class="px-4 py-2">
+            <td class="col-span-2 block min-w-0 px-2 py-2 md:table-cell md:px-4">
+                <label class="block min-w-0">
+                    <span class="block mb-1 text-xs text-gray-500 md:sr-only">Coder</span>
                 <select name="coder"
-                        class="primary-interactive w-24 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 text-xs focus:border-accent focus:outline-none"
+                        class="primary-interactive w-full min-w-0 md:w-56 bg-surface-3 border border-white/10 rounded px-2 py-1 text-gray-200 text-xs focus:border-accent focus:outline-none"
                         hx-put="{{ put_url }}"
                         hx-trigger="change"
                         hx-target="#settings-repo-list"
@@ -98,10 +113,11 @@
                     <option value="{{ repo.coder }}" selected disabled>{{ repo.coder }} (unavailable)</option>
                     {% endif %}
                 </select>
+                </label>
             </td>
-            <td class="px-4 py-2 text-right">
+            <td class="block px-2 py-2 text-right md:table-cell md:px-4">
                 <button type="button"
-                        class="primary-interactive text-xs font-medium px-2 py-1 rounded border border-fail/30 text-fail"
+                        class="primary-interactive text-xs font-medium px-2 py-1 rounded border border-fail/30 text-fail hover:bg-fail/10 hover:border-fail"
                         hx-delete="{{ delete_url }}"
                         hx-target="#settings-repo-list"
                         hx-swap="innerHTML"
@@ -113,8 +129,10 @@
             </td>
         </tr>
         {% endfor %}
-        <tr class="border-t border-white/5 bg-surface-3/40">
-            <td colspan="7" class="px-4 py-3">
+    </tbody>
+</table>
+</div>
+<div class="border-t border-white/5 bg-surface-3/40 px-4 py-3">
                 <form class="flex flex-wrap items-center gap-2"
                       hx-post="/settings/repos"
                       hx-target="#settings-repo-list"
@@ -123,7 +141,7 @@
                            name="url"
                            required
                            placeholder="https://github.com/owner/repo"
-                           class="primary-interactive flex-1 min-w-[20rem] bg-surface-3 border border-white/10 rounded px-3 py-1.5 text-gray-200 focus:border-accent focus:outline-none">
+                           class="primary-interactive w-full min-w-0 md:flex-1 bg-surface-3 border border-white/10 rounded px-3 py-1.5 text-gray-200 focus:border-accent focus:outline-none">
                     <input type="text"
                            name="branch"
                            value="main"
@@ -133,7 +151,4 @@
                         Add Repository
                     </button>
                 </form>
-            </td>
-        </tr>
-    </tbody>
-</table>
+</div>
