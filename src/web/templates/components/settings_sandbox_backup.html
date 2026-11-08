@@ -1,5 +1,5 @@
 <section class="space-y-4" id="settings-sandbox-backup">
-    <h2 class="text-xl font-semibold tracking-tight mb-4">Sandbox and backup</h2>
+    <h2 class="text-xl font-semibold tracking-tight mb-4">Protection &amp; backups</h2>
     <div class="rounded-lg border border-white/5 bg-surface-2 p-5 space-y-4">
 
         <label class="flex items-center gap-2">
@@ -11,17 +11,17 @@
                    hx-target="#settings-sandbox-backup"
                    hx-swap="outerHTML"
                    value="true"
-                   class="w-4 h-4">
+                   class="w-4 h-4 accent-accent">
             <span class="text-sm">Coder filesystem isolation (bubblewrap)</span>
             {% if sandbox_actual_state == 'unavailable' %}
-            <span class="text-xs px-2 py-0.5 rounded bg-warn/10 text-warn">bwrap unavailable</span>
+            <span class="text-xs px-2 py-0.5 rounded bg-fail/10 text-fail">bwrap unavailable</span>
             {% elif sandbox_actual_state == 'active' %}
             <span class="text-xs px-2 py-0.5 rounded bg-ok/10 text-ok">active</span>
             {% endif %}
         </label>
         <p class="text-xs text-gray-400 ml-6">
             When enabled, coders run in a bubblewrap sandbox limiting host filesystem
-            access. Requires bwrap binary present.
+            access. Bubblewrap must be installed and pass its runtime check.
         </p>
 
         <label class="flex items-center gap-2">
@@ -33,16 +33,16 @@
                    hx-trigger="change"
                    hx-swap="none"
                    value="true"
-                   class="w-4 h-4">
+                   class="w-4 h-4 accent-accent">
             <span class="text-sm">Git bundle backups before merge</span>
             {% if not daemon.git_bundle_backup_dir %}
             <span class="text-xs px-2 py-0.5 rounded bg-warn/10 text-warn">backup directory required</span>
             {% endif %}
         </label>
         <p class="text-xs text-gray-400 ml-6">
-            Bundle written to the backup directory below before each merge_pr call.
-            Defensive against force-push mistakes. Both the directory and this toggle
-            must be set for bundles to be created.
+            Save a Git bundle in the backup directory before each merge so repository
+            history can be recovered after an accidental force push. Set the directory
+            and enable this option to create backups.
         </p>
 
         <label class="flex flex-col gap-1 text-sm">

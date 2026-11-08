@@ -7,14 +7,14 @@
     <nav aria-label="Settings sections"
          class="min-w-0 overflow-x-auto rounded-lg border border-white/10 bg-surface-2 p-2 lg:sticky lg:top-6 lg:self-start lg:overflow-visible">
         <div class="flex w-max gap-1 lg:w-auto lg:flex-col">
-            <a href="#settings-coders-section" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Coders</a>
-            <a href="#settings-github" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">GitHub</a>
-            <a href="#settings-repositories" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Repositories</a>
-            <a href="#settings-automation" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Automation</a>
-            <a href="#settings-usage" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Usage limits</a>
-            <a href="#settings-notifications-section" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Notifications</a>
-            <a href="#settings-protection-backups" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Protection &amp; backups</a>
-            <a href="#settings-appearance" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Appearance</a>
+            <a href="#settings-coders-section" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 aria-[current=location]:bg-accent/10 aria-[current=location]:text-accent hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Coders</a>
+            <a href="#settings-github" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 aria-[current=location]:bg-accent/10 aria-[current=location]:text-accent hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">GitHub</a>
+            <a href="#settings-repositories" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 aria-[current=location]:bg-accent/10 aria-[current=location]:text-accent hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Repositories</a>
+            <a href="#settings-automation" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 aria-[current=location]:bg-accent/10 aria-[current=location]:text-accent hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Automation</a>
+            <a href="#settings-usage" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 aria-[current=location]:bg-accent/10 aria-[current=location]:text-accent hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Usage limits</a>
+            <a href="#settings-notifications-section" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 aria-[current=location]:bg-accent/10 aria-[current=location]:text-accent hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Notifications</a>
+            <a href="#settings-protection-backups" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 aria-[current=location]:bg-accent/10 aria-[current=location]:text-accent hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Protection &amp; backups</a>
+            <a href="#settings-appearance" class="block whitespace-nowrap rounded px-3 py-2 text-sm text-gray-300 aria-[current=location]:bg-accent/10 aria-[current=location]:text-accent hover:bg-surface-3 hover:text-gray-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-accent">Appearance</a>
         </div>
     </nav>
 
@@ -26,7 +26,7 @@
 
     <section id="settings-github" aria-label="GitHub" class="scroll-mt-6">
         <h2 class="text-xl font-semibold tracking-tight mb-4">GitHub</h2>
-    <div class="mt-4 rounded-lg border border-white/10 bg-surface-3 p-4">
+    <div class="rounded-lg border border-white/5 bg-surface-2 p-5">
         {% set gh_ok = auth.gh.status == "ok" %}
         <div class="flex items-center gap-3 mb-2">
             <span class="w-2.5 h-2.5 rounded-full {% if gh_ok %}bg-ok{% else %}bg-fail{% endif %}"
@@ -40,8 +40,8 @@
         <p class="mt-3 text-xs text-gray-500">
             Infrastructure only. Run <span class="font-mono text-gray-400">docker compose run --rm daemon bash</span> to re-authenticate.
         </p>
-    </div>
         {% include "components/settings_github_usage.html" %}
+    </div>
     </section>
 
     <section id="settings-repositories" class="scroll-mt-6">
@@ -77,7 +77,7 @@
         {% include "components/settings_notifications.html" %}
     </section>
 
-    <section id="settings-protection-backups" aria-label="Protection and backups" class="scroll-mt-6">
+    <section id="settings-protection-backups" aria-label="Protection &amp; backups" class="scroll-mt-6">
         {% include "components/settings_sandbox_backup.html" %}
     </section>
 
@@ -102,6 +102,30 @@
 
 <script>{% include "components/settings_browser_login_controller.js" %}</script>
 <script>{% include "components/settings_save_feedback.js" %}</script>
+<script>
+    (function () {
+        const sectionLinks = [...document.querySelectorAll('nav[aria-label="Settings sections"] a')];
+        const sections = sectionLinks.map(link => document.querySelector(link.getAttribute('href')));
+        function updateCurrentSection() {
+            let current = 0;
+            sections.forEach((section, index) => {
+                if (section.getBoundingClientRect().top <= 25) current = index;
+            });
+            if (window.scrollY > 0 && window.scrollY + window.innerHeight >=
+                document.documentElement.scrollHeight - 1) current = sections.length - 1;
+            sectionLinks.forEach((link, index) => {
+                if (index === current) link.setAttribute('aria-current', 'location');
+                else link.removeAttribute('aria-current');
+            });
+        }
+        const sectionObserver = new IntersectionObserver(updateCurrentSection, {
+            rootMargin: '-24px 0px 0px 0px',
+        });
+        sections.forEach(section => sectionObserver.observe(section));
+        window.addEventListener('scroll', updateCurrentSection, {passive: true});
+        updateCurrentSection();
+    })();
+</script>
 <script>
     (function () {
         let leavingSettings = false;

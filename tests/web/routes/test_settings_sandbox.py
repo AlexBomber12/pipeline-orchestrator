@@ -122,7 +122,7 @@ def test_settings_renders_sandbox_section(base_config: Path) -> None:
     assert 'name="git_bundle_backup_dir"' in body
     assert 'name="git_bundle_backup_daily_retention"' in body
     assert 'name="main_commit_audit_interval_idle_cycles"' in body
-    assert "Sandbox and backup" in body
+    assert "Protection &amp; backups" in body
 
 
 def test_toggle_sandbox_off_persists(base_config: Path) -> None:
