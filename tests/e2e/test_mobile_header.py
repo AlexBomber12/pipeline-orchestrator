@@ -12,7 +12,9 @@ def test_mobile_header(page, dashboard_url, width, path):
     assert response.status == 200
     page.wait_for_function("getComputedStyle(document.querySelector('#header-menu summary')).width === '44px'")
     assert page.evaluate('document.documentElement.scrollWidth') == width
-    title = page.locator('h1').first.bounding_box()
+    # The shared brand is independent of each page's content heading.
+    navigation = page.get_by_role('navigation', name='Main navigation')
+    title = navigation.get_by_role('link', name='Pipeline Orchestrator').bounding_box()
     automation = page.locator('#automation-menu-toggle').bounding_box()
     menu = page.locator('#header-menu summary')
     box = menu.bounding_box()

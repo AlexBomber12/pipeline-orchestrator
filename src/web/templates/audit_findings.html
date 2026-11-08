@@ -1,9 +1,20 @@
 {% extends "base.html" %}
+{% block title %}Audit - {{ repo_name }} - Pipeline Orchestrator{% endblock %}
+
 {% block content %}
-<div class="mx-auto max-w-4xl p-6">
+<div class="mx-auto max-w-4xl">
+    <nav aria-label="Breadcrumb" class="mb-6 text-sm text-gray-400">
+        <ol class="flex flex-wrap items-center gap-2">
+            <li><a href="/" class="secondary-interactive text-accent">All repositories</a></li>
+            <li aria-hidden="true">/</li>
+            <li><a href="/repo/{{ repo_name }}" class="secondary-interactive text-accent">{{ repo_name }}</a></li>
+            <li aria-hidden="true">/</li>
+            <li aria-current="page">Audit</li>
+        </ol>
+    </nav>
     <h1 class="mb-4 text-2xl font-semibold">Direct-commit audit: {{ repo_name }} ({{ branch }})</h1>
     {% if last_audit_at %}
-    <p class="mb-4 text-xs text-gray-400">Last audit: {{ last_audit_at }}</p>
+    <p class="mb-4 text-xs text-gray-400">Last audit: <span data-ts="{{ last_audit_at }}" title="{{ last_audit_at }}">{{ last_audit_at }}</span></p>
     {% endif %}
 
     {% if findings %}
@@ -29,7 +40,12 @@
                 <td class="py-2 text-xs">{{ f.message_first_line }}</td>
                 <td class="py-2 text-xs">{{ f.violation_category }}</td>
                 <td class="py-2 text-xs">{{ f.parent_count }}</td>
-                <td class="py-2 text-xs">{{ f.pr_number or "" }}</td>
+                <td class="py-2 text-xs">
+                    {% if f.pr_number %}
+                    <a href="https://github.com/{{ github_owner_repo }}/pull/{{ f.pr_number }}"
+                       target="_blank" rel="noopener noreferrer" class="secondary-interactive text-accent">#{{ f.pr_number }}</a>
+                    {% endif %}
+                </td>
             </tr>
             {% endfor %}
         </tbody>

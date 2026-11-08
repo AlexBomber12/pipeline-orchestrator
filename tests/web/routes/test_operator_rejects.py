@@ -8,7 +8,6 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-
 from src.cancellation.storage import CancellationCause, cause_key, index_key
 from src.models import PipelineState, RepoState
 from src.web import app as web_app
@@ -155,6 +154,8 @@ def test_rejects_page_lists_operator_reject_records_only(
     assert response.text.count("data-operator-reject-row") == 1
     assert "PR-1" in response.text
     assert "operator excerpt" in response.text
+    assert 'data-ts="2026-05-19T12:00:00+00:00"' in response.text
+    assert 'title="2026-05-19T12:00:00+00:00"' in response.text
     assert "crash excerpt" not in response.text
 
 
@@ -237,6 +238,13 @@ def test_rejects_page_empty_state(
 
     assert response.status_code == 200
     assert "No operator rejects recorded for this repo." in response.text
+    assert f"<title>Rejects - {REPO_NAME} - Pipeline Orchestrator</title>" in response.text
+    assert response.text.count("<h1 ") == 1
+    assert 'aria-label="Breadcrumb"' in response.text
+    assert 'href="/" class="secondary-interactive text-accent">All repositories</a>' in response.text
+    assert f'href="/repo/{REPO_NAME}"' in response.text
+    assert 'aria-current="page">Rejects</li>' in response.text
+    assert 'class="max-w-4xl mx-auto"' in response.text
 
 
 def test_rejects_page_404_for_unknown_repo(

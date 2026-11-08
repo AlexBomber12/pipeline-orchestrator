@@ -112,6 +112,13 @@ def test_audit_page_renders_empty_state_when_no_findings(
 
     assert response.status_code == 200
     assert "No direct-to-main commits" in response.text
+    assert f"<title>Audit - {REPO_NAME} - Pipeline Orchestrator</title>" in response.text
+    assert response.text.count("<h1 ") == 1
+    assert 'aria-label="Breadcrumb"' in response.text
+    assert 'href="/" class="secondary-interactive text-accent">All repositories</a>' in response.text
+    assert f'href="/repo/{REPO_NAME}"' in response.text
+    assert 'aria-current="page">Audit</li>' in response.text
+    assert 'class="mx-auto max-w-4xl"' in response.text
 
 
 def test_audit_page_lists_findings(
@@ -153,7 +160,7 @@ def test_audit_page_links_to_github_commit(
     base_config: Path,
     redis_client: _AuditRedis,
 ) -> None:
-    finding = _finding(1)
+    finding = {**_finding(1), "pr_number": 42}
     redis_client.lists[_findings_key()] = [json.dumps(finding)]
 
     with TestClient(app) as client:
@@ -163,6 +170,8 @@ def test_audit_page_links_to_github_commit(
         f'href="https://github.com/AlexBomber12/pipeline-orchestrator/commit/{finding["sha"]}"'
         in response.text
     )
+    assert 'href="https://github.com/AlexBomber12/pipeline-orchestrator/pull/42"' in response.text
+    assert '>#42</a>' in response.text
 
 
 def test_audit_page_shows_last_audit_timestamp(
@@ -175,7 +184,8 @@ def test_audit_page_shows_last_audit_timestamp(
         response = client.get(f"/repo/{REPO_NAME}/audit")
 
     assert response.status_code == 200
-    assert "Last audit: 2026-05-19T12:00:00Z" in response.text
+    assert 'data-ts="2026-05-19T12:00:00Z"' in response.text
+    assert 'title="2026-05-19T12:00:00Z"' in response.text
 
 
 def test_audit_page_404_for_unknown_repo(
