@@ -918,17 +918,20 @@
                 if (diffMin < 1440) return Math.round(diffMin / 60) + 'h ago';
                 return dt.toLocaleDateString([], {month: 'short', day: 'numeric'});
             }
+            function formatTimestamp(el, dt) {
+                const text = relativeTime(dt);
+                el.textContent = text || 'unavailable';
+                if (text && !el.hasAttribute('title')) {
+                    el.title = dt.toLocaleString([], {timeZoneName: 'short'});
+                }
+            }
             document.querySelectorAll('[data-ts]').forEach(el => {
-                const ts = el.dataset.ts;
-                if (!ts) return;
-                const text = relativeTime(new Date(ts));
-                if (text) el.textContent = text;
+                formatTimestamp(el, new Date(el.dataset.ts || NaN));
             });
             document.querySelectorAll('[data-ts-unix]').forEach(el => {
-                const ts = parseInt(el.dataset.tsUnix, 10);
-                if (isNaN(ts)) return;
-                const text = relativeTime(new Date(ts * 1000));
-                if (text) el.textContent = text;
+                const raw = el.dataset.tsUnix.trim();
+                const ts = raw ? Number(raw) : NaN;
+                formatTimestamp(el, new Date(ts * 1000));
             });
         }
         document.addEventListener('DOMContentLoaded', formatTimestamps);

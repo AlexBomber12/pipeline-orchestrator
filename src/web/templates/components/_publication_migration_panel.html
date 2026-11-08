@@ -9,7 +9,7 @@
         <div>Head repository: {{ migration.head_repo or 'unavailable' }}</div>
         <div>Ref: {{ migration.ref }}</div>
         <div>HEAD: {{ migration.head_sha }}</div>
-        <div>Publication: {{ migration.published_at.isoformat() if migration.published_at else 'unavailable' }}</div>
+        <div>Publication: <span data-ts="{{ migration.published_at.isoformat() if migration.published_at else '' }}">{{ migration.published_at.isoformat() if migration.published_at else 'unavailable' }}</span></div>
         <div>Evidence: {{ migration.provenance or 'unavailable' }}</div>
     </dl>
     {% if publication_migration_command %}
@@ -30,4 +30,3 @@
     {% endif %}
 </section>
 {% endif %}
-
