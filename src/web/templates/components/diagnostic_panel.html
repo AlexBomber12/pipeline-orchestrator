@@ -7,7 +7,7 @@
    the destructive action lands in PR-334; until then the partial
    endpoint passes ``False`` and the button is hidden. #}
 {% macro diagnostic_panel(diagnostic, retry_cap, reset_button_enabled=False) %}
-<div class="diagnostic-panel rounded border border-white/5 bg-surface-3 p-4 mt-2"
+<div class="diagnostic-panel min-w-0 break-all rounded border border-white/5 bg-surface-3 p-4 mt-2"
      data-diagnostic-panel
      data-task-id="{{ diagnostic.task_id }}">
     <h4 class="text-sm font-medium mb-2">Diagnostic state for <span class="font-mono">{{ diagnostic.task_id }}</span></h4>
@@ -25,28 +25,28 @@
     </div>
     {% endif %}
 
-    <dl class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+    <dl class="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1 text-xs">
         <dt class="text-gray-400">Frontmatter status</dt>
-        <dd class="font-mono">{{ diagnostic.frontmatter_status or "-" }}</dd>
+        <dd class="min-w-0 break-all font-mono">{{ diagnostic.frontmatter_status or "-" }}</dd>
 
         <dt class="text-gray-400">Retry count</dt>
-        <dd class="font-mono">{{ diagnostic.retry_count }} / {{ retry_cap }}</dd>
+        <dd class="min-w-0 break-all font-mono">{{ diagnostic.retry_count }} / {{ retry_cap }}</dd>
 
         <dt class="text-gray-400">Fingerprint matches spec</dt>
-        <dd class="font-mono">{{ "yes" if diagnostic.retry_fingerprint_matches_current_spec else "no" }}</dd>
+        <dd class="min-w-0 break-all font-mono">{{ "yes" if diagnostic.retry_fingerprint_matches_current_spec else "no" }}</dd>
 
         <dt class="text-gray-400">Current run started</dt>
-        <dd class="font-mono">{{ diagnostic.current_run_started_at or "-" }}</dd>
+        <dd class="min-w-0 break-all font-mono">{{ diagnostic.current_run_started_at or "-" }}</dd>
 
         <dt class="text-gray-400">Attempt count</dt>
-        <dd class="font-mono">{{ diagnostic.attempt_count or 0 }}</dd>
+        <dd class="min-w-0 break-all font-mono">{{ diagnostic.attempt_count or 0 }}</dd>
 
         <dt class="text-gray-400">Skip AI diagnose</dt>
-        <dd class="font-mono">{{ "yes" if diagnostic.skip_ai_error_diagnose else "no" }}</dd>
+        <dd class="min-w-0 break-all font-mono">{{ "yes" if diagnostic.skip_ai_error_diagnose else "no" }}</dd>
 
         {% if diagnostic.current_pr %}
         <dt class="text-gray-400">Open PR</dt>
-        <dd class="font-mono">
+        <dd class="min-w-0 break-all font-mono">
             <a href="{{ diagnostic.current_pr.url }}"
                target="_blank"
                rel="noopener noreferrer"
