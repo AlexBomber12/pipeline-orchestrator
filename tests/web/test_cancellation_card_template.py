@@ -13,6 +13,7 @@ left intact.
 
 from __future__ import annotations
 
+import pytest
 from src.cancellation.storage import CancellationCause
 from src.web import app as web_app
 
@@ -244,3 +245,44 @@ def test_operator_recovery_record_keeps_category_class_without_subsource() -> No
     assert "category-operator_recovery" in rendered
     assert "subsource-unknown" in rendered
     assert "Manual recovery via dashboard" in rendered
+
+
+@pytest.mark.parametrize("payload", [
+    {"subsource": "crash"},
+    {"subsource": "review_timeout"},
+    {"subsource": "guardrail"},
+    {"subsource": "future_detector"},
+    {"legacy_category": "ESCALATE"},
+])
+def test_detailed_cause_has_one_label_and_terminal_failure_rail(payload: dict) -> None:
+    rendered = _render(_error_cause(payload))
+
+    assert rendered.count('class="cause-badge ') == 1
+    assert 'class="category-badge"' not in rendered
+    assert 'style="border-left-color: var(--fail)"' in rendered
+
+
+@pytest.mark.parametrize("count", [0, 1, 3])
+def test_history_places_dependents_inside_card_header(count: int) -> None:
+    cause = {**vars(_error_cause({"subsource": "crash"})), "dependents_count": count}
+    rendered = web_app.templates.env.get_template(
+        "components/cancellation_history.html"
+    ).render(causes=[cause])
+
+    if count:
+        chip = f'Blocks {count} task(s)'
+        assert rendered.count(chip) == 1
+        assert rendered.index("<article") < rendered.index("<header")
+        assert rendered.index("<header") < rendered.index(chip) < rendered.index("</header>")
+        assert rendered.index("</header>") < rendered.index("</article>")
+    else:
+        assert "dependents-badge" not in rendered
+
+
+def test_guardrail_accept_once_uses_shared_confirmation_dialog() -> None:
+    rendered = _render(_error_cause({"subsource": "guardrail"}))
+
+    assert 'data-confirm-title="Accept once"' in rendered
+    assert 'data-confirm="Accept this guardrail finding once for PR-999?"' in rendered
+    assert 'hx-confirm=' not in rendered
+    assert 'hx-post="/repos/example__alpha/tasks/PR-999/guardrail/accept-once"' in rendered

@@ -7,8 +7,8 @@
 
    PR-257: causes carry an injected ``dependents_count`` attribute and
    are sorted descending by it so canceled roots blocking the most
-   downstream work surface first; a "Blocks N task(s)" badge follows
-   each card with a positive count. The default of zero applies when
+   downstream work surface first; a "Blocks N task(s)" badge appears
+   inside each card header with a positive count. The default of zero applies when
    the canceled task has no dependents (or when QUEUE.md was unreadable
    and the closure could not be computed).
 
@@ -39,12 +39,7 @@
     </form>
     {% if causes %}
     {% for cause in causes | sort(attribute='dependents_count', reverse=True) %}
-        {{ cancellation_card(cause) }}
-        {% if cause.dependents_count and cause.dependents_count > 0 %}
-        <div class="dependents-badge mt-1 text-xs text-warn">
-            Blocks {{ cause.dependents_count }} task(s)
-        </div>
-        {% endif %}
+        {{ cancellation_card(cause, dependents_count=cause.dependents_count | default(0)) }}
     {% endfor %}
     {% else %}
     <p class="text-sm text-gray-500 italic">No cancellations recorded in the last 7 days.</p>
