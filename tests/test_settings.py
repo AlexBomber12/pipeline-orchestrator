@@ -5614,8 +5614,11 @@ def test_explains_proactive_vs_reactive(
 
     assert response.status_code == 200
     body = response.text
-    assert "proactively before the provider returns a limit response" in body
-    assert "Reactive provider-limit detection is always on" in body
+    assert "Pause thresholds stop new tasks from starting" in body
+    assert "Provider limit responses also pause new tasks automatically." in body
+    assert "Leave a ceiling blank to disable it" in body
+    assert "legacy rate-limit fields" not in body
+    assert "legacy spend-ceiling fields" not in body
 
 
 def test_persists_to_same_fields(
