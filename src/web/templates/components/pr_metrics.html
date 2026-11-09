@@ -14,12 +14,18 @@
 
     {% if metrics_records %}
     <div class="overflow-x-auto">
-        <table class="min-w-full text-left text-sm">
+        <table class="w-full min-w-[48rem] table-fixed break-words text-left text-sm">
+            <colgroup>
+                <col class="w-1/5">
+                <col class="w-2/5">
+                <col class="w-[15%]">
+                <col class="w-[10%]">
+                <col class="w-[15%]">
+            </colgroup>
             <thead class="border-b border-white/5 text-xs uppercase tracking-[0.16em] text-gray-500">
                 <tr>
                     <th class="pb-3 pr-4 font-medium">Task</th>
-                    <th class="pb-3 pr-4 font-medium">Coder</th>
-                    <th class="pb-3 pr-4 font-medium">Model</th>
+                    <th class="pb-3 pr-4 font-medium">Coder / invocation settings</th>
                     <th class="pb-3 pr-4 font-medium">Duration</th>
                     <th class="pb-3 pr-4 font-medium">FIX Iterations</th>
                     <th class="pb-3 font-medium">Exit Reason</th>
@@ -31,6 +37,8 @@
                     <td class="py-3 pr-4 font-mono text-gray-200">{{ record.task_id }}</td>
                     <td class="py-3 pr-4 text-gray-300">
                         {% if record.invocations %}
+                            <details data-run-invocations>
+                                <summary class="secondary-interactive cursor-pointer">{{ record.invocations|length }} invocations</summary>
                             {% for invocation in record.invocations %}
                             <div class="{% if not loop.first %}mt-2 border-t border-white/5 pt-2{% endif %}" data-run-invocation-settings>
                                 <div class="text-[11px] uppercase tracking-wide text-gray-500">
@@ -39,23 +47,15 @@
                                 <div>Plugin ID: <span class="font-mono">{{ invocation.plugin_id }}</span></div>
                                 {% if invocation.attempt_index %}<div class="font-mono text-[11px] text-gray-500">Attempt {{ invocation.attempt_index }}</div>{% endif %}
                                 {% if invocation.run_id %}<div class="font-mono text-[11px] text-gray-500 break-all">Run {{ invocation.run_id }}</div>{% endif %}
+                                <div>Model override: {{ invocation.model_override_label }}</div>
+                                <div>Reasoning effort override: {{ invocation.reasoning_effort_override_label }}</div>
+                                <div class="mt-1 text-[11px] text-gray-500">Provider execution values unconfirmed</div>
                             </div>
                             {% endfor %}
+                            </details>
                         {% else %}
                             <div>{{ record.coder }}</div>
                             <div class="text-[11px] text-gray-500">Legacy profile; invocation settings unavailable</div>
-                        {% endif %}
-                    </td>
-                    <td class="py-3 pr-4 font-mono text-xs text-gray-400">
-                        {% if record.invocations %}
-                            {% for invocation in record.invocations %}
-                            <div class="{% if not loop.first %}mt-2 border-t border-white/5 pt-2{% endif %}">
-                                <div>Model override: {{ invocation.model_override_label }}</div>
-                                <div>Reasoning effort override: {{ invocation.reasoning_effort_override_label }}</div>
-                                <div class="mt-1 font-sans text-[11px] text-gray-500">Provider execution values unconfirmed</div>
-                            </div>
-                            {% endfor %}
-                        {% else %}
                             <div>Legacy model: {{ record.model }}</div>
                             <div>Reasoning effort override: Unknown</div>
                         {% endif %}

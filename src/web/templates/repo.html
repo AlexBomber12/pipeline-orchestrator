@@ -14,7 +14,7 @@
     [data-repo-tab][aria-selected="true"] { border-color: currentColor; color: #e5e7eb; }
 </style>
 <div role="tablist" aria-label="Repository views" class="flex gap-2 overflow-x-auto mb-4">
-    {% for key, label in [('overview', 'Overview'), ('events', 'Events'), ('tasks', 'Tasks'), ('cancellations', 'Cancellations'), ('coder-log', 'Coder log')] %}
+    {% for key, label in [('overview', 'Overview'), ('events', 'Events'), ('tasks', 'Tasks'), ('runs', 'Runs'), ('cancellations', 'Cancellations'), ('coder-log', 'Coder log')] %}
     <button type="button" role="tab" id="repo-tab-{{ key }}" data-repo-tab="{{ key }}"
             aria-controls="repo-panel-{{ key }}" aria-selected="{{ 'true' if loop.first else 'false' }}"
             tabindex="{{ 0 if loop.first else -1 }}"
@@ -48,7 +48,7 @@
 </div>
 {# Reset must survive panel and summary refreshes. #}
 <div id="repo-reset-dialog"></div>
-{% for key in ['events', 'tasks', 'cancellations', 'coder-log'] %}
+{% for key in ['events', 'tasks', 'runs', 'cancellations', 'coder-log'] %}
 <div id="repo-panel-{{ key }}" role="tabpanel" aria-labelledby="repo-tab-{{ key }}" tabindex="0" hidden>
     <template data-panel-content>
         {% if key == 'events' %}
@@ -57,6 +57,9 @@
         <div hx-get="/repos/{{ repo.name }}/tasks"
              hx-trigger="load, repo:history_updated from:body, repo:state_change from:body"
              hx-swap="innerHTML"></div>
+        {% elif key == 'runs' %}
+        <div hx-get="/partials/repo/{{ repo.name }}/metrics"
+             hx-trigger="load" hx-swap="innerHTML"></div>
         {% elif key == 'cancellations' %}
         <div hx-get="/partials/repo/{{ repo.name }}/cancellations"
              hx-trigger="panel:activate" hx-swap="innerHTML"></div>

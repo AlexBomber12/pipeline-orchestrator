@@ -40,6 +40,18 @@ def repo_tabs(page, dashboard_url):
             body = web_app.templates.get_template('components/event_list.html').render(
                 repo=repo, events=events, oob=True,
             )
+        elif key == 'metrics':
+            body = web_app.templates.get_template('components/pr_metrics.html').render(
+                repo=repo, metrics_records=[{
+                    'task_id': 'PR-505', 'duration_text': '1m', 'fix_iterations': 1,
+                    'exit_reason_label': 'merged', 'exit_reason_classes': '',
+                    'invocations': [{
+                        'plugin_id': 'codex', 'phase_label': 'FIX', 'fix_iteration': 1,
+                        'model_override_label': 'fixture-model',
+                        'reasoning_effort_override_label': 'high',
+                    }],
+                }],
+            )
         else:
             body = f'<p>{key} read {reads[key]}</p>'
         route.fulfill(body=body, content_type='text/html')
@@ -145,3 +157,27 @@ def test_hidden_panels_keep_subscriptions_and_event_scroll(page, repo_tabs):
     with page.expect_response('**/partials/repo/example__tabs/events'):
         page.evaluate("htmx.trigger(document.body, 'repo:event_log_append')")
     assert wrapper.evaluate('node => node.scrollTop') == 120
+
+
+def test_runs_lazy_load_disclosure_and_live_refresh(page, repo_tabs):
+    url, reads = repo_tabs
+    page.goto(url, wait_until='load')
+    assert reads['metrics'] == 0
+    runs = page.get_by_role('tab', name='Runs')
+    with page.expect_response('**/partials/repo/example__tabs/metrics'):
+        runs.click()
+    panel = page.locator('#repo-panel-runs')
+    expect(panel).to_contain_text('PR-505')
+    details = panel.locator('details')
+    expect(details).not_to_have_attribute('open', '')
+    expect(panel.get_by_text('Model override: fixture-model')).not_to_be_visible()
+    details.locator('summary').click()
+    expect(panel.get_by_text('Model override: fixture-model')).to_be_visible()
+    page.get_by_role('tab', name='Overview').click()
+    runs.click()
+    assert reads['metrics'] == 1
+    expect(details).to_have_attribute('open', '')
+    with page.expect_response('**/partials/repo/example__tabs/metrics'):
+        page.evaluate("htmx.trigger(document.body, 'repo:pr_metrics_update')")
+    expect(panel).to_contain_text('PR-505')
+    assert reads['metrics'] == 2
