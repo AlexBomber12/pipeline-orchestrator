@@ -9,7 +9,8 @@ from src.web.app import templates
 
 COMPONENT_DIR = Path("src/web/templates/components")
 CHANGED_COMPONENTS = (
-    COMPONENT_DIR / "repo_list.html",
+    COMPONENT_DIR / "repo_cards.html",
+    COMPONENT_DIR / "repo_summary.html",
     COMPONENT_DIR / "activity_feed.html",
 )
 PAUSED_BADGE = "bg-transparent text-muted border-muted"
@@ -40,10 +41,6 @@ def _render_repo_cards(repo: RepoState) -> str:
         upload_feedback_target=lambda _name: "",
         utcnow=lambda: datetime.now(timezone.utc),
     )
-
-
-def _render_repo_list(repo: RepoState) -> str:
-    return templates.get_template("components/repo_list.html").render(repos=[repo])
 
 
 def _render_repo_summary(repo: RepoState) -> str:
@@ -79,8 +76,9 @@ def _render_activity_feed(state: PipelineState) -> str:
     )
 
 
-def test_no_local_state_styles_in_repo_list() -> None:
-    assert "set state_styles =" not in _source(COMPONENT_DIR / "repo_list.html")
+def test_no_local_state_styles_in_live_repo_components() -> None:
+    for name in ("repo_cards.html", "repo_summary.html"):
+        assert "set state_styles =" not in _source(COMPONENT_DIR / name)
 
 
 def test_no_local_state_styles_in_activity_feed() -> None:
@@ -96,7 +94,6 @@ def test_paused_badge_consistent_across_components() -> None:
 
     for html in (
         _render_repo_cards(repo),
-        _render_repo_list(repo),
         _render_repo_summary(repo),
     ):
         assert PAUSED_BADGE in html
@@ -122,7 +119,8 @@ def test_all_pipeline_states_render_in_each_component() -> None:
     for state in PipelineState:
         repo = _repo(state)
         rendered = (
-            _render_repo_list(repo),
+            _render_repo_cards(repo),
+            _render_repo_summary(repo),
             _render_activity_feed(state),
         )
 

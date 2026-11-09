@@ -5,6 +5,11 @@ from playwright.sync_api import expect
 
 
 def test_activity_feed(page, dashboard_url):
+    # Layout needs Tailwind on the first page load, even if its CDN is unavailable.
+    # Use the actual CDN runtime so responsive utilities are still exercised.
+    page.route('https://cdn.tailwindcss.com/**', lambda route: route.fulfill(
+        path=Path(__file__).parent / 'assets/tailwind-3.4.17.js',
+        content_type='application/javascript'))
     page.route('https://unpkg.com/htmx.org@2.0.4', lambda route: route.fulfill(
         path=Path(__file__).parent / 'assets/htmx-2.0.4.min.js',
         content_type='application/javascript'))
