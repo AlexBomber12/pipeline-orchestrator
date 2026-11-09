@@ -693,17 +693,29 @@ run_fix_existing_pr PR-42 pr-42-fix true
     ('fatal error in commit_refs_rules', 3, 3, 7),
     ('GH013: Repository rule violations found', 1, 1, 7),
     ('non-fast-forward', 1, 1, 7),
+    ('stale info', 1, 1, 7),
+    ('Authentication failed', 1, 1, 7),
     ('', 0, 1, 0),
 ])
-def test_capacity_push_retries_only_bounded_ref_rules_service_failures(
-    tmp_path, failure, failures, expected_calls, expected_status,
+@pytest.mark.parametrize('mode', ['capacity', 'existing', 'new'])
+def test_shim_push_retries_only_bounded_ref_rules_service_failures(
+    tmp_path, failure, failures, expected_calls, expected_status, mode,
 ):
     result = subprocess.run(
         ['bash', '-c', '''
 source "$1"
 fixture_failure="$2"
 fixture_failures="$3"
+fixture_mode="$4"
 git() {
+    if [[ "$1" == rev-parse ]]; then
+        if [[ "$fixture_mode" == existing ]]; then
+            printf '%040d\\n' 1
+            return 0
+        fi
+        return 1
+    fi
+    [[ "$1" == push ]] || return 0
     printf '%s\\n' "$*" >> push-calls
     if [[ "$(wc -l < push-calls)" -le "$fixture_failures" ]]; then
         printf '%s\\n' "$fixture_failure" >&2
@@ -712,15 +724,22 @@ git() {
     printf 'published\\n'
 }
 sleep() { printf '%s\\n' "$*" >> sleeps; }
-push_capacity_branch pr-42-capacity
+if [[ "$fixture_mode" == capacity ]]; then
+    push_capacity_branch pr-42-capacity
+else
+    safe_push_branch pr-42-capacity
+fi
 printf 'continued\\n'
-''', 'bash', str(SHIM.resolve()), failure, str(failures)],
+''', 'bash', str(SHIM.resolve()), failure, str(failures), mode],
         cwd=tmp_path, capture_output=True, text=True, timeout=5,
     )
     assert result.returncode == expected_status, result.stderr
-    assert (tmp_path / 'push-calls').read_text().splitlines() == [
-        'push -u origin pr-42-capacity',
-    ] * expected_calls
+    command = 'push -u origin pr-42-capacity'
+    if mode == 'existing':
+        command += f' --force-with-lease=pr-42-capacity:{1:040d}'
+    elif mode == 'new':
+        command += ' --force-with-lease'
+    assert (tmp_path / 'push-calls').read_text().splitlines() == [command] * expected_calls
     sleeps = tmp_path / 'sleeps'
     assert (sleeps.read_text().splitlines() if sleeps.exists() else []) == ['2'] * (expected_calls - 1)
     assert ('continued' in result.stdout) is (expected_status == 0)

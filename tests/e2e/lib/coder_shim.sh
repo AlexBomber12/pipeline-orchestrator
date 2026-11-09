@@ -159,19 +159,22 @@ safe_push_branch() {
     local expected
     expected="$(git rev-parse --verify "refs/remotes/origin/${branch}" 2>/dev/null || true)"
     if [ -n "${expected}" ]; then
-        git push -u origin "${branch}" --force-with-lease="${branch}:${expected}"
+        push_with_ref_rules_retry -u origin "${branch}" --force-with-lease="${branch}:${expected}"
     else
-        git push -u origin "${branch}" --force-with-lease
+        push_with_ref_rules_retry -u origin "${branch}" --force-with-lease
     fi
 }
 
 push_capacity_branch() {
-    # GitHub can transiently fail its ref-rules service before this scenario
-    # reaches the intended provider failure. Retry the same ordinary push only;
-    # policy rejections and other git errors must still fail the fixture.
-    local branch="$1" attempt output status
+    push_with_ref_rules_retry -u origin "$1"
+}
+
+push_with_ref_rules_retry() {
+    # Retry identical arguments so lease expectations stay fixed. GitHub's
+    # transient ref-rules service failure must not hide policy or auth errors.
+    local attempt output status
     for attempt in 1 2 3; do
-        if output="$(git push -u origin "${branch}" 2>&1)"; then
+        if output="$(git push "$@" 2>&1)"; then
             printf '%s\n' "${output}" >&2
             return 0
         else
@@ -181,7 +184,7 @@ push_capacity_branch() {
         if [[ "${output}" != *"fatal error in commit_refs_rules"* || "${attempt}" -eq 3 ]]; then
             return "${status}"
         fi
-        printf 'shim: retrying capacity branch push after GitHub ref-rules service failure (%s/3)\n' "${attempt}" >&2
+        printf 'shim: retrying branch push after GitHub ref-rules service failure (%s/3)\n' "${attempt}" >&2
         sleep 2
     done
 }
