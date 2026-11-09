@@ -9,7 +9,9 @@
 {% endif %}
 {% from 'components/_event_style.html' import category_style, severity_styles %}
 {% if events %}
+{% if show_help | default(True) %}
 <p class="mb-2 text-xs text-gray-500">Unknown: Severity not recorded. Error (derived from transition): historical transition into ERROR.</p>
+{% endif %}
 <ul class="divide-y divide-white/5 font-mono text-xs">
     {% for entry in events|reverse %}
     {% set entry_count = entry.get('count', 1) %}

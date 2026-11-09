@@ -31,6 +31,8 @@
    fallback covers repos beyond MAX_STREAMS (the SSE manager below only
    subscribes to the first slice), and also catches the case where SSE
    itself is unreachable. #}
+<div class="grid grid-cols-1 xl:grid-cols-[minmax(0,2fr)_minmax(0,1fr)] gap-6 items-start" data-dashboard-layout>
+<div class="min-w-0">
 <div id="grid-refresh-warning" role="status" class="mb-3 text-sm text-warn"
      {% if observation_available %}hidden{% endif %}>Report unavailable; retrying.</div>
 <div data-observed-at="{{ observation_now.isoformat() if observation_available else '' }}"
@@ -39,6 +41,15 @@
      hx-swap="innerHTML"
      id="repo-grid">
     {% include "components/repo_cards.html" %}
+</div>
+</div>
+<aside id="activity-feed" class="min-w-0"
+       aria-label="Cross-repository activity"
+       hx-get="/partials/activity-feed"
+       hx-trigger="repo:event_log_append from:body, every 30s"
+       hx-swap="innerHTML">
+    {% include "components/activity_feed.html" %}
+</aside>
 </div>
 <script>
     (function () {

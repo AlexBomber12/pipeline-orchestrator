@@ -73,7 +73,7 @@ def _render_activity_feed(state: PipelineState) -> str:
                 "repo_style": "bg-gray-500/10 text-gray-300 border-gray-500/30",
                 "repo_abbrev": "repo",
                 "state": state.value,
-                "event": "state update",
+                "details": {"tier": state.value, "event": "state update"},
             }
         ]
     )
@@ -114,7 +114,8 @@ def test_repo_card_uses_registered_coder_id_for_active_custom_plugin() -> None:
 
 def test_each_component_imports_canonical() -> None:
     for path in CHANGED_COMPONENTS:
-        assert 'import "components/_repo_state_styles.html"' in _source(path)
+        canonical = "_event_style.html" if path.name == "activity_feed.html" else "_repo_state_styles.html"
+        assert canonical in _source(path)
 
 
 def test_all_pipeline_states_render_in_each_component() -> None:

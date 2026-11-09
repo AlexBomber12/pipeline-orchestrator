@@ -945,6 +945,7 @@ def _activity_feed_entry(
         "time": _format_history_time(time_str),
         "state": entry.get("state", PipelineState.IDLE.value),
         "event": entry.get("event", ""),
+        "details": entry,
     }
 
 
@@ -1648,6 +1649,7 @@ async def index(request: Request) -> HTMLResponse:
             "title": "Dashboard",
             **_observation_context(redis_client, redis_warning),
             "repos": states,
+            "feed": _build_activity_feed(states),
             "stats": stats,
             "latest_alert": latest_alert,
             "alerts": alerts,
