@@ -11,7 +11,7 @@ The north-star metric is cost per merged PR, summed across every stage that cont
 - Marginal cost: the incremental cost of choosing an agent for the next run. Within a subscription quota this is effectively zero, so routing decisions should treat in-quota work differently from metered work.
 - Amortized cost: monthly subscription price divided by merged PRs in the same month. This is the reporting view because it answers whether the system is actually becoming cheaper or more expensive as usage scales.
 
-Routing should optimize marginal cost subject to success and latency constraints. Reporting should show both marginal and amortized cost so operators can distinguish "free inside the current quota" from "cheap in the aggregate." Pricing details belong in `docs/CODER_PRICING.md`, which does not exist yet.
+Routing should optimize marginal cost subject to success and latency constraints. Reporting should show both marginal and amortized cost so operators can distinguish "free inside the current quota" from "cheap in the aggregate." Pricing details belong in `docs/CODER_PRICING.md` (planned).
 
 ## 3. Pipeline vision
 
@@ -223,8 +223,8 @@ When Planner or Reviewer becomes an in-process role, the common pieces shared wi
 ## 16. Links to supporting docs
 
 - [`docs/CODER_PRIORS.md`](docs/CODER_PRIORS.md): current per-coder priority priors and benchmark basis.
-- `docs/CODER_PRICING.md`: planned future pricing table and amortization notes. Not present yet.
-- `docs/MODEL_PROFILING.md`: optional future profiling notes. Not present yet.
+- `docs/CODER_PRICING.md` (planned): future pricing table and amortization notes.
+- `docs/MODEL_PROFILING.md` (planned): optional future profiling notes.
 - `ARCHITECTURE_HYPOTHESES.md`: optional external critique document if the repo adopts one later. Not present today.
 
 `DESIGN.md` is the canonical current-state architecture and decision document. Supporting docs should provide inputs, measurements, or challenge material, not replace this file.
