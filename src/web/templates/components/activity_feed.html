@@ -1,24 +1,22 @@
-{% import "components/_repo_state_styles.html" as repo_state %}
+{% from "components/_event_style.html" import neutral_category %}
 <section class="rounded-lg border border-white/5 bg-surface-2 p-5">
     <div class="flex items-baseline justify-between mb-3">
         <h3 class="text-sm font-semibold text-gray-300">Activity</h3>
         <span class="font-mono text-xs text-gray-500">{{ feed|length }} events</span>
     </div>
     {% if feed %}
-    <ul class="max-h-96 overflow-y-auto divide-y divide-white/5 font-mono text-xs">
+    <p class="mb-2 text-xs text-gray-500">Unknown: Severity not recorded. Error (derived from transition): historical transition into ERROR.</p>
+    <ul class="max-h-[32rem] overflow-y-auto divide-y divide-white/5">
         {% for entry in feed %}
-        {% set entry_style = repo_state.state_styles.get(entry.state, repo_state.state_styles['IDLE']) %}
-        <li class="flex items-center gap-2 py-2">
-            <span class="text-gray-500 shrink-0">{{ entry.time }}</span>
+        <li class="min-w-0 py-2">
             <a href="/repo/{{ entry.repo_name }}"
                title="{{ entry.repo_name }}"
-               class="text-[10px] font-semibold px-1.5 py-0.5 rounded border {{ entry.repo_style }} shrink-0 hover:opacity-80">
+               class="inline-flex text-[10px] font-semibold px-1.5 py-0.5 rounded border {{ neutral_category }} hover:opacity-80">
                 {{ entry.repo_abbrev }}
             </a>
-            <span class="min-w-[4.5rem] text-center text-[10px] font-medium px-1.5 py-0.5 rounded border {{ entry_style.badge }} shrink-0">
-                {{ entry.state }}
-            </span>
-            <span class="text-gray-300 truncate">{{ entry.event }}</span>
+            {% with events=[entry.details], show_help=False, oob=False %}
+                {% include "components/event_list.html" %}
+            {% endwith %}
         </li>
         {% endfor %}
     </ul>
