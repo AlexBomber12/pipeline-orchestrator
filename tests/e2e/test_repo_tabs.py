@@ -181,3 +181,48 @@ def test_runs_lazy_load_disclosure_and_live_refresh(page, repo_tabs):
         page.evaluate("htmx.trigger(document.body, 'repo:pr_metrics_update')")
     expect(panel).to_contain_text('PR-505')
     assert reads['metrics'] == 2
+
+
+@pytest.mark.parametrize('status, template, message, dismiss', [
+    (200, 'upload_success.html', 'Tasks uploaded', 'Dismiss upload feedback'),
+    (422, 'upload_error.html', 'Invalid task header', 'Dismiss upload error'),
+])
+def test_repo_page_upload_feedback(page, repo_tabs, status, template, message, dismiss):
+    url, _ = repo_tabs
+    feedback = web_app.templates.get_template('components/' + template).render(
+        message_lines=[message], uploaded_files=['PR-507.md'] if status == 200 else [],
+        validation_errors=[],
+    )
+    requests = []
+
+    def upload(route):
+        requests.append(route.request)
+        route.fulfill(status=status, body=feedback, content_type='text/html', headers={
+            'HX-Retarget': '#upload-feedback-example__tabs', 'HX-Reswap': 'innerHTML',
+        })
+
+    page.route('**/repos/example__tabs/upload-tasks', upload)
+    page.goto(url + '#tasks', wait_until='load')
+    panel = page.locator('#repo-panel-tasks')
+    expect(panel.locator('label')).to_have_text('Upload tasks')
+    with page.expect_file_chooser() as chooser:
+        panel.locator('label').click()
+    with page.expect_response('**/repos/example__tabs/upload-tasks'):
+        chooser.value.set_files({
+            'name': 'PR-507.md', 'mimeType': 'text/markdown', 'buffer': b'fixture task',
+        })
+    card = panel.locator('[data-upload-feedback-card]')
+    expect(card).to_contain_text(message)
+    expect(panel.locator('input[type=file]')).to_be_enabled()
+    assert len(requests) == 1 and requests[0].method == 'POST'
+    assert 'multipart/form-data' in requests[0].headers['content-type']
+    assert b'PR-507.md' in requests[0].post_data_buffer
+    assert b'fixture task' in requests[0].post_data_buffer
+    page.get_by_role('tab', name='Overview').click()
+    page.get_by_role('tab', name='Tasks').click()
+    expect(card).to_contain_text(message)
+    with page.expect_response('**/repos/example__tabs/tasks'):
+        page.evaluate("htmx.trigger(document.body, 'repo:history_updated')")
+    expect(card).to_contain_text(message)
+    card.get_by_role('button', name=dismiss).click()
+    expect(card).to_have_count(0)
