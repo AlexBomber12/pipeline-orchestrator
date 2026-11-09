@@ -3,6 +3,7 @@
 {% block title %}{{ repo.name }} - Pipeline Orchestrator{% endblock %}
 
 {% block content %}
+{% from "components/_upload_form.html" import upload_form with context %}
 <div class="mb-6">
     <a href="/" class="secondary-interactive inline-flex items-center gap-2 text-sm text-accent">
         <span aria-hidden="true">&larr;</span>
@@ -54,6 +55,11 @@
         {% if key == 'events' %}
         {% include "components/event_log.html" %}
         {% elif key == 'tasks' %}
+        <div class="mb-4">
+            {{ upload_form(repo, labelled=true) }}
+            <span id="upload-indicator-{{ repo.name }}" class="htmx-indicator text-xs text-gray-400">Uploading...</span>
+            <div id="upload-feedback-{{ repo.name }}"></div>
+        </div>
         <div hx-get="/repos/{{ repo.name }}/tasks"
              hx-trigger="load, repo:history_updated from:body, repo:state_change from:body"
              hx-swap="innerHTML"></div>

@@ -1781,6 +1781,12 @@ def test_repo_detail_route_renders_full_page(
     assert "alpha" in body
     assert "All repositories" in body
     assert 'hx-get="/partials/repo/example__alpha"' in body
+    assert 'hx-post="/repos/example__alpha/upload-tasks"' in body
+    assert '<span>Upload tasks</span>' in body
+    assert 'hx-target="#upload-feedback-example__alpha"' in body
+    assert 'hx-disabled-elt="#upload-example__alpha"' in body
+    assert 'id="upload-feedback-example__alpha"' in body
+    assert 'id="upload-indicator-example__alpha"' in body
     # Pause/resume/stop publish history_updated; the summary fragment
     # owns the play/pause/stop controls (their visibility depends on
     # repo.user_paused), so it must refresh on history_updated too —
