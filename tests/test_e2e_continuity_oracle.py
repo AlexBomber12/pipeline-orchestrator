@@ -11,7 +11,7 @@ from tests.e2e import test_failure_continuity as scenario
 from tests.e2e.lib.ci_outcome import LifecycleTimeout
 
 
-@pytest.mark.parametrize("scan_phase", ["before_restart", "restart", "resume"])
+@pytest.mark.parametrize("scan_phase", ["before_restart", "restart", "resume", "after_recovery"])
 def test_restart_readiness_uses_restart_boundary(monkeypatch, scan_phase):
     boundary = datetime(2026, 11, 8, tzinfo=timezone.utc)
     elapsed = 0
@@ -37,6 +37,11 @@ def test_restart_readiness_uses_restart_boundary(monkeypatch, scan_phase):
     monkeypatch.setattr(scenario, "_resume_daemon", lambda slug: operation("resume"))
 
     def snapshot(*args, **kwargs):
+        nonlocal published
+        # Replay the retained-queue restart: recovery takes 134s, then
+        # selection completes at 195s, beyond the empty-queue 180s bound.
+        if scan_phase == "after_recovery" and elapsed >= 195:
+            published = boundary + timedelta(seconds=195)
         response = MagicMock()
         response.__enter__.return_value.read.return_value = json.dumps({"states": [{
             "name": "slug", "state": "IDLE", "user_paused": False,
@@ -57,8 +62,8 @@ def test_restart_readiness_uses_restart_boundary(monkeypatch, scan_phase):
     if scan_phase == "before_restart":
         with pytest.raises(LifecycleTimeout):
             scenario._restart_and_wait_for_idle("slug")
-        assert elapsed == 184
+        assert elapsed == 304
     else:
         scenario._restart_and_wait_for_idle("slug")
-        assert elapsed == 4
+        assert elapsed == (195 if scan_phase == "after_recovery" else 4)
     assert operations == ["restart", "resume"]

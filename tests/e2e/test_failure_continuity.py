@@ -104,7 +104,11 @@ def _restart_and_wait_for_idle(slug):
     restarted_after = datetime.now(timezone.utc)
     _restart()
     _resume_daemon(slug)
-    _wait_for_fresh_idle(slug, after=restarted_after)
+    # A retained queue can require a stale-cache recovery scan before the
+    # ordinary selection scan. CI run 42544115809 took 134s + 61s for these
+    # phases, exceeding the empty-testbed startup allowance of 180s. Keep a
+    # bounded allowance for both scans and still require fresh completion.
+    _wait_for_fresh_idle(slug, after=restarted_after, timeout_sec=300)
 
 
 @pytest.mark.parametrize("dirty", [False, True], ids=["clean-merged", "dirty-held"])
