@@ -13,6 +13,9 @@ RUN apt-get update \
         gnupg \
     && rm -rf /var/lib/apt/lists/*
 
+COPY scripts/install_tailwind.sh /usr/local/libexec/install_tailwind.sh
+RUN sh /usr/local/libexec/install_tailwind.sh
+
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
         | gpg --dearmor -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
     && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
