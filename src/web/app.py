@@ -82,8 +82,8 @@ _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 _css_fallback_reported = False
 
 
-def _compiled_css_context(request) -> dict[str, Any]:
-    """Revalidate on render: bind-mounted sources can change after startup."""
+def _compiled_css_context() -> dict[str, Any]:
+    """Revalidate full-page renders so bind-mounted source edits invalidate CSS."""
     global _css_fallback_reported
     digest = None
     try:
@@ -99,7 +99,9 @@ def _compiled_css_context(request) -> dict[str, Any]:
     return {"compiled_css_available": digest is not None, "compiled_css_digest": digest}
 
 
-templates = Jinja2Templates(directory=str(_TEMPLATES_DIR), context_processors=[_compiled_css_context])
+templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+# Only base.html calls this helper; polled fragments do not need CSS evidence.
+templates.env.globals["compiled_css_context"] = _compiled_css_context
 templates.env.globals["utcnow"] = lambda: datetime.now(timezone.utc)
 
 

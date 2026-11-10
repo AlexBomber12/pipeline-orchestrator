@@ -10,6 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.testclient import TestClient
 from scripts.build_tailwind import ROOT, build
 from src.web import app as web_app
+from src.web.routes.dashboard import partial_redis_banner
 
 
 @pytest.fixture
@@ -20,6 +21,9 @@ def css_site(tmp_path, monkeypatch):
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy(ROOT / name, target)
     shutil.copytree(ROOT / "src/web/templates", root / "src/web/templates")
+    (root / "src/web/templates/css_child.html").write_text(
+        '{% extends "base.html" %}{% block title %}Inherited CSS page{% endblock %}'
+    )
     compiler = tmp_path / "tailwindcss"
     compiler.write_text('#!/bin/sh\nwhile [ "$1" != "-o" ]; do shift; done\nprintf ".text-ok{}" > "$2"\n')
     compiler.chmod(0o755)
@@ -40,6 +44,12 @@ def css_site(tmp_path, monkeypatch):
     @site.get("/")
     def page(request: Request):
         return web_app.templates.TemplateResponse(request, "base.html", {})
+
+    @site.get("/inherited")
+    async def inherited_page(request: Request):
+        return web_app.templates.TemplateResponse(request, "css_child.html", {})
+
+    site.add_api_route("/partials/redis-banner", partial_redis_banner)
 
     with TestClient(site) as client:
         yield root, output, compiler, client
@@ -124,3 +134,47 @@ def test_asset_changes_during_verification(css_site, monkeypatch):
 
     monkeypatch.setattr(web_app, "_css_is_current", changes)
     assert_fallback(client)
+
+
+def test_polled_fragment_skips_css_filesystem_work(css_site, monkeypatch, caplog):
+    root, output, compiler, client = css_site
+    assert build(root, output, compiler)
+
+    def unexpected_css_work(*args, **kwargs):
+        pytest.fail("Fragment responses must not read or verify compiled CSS")
+
+    monkeypatch.setattr(web_app, "_css_digest", unexpected_css_work)
+    monkeypatch.setattr(web_app, "_css_is_current", unexpected_css_work)
+    for _ in range(3):
+        response = client.get("/partials/redis-banner")
+        assert response.status_code == 200
+        assert "Redis not configured" in response.text
+        assert "/static/app.css" not in response.text
+    assert not caplog.records
+
+
+def test_inherited_page_verifies_once_and_notices_source_edit(css_site, monkeypatch):
+    root, output, compiler, client = css_site
+    assert build(root, output, compiler)
+    verify = web_app._css_is_current
+    calls = []
+
+    def counted_verification(**kwargs):
+        calls.append(kwargs)
+        return verify(**kwargs)
+
+    monkeypatch.setattr(web_app, "_css_is_current", counted_verification)
+    response = client.get("/inherited")
+    assert response.status_code == 200
+    assert "Inherited CSS page" in response.text
+    digest = hashlib.sha256((output / "app.css").read_bytes()).hexdigest()
+    assert f'/static/app.css?v={digest}' in response.text
+    assert "cdn.tailwindcss.com" not in response.text
+    assert len(calls) == 1
+    template = root / "src/web/templates/css_child.html"
+    template.write_text(template.read_text() + "<!-- live edit -->")
+    response = client.get("/inherited")
+    assert response.status_code == 200
+    assert "cdn.tailwindcss.com" in response.text
+    assert '/static/app.css?v=' not in response.text
+    assert len(calls) == 2

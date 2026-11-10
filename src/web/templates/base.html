@@ -6,8 +6,9 @@
     <meta name="color-scheme" content="dark light">
     <title>{% block title %}Pipeline Orchestrator{% endblock %}</title>
 
-    {% if compiled_css_available %}
-    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v={{ compiled_css_digest }}">
+    {% set compiled_css = compiled_css_context() %}
+    {% if compiled_css.compiled_css_available %}
+    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v={{ compiled_css.compiled_css_digest }}">
     {% else %}
     <script src="https://cdn.tailwindcss.com"></script>
     {% endif %}
@@ -63,7 +64,7 @@
         })();
     </script>
 
-    {% if not compiled_css_available %}
+    {% if not compiled_css.compiled_css_available %}
     <script>
         tailwind.config = {
             darkMode: 'class',
