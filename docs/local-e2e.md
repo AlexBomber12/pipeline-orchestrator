@@ -93,3 +93,23 @@ Without socket access, `ci.sh` cannot start `docker compose` for the test stack.
 5. Push the change and let GHA validate it in a clean environment.
 
 If the new test needs a shim scenario that does not yet exist, add the scenario to `tests/e2e/lib/coder_shim.sh` first, then write the test that invokes `coder_shim("new_scenario")`. Keep the shim deterministic: scenarios should not depend on wall-clock timing beyond the explicit `slow` injection, otherwise tests will flake under GHA's noisier runner load. When you submit the PR, mention any new scenarios in the PR description so reviewers know the shim contract changed.
+
+## Tailwind startup build
+
+`bash scripts/test-e2e.sh --filter test_web_compiles_current_css` uses the existing
+isolated stack and checks startup output plus real-compiler and partial-output
+cases. Rebuild the test image after source changes; this stack copies `/app`
+into the image. Both Compose definitions mount `/data` read-write. The image's
+`runner` user is UID 1000 (also explicit in production Compose); the harness
+makes `tests/e2e/data` writable before startup. The test requires CSS ownership
+by that runtime UID, rather than accepting a CDN-only response.
+
+Only the web command builds `/data/static/app.css`. Its adjacent
+`app.css.manifest.json` binds compiler bytes, builder, config, input CSS and all
+HTML/JS source paths and hashes to the published CSS digest. Consumers must
+use `scripts.build_tailwind.is_current()` to validate this evidence; later
+mounted source edits invalidate it. Failed builds log ERROR, discard temporary
+output and invalidate the manifest, preserving any previous complete stylesheet.
+The existing CDN remains active; serving compiled CSS is a separate task.
+Production bind-directory ownership must be provisioned by the operator; startup
+does not change permissions or ownership. This test does not deploy the image.

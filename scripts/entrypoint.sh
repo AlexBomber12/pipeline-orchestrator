@@ -29,4 +29,9 @@ if [ "${git_config_lock_acquired}" -ne 1 ]; then
     exit 1
 fi
 
+# Test Compose nests this entrypoint; only the inner web command builds CSS.
+if [[ "${1:-}" == "uvicorn" || ( "${1:-}" == "python" && "${2:-}" == "-m" && "${3:-}" == "uvicorn" ) ]]; then
+    python scripts/build_tailwind.py || echo "ERROR: Tailwind unavailable; continuing with existing CDN fallback" >&2
+fi
+
 exec "$@"
