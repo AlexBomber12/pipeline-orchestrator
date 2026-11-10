@@ -6,7 +6,12 @@
     <meta name="color-scheme" content="dark light">
     <title>{% block title %}Pipeline Orchestrator{% endblock %}</title>
 
+    {% set compiled_css = compiled_css_context() %}
+    {% if compiled_css.compiled_css_available %}
+    <link rel="stylesheet" href="{{ url_for('static', path='app.css') }}?v={{ compiled_css.compiled_css_digest }}">
+    {% else %}
     <script src="https://cdn.tailwindcss.com"></script>
+    {% endif %}
     <script src="https://unpkg.com/htmx.org@2.0.4"></script>
     <script>
         document.addEventListener('htmx:configRequest', function () {});
@@ -59,6 +64,7 @@
         })();
     </script>
 
+    {% if not compiled_css.compiled_css_available %}
     <script>
         tailwind.config = {
             darkMode: 'class',
@@ -91,6 +97,8 @@
             },
         };
     </script>
+
+    {% endif %}
 
     <style>
         :root {
