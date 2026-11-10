@@ -36,7 +36,11 @@ from typing import Any, AsyncIterator
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from scripts.build_tailwind import ROOT as _CSS_ROOT
+from scripts.build_tailwind import digest as _css_digest
+from scripts.build_tailwind import is_current as _css_is_current
 
 from src.coder_registry import CoderMetadataView, CoderRegistry, ModelSetting
 from src.coders import build_coder_registry
@@ -73,8 +77,29 @@ _UPLOAD_MAX_TOTAL_BYTES = 1_000_000  # 1 MB
 logger = logging.getLogger(__name__)
 _METADATA_RETRY_INTERVAL_SECONDS = 1.0
 
+STATIC_DIR = Path(os.environ.get("PO_STATIC_DIR", "/data/static"))
 _TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
-templates = Jinja2Templates(directory=str(_TEMPLATES_DIR))
+_css_fallback_reported = False
+
+
+def _compiled_css_context(request) -> dict[str, Any]:
+    """Revalidate on render: bind-mounted sources can change after startup."""
+    global _css_fallback_reported
+    digest = None
+    try:
+        # Read the cache key before verifying these bytes against build evidence.
+        candidate = _css_digest(STATIC_DIR / "app.css")
+        if _css_is_current(root=_CSS_ROOT, output=STATIC_DIR) and candidate == _css_digest(STATIC_DIR / "app.css"):
+            digest = candidate
+    except OSError:
+        pass
+    if digest is None and not _css_fallback_reported:
+        logger.warning("Tailwind compiled CSS unavailable or stale; using CDN fallback")
+    _css_fallback_reported = digest is None
+    return {"compiled_css_available": digest is not None, "compiled_css_digest": digest}
+
+
+templates = Jinja2Templates(directory=str(_TEMPLATES_DIR), context_processors=[_compiled_css_context])
 templates.env.globals["utcnow"] = lambda: datetime.now(timezone.utc)
 
 
@@ -426,6 +451,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(title="Pipeline Orchestrator", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR, check_dir=False), name="static")
 
 
 _OPERATOR_HEARTBEAT_MUTATION_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
